@@ -21,13 +21,13 @@ green, then commit). Conformance-driven: re-measure `language/expressions` each 
 - [x] M2-T021 [US2] `builtin_string.zig` natives: `charAt`/`charCodeAt`/`indexOf`/`includes`/`slice`/`substring`/`toUpperCase`/`toLowerCase`/`split` (byte-oriented; full Unicode deferred)
 - [x] M2-T022 [P] [US2] string tests (11, inline). Note: `language/expressions` plateaued at 23.3% — those failures need other features; strings/arrays pay off in `built-ins/*` → measure at close (SC-003). Bench green (ljs ≤ Node).
 
-## Cycle 3 — US3 Object statics (P2)
-- [ ] M2-T030 [US3] `Object.keys`/`getOwnPropertyNames`/`create`/`getPrototypeOf`/`assign`/`defineProperty`; `Object.prototype.hasOwnProperty`
-- [ ] M2-T031 [P] [US3] object tests + re-measure
-
-## Cycle 4 — US4 Number/Math/globals (P2)
-- [ ] M2-T040 [US4] `Math` (floor/ceil/abs/max/min/pow/sqrt/round/…), `Number` (isNaN/isFinite/isInteger/parseInt/parseFloat), globals `NaN`/`Infinity`/`isNaN`/`isFinite`/`parseInt`/`parseFloat`
-- [ ] M2-T041 [P] [US4] number/math tests + re-measure
+## Cycles 3–4 — Object statics + Number/Math — DEFERRED (conformance-driven pivot)
+> Diagnostic at Cycle-2 close: `language/expressions` fails are **10,763 parse_error** vs only
+> **1,817 unexpected_error**. Object/Math built-ins attack the small bucket → **deferred** in
+> favor of **M3 (parser/syntax coverage)**, which attacks the 6× larger parse_error bucket.
+> Revisit Object/Math after syntax (they still help `built-ins/*` + the unexpected_error bucket).
+- [ ] M2-T030 [US3] (deferred) `Object.keys`/`create`/`getPrototypeOf`/`assign`/`defineProperty`/`hasOwnProperty`
+- [ ] M2-T040 [US4] (deferred) `Math` + `Number` + numeric globals
 
 ## Close
 - [ ] M2-T050 Record new conformance baseline (`language/expressions` + `built-ins/Array`+`/String` slices, SC-002/003); README/roadmap; bench green; no M1 regression (27/6/2)
