@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ljs Test262 Conformance Report / Baseline",
+  "description": "Schema for both the emitted conformance report (--report) and the stored baseline (--update-baseline). A baseline is a report plus the passing-id set used for regression detection.",
+  "type": "object",
+  "required": ["subset", "pinned_commit", "total", "passed", "failed", "skipped", "conformance_pct"],
+  "properties": {
+    "subset": {
+      "type": "string",
+      "description": "Path or pattern the run was restricted to (FR-008). Empty/'.' means whole suite."
+    },
+    "pinned_commit": {
+      "type": "string",
+      "description": "The vendored Test262 commit hash this run was executed against (FR-012)."
+    },
+    "total": { "type": "integer", "minimum": 0 },
+    "passed": { "type": "integer", "minimum": 0 },
+    "failed": { "type": "integer", "minimum": 0 },
+    "skipped": { "type": "integer", "minimum": 0 },
+    "conformance_pct": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "passed / (passed + failed) * 100; skips excluded from the denominator."
+    },
+    "generated_at": {
+      "type": "string",
+      "description": "Timestamp recorded when a baseline is written (informational; not used in comparison)."
+    },
+    "results": {
+      "type": "array",
+      "description": "Per-execution results. Optional in a baseline (which may store only passing_ids).",
+      "items": {
+        "type": "object",
+        "required": ["path", "mode", "outcome"],
+        "properties": {
+          "path": { "type": "string", "description": "Test file path relative to the suite root." },
+          "mode": { "type": "string", "enum": ["strict", "sloppy"] },
+          "outcome": { "type": "string", "enum": ["pass", "fail", "skip"] },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "wrong_error",
+              "unexpected_error",
+              "no_error_expected_throw",
+              "parse_error",
+              "step_limit",
+              "crash",
+              "unsupported_feature",
+              "unsupported_flag"
+            ],
+            "description": "Present on fail/skip; absent on pass."
+          }
+        }
+      }
+    },
+    "passing_ids": {
+      "type": "array",
+      "description": "Baseline only: ids ('<path>#<mode>') that passed; the regression-detection set (FR-009).",
+      "items": { "type": "string" }
+    },
+    "regressions": {
+      "type": "array",
+      "description": "Report only: passing_ids in the baseline that did NOT pass this run.",
+      "items": { "type": "string" }
+    },
+    "improvements": {
+      "type": "array",
+      "description": "Report only: ids that passed this run but were not in the baseline.",
+      "items": { "type": "string" }
+    }
+  }
+}

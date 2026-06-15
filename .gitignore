@@ -1,0 +1,12 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Spec Kit / agent (may contain credentials)
+.claude/
+
+# Test262 vendored suite (large)
+vendor/test262/
+
+# OS
+.DS_Store
