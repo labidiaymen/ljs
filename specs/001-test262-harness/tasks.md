@@ -88,11 +88,13 @@ deliberately slowed case is flagged as a regression (SC-007, SC-008).
 > Co-P1 with US1. T035 lands during Setup/Foundational (skeleton runnable as soon as `ljs run`
 > exists); the rest follows once the engine entry point (T013) and `ljs run` (T024) exist.
 
-- [ ] T035 [P] [US4] Create benchmark skeleton `bench/runner.zig` + ≥3 trivial-subset cases in `bench/cases/*.js` (arithmetic-heavy; within the supported language subset)
-- [ ] T036 [US4] Implement timing in `bench/runner.zig`: run each case on ljs (`ljs run`) and Node (`node`), warm-up + N timed reps, report `ljs_ms`/`node_ms`/`ratio` (median + min) — FR-014 (depends T013, T024)
-- [ ] T037 [US4] Handle Node-absent: still time ljs, mark the Node column unavailable, don't fail — FR-016, SC-009
-- [ ] T038 [US4] Implement ljs baseline read/write (`bench/baseline.json`) + ljs-vs-self regression detection with noise tolerance + `--update-baseline` — FR-015, SC-008
-- [ ] T039 [US4] Wire `zig build bench -- [--update-baseline] [--reps N]` in `build.zig`, per the benchmark contract
+- [x] T035 [P] [US4] Benchmark cases `bench/cases/*.js` (arith_sum, arith_mix, string_cat) + runner — implemented as `scripts/bench.py` (note ↓), not `bench/runner.zig`
+- [x] T036 [US4] Timing in `scripts/bench.py`: run each case on ljs (`ljs run`) and Node, warm-up + N reps, report `ljs_ms`/`node_ms`/`ratio` (min+median) — FR-014
+- [x] T037 [US4] Node-absent handling: still time ljs, mark Node column `n/a`, don't fail — FR-016, SC-009
+- [x] T038 [US4] ljs baseline read/write (`bench/baseline.json`) + ljs-vs-self regression detection with ±tolerance + `--update-baseline` — FR-015, SC-008
+- [x] T039 [US4] Wired `zig build bench -- [--update-baseline] [--reps N]` in `build.zig` (runs `scripts/bench.py`, builds ljs first) — verified: ratios reported + regression detected (exit 1)
+
+> **Design note (autonomous call):** the M0 bench runner is `scripts/bench.py` (mirrors `scripts/lint.sh`), not a native `bench/runner.zig`. Zig 0.16's subprocess API (`std.process.Child`) is mid-refactor and not stable to build against now; the engine stays pure Zig and a native runner is deferred until that API settles. See research.md D10.
 
 **Checkpoint**: the ljs-vs-Node performance signal exists and is regression-protected.
 

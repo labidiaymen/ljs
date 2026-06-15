@@ -1,0 +1,17 @@
+{
+  "tolerance_pct": 15.0,
+  "cases": {
+    "arith_mix.js": {
+      "ljs_ms_median": 10.675,
+      "ljs_ms_min": 9.746
+    },
+    "arith_sum.js": {
+      "ljs_ms_median": 11.362,
+      "ljs_ms_min": 10.725
+    },
+    "string_cat.js": {
+      "ljs_ms_median": 9.497,
+      "ljs_ms_min": 9.045
+    }
+  }
+}

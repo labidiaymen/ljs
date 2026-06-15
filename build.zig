@@ -162,6 +162,14 @@ pub fn build(b: *std.Build) void {
     const lint_step = b.step("lint", "Run zig fmt --check and ZLint (if installed)");
     lint_step.dependOn(&lint.step);
 
+    // `zig build bench [-- --update-baseline] [-- --reps N]` — benchmark ljs vs Node and
+    // gate on ljs-vs-self regression (constitution Principle IV). Builds ljs first.
+    const bench = b.addSystemCommand(&[_][]const u8{ "python3", "scripts/bench.py" });
+    bench.step.dependOn(b.getInstallStep());
+    if (b.args) |bench_args| bench.addArgs(bench_args);
+    const bench_step = b.step("bench", "Benchmark ljs vs Node (perf gate)");
+    bench_step.dependOn(&bench.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

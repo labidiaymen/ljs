@@ -127,6 +127,11 @@ All decisions below resolve the Technical Context. No `NEEDS CLARIFICATION` rema
 - **Alternatives considered**: JS-level microbench libraries (need a capable engine ljs lacks
   at M0 — rejected); benchmarking only ljs without a reference (loses the V8 comparison the
   user asked for — rejected).
+- **Implementation (M0):** the runner is `scripts/bench.py` (python3), invoked by
+  `zig build bench` the same way `zig build lint` wraps `scripts/lint.sh`. A native
+  `bench/runner.zig` was deferred: Zig 0.16's `std.process.Child` subprocess API is
+  mid-refactor and not stable to build against yet. The engine itself stays pure Zig; only the
+  dev-tooling gate is a script. Revisit a native port when the 0.16 process API settles.
 
 ## Summary of resolved unknowns
 
