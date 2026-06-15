@@ -123,10 +123,47 @@ specific Early Errors / unsupported-syntax parse rejections so those tests still
     remaining §15.7.1 Early Errors (Cycle 5). Subclassing built-ins links the chains but does not yet
     install exotic internal slots (the positive value-checks that recovered are prototype-chain ones).
 
-## Cycle 3 — Accessors, computed names, method-shorthand edges (US3)
-- [ ] M4-T030 `get x(){…}` / `set x(v){…}` in a class body (instance + static), reusing the §13.2.5.6
-  accessor model; computed method/field names `[expr](){…}` / `[expr] = v;` (key evaluated at class
-  definition); method-shorthand edge cases (reserved-word + numeric/string keys).
+## Cycle 3 — Accessors, computed names, method-shorthand edges (US3) 🎯 (DONE — harness metric: passed 5526 → 5766, +240 net, 0 true regressions; conformance 32.6% → 34.0%)
+- [x] M4-T030 `get x(){…}` / `set x(v){…}` in a class body (instance + static), reusing the §13.2.5.6
+  accessor model; computed method/field/accessor names `[expr](){…}` / `[expr] = v;` / `get [expr](){…}`
+  (key evaluated at class definition, in definition order).
+  - **AST (`src/ast.zig`):** no change needed — Cycle 1 already provisioned `ClassElementKind.get`/`.set`
+    and `ClassElement.computed_key` (`?*const Node`). This cycle wires them through the parser + evaluator.
+  - **Parser (`src/parser.zig`):** `parseClassElement` no longer parse-rejects `get`/`set` (when followed
+    by a PropertyName); a new `parseClassAccessor` mirrors the object-literal §13.2.5.6 accessor path —
+    accessor arity Early Errors (getter takes 0 params, setter exactly 1, no rest), [[HomeObject]] context
+    (`in_method = true`, `in_derived_ctor = false`) so `super.x` is allowed but `super(...)` is not, and the
+    §15.7.1 name restrictions (`constructor` may not be a getter/setter; a `static` accessor named
+    `prototype` is forbidden). Computed keys flow through the existing `parsePropertyName` `[expr]` branch
+    (already used by methods/fields since Cycle 1) — only generators (`*m`) and async are still rejected.
+  - **Interpreter (`src/interpreter.zig`):** `evalClass` is now a single definition-order pass over
+    `c.elements`: a new `classElementKey` helper evaluates a computed `[expr]` key (ToPropertyKey →
+    ToString) at class-definition time interleaved with the other elements (so key side-effects observe
+    definition order); `.get`/`.set` elements install via `defineAccessor` on `.prototype` (instance) or
+    the constructor (static), merging a get+set pair for the same key into one accessor property, and carry
+    [[HomeObject]] (= the install target) so `super.x` works inside an accessor; instance-field records are
+    collected during the pass (with their resolved keys) and attached to the constructor's
+    `FunctionData.fields` afterward (the constructor is built first with empty fields, then mutated). The
+    object-model `PropertyValue.accessor` + `defineAccessor` (M3 C6) and computed-key eval (`propKey`) are
+    reused as-is.
+  - **Tests (`src/engine.zig`):** `get x(){return 5}` → `.x` is 5; `set x(v)` stores; a get+set pair
+    round-trips; setter-only; static `get`/`set`; `super.x` inside a derived getter; computed method
+    `['a'+'b'](){return 1}` → `new C().ab()`; computed instance + static fields; bare computed field;
+    computed getter/setter; definition-order key-eval (`[a()][b()]` → "ab"); numeric computed key ToString.
+    The Cycle-1 "unsupported syntax still rejects" test was updated to drop `get`/`set` (now supported) and
+    add `static *m`, `async m`, `async *m` (still rejected — generators/async are a separate milestone).
+  - **Conformance + regression hunt (harness metric, ReleaseFast):** `passed 5526 → 5766` (+240 net),
+    conformance 32.6% → 34.0%. **0 true regressions** by `mode+path` (`comm` before/after); 240 recoveries
+    — 236 `class/*` (`accessor-name-inst/*` + `accessor-name-static/*` accessor positives, `cpn-*`
+    computed-property-name positives, plus `scope-{static-,}setter-paramsbody-*`) and 4 `super/*`. The
+    generator/async class negatives still parse-reject (they are in the 0-regression set). Baseline gate
+    green ("no regression vs baseline"). Bench green (loop_mix −8.0%,
+    loop_sum −7.7%, str_build −11.0%; perf ok, ljs 0.2–0.5× Node — the accessor/computed-key work is off
+    the hot path).
+  - **Landed:** instance + static `get`/`set` accessors (get+set merge, [[HomeObject]] for `super`);
+    computed method/field/accessor names evaluated at class-definition time in definition order. **Deferred:**
+    private `#x` + static blocks (Cycle 4); the remaining §15.7.1 Early Errors (Cycle 5); generator/async
+    methods (separate future milestone — kept parse-rejecting).
 
 ## Cycle 4 — Private names + static blocks (US4)
 - [ ] M4-T040 Private fields/methods `#x` (private names lexically scoped to the class body, accessed

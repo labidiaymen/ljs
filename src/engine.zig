@@ -488,11 +488,12 @@ test "M4 classes: body is strict (Cycle 1, §15.7)" {
 }
 
 test "M4 classes: unsupported element syntax still parse-rejects (Cycle 1 scope)" {
-    // generators / async / accessors are deferred — they must still parse-reject so the
+    // generators / async are a separate future milestone — they must still parse-reject so the
     // negative-parse class tests that use them keep passing.
     try expectSyntaxError("class C { *m() {} }"); // generator method (deferred)
-    try expectSyntaxError("class C { get x() { return 1; } }"); // accessor (Cycle 3)
-    try expectSyntaxError("class C { set x(v) {} }"); // accessor (Cycle 3)
+    try expectSyntaxError("class C { static *m() {} }"); // static generator (deferred)
+    try expectSyntaxError("class C { async m() {} }"); // async method (deferred)
+    try expectSyntaxError("class C { async *m() {} }"); // async generator (deferred)
     // a ClassDeclaration requires a name
     try expectSyntaxError("class {}");
 }
@@ -588,6 +589,71 @@ test "M4 classes: super early errors (Cycle 2, §13.3.5.1 / §13.3.7.1)" {
     // extends a non-constructor, non-null value throws a TypeError at runtime
     try expectThrows("class B extends 5 {}");
     try expectThrows("class B extends ({}) {}");
+}
+
+test "M4 classes: accessors get/set (Cycle 3, §15.7 / §13.2.5.6)" {
+    // a getter on the prototype: `.x` invokes it
+    try expectNumber("class C { get x() { return 5; } } new C().x", 5);
+    // a setter stores via the instance; a separate getter reads it back (get+set merge to one prop)
+    try expectNumber(
+        "class C { set x(v) { this._x = v; } get x() { return this._x; } } " ++
+            "var c = new C(); c.x = 9; c.x",
+        9,
+    );
+    // a setter-only accessor: assignment runs the setter (here recording into another field)
+    try expectNumber(
+        "class C { set x(v) { this.seen = v + 1; } } var c = new C(); c.x = 41; c.seen",
+        42,
+    );
+    // a getter reading instance state set by the constructor
+    try expectNumber(
+        "class C { constructor() { this.v = 3; } get doubled() { return this.v * 2; } } new C().doubled",
+        6,
+    );
+    // static getter on the constructor
+    try expectNumber("class C { static get answer() { return 42; } } C.answer", 42);
+    // static setter
+    try expectNumber(
+        "class C { static set v(x) { C._v = x; } } C.v = 7; C._v",
+        7,
+    );
+    // an accessor carries [[HomeObject]] — super.x inside a getter resolves to the parent accessor
+    try expectNumber(
+        "class A { get x() { return 100; } } " ++
+            "class B extends A { get x() { return super.x + 1; } } " ++
+            "new B().x",
+        101,
+    );
+}
+
+test "M4 classes: computed names (Cycle 3, §15.7)" {
+    // computed method name `[expr]() {}`
+    try expectNumber("class C { ['a' + 'b']() { return 1; } } new C().ab()", 1);
+    // computed instance field name `[expr] = init`
+    try expectNumber("class C { ['v' + 1] = 7; } new C().v1", 7);
+    // a bare computed field `[expr];` is created undefined
+    try expectStr("var k = 'q'; class C { [k]; } typeof new C().q", "undefined");
+    // computed static method name
+    try expectNumber("class C { static ['s' + 'm']() { return 9; } } C.sm()", 9);
+    // computed static field name
+    try expectNumber("class C { static ['n' + 1] = 4; } C.n1", 4);
+    // computed accessor (getter) name
+    try expectNumber("class C { get ['g' + 'x']() { return 8; } } new C().gx", 8);
+    // computed accessor (setter) name round-trips with a matching computed getter
+    try expectNumber(
+        "var k = 'p'; class C { set [k](v) { this._p = v; } get [k]() { return this._p; } } " ++
+            "var c = new C(); c.p = 5; c.p",
+        5,
+    );
+    // the key expression is evaluated at class-definition time, in definition order
+    try expectStr(
+        "var log = ''; var a = () => { log += 'a'; return 'm1'; }; " ++
+            "var b = () => { log += 'b'; return 'm2'; }; " ++
+            "class C { [a()]() {} [b()]() {} } log",
+        "ab",
+    );
+    // a numeric computed key is ToString'd
+    try expectNumber("class C { [1 + 1]() { return 3; } } new C()[2]()", 3);
 }
 
 test "M3 object literal sugar: shorthand, computed, method (US6, §13.2.5)" {

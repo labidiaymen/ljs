@@ -552,9 +552,11 @@ pub const Parser = struct {
             }
         }
 
-        // §15.7 Unsupported element prefixes parse-reject (preserve negatives): generator `* m`,
-        // `async m`, private `#x`, and accessors `get`/`set` (Cycle 3). `get`/`set` are only a
-        // modifier when followed by a property name (else they are an ordinary element key).
+        // §15.7 Unsupported element prefixes parse-reject (preserve negatives): generator `* m` and
+        // `async m` (a separate future milestone), private `#x` (Cycle 4). Accessors `get`/`set`
+        // (handled just below) and computed names `[expr]` land this cycle. `get`/`set`/`async` are
+        // only a modifier when followed by something that begins a property name (else they are an
+        // ordinary element key, e.g. `get(){}` / `get = 1` / `get;`).
         switch (self.peek().kind) {
             .star => return ParseError.UnexpectedToken, // generator method (deferred)
             .identifier => {
@@ -562,10 +564,11 @@ pub const Parser = struct {
                 if (std.mem.eql(u8, w, "async") and startsAccessorName(self.tokens[self.idx + 1].kind)) {
                     return ParseError.UnexpectedToken; // async method (deferred)
                 }
+                // §15.7 `get x(){…}` / `set x(v){…}` accessor (instance or static).
                 if ((std.mem.eql(u8, w, "get") or std.mem.eql(u8, w, "set")) and
                     startsAccessorName(self.tokens[self.idx + 1].kind))
                 {
-                    return ParseError.UnexpectedToken; // accessor (Cycle 3)
+                    return self.parseClassAccessor(is_static, std.mem.eql(u8, w, "get"));
                 }
             },
             // §15.7 a private name `#x` (field/method) is Cycle 4.
@@ -644,6 +647,50 @@ pub const Parser = struct {
             .key = pn.key,
             .computed_key = pn.computed,
             .value = .{ .field_init = field_init },
+        };
+    }
+
+    /// §15.7 MethodDefinition `get PropName(){…}` / `set PropName(v){…}` in a class body (the leading
+    /// `get`/`set` token has NOT yet been consumed; `is_get` selects which). Mirrors the object-literal
+    /// accessor path (§13.2.5.6): the accessor arity Early Errors, [[HomeObject]] context for `super`,
+    /// and the §15.7.1 name restrictions (`constructor` may not be an accessor; a `static` accessor may
+    /// not be named `prototype`). Computed keys `get [expr](){…}` are supported (key in `computed_key`).
+    fn parseClassAccessor(self: *Parser, is_static: bool, is_get: bool) ParseError!ast.ClassElement {
+        _ = self.advance(); // consume `get` / `set`
+        const pn = try self.parsePropertyName();
+        const is_literal = pn.computed == null;
+        // §15.7.1 Early Errors: `constructor` may not be a getter/setter; a `static` accessor named
+        // `prototype` is forbidden.
+        if (is_literal) {
+            if (!is_static and std.mem.eql(u8, pn.key, "constructor")) return ParseError.UnexpectedToken;
+            if (is_static and std.mem.eql(u8, pn.key, "prototype")) return ParseError.UnexpectedToken;
+        }
+        // §13.3.5: an accessor body has a [[HomeObject]] (so `super.x` is allowed) but is not a
+        // constructor (so `super(...)` is a SyntaxError). Save/restore so the flags don't leak.
+        const saved_in_method = self.in_method;
+        const saved_in_derived = self.in_derived_ctor;
+        defer self.in_method = saved_in_method;
+        defer self.in_derived_ctor = saved_in_derived;
+        self.in_method = true;
+        self.in_derived_ctor = false;
+        const pl = try self.parseParams();
+        // §13.2.5.1 accessor arity Early Errors: a getter takes no parameters; a setter takes exactly
+        // one (a default is allowed, a rest element is not).
+        if (is_get) {
+            if (pl.params.len != 0 or pl.rest != null) return ParseError.UnexpectedToken;
+        } else {
+            if (pl.params.len != 1 or pl.rest != null) return ParseError.UnexpectedToken;
+        }
+        const body = try self.parseMethodBody(pl);
+        if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
+        const f = try self.arena.create(ast.Function);
+        f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body };
+        return .{
+            .kind = if (is_get) .get else .set,
+            .is_static = is_static,
+            .key = pn.key,
+            .computed_key = pn.computed,
+            .value = .{ .func = f },
         };
     }
 

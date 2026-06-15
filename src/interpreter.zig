@@ -658,6 +658,18 @@ pub const Interpreter = struct {
         return .{ .key = p.key };
     }
 
+    /// §15.7.14 resolve a ClassElement's PropertyName: a computed `[expr]` (evaluated in the class
+    /// scope at definition time, ToPropertyKey → ToString in the M-subset) or the static key parsed
+    /// earlier. Mirrors `propKey` for object-literal members.
+    fn classElementKey(self: *Interpreter, el: ast.ClassElement, env: *Environment) EvalError!KeyResult {
+        if (el.computed_key) |ck| {
+            const c = try self.evalExpr(ck, env);
+            if (c.isAbrupt()) return .{ .completion = c };
+            return .{ .key = try self.toString(c.normal) };
+        }
+        return .{ .key = el.key };
+    }
+
     /// §7.3.25 CopyDataProperties — copy `source`'s own enumerable data properties into `target`
     /// (invoking getters to read the values). Null/undefined sources are no-ops. Used by object
     /// spread `{...source}`.
@@ -795,19 +807,15 @@ pub const Interpreter = struct {
             }
         }
 
-        // Locate the explicit constructor (if any) and collect the instance field initializers.
+        // Locate the explicit constructor (if any). Instance field records are collected during the
+        // definition-order installation pass below (their keys — including computed `[expr]` keys —
+        // are evaluated at class-definition time, §15.7.14 ClassElementEvaluation) and attached to the
+        // constructor's FunctionData afterward.
         var ctor_fn: ?*const ast.Function = null;
-        var fields: std.ArrayListUnmanaged(@import("object.zig").FieldInit) = .empty;
         for (c.elements) |el| {
-            switch (el.kind) {
-                .constructor => ctor_fn = el.value.func,
-                .field => if (!el.is_static) {
-                    // Cycle 1: keys are static names (computed keys land in Cycle 3).
-                    try fields.append(self.arena, .{ .key = el.key, .init = el.value.field_init });
-                },
-                else => {},
-            }
+            if (el.kind == .constructor) ctor_fn = el.value.func;
         }
+        var fields: std.ArrayListUnmanaged(@import("object.zig").FieldInit) = .empty;
 
         // §15.7.14: build the constructor function object. Default constructor: a base class gets an
         // empty body; a derived class's default constructor forwards its args to `super(...)` (handled
@@ -817,7 +825,6 @@ pub const Interpreter = struct {
             .rest = if (ctor_fn) |f| f.rest else null,
             .body = if (ctor_fn) |f| f.body else &.{},
             .closure = class_env,
-            .fields = fields.items,
             .is_class_ctor = true,
             .is_derived_ctor = is_derived,
             .super_ctor = super_ctor,
@@ -843,39 +850,70 @@ pub const Interpreter = struct {
             ctor.prototype = super_ctor;
         }
 
-        // §15.7.14: install methods (and, this cycle, static fields). Instance members → `.prototype`,
-        // static members → the constructor object. Each method's [[HomeObject]] is its install target.
+        // §15.7.14 ClassElementEvaluation: walk the ClassBody in definition order, installing methods,
+        // accessors, and static fields, and collecting instance-field records. Instance members →
+        // `.prototype`, static members → the constructor object. A computed `[expr]` PropertyName is
+        // evaluated HERE (definition order, ToPropertyKey → ToString in the M-subset), so its
+        // side-effects interleave with the other elements. Each method/accessor's [[HomeObject]] is its
+        // install target (so `super.x` inside it looks up `home_object.[[Prototype]]`).
         for (c.elements) |el| {
             switch (el.kind) {
                 .constructor => {}, // already the [[Call]] body
                 .method => {
+                    const key = try self.classElementKey(el, class_env);
+                    if (key.isAbrupt()) return key.completion;
                     const fc = try self.evalFunctionExpr(el.value.func, class_env);
                     if (fc.isAbrupt()) return fc;
                     const target = if (el.is_static) ctor else proto;
-                    // §9.2.5: a method's [[HomeObject]] is the object it is defined on — `super.x`
-                    // inside it looks up `home_object.[[Prototype]]`.
+                    // §9.2.5: a method's [[HomeObject]] is the object it is defined on.
                     if (fc.normal == .object) {
                         if (fc.normal.object.call) |*mfd| mfd.home_object = target;
                     }
-                    try target.set(el.key, fc.normal);
+                    try target.set(key.key, fc.normal);
                 },
-                .field => if (el.is_static) {
-                    // §15.7.14: a static field initializer runs at class definition with `this` = the
-                    // constructor object.
-                    var v: Value = .undefined;
-                    if (el.value.field_init) |ie| {
-                        const saved_this = self.this_val;
-                        self.this_val = .{ .object = ctor };
-                        const ic = try self.evalExpr(ie, class_env);
-                        self.this_val = saved_this;
-                        if (ic.isAbrupt()) return ic;
-                        v = ic.normal;
+                .get, .set => {
+                    // §15.7 accessor (§13.2.5.6 model): merge a get/set pair for the same key into one
+                    // accessor property on `.prototype` (instance) or the constructor (static).
+                    const key = try self.classElementKey(el, class_env);
+                    if (key.isAbrupt()) return key.completion;
+                    const fc = try self.evalFunctionExpr(el.value.func, class_env);
+                    if (fc.isAbrupt()) return fc;
+                    const target = if (el.is_static) ctor else proto;
+                    const f = fc.normal.object;
+                    // §9.2.5: the accessor carries [[HomeObject]] too (so `super.x` works inside it).
+                    if (f.call) |*mfd| mfd.home_object = target;
+                    if (el.kind == .get) {
+                        try target.defineAccessor(key.key, f, null);
+                    } else {
+                        try target.defineAccessor(key.key, null, f);
                     }
-                    try ctor.set(el.key, v);
                 },
-                .get, .set => {}, // accessors land in Cycle 3
+                .field => {
+                    const key = try self.classElementKey(el, class_env);
+                    if (key.isAbrupt()) return key.completion;
+                    if (el.is_static) {
+                        // §15.7.14: a static field initializer runs at class definition with `this` =
+                        // the constructor object.
+                        var v: Value = .undefined;
+                        if (el.value.field_init) |ie| {
+                            const saved_this = self.this_val;
+                            self.this_val = .{ .object = ctor };
+                            const ic = try self.evalExpr(ie, class_env);
+                            self.this_val = saved_this;
+                            if (ic.isAbrupt()) return ic;
+                            v = ic.normal;
+                        }
+                        try ctor.set(key.key, v);
+                    } else {
+                        // §15.7.14: the instance FieldDefinition's name is evaluated now (definition
+                        // order); the initializer is run per-instance by initInstanceFields.
+                        try fields.append(self.arena, .{ .key = key.key, .init = el.value.field_init });
+                    }
+                },
             }
         }
+        // §15.7.14: stash the resolved instance-field records on the constructor (run per `new`).
+        if (ctor.call) |*fd| fd.fields = fields.items;
 
         // §15.7.14: bind the class name immutably in the inner scope for self-reference.
         if (c.name) |name| try class_env.declare(name, .{ .object = ctor }, false, true);
