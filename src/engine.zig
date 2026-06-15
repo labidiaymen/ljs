@@ -488,14 +488,106 @@ test "M4 classes: body is strict (Cycle 1, §15.7)" {
 }
 
 test "M4 classes: unsupported element syntax still parse-rejects (Cycle 1 scope)" {
-    // generators / async / accessors / super are deferred — they must still parse-reject so the
+    // generators / async / accessors are deferred — they must still parse-reject so the
     // negative-parse class tests that use them keep passing.
     try expectSyntaxError("class C { *m() {} }"); // generator method (deferred)
     try expectSyntaxError("class C { get x() { return 1; } }"); // accessor (Cycle 3)
     try expectSyntaxError("class C { set x(v) {} }"); // accessor (Cycle 3)
-    try expectSyntaxError("class C extends Object { constructor() { super(); } }"); // super (Cycle 2)
     // a ClassDeclaration requires a name
     try expectSyntaxError("class {}");
+}
+
+test "M4 classes: extends + super (Cycle 2, §15.7.14 / §13.3.5 / §13.3.7)" {
+    // extends links the chains; super() runs the parent ctor on `this`; own fields after super().
+    try expectNumber(
+        "class A { constructor() { this.x = 1; } } " ++
+            "class B extends A { constructor() { super(); this.y = 2; } } " ++
+            "var b = new B(); b.x + b.y",
+        3,
+    );
+    // an instance of a derived class is `instanceof` both the derived and the base class
+    try expectBool(
+        "class A {} class B extends A {} (new B()) instanceof A",
+        true,
+    );
+    try expectBool(
+        "class A {} class B extends A {} (new B()) instanceof B",
+        true,
+    );
+    // super.method() invokes the parent method with `this` = the current instance
+    try expectNumber(
+        "class A { m() { return 10; } } " ++
+            "class B extends A { m() { return super.m() + 5; } } " ++
+            "new B().m()",
+        15,
+    );
+    // super.method() can read instance state via the current `this`
+    try expectNumber(
+        "class A { who() { return this.v; } } " ++
+            "class B extends A { constructor() { super(); this.v = 7; } get() { return super.who(); } } " ++
+            "new B().get()",
+        7,
+    );
+    // super.prop reads a parent prototype data property (not the instance's own)
+    try expectNumber(
+        "class A { constructor() { this.label = 99; } } A.prototype.label = 1; " ++
+            "class B extends A { read() { return super.label; } } " ++
+            "var b = new B(); b.read()",
+        1,
+    );
+    // static inheritance: a static member of the base is reachable through the derived constructor
+    try expectNumber(
+        "class A { static s() { return 42; } } class B extends A {} B.s()",
+        42,
+    );
+    try expectNumber(
+        "class A { static n = 8; } class B extends A {} B.n",
+        8,
+    );
+    // default derived constructor forwards args to super(...)
+    try expectNumber(
+        "class A { constructor(a, b) { this.s = a + b; } } class B extends A {} new B(40, 2).s",
+        42,
+    );
+    // extends an arbitrary expression (the heritage is a LeftHandSideExpression)
+    try expectNumber(
+        "var box = { Base: class { constructor() { this.v = 5; } } }; " ++
+            "class D extends box.Base { constructor() { super(); this.v += 1; } } new D().v",
+        6,
+    );
+    // a three-level chain: C extends B extends A — each super() initializes its level
+    try expectNumber(
+        "class A { constructor() { this.a = 1; } } " ++
+            "class B extends A { constructor() { super(); this.b = 2; } } " ++
+            "class C extends B { constructor() { super(); this.c = 3; } } " ++
+            "var o = new C(); o.a + o.b + o.c",
+        6,
+    );
+    // derived instance fields initialize AFTER super() (so they can see parent-set state)
+    try expectNumber(
+        "class A { constructor() { this.base = 10; } } " ++
+            "class B extends A { y = this.base + 1; } " ++
+            "new B().y",
+        11,
+    );
+    // extends null: the prototype chain links to null (instance is not instanceof Object via chain)
+    try expectStr("class A extends null {} typeof A", "function");
+}
+
+test "M4 classes: super early errors (Cycle 2, §13.3.5.1 / §13.3.7.1)" {
+    // super(...) outside a derived constructor is a SyntaxError
+    try expectSyntaxError("class A { constructor() { super(); } }"); // non-derived ctor
+    try expectSyntaxError("class A extends Object { m() { super(); } }"); // non-constructor method
+    try expectSyntaxError("function f() { super(); }"); // outside any class
+    try expectSyntaxError("super();"); // top level
+    // super.prop outside a method is a SyntaxError
+    try expectSyntaxError("function f() { return super.x; }");
+    try expectSyntaxError("super.x;"); // top level
+    // a bare `super` (not a SuperProperty/SuperCall) is always a SyntaxError
+    try expectSyntaxError("class A extends Object { m() { return super; } }");
+    // extends a non-constructor, non-null value throws a TypeError at runtime
+    try expectThrows("class B extends 5 {}");
+    try expectThrows("class B extends ({}) {}");
 }
 
 test "M3 object literal sugar: shorthand, computed, method (US6, §13.2.5)" {

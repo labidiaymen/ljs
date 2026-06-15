@@ -41,6 +41,15 @@ pub const FunctionData = struct {
     /// §15.7: a class constructor (explicit or default) is flagged so a plain `C()` call (without
     /// `new`) throws a TypeError per §15.7.14 ([[Call]] of a class constructor is not allowed).
     is_class_ctor: bool = false,
+    /// §9.2.5 / §15.7.14 [[HomeObject]]: for a class/object method the object the method is defined
+    /// on — its `.prototype` (instance method) or the constructor (static method). `super.x` inside
+    /// the method resolves against `home_object.[[Prototype]]`. Null for ordinary functions/arrows.
+    home_object: ?*Object = null,
+    /// §15.7.14: a derived class constructor (one whose class has an `extends` heritage). `super(...)`
+    /// is only legal here; `super_ctor` is the superclass constructor object to invoke. Default
+    /// derived constructor (no explicit `constructor`) forwards its args to `super(...)`.
+    is_derived_ctor: bool = false,
+    super_ctor: ?*Object = null,
 };
 
 /// §15.7.14 one resolved instance FieldDefinition: the property key (computed keys are evaluated at

@@ -70,6 +70,14 @@ pub const Node = union(enum) {
     /// so the short-circuit propagates, but does not itself test for nullish). If the base short-
     /// circuits, the WHOLE chain evaluates to `undefined` (§13.3.9.1, the `Return undefined` step).
     optional: struct { base: *const Node, optional: bool, link: OptionalLink },
+    /// §13.3.7 SuperCall `super(args)` — only valid in a derived-class constructor. Calls the
+    /// superclass constructor with the current `this` (parse-restricted to derived constructors).
+    super_call: []const *const Node,
+    /// §13.3.5 SuperProperty `super.name` / `super[key]` — looks up starting at the active method's
+    /// [[HomeObject]].[[Prototype]], but reads/invokes with `this` = the current `this`. `name` is a
+    /// static IdentifierName; `key` (non-null) is the computed `super[expr]` index. Parse-restricted
+    /// to method bodies.
+    super_member: struct { name: []const u8 = "", key: ?*const Node = null },
 };
 
 /// One link of an optional chain: the access applied to the (non-nullish) base. `call` carries the

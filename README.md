@@ -8,7 +8,7 @@ performance story from day one.
 > functions/closures, objects, control flow, exceptions, and now the full modern-syntax surface
 > (operators, template literals, spread/rest, destructuring, arrow functions, object-literal sugar,
 > `?.`/`??`, the complete assignment-operator set, and strict-mode Early Errors) — enough to load
-> the Test262 harness and pass **32.3%** of `language/expressions` (5,484 tests, harness metric).
+> the Test262 harness and pass **32.6%** of `language/expressions` (5,526 tests, harness metric).
 > Classes, generators, and async are later milestones. The bytecode/JIT tiers are future work. A
 > learning-grade, in-progress engine, not a drop-in Node replacement.
 
@@ -88,11 +88,12 @@ tests that call `assert.*`; e.g. at commit `9320218` (M4 Cycle 1) the same code 
 vs harness **32.3%** on `language/expressions` (passed 4,622 → 5,484). The committed baseline
 `baseline/language-expressions.json` and all M4+ deltas use the harness metric.
 
-**M4 Cycle 1 result (harness metric):** `test/language/expressions` → **5,484 passed / 11,487 failed /
-2,244 skipped = 32.3%**. M3's nine syntax cycles moved this from the **M1 baseline of 23.3%** by
-draining the `parse_error` bucket; M4 begins draining the class bucket (**classes alone are ≈2,405
-unique failing test files**), with generators/async next. The harness also validates classification,
-fault isolation, determinism, and regression detection.
+**M4 Cycle 2 result (harness metric):** `test/language/expressions` → **5,526 passed / 11,445 failed /
+2,244 skipped = 32.6%** (Cycle 1 was 5,484 = 32.3%; Cycle 2 added `extends` + `super`, +42, 0 true
+regressions). M3's nine syntax cycles moved this from the **M1 baseline of 23.3%** by draining the
+`parse_error` bucket; M4 is draining the class bucket (**classes alone are ≈2,405 unique failing test
+files**), with generators/async next. The harness also validates classification, fault isolation,
+determinism, and regression detection.
 
 ## Roadmap
 

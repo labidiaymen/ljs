@@ -37,6 +37,11 @@ pub const Interpreter = struct {
     /// The current `this` binding (§9.4.5 GetThisEnvironment, M1 subset): set by method calls,
     /// undefined otherwise. Saved/restored around each [[Call]].
     this_val: Value = .undefined,
+    /// §9.2.5 / §13.3.5 the active function's [[HomeObject]] — set when a class/object method is
+    /// invoked (to its `home_object`), null otherwise. `super.x` resolves against
+    /// `home_object.[[Prototype]]`; `super(...)` invokes `home_object`'s constructor's superclass.
+    /// Saved/restored around each [[Call]] alongside `this_val`.
+    home_object: ?*Object = null,
     /// The realm's global environment — used to resolve the Error family for engine-thrown
     /// errors (so they carry the right prototype + name). Set by the engine after setup.
     globals: ?*Environment = null,
@@ -380,8 +385,73 @@ pub const Interpreter = struct {
                 return .{ .normal = .{ .string = buf.items } };
             },
             .this => return .{ .normal = self.this_val },
+            .super_call => |args| return self.evalSuperCall(args, env),
+            .super_member => |sm| {
+                // §13.3.5 SuperProperty (read) — `super.x` / `super[k]`: look up on the home object's
+                // [[Prototype]], with `this` = the current `this` as the receiver (for getters).
+                const key = if (sm.key) |kn| blk: {
+                    const kc = try self.evalExpr(kn, env);
+                    if (kc.isAbrupt()) return kc;
+                    break :blk try self.toString(kc.normal);
+                } else sm.name;
+                return self.getSuperProperty(key);
+            },
             .spread => return self.throwError("SyntaxError", "Unexpected token '...'"), // only valid in array/call/new lists
         }
+    }
+
+    /// §13.3.5 GetSuperBase + Get — resolve `super.<key>` against the active method's
+    /// [[HomeObject]].[[Prototype]], invoking accessors with `this` = the current `this` (the
+    /// receiver), NOT against `this`'s own properties. A missing home/proto yields `undefined`.
+    fn getSuperProperty(self: *Interpreter, key: []const u8) EvalError!Completion {
+        const home = self.home_object orelse return .{ .normal = .undefined };
+        const base = home.prototype orelse return .{ .normal = .undefined };
+        const loc = base.getProp(key) orelse return .{ .normal = .undefined };
+        switch (loc.pv) {
+            .data => |v| return .{ .normal = v },
+            // §10.2.x: a getter found on the super chain runs with `this` = the current receiver.
+            .accessor => |a| {
+                const getter = a.get orelse return .{ .normal = .undefined };
+                return self.callFunction(getter, &.{}, self.this_val);
+            },
+        }
+    }
+
+    /// §13.3.7.1 SuperCall — invoke the superclass constructor with the current `this`. M-subset:
+    /// the instance already exists (created proto-linked to the derived `.prototype` by `evalNew`);
+    /// `super(...)` runs the parent constructor body on that same `this`, initializing parent fields
+    /// and running the parent constructor logic. The superclass constructor is read from the active
+    /// method's [[HomeObject]] chain (the derived constructor's home is the derived `.prototype`; its
+    /// `super_ctor` carries the linked parent). Returns the (unchanged) instance value.
+    fn evalSuperCall(self: *Interpreter, arg_nodes: []const *const ast.Node, env: *Environment) EvalError!Completion {
+        // The active derived constructor is `home_object.constructor`; it carries the linked parent
+        // (`super_ctor`) and this class's own instance fields, initialized AFTER the parent returns.
+        const cur_fd = self.currentCtorData() orelse
+            return self.throwError("SyntaxError", "'super' keyword unexpected here");
+        var args: std.ArrayListUnmanaged(Value) = .empty;
+        const alc = try self.evalSpreadList(arg_nodes, env, &args);
+        if (alc.isAbrupt()) return alc;
+        if (self.this_val != .object) return self.throwError("ReferenceError", "'super' called with no 'this'");
+        const instance = self.this_val.object;
+        // §15.7.14: run the parent constructor (its own fields-before-body for a base parent), then
+        // this derived class's own instance fields — both on the existing `this`.
+        if (cur_fd.super_ctor) |sup| {
+            const pc = try self.runParentCtor(sup, args.items, instance);
+            if (pc.isAbrupt()) return pc;
+        }
+        const fc = try self.initInstanceFields(cur_fd, instance);
+        if (fc.isAbrupt()) return fc;
+        return .{ .normal = self.this_val };
+    }
+
+    /// The active method's enclosing constructor FunctionData: the active [[HomeObject]] is the
+    /// class's `.prototype`, whose `constructor` is that class's constructor (carrying `super_ctor`
+    /// and the instance `fields`). Used by `super(...)` to find the parent ctor + own fields.
+    fn currentCtorData(self: *Interpreter) ?@import("object.zig").FunctionData {
+        const home = self.home_object orelse return null;
+        const ctor_v = home.get("constructor") orelse return null;
+        if (ctor_v != .object) return null;
+        return ctor_v.object.call;
     }
 
     /// §13.15.2 LogicalAssignment `&&=` / `||=` / `??=`. Short-circuit, evaluating the target
@@ -453,18 +523,54 @@ pub const Interpreter = struct {
         const alc = try self.evalSpreadList(n.args, env, &args);
         if (alc.isAbrupt()) return alc;
 
-        // §15.7.14: a (base, non-derived) class instantiation runs the instance FieldDefinitions on
-        // the new object BEFORE the constructor body executes. (Derived-class field ordering — after
-        // `super()` — is Cycle 2.) Ordinary functions carry no fields, so this is a no-op for them.
-        if (ctor.call) |fd| {
-            const fc = try self.initInstanceFields(fd, new_obj);
-            if (fc.isAbrupt()) return fc;
+        const is_derived = if (ctor.call) |fd| fd.is_derived_ctor else false;
+
+        // §15.7.14 field ordering: a BASE class runs the instance FieldDefinitions on the new object
+        // BEFORE the constructor body. A DERIVED class initializes its own fields AFTER `super(...)`
+        // returns (done in evalSuperCall / the implicit-super path below), so they are skipped here.
+        // Ordinary functions carry no fields, so this is a no-op for them.
+        if (!is_derived) {
+            if (ctor.call) |fd| {
+                const fc = try self.initInstanceFields(fd, new_obj);
+                if (fc.isAbrupt()) return fc;
+            }
+        }
+
+        // §15.7.14: a DERIVED class with NO explicit constructor has a default constructor that runs
+        // `super(...args)` then initializes its own fields. Synthesize that here (the body is empty).
+        if (is_derived) {
+            const fd = ctor.call.?;
+            if (fd.body.len == 0) {
+                if (fd.super_ctor) |sup| {
+                    // Run the parent constructor (base or derived) on the new instance.
+                    const pc = try self.runParentCtor(sup, args.items, new_obj);
+                    if (pc.isAbrupt()) return pc;
+                }
+                // Then this class's own fields.
+                const fc = try self.initInstanceFields(fd, new_obj);
+                if (fc.isAbrupt()) return fc;
+                return .{ .normal = .{ .object = new_obj } };
+            }
         }
 
         const result = try self.callFunction(ctor, args.items, .{ .object = new_obj });
         if (result.isAbrupt()) return result;
         if (result.normal == .object) return .{ .normal = result.normal }; // explicit object return wins
         return .{ .normal = .{ .object = new_obj } };
+    }
+
+    /// §15.7.14: run a parent constructor `sup` on an existing `instance` (the `super(...)` /
+    /// default-derived path). If the parent is itself a BASE class, its instance fields initialize
+    /// before its body; a DERIVED parent runs its own body (which calls its own `super(...)`), so its
+    /// fields are handled by that nested call. The parent's `home_object` is installed by callFunction.
+    fn runParentCtor(self: *Interpreter, sup: *Object, args: []const Value, instance: *Object) EvalError!Completion {
+        if (sup.call) |sfd| {
+            if (!sfd.is_derived_ctor) {
+                const fc = try self.initInstanceFields(sfd, instance);
+                if (fc.isAbrupt()) return fc;
+            }
+        }
+        return self.callFunction(sup, args, .{ .object = instance });
     }
 
     /// §15.7.14 InitializeInstanceElements — define each instance FieldDefinition on `instance`, in
@@ -477,6 +583,11 @@ pub const Interpreter = struct {
         const saved_this = self.this_val;
         self.this_val = .{ .object = instance };
         defer self.this_val = saved_this;
+        // §13.3.5: a field initializer's [[HomeObject]] is the class's `.prototype` (the ctor's home),
+        // so `super.x` inside an initializer resolves against the superclass prototype.
+        const saved_home = self.home_object;
+        self.home_object = fd.home_object;
+        defer self.home_object = saved_home;
         for (fd.fields) |field| {
             var v: Value = .undefined;
             if (field.init) |ie| {
@@ -646,16 +757,43 @@ pub const Interpreter = struct {
         }
     }
 
-    /// §15.7.14 ClassDefinitionEvaluation (Cycle 1 subset — no `extends`/`super` yet). Builds the
-    /// constructor function object: its body is the explicit `constructor` method (or a default empty
-    /// body), its `.prototype` carries the instance methods, and the constructor object itself carries
-    /// the static methods/fields. Instance FieldDefinitions are stashed on the constructor's
-    /// `FunctionData.fields` and run per-instance by `evalNew` before the constructor body. The class
-    /// name is bound in an inner scope so a method/field initializer can reference the class itself.
+    /// §15.7.14 ClassDefinitionEvaluation. Builds the constructor function object: its body is the
+    /// explicit `constructor` method (or a default body), its `.prototype` carries the instance
+    /// methods, and the constructor object itself carries the static methods/fields. Instance
+    /// FieldDefinitions are stashed on the constructor's `FunctionData.fields` and run per-instance by
+    /// `evalNew`/`super(...)`. The class name is bound in an inner scope for self-reference. With an
+    /// `extends` heritage (Cycle 2): the superclass is evaluated, the prototype chains are linked
+    /// (`proto.[[Prototype]]` = `Super.prototype`, `ctor.[[Prototype]]` = `Super` for static
+    /// inheritance; `extends null` → `proto.[[Prototype]]` = null), and every method gets a
+    /// [[HomeObject]] so `super.x` resolves; a derived constructor records its `super_ctor`.
     fn evalClass(self: *Interpreter, c: *const ast.Class, env: *Environment) EvalError!Completion {
         // §15.7.14: a class is created in a new declarative scope that holds the (immutable) class
         // binding for self-reference. Methods/field initializers close over this scope.
         const class_env = try Environment.create(self.arena, env);
+
+        // §15.7.14 ClassHeritage: evaluate `extends LHS`. `super_ctor` is the parent constructor
+        // (null for `extends null` and for a non-derived class); `is_derived` is set by the presence
+        // of the heritage clause (so `extends null` is still a derived class with no parent ctor).
+        var super_ctor: ?*Object = null;
+        var super_proto: ?*Object = null; // the prototype to link the instance `.prototype` to
+        var super_proto_is_null = false; // `extends null` explicitly links to null
+        const is_derived = c.superclass != null;
+        if (c.superclass) |se| {
+            const sc = try self.evalExpr(se, class_env);
+            if (sc.isAbrupt()) return sc;
+            switch (sc.normal) {
+                .null => super_proto_is_null = true, // §15.7.14: `extends null`
+                .object => |so| {
+                    // §15.7.14: the superclass must be a constructor with an object/null `.prototype`.
+                    if (so.kind != .function) return self.throwError("TypeError", "Class extends value is not a constructor or null");
+                    super_ctor = so;
+                    if (so.get("prototype")) |pv| {
+                        if (pv == .object) super_proto = pv.object;
+                    }
+                },
+                else => return self.throwError("TypeError", "Class extends value is not a constructor or null"),
+            }
+        }
 
         // Locate the explicit constructor (if any) and collect the instance field initializers.
         var ctor_fn: ?*const ast.Function = null;
@@ -671,7 +809,9 @@ pub const Interpreter = struct {
             }
         }
 
-        // §15.7.14: build the constructor function object. Default constructor = empty body.
+        // §15.7.14: build the constructor function object. Default constructor: a base class gets an
+        // empty body; a derived class's default constructor forwards its args to `super(...)` (handled
+        // by `is_derived_ctor` + an implicit super-call in evalNew when there's no explicit ctor body).
         const ctor = try Object.createFunction(self.arena, .{
             .params = if (ctor_fn) |f| f.params else &.{},
             .rest = if (ctor_fn) |f| f.rest else null,
@@ -679,15 +819,32 @@ pub const Interpreter = struct {
             .closure = class_env,
             .fields = fields.items,
             .is_class_ctor = true,
+            .is_derived_ctor = is_derived,
+            .super_ctor = super_ctor,
         });
         // The constructor's `.prototype` object holds the instance methods.
         const proto: *Object = blk: {
             const pv = ctor.get("prototype") orelse break :blk try Object.create(self.arena, null);
             break :blk if (pv == .object) pv.object else try Object.create(self.arena, null);
         };
+        // §15.7.14: a class constructor's [[HomeObject]] is its `.prototype` (so `super.x` in the
+        // constructor resolves against `Super.prototype`); the ctor reads its own `super_ctor` for
+        // `super(...)` via `proto.constructor`.
+        if (ctor.call) |*fd| fd.home_object = proto;
+        try proto.set("constructor", .{ .object = ctor });
+
+        // §15.7.14 link the prototype chains for inheritance.
+        if (is_derived) {
+            // `proto.[[Prototype]]` = `Super.prototype` (or null for `extends null` / a parent whose
+            // `.prototype` is not an object).
+            proto.prototype = if (super_proto_is_null) null else super_proto;
+            // `ctor.[[Prototype]]` = `Super` (static inheritance). For `extends null` there is no
+            // parent constructor, so static inheritance falls back to the default function proto chain.
+            ctor.prototype = super_ctor;
+        }
 
         // §15.7.14: install methods (and, this cycle, static fields). Instance members → `.prototype`,
-        // static members → the constructor object.
+        // static members → the constructor object. Each method's [[HomeObject]] is its install target.
         for (c.elements) |el| {
             switch (el.kind) {
                 .constructor => {}, // already the [[Call]] body
@@ -695,6 +852,11 @@ pub const Interpreter = struct {
                     const fc = try self.evalFunctionExpr(el.value.func, class_env);
                     if (fc.isAbrupt()) return fc;
                     const target = if (el.is_static) ctor else proto;
+                    // §9.2.5: a method's [[HomeObject]] is the object it is defined on — `super.x`
+                    // inside it looks up `home_object.[[Prototype]]`.
+                    if (fc.normal == .object) {
+                        if (fc.normal.object.call) |*mfd| mfd.home_object = target;
+                    }
                     try target.set(el.key, fc.normal);
                 },
                 .field => if (el.is_static) {
@@ -784,6 +946,20 @@ pub const Interpreter = struct {
                 if (got.isAbrupt()) return got;
                 callee = got.normal;
             },
+            .super_member => |sm| {
+                // §13.3.5: `super.m(args)` — resolve `m` on the home object's [[Prototype]], but call
+                // it with `this` = the CURRENT `this` (not the super base). (`super(...)` is the
+                // separate SuperCall node, handled in evalExpr.)
+                const key = if (sm.key) |kn| blk: {
+                    const kc = try self.evalExpr(kn, env);
+                    if (kc.isAbrupt()) return kc;
+                    break :blk try self.toString(kc.normal);
+                } else sm.name;
+                const got = try self.getSuperProperty(key);
+                if (got.isAbrupt()) return got;
+                this_for_call = self.this_val;
+                callee = got.normal;
+            },
             else => {
                 const cc = try self.evalExpr(c.callee, env);
                 if (cc.isAbrupt()) return cc;
@@ -852,6 +1028,12 @@ pub const Interpreter = struct {
         const saved_this = self.this_val;
         self.this_val = if (fd.is_arrow) fd.captured_this else this_val;
         defer self.this_val = saved_this;
+        // §9.2.5/§13.3.5: a method invocation installs its [[HomeObject]] for `super` resolution.
+        // An arrow has no own home object — it lexically keeps the enclosing one (like `this`), so
+        // it is left untouched; an ordinary function's home_object is null, masking outer `super`.
+        const saved_home = self.home_object;
+        if (!fd.is_arrow) self.home_object = fd.home_object;
+        defer self.home_object = saved_home;
 
         for (fd.body) |stmt| {
             const c = try self.evalStmt(stmt, call_env);

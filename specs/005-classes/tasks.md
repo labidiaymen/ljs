@@ -73,12 +73,55 @@ specific Early Errors / unsupported-syntax parse rejections so those tests still
     (parsed, not yet evaluated — Cycle 2); accessors/computed names (Cycle 3); private `#x` + static
     blocks (Cycle 4); remaining §15.7.1 Early Errors (Cycle 5).
 
-## Cycle 2 — Inheritance: `extends` + `super(...)` + `super.x` / `super.m()` (US2)
-- [ ] M4-T020 Wire the superclass: `D.prototype.[[Prototype]]` = `C.prototype`, `D.[[Prototype]]` = `C`
-  (§15.7.14). A derived `super(...)` (§13.3.7 SuperCall) calls the parent constructor with the current
-  `this`; default derived constructor is `constructor(...args){ super(...args); }`. `super.x` /
-  `super.m()` (§13.3.5 SuperProperty) look up the method's home-object prototype. Un-reject `super`
-  inside class bodies/methods. Correct prototype chaining for inheritance.
+## Cycle 2 — Inheritance: `extends` + `super(...)` + `super.x` / `super.m()` (US2) 🎯 (DONE — harness metric: passed 5484 → 5526, +42 net, 0 true regressions; conformance 32.3% → 32.6%)
+- [x] M4-T020 Wire the superclass: `B.prototype.[[Prototype]]` = `Super.prototype`, `B.[[Prototype]]` =
+  `Super` (§15.7.14 — static inheritance); `extends null` → `B.prototype.[[Prototype]]` = null. A
+  derived `super(...)` (§13.3.7 SuperCall) calls the parent constructor with the current `this`; the
+  default derived constructor forwards its args to `super(...)`. `super.x` / `super.m()` (§13.3.5
+  SuperProperty) look up the active method's [[HomeObject]].[[Prototype]] but invoke with `this` = the
+  current `this`. `super` is un-rejected inside method/derived-constructor bodies.
+  - **AST (`src/ast.zig`):** new `Node.super_call: []const *const Node` (SuperCall args) and
+    `Node.super_member: { name, key }` (SuperProperty `super.x` / `super[expr]`).
+  - **Object model (`src/object.zig`):** `FunctionData` gains `home_object: ?*Object` (the object a
+    method is defined on — instance method → `.prototype`, static method → the constructor; the
+    constructor's home is the `.prototype`), `is_derived_ctor`, and `super_ctor` (the linked parent
+    constructor, used by `super(...)`).
+  - **Parser (`src/parser.zig`):** two context flags — `in_method` (a MethodDefinition/field-init body
+    has a [[HomeObject]] → `super.x` allowed) and `in_derived_ctor` (only a derived class's
+    `constructor` → `super(...)` allowed). `parseFunction` resets both to false (an ordinary nested
+    function has no home / is not a constructor); arrows DELIBERATELY keep them (lexical `super`, like
+    `this`). `super` is handled in `parsePostfix` (it is always the base of `.`/`[]`/`()`); a bare
+    `super` or a `super`/`super(...)` outside its allowed context is a SyntaxError (§13.3.5.1 /
+    §13.3.7.1 Early Errors — these keep the negative-parse tests rejecting, so un-rejecting `super`
+    nets 0 regressions).
+  - **Interpreter (`src/interpreter.zig`):** `evalClass` evaluates `extends`, links the prototype
+    chains, sets each method's `home_object`, sets `proto.constructor`, and records the derived ctor's
+    `super_ctor`/`is_derived_ctor`. The interpreter carries the active `home_object` (set in
+    `callFunction` per call, inherited by arrows). `super.x` resolves against
+    `home_object.[[Prototype]]` with `this` = the receiver (getters honored); `super.m(args)` calls
+    with `this` = the current `this`. `super(...)` runs the parent ctor on the existing `this` (a base
+    parent inits its fields before its body), then the derived class's own fields (§15.7.14 ordering:
+    derived fields after `super()`). `evalNew` skips upfront field-init for derived classes and
+    synthesizes the implicit `super(...args)` + field-init for a default derived constructor.
+  - **Tests (`src/engine.zig`):** `class A{constructor(){this.x=1}} class B extends A{constructor(){
+    super();this.y=2}} new B().x+new B().y` → 3; `super.m()` calling the parent method; `b instanceof A`
+    + `b instanceof B`; `super.prop` reading the parent prototype data prop; static inheritance
+    (`B.s()` / `B.n`); default derived ctor arg-forwarding; `extends` an expression; a 3-level chain;
+    derived fields after `super()`; `extends null`; and the §13.3.5.1/§13.3.7.1 Early-Error negatives.
+  - **Conformance + regression hunt (harness metric):** `passed 5484 → 5526` (+42 net), conformance
+    32.3% → 32.6%. **0 true regressions** by `mode+path` (`comm` before/after, ReleaseFast); 42
+    recoveries — all super/extends-related: `super/prop-dot-cls-val*`, `super/prop-expr-cls-val*`,
+    `super/call-*`, `super/super-reference-resolution`, `arrow-function/lexical-super*` (confirming
+    arrows inherit `super` lexically), and `class/subclass-builtins/subclass-{Array,Error,Object,…}`.
+    Baseline gate green ("no regression vs baseline"). Bench green (loop_mix −5.2%, loop_sum −5.6%,
+    str_build −4.4%; perf ok, ljs 0.2–0.5× Node — the super/home-object additions are off the hot path).
+  - **Landed:** `extends Expr` + prototype/static-inheritance linking + `extends null`; `super(...)` in
+    a derived constructor (explicit + default); `super.x` / `super[k]` / `super.m(args)` via
+    [[HomeObject]]; lexical `super` in arrows; derived-class field ordering (after `super()`); the
+    §13.3.5.1/§13.3.7.1 Early Errors; `extends` a non-constructor/non-null → runtime TypeError.
+    **Deferred:** accessors/computed names (Cycle 3); private `#x` + static blocks (Cycle 4); the
+    remaining §15.7.1 Early Errors (Cycle 5). Subclassing built-ins links the chains but does not yet
+    install exotic internal slots (the positive value-checks that recovered are prototype-chain ones).
 
 ## Cycle 3 — Accessors, computed names, method-shorthand edges (US3)
 - [ ] M4-T030 `get x(){…}` / `set x(v){…}` in a class body (instance + static), reusing the §13.2.5.6

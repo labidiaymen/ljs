@@ -24,6 +24,16 @@ pub const Parser = struct {
     /// Saved/restored around each function body in `parseFunction`/`finishArrow`/method parsing.
     strict: bool = false,
 
+    /// §13.3.5 SuperProperty context: true while parsing a method/accessor/constructor body (a
+    /// MethodDefinition has a [[HomeObject]]). `super.x` / `super[x]` is a SyntaxError outside one
+    /// (§15.7.1 / a SuperProperty must appear within a method). Saved/restored around every function
+    /// body; an ordinary FunctionDeclaration/Expression/arrow resets it to false (it has no home).
+    in_method: bool = false,
+    /// §13.3.7 SuperCall context: true only inside a DERIVED class constructor (a constructor of a
+    /// class with an `extends` heritage). `super(...)` is a SyntaxError anywhere else — including a
+    /// non-derived constructor and any non-constructor method. Saved/restored like `in_method`.
+    in_derived_ctor: bool = false,
+
     /// `mode == .strict` starts the whole Script in strict context (the Test262 runner runs each
     /// test in both modes, expecting the engine to honor `RunMode`). An explicit `"use strict"`
     /// directive prologue is detected independently in `parseProgram`.
@@ -421,6 +431,15 @@ pub const Parser = struct {
     fn parseFunction(self: *Parser) ParseError!*const ast.Function {
         const enclosing_strict = self.strict;
         defer self.strict = enclosing_strict; // §11.2.2: never un-strict an inner scope on the way out
+        // §13.3.5/§13.3.7: an ordinary FunctionDeclaration/Expression has its OWN [[HomeObject]] (none)
+        // and is not a constructor — `super` does NOT cross into it from an enclosing method. (Arrows
+        // DO inherit `super` lexically, like `this`; `finishArrow` deliberately keeps these flags.)
+        const saved_in_method = self.in_method;
+        const saved_in_derived = self.in_derived_ctor;
+        defer self.in_method = saved_in_method;
+        defer self.in_derived_ctor = saved_in_derived;
+        self.in_method = false;
+        self.in_derived_ctor = false;
         var name: ?[]const u8 = null;
         if (self.peek().kind == .identifier) name = self.advance().lexeme;
         // §13.1.1: a strict function's name (BindingIdentifier) may not be `eval`/`arguments`/a
@@ -482,6 +501,8 @@ pub const Parser = struct {
         defer self.strict = enclosing_strict;
         self.strict = true;
 
+        const is_derived = superclass != null; // §15.7.14: `extends`-bearing class → derived ctors
+
         _ = try self.expect(.lbrace);
         var elements: std.ArrayList(ast.ClassElement) = .empty;
         while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
@@ -490,7 +511,7 @@ pub const Parser = struct {
                 _ = self.advance();
                 continue;
             }
-            try elements.append(self.arena, try self.parseClassElement());
+            try elements.append(self.arena, try self.parseClassElement(is_derived));
         }
         _ = try self.expect(.rbrace);
 
@@ -512,7 +533,7 @@ pub const Parser = struct {
     /// `x = init;` / `x;` (instance or static). Unsupported forms parse-reject this cycle to preserve
     /// the negative-parse class tests: generators (`* m`), `async`, accessors (`get`/`set`, Cycle 3),
     /// private names (`#x`, Cycle 4), and static initialization blocks (`static { }`, Cycle 4).
-    fn parseClassElement(self: *Parser) ParseError!ast.ClassElement {
+    fn parseClassElement(self: *Parser, is_derived: bool) ParseError!ast.ClassElement {
         // §15.7 `static` modifier (contextual): it is a modifier only when followed by something that
         // begins a (non-static) element name. `static(){}`/`static = 1`/`static;`/`static }` use the
         // identifier `static` as the element key instead.
@@ -536,7 +557,6 @@ pub const Parser = struct {
         // modifier when followed by a property name (else they are an ordinary element key).
         switch (self.peek().kind) {
             .star => return ParseError.UnexpectedToken, // generator method (deferred)
-            .kw_super => return ParseError.UnexpectedToken, // `super` element (Cycle 2)
             .identifier => {
                 const w = self.peek().lexeme;
                 if (std.mem.eql(u8, w, "async") and startsAccessorName(self.tokens[self.idx + 1].kind)) {
@@ -561,14 +581,23 @@ pub const Parser = struct {
             // §15.7 MethodDefinition `m(params){…}` — instance (on `.prototype`) or static method.
             // §15.7.1 Early Error: a `static` method may not be named `prototype`.
             if (is_static and is_literal and std.mem.eql(u8, pn.key, "prototype")) return ParseError.UnexpectedToken;
+            // §15.7: a non-static method named `constructor` is the class constructor.
+            const is_ctor = !is_static and is_literal and std.mem.eql(u8, pn.key, "constructor");
+            // §13.3.5/§13.3.7: every MethodDefinition body has a [[HomeObject]] (`super.x` allowed);
+            // `super(...)` is allowed only in a DERIVED class's `constructor`. Saved/restored so the
+            // flags don't leak to the next element (or, via the defers, to anything after the body).
+            const saved_in_method = self.in_method;
+            const saved_in_derived = self.in_derived_ctor;
+            defer self.in_method = saved_in_method;
+            defer self.in_derived_ctor = saved_in_derived;
+            self.in_method = true;
+            self.in_derived_ctor = is_ctor and is_derived;
             const pl = try self.parseParams();
             const body = try self.parseMethodBody(pl);
             // §15.7 / §13.2.5.1 UniqueFormalParameters — a method's parameters have no duplicates.
             if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
             const f = try self.arena.create(ast.Function);
             f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body };
-            // §15.7: a non-static method named `constructor` is the class constructor.
-            const is_ctor = !is_static and is_literal and std.mem.eql(u8, pn.key, "constructor");
             return .{
                 .kind = if (is_ctor) .constructor else .method,
                 .is_static = is_static,
@@ -588,7 +617,15 @@ pub const Parser = struct {
         var field_init: ?*const ast.Node = null;
         if (self.peek().kind == .assign) {
             _ = self.advance();
+            // §13.3.5: a FieldDefinition Initializer has a [[HomeObject]] (so `super.x` is allowed),
+            // but it is NOT a constructor (so `super(...)` is a SyntaxError here). Save/restore.
+            const saved_in_method = self.in_method;
+            const saved_in_derived = self.in_derived_ctor;
+            self.in_method = true;
+            self.in_derived_ctor = false;
             field_init = try self.parseAssignment();
+            self.in_method = saved_in_method;
+            self.in_derived_ctor = saved_in_derived;
             // §15.7.1 Early Error: a FieldDefinition Initializer may not contain `arguments`
             // (ContainsArguments) — `x = arguments` / `[k] = f(arguments)` are SyntaxErrors.
             if (containsArguments(field_init.?)) return ParseError.UnexpectedToken;
@@ -983,8 +1020,52 @@ pub const Parser = struct {
     /// the chain is "optional": every following `.`/`[]`/`()` is emitted as an `optional` node so a
     /// nullish short-circuit propagates to the end of the chain (§13.3.9.1).
     fn parsePostfix(self: *Parser) ParseError!*const ast.Node {
-        var expr = try self.parsePrimary();
-        var in_chain = false; // have we seen a `?.` for the current chain root?
+        // §13.3 SuperProperty / SuperCall — `super` is never a standalone primary; it must be the
+        // base of `super.name`, `super[expr]`, or `super(args)`. Handle it here so the early errors
+        // (must be inside a method / derived constructor) fire and the form is captured directly.
+        if (self.peek().kind == .kw_super) {
+            const sup = try self.parseSuper();
+            return self.continuePostfix(sup, false);
+        }
+        const expr = try self.parsePrimary();
+        return self.continuePostfix(expr, false);
+    }
+
+    /// §13.3.7 SuperCall / §13.3.5 SuperProperty — current token is `super`. A `super(args)` is only
+    /// legal in a derived constructor; a `super.name` / `super[expr]` only inside a method (anything
+    /// with a [[HomeObject]]). A bare `super` (no following `(` / `.` / `[`) is a SyntaxError.
+    fn parseSuper(self: *Parser) ParseError!*const ast.Node {
+        _ = self.advance(); // super
+        switch (self.peek().kind) {
+            .lparen => {
+                // §13.3.7.1 Early Error: a SuperCall must appear within a derived-class constructor.
+                if (!self.in_derived_ctor) return ParseError.UnexpectedToken;
+                const args = try self.parseArgs();
+                return self.alloc(.{ .super_call = args });
+            },
+            .dot => {
+                // §13.3.5.1 Early Error: a SuperProperty must appear within a method ([[HomeObject]]).
+                if (!self.in_method) return ParseError.UnexpectedToken;
+                _ = self.advance();
+                const name = try self.expectPropertyName();
+                return self.alloc(.{ .super_member = .{ .name = name } });
+            },
+            .lbracket => {
+                if (!self.in_method) return ParseError.UnexpectedToken;
+                _ = self.advance();
+                const key = try self.parseAssignment();
+                _ = try self.expect(.rbracket);
+                return self.alloc(.{ .super_member = .{ .key = key } });
+            },
+            else => return ParseError.UnexpectedToken, // bare `super` is never a primary
+        }
+    }
+
+    /// Continue a Member/Call postfix chain from an already-parsed base (`expr`). Shared by the
+    /// ordinary-primary path and the `super.x` base. `in_chain` records whether a `?.` has appeared.
+    fn continuePostfix(self: *Parser, base: *const ast.Node, started_in_chain: bool) ParseError!*const ast.Node {
+        var expr = base;
+        var in_chain = started_in_chain; // have we seen a `?.` for the current chain root?
         while (true) {
             switch (self.peek().kind) {
                 .question_dot => {
@@ -1272,9 +1353,9 @@ pub const Parser = struct {
             .kw_import => return ParseError.UnexpectedToken,
             // §15.7 ClassExpression (primary position). The name is optional (`class { … }`).
             .kw_class => return self.alloc(.{ .class_expr = try self.parseClass(false) }),
-            // §13.3.5 SuperProperty / §13.3.7 SuperCall are unsupported — `super` is reserved, so any
-            // `super(...)` / `super.x` is a parse-phase SyntaxError. (Recovers the object method
-            // `name-super-call-*` negatives: a direct super in a method body/param must fail to parse.)
+            // §13.3.5/§13.3.7: `super` is handled in `parsePostfix` (it must be the base of a
+            // SuperProperty/SuperCall). Reaching it here means a bare `super` in a non-postfix
+            // position (e.g. `super + 1`) — always a SyntaxError.
             .kw_super => return ParseError.UnexpectedToken,
             .lparen => {
                 // §13.2.3 ParenthesizedExpression : `(` Expression `)` — a full Expression, so the
@@ -1466,6 +1547,11 @@ fn containsArguments(node: *const ast.Node) bool {
                 },
             }
         },
+        .super_call => |args| {
+            for (args) |a| if (containsArguments(a)) return true;
+            return false;
+        },
+        .super_member => |sm| return if (sm.key) |k| containsArguments(k) else false,
         // Recurse into ArrowFunction bodies (no own `arguments`); STOP at an ordinary function /
         // class (they bind/scope their own `arguments`).
         .function => |f| return f.is_arrow and bodyContainsArguments(f.body),
