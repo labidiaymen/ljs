@@ -55,6 +55,22 @@ ljs run <file>        # evaluate a source file
 - First ljs-vs-Node benchmark wired up (lean native startup currently beats Node on tiny scripts;
   that flips once compute-bound benchmarks exist)
 
+## Conformance (Test262)
+
+```sh
+# vendor a slice of the official suite (fast sparse checkout), pinned via test262.pin
+./scripts/vendor-test262.sh test/language/expressions/addition
+zig build test262 -- --path vendor/test262/test/language/expressions/addition
+# baseline + regression gate:
+zig build test262 -- --path <dir> --update-baseline baseline/<name>.json
+zig build test262 -- --path <dir> --baseline baseline/<name>.json   # exit 1 on regression
+```
+
+At M0 the real-suite pass rate is **~0% by design**: real positive tests call `assert.sameValue(…)`,
+which needs functions/objects the tree-walk engine doesn't have yet. M0 validates the harness
+(classification, fault isolation, determinism, regression detection) — not the pass rate. The
+curated sample in `tests/fixtures/sample/` classifies 27/6/2 (81.8%), matching a hand-tally.
+
 ## Roadmap
 
 | Milestone | Focus |
