@@ -88,7 +88,7 @@ pub const Interpreter = struct {
             },
             .func_decl => |f| {
                 // §15.2 — bind a function object to its name in the current scope.
-                const obj = try Object.createFunction(self.arena, .{ .params = f.params, .body = f.body, .closure = env });
+                const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env });
                 if (f.name) |name| try env.declare(name, .{ .object = obj }, true, true);
                 return .{ .normal = .undefined };
             },
@@ -257,13 +257,10 @@ pub const Interpreter = struct {
                 return .{ .normal = .{ .object = obj } };
             },
             .array_literal => |elems| {
-                // §13.2.4 ArrayLiteral
+                // §13.2.4 ArrayLiteral — `...spread` elements flatten in place.
                 const arr = try Object.createArray(self.arena, self.arrayProto());
-                for (elems) |e| {
-                    const c = try self.evalExpr(e, env);
-                    if (c.isAbrupt()) return c;
-                    try arr.elements.append(self.arena, c.normal);
-                }
+                const lc = try self.evalSpreadList(elems, env, &arr.elements);
+                if (lc.isAbrupt()) return lc;
                 return .{ .normal = .{ .object = arr } };
             },
             .member => |m| {
@@ -364,6 +361,7 @@ pub const Interpreter = struct {
                 return .{ .normal = .{ .string = buf.items } };
             },
             .this => return .{ .normal = self.this_val },
+            .spread => return self.throwError("SyntaxError", "Unexpected token '...'"), // only valid in array/call/new lists
         }
     }
 
@@ -382,12 +380,9 @@ pub const Interpreter = struct {
         }
         const new_obj = try Object.create(self.arena, proto);
 
-        var args: std.ArrayList(Value) = .empty;
-        for (n.args) |arg| {
-            const ac = try self.evalExpr(arg, env);
-            if (ac.isAbrupt()) return ac;
-            try args.append(self.arena, ac.normal);
-        }
+        var args: std.ArrayListUnmanaged(Value) = .empty;
+        const alc = try self.evalSpreadList(n.args, env, &args);
+        if (alc.isAbrupt()) return alc;
 
         const result = try self.callFunction(ctor, args.items, .{ .object = new_obj });
         if (result.isAbrupt()) return result;
@@ -396,8 +391,33 @@ pub const Interpreter = struct {
     }
 
     fn evalFunctionExpr(self: *Interpreter, f: *const ast.Function, env: *Environment) EvalError!Completion {
-        const obj = try Object.createFunction(self.arena, .{ .params = f.params, .body = f.body, .closure = env });
+        const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env });
         return .{ .normal = .{ .object = obj } };
+    }
+
+    /// Evaluate an argument / element list into `out`, flattening `...expr` spread elements
+    /// (§13.2.4 / §13.3 — arrays spread their elements, strings their characters). Returns an
+    /// abrupt completion to propagate, else `.{ .normal = .undefined }`.
+    fn evalSpreadList(self: *Interpreter, nodes: []const *const ast.Node, env: *Environment, out: *std.ArrayListUnmanaged(Value)) EvalError!Completion {
+        for (nodes) |n| {
+            if (n.* == .spread) {
+                const sc = try self.evalExpr(n.spread, env);
+                if (sc.isAbrupt()) return sc;
+                switch (sc.normal) {
+                    .object => |o| {
+                        if (o.kind != .array) return self.throwError("TypeError", "spread target is not iterable");
+                        for (o.elements.items) |el| try out.append(self.arena, el);
+                    },
+                    .string => |s| for (s, 0..) |_, i| try out.append(self.arena, .{ .string = s[i .. i + 1] }),
+                    else => return self.throwError("TypeError", "spread target is not iterable"),
+                }
+            } else {
+                const c = try self.evalExpr(n, env);
+                if (c.isAbrupt()) return c;
+                try out.append(self.arena, c.normal);
+            }
+        }
+        return .{ .normal = .undefined };
     }
 
     /// §13.3.6 Call. Resolves the callee (with `this` for method calls), evaluates arguments,
@@ -431,12 +451,9 @@ pub const Interpreter = struct {
             },
         }
 
-        var args: std.ArrayList(Value) = .empty;
-        for (c.args) |arg| {
-            const ac = try self.evalExpr(arg, env);
-            if (ac.isAbrupt()) return ac;
-            try args.append(self.arena, ac.normal);
-        }
+        var args: std.ArrayListUnmanaged(Value) = .empty;
+        const alc = try self.evalSpreadList(c.args, env, &args);
+        if (alc.isAbrupt()) return alc;
 
         if (callee != .object or callee.object.kind != .function) {
             return self.throwError("TypeError", "value is not a function");
@@ -457,6 +474,14 @@ pub const Interpreter = struct {
         for (fd.params, 0..) |param, i| {
             const v: Value = if (i < args.len) args[i] else .undefined; // missing args → undefined
             try call_env.declare(param, v, true, true);
+        }
+        if (fd.rest) |rest_name| {
+            // §15.1 rest parameter — bind leftover args (beyond the fixed params) as an Array.
+            const rest_arr = try Object.createArray(self.arena, self.arrayProto());
+            if (args.len > fd.params.len) {
+                for (args[fd.params.len..]) |a| try rest_arr.elements.append(self.arena, a);
+            }
+            try call_env.declare(rest_name, .{ .object = rest_arr }, true, true);
         }
         const saved_this = self.this_val;
         self.this_val = this_val;

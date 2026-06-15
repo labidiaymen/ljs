@@ -51,6 +51,7 @@ pub const Node = union(enum) {
     conditional: struct { cond: *const Node, then: *const Node, otherwise: *const Node }, // §13.14 ?:
     update: struct { op: UpdateOp, prefix: bool, target: *const Node }, // §13.4 ++ / --
     template: struct { quasis: []const []const u8, exprs: []const *const Node }, // §13.2.8 `a${x}b`
+    spread: *const Node, // §13.2.4 / §13.3 spread element `...expr` (in array literals & call args)
     this, // §13.2.1 ThisExpression
 };
 
@@ -61,6 +62,7 @@ pub const Property = struct { key: []const u8, value: *const Node };
 pub const Function = struct {
     name: ?[]const u8,
     params: []const []const u8,
+    rest: ?[]const u8 = null, // §15.1 rest parameter `...xs`
     body: []const Stmt,
 };
 

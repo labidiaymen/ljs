@@ -27,6 +27,7 @@ pub const NativeId = enum {
 /// The closure captured by a function object: parameter names, body, and defining scope.
 pub const FunctionData = struct {
     params: []const []const u8,
+    rest: ?[]const u8 = null,
     body: []const ast.Stmt,
     closure: *Environment,
 };

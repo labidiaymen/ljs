@@ -260,6 +260,25 @@ test "M3 template literals (US2)" {
     try expectStr("`line\\nbreak`", "line\nbreak");
 }
 
+test "M3 spread & rest (US3)" {
+    // spread in array literals
+    try expectNumber("[...[1, 2, 3]].length", 3);
+    try expectNumber("var a = [1, 2]; [0, ...a, 3].length", 4);
+    try expectNumber("var a = [1, 2]; [0, ...a, 3][2]", 2);
+    try expectNumber("[...[1, 2], ...[3, 4]].length", 4);
+    try expectStr("[...\"ab\"].join(\"-\")", "a-b"); // string spreads to chars
+    // spread in call args
+    try expectNumber("function add(a, b, c) { return a + b + c; } add(...[1, 2, 3])", 6);
+    try expectNumber("function f(a, b) { return a + b; } var xs = [10, 20]; f(...xs)", 30);
+    // rest parameters
+    try expectNumber("function f(...xs) { return xs.length; } f(1, 2, 3, 4)", 4);
+    try expectNumber("function f(a, ...xs) { return a + xs.length; } f(9, 1, 2, 3)", 12);
+    try expectNumber("function f(...xs) { return xs.length; } f()", 0);
+    try expectNumber("function f(a, b, ...xs) { return xs[0]; } f(1, 2, 7, 8)", 7);
+    // spread + rest combined
+    try expectNumber("function f(...xs) { return xs[1]; } f(...[5, 6, 7])", 6);
+}
+
 test "deep recursion throws RangeError, not a segfault" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

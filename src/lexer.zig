@@ -31,6 +31,7 @@ pub const TokenKind = enum {
     kw_switch,
     kw_case,
     kw_default,
+    kw_import, // import (modules / dynamic ImportCall — unsupported, parse-rejected)
     pipe_pipe, // ||
     amp_amp, // &&
     star_star, // **
@@ -42,6 +43,7 @@ pub const TokenKind = enum {
     shr, // >>
     shr_un, // >>>
     template, // `...${}...` (raw inner stored in string_value)
+    ellipsis, // ...
     kw_in, // in
     plus_plus, // ++
     minus_minus, // --
@@ -181,6 +183,7 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, word, "switch")) return .{ .kind = .kw_switch, .lexeme = word };
             if (std.mem.eql(u8, word, "case")) return .{ .kind = .kw_case, .lexeme = word };
             if (std.mem.eql(u8, word, "default")) return .{ .kind = .kw_default, .lexeme = word };
+            if (std.mem.eql(u8, word, "import")) return .{ .kind = .kw_import, .lexeme = word };
             return .{ .kind = .identifier, .lexeme = word };
         }
 
@@ -223,7 +226,13 @@ pub const Lexer = struct {
             '}' => return tok(.rbrace, self.src[start..self.pos]),
             '[' => return tok(.lbracket, self.src[start..self.pos]),
             ']' => return tok(.rbracket, self.src[start..self.pos]),
-            '.' => return tok(.dot, self.src[start..self.pos]),
+            '.' => {
+                if (self.peek() == '.' and self.peek2() == '.') {
+                    self.pos += 2;
+                    return tok(.ellipsis, self.src[start..self.pos]);
+                }
+                return tok(.dot, self.src[start..self.pos]);
+            },
             ':' => return tok(.colon, self.src[start..self.pos]),
             ',' => return tok(.comma, self.src[start..self.pos]),
             ';' => return tok(.semicolon, self.src[start..self.pos]),

@@ -125,7 +125,7 @@ pub const Parser = struct {
             _ = self.advance();
             var list: std.ArrayList(*const ast.Node) = .empty;
             while (self.peek().kind != .rparen and self.peek().kind != .eof) {
-                try list.append(self.arena, try self.parseAssignment());
+                try list.append(self.arena, try self.parseSpreadable());
                 if (self.peek().kind == .comma) {
                     _ = self.advance();
                     continue;
@@ -295,17 +295,25 @@ pub const Parser = struct {
     fn parseFunction(self: *Parser) ParseError!*const ast.Function {
         var name: ?[]const u8 = null;
         if (self.peek().kind == .identifier) name = self.advance().lexeme;
-        const params = try self.parseParams();
+        const pl = try self.parseParams();
         const body = try self.parseBlock();
         const f = try self.arena.create(ast.Function);
-        f.* = .{ .name = name, .params = params, .body = body };
+        f.* = .{ .name = name, .params = pl.params, .rest = pl.rest, .body = body };
         return f;
     }
 
-    fn parseParams(self: *Parser) ParseError![]const []const u8 {
+    const ParamList = struct { params: []const []const u8, rest: ?[]const u8 };
+
+    fn parseParams(self: *Parser) ParseError!ParamList {
         _ = try self.expect(.lparen);
         var params: std.ArrayList([]const u8) = .empty;
+        var rest: ?[]const u8 = null;
         while (self.peek().kind != .rparen and self.peek().kind != .eof) {
+            if (self.peek().kind == .ellipsis) { // §15.1 rest parameter (must be last)
+                _ = self.advance();
+                rest = (try self.expect(.identifier)).lexeme;
+                break;
+            }
             const p = try self.expect(.identifier);
             try params.append(self.arena, p.lexeme);
             if (self.peek().kind == .comma) {
@@ -315,7 +323,16 @@ pub const Parser = struct {
             break;
         }
         _ = try self.expect(.rparen);
-        return params.items;
+        return .{ .params = params.items, .rest = rest };
+    }
+
+    /// An argument or array element that may be a spread `...expr`.
+    fn parseSpreadable(self: *Parser) ParseError!*const ast.Node {
+        if (self.peek().kind == .ellipsis) {
+            _ = self.advance();
+            return self.alloc(.{ .spread = try self.parseAssignment() });
+        }
+        return self.parseAssignment();
     }
 
     fn parseBlock(self: *Parser) ParseError![]const ast.Stmt {
@@ -454,7 +471,7 @@ pub const Parser = struct {
                     _ = self.advance();
                     var args: std.ArrayList(*const ast.Node) = .empty;
                     while (self.peek().kind != .rparen and self.peek().kind != .eof) {
-                        try args.append(self.arena, try self.parseAssignment());
+                        try args.append(self.arena, try self.parseSpreadable());
                         if (self.peek().kind == .comma) {
                             _ = self.advance();
                             continue;
@@ -533,7 +550,7 @@ pub const Parser = struct {
                 _ = self.advance();
                 var elems: std.ArrayList(*const ast.Node) = .empty;
                 while (self.peek().kind != .rbracket and self.peek().kind != .eof) {
-                    try elems.append(self.arena, try self.parseAssignment());
+                    try elems.append(self.arena, try self.parseSpreadable());
                     if (self.peek().kind == .comma) {
                         _ = self.advance();
                         continue;
@@ -556,6 +573,11 @@ pub const Parser = struct {
                 return self.parseTemplate(t.string_value);
             },
             .kw_new => return self.parseNew(),
+            // §13.3.10 ImportCall / §16.2 modules are unsupported — `import` is a reserved word, so
+            // any expression form (`import(x)`, `import.meta`, …) is a parse-phase SyntaxError. This
+            // also keeps spread support honest: ImportCall forbids `...` (a Forbidden Extension), so
+            // `import(...x)` must not parse as an ordinary spread call.
+            .kw_import => return ParseError.UnexpectedToken,
             .lparen => {
                 _ = self.advance();
                 const inner = try self.parseAssignment();

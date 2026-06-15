@@ -19,8 +19,9 @@ spec (this is parser/evaluator work; no new architecture).
 - [x] M3-T020 `a${x}b` template literals: lexer raw-scan (brace-tracked), parser quasi/expr split + sub-parse (nested + escapes), interpreter ToString-concat. Conformance flat on expressions (24.2%) — templates are rare there.
 - [x] M3-T021 **Perf fix** (bench gate caught a real ~15% loop slowdown across M2/M3): blocks allocate a child scope only when they lexically declare (let/const/function); declaration-free bodies reuse the parent env → no per-iteration alloc. loop_sum now *beats* its baseline. Behavior-preserving.
 
-## Cycle 3 — US3 Spread & rest
-- [ ] M3-T030 `...` in array literals + call args (flatten iterables/arrays); rest params (`function f(...xs)`)
+## Cycle 3 — US3 Spread & rest (DONE — conformance 23.6% → 25.3%, +289)
+- [x] M3-T030 `...` in array literals + call/new args (flatten arrays + strings); rest params (`function f(...xs)` → leftover args bound as an Array). Lexer `ellipsis`, `spread` AST node, `parseSpreadable`, `evalSpreadList`, rest-param binding in `[[Call]]`.
+- [x] M3-T031 Spread-correctness boundary: ImportCall (§13.3.10) forbids `...` (a Forbidden Extension), so `import(...x)` must not parse as a spread call. `import` is a reserved word the engine doesn't implement → recognized as `kw_import` and parse-rejected (SyntaxError). This fixes the spread-induced regression on `dynamic-import/syntax/invalid/*-no-rest-param` AND converts the other invalid-ImportCall negatives (empty/extra-args/`new import()`) to passes → net +289. Known gap: 18 `dynamic-import/syntax/valid` tests (import appears but isn't evaluated) now parse-fail; recovering them needs real ImportCall parsing — deferred to a future modules/dynamic-import milestone.
 
 ## Cycle 4 — US4 Destructuring
 - [ ] M3-T040 Array/object binding patterns in `var`/`let`/`const` + params (with defaults/holes)
