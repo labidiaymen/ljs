@@ -25,6 +25,11 @@ pub const TokenKind = enum {
     kw_finally,
     kw_break,
     kw_continue,
+    kw_typeof,
+    kw_new,
+    kw_instanceof,
+    pipe_pipe, // ||
+    amp_amp, // &&
     identifier,
     plus,
     minus,
@@ -148,6 +153,9 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, word, "finally")) return .{ .kind = .kw_finally, .lexeme = word };
             if (std.mem.eql(u8, word, "break")) return .{ .kind = .kw_break, .lexeme = word };
             if (std.mem.eql(u8, word, "continue")) return .{ .kind = .kw_continue, .lexeme = word };
+            if (std.mem.eql(u8, word, "typeof")) return .{ .kind = .kw_typeof, .lexeme = word };
+            if (std.mem.eql(u8, word, "new")) return .{ .kind = .kw_new, .lexeme = word };
+            if (std.mem.eql(u8, word, "instanceof")) return .{ .kind = .kw_instanceof, .lexeme = word };
             return .{ .kind = .identifier, .lexeme = word };
         }
 
@@ -181,6 +189,20 @@ pub const Lexer = struct {
             '=' => {
                 if (self.peek() == '=') return self.lexEqEq(start);
                 return tok(.assign, self.src[start..self.pos]);
+            },
+            '|' => {
+                if (self.peek() == '|') {
+                    self.pos += 1;
+                    return tok(.pipe_pipe, self.src[start..self.pos]);
+                }
+                return LexError.UnexpectedCharacter; // bitwise OR not in M1
+            },
+            '&' => {
+                if (self.peek() == '&') {
+                    self.pos += 1;
+                    return tok(.amp_amp, self.src[start..self.pos]);
+                }
+                return LexError.UnexpectedCharacter; // bitwise AND not in M1
             },
             else => return LexError.UnexpectedCharacter,
         }

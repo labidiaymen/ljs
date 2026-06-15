@@ -234,8 +234,48 @@ pub const Interpreter = struct {
             },
             .function => |f| return self.evalFunctionExpr(f, env),
             .call => |c| return self.evalCall(c, env),
+            .new_expr => |n| return self.evalNew(n, env),
+            .logical => |l| {
+                // §13.13 short-circuit: `||` returns left if truthy, `&&` returns left if falsy.
+                const lc = try self.evalExpr(l.left, env);
+                if (lc.isAbrupt()) return lc;
+                const truthy = toBoolean(lc.normal);
+                switch (l.op) {
+                    .or_ => if (truthy) return lc,
+                    .and_ => if (!truthy) return lc,
+                }
+                return self.evalExpr(l.right, env);
+            },
             .this => return .{ .normal = self.this_val },
         }
+    }
+
+    /// §13.3.5 new — construct an object proto-linked to the constructor's `.prototype`, run
+    /// the body with `this` = the new object; if the body returns an object, use it instead.
+    fn evalNew(self: *Interpreter, n: anytype, env: *Environment) EvalError!Completion {
+        const cc = try self.evalExpr(n.callee, env);
+        if (cc.isAbrupt()) return cc;
+        if (cc.normal != .object or cc.normal.object.kind != .function) {
+            return self.throwError("TypeError", "value is not a constructor");
+        }
+        const ctor = cc.normal.object;
+        var proto: ?*Object = null;
+        if (ctor.get("prototype")) |pv| {
+            if (pv == .object) proto = pv.object;
+        }
+        const new_obj = try Object.create(self.arena, proto);
+
+        var args: std.ArrayList(Value) = .empty;
+        for (n.args) |arg| {
+            const ac = try self.evalExpr(arg, env);
+            if (ac.isAbrupt()) return ac;
+            try args.append(self.arena, ac.normal);
+        }
+
+        const result = try self.callFunction(ctor, args.items, .{ .object = new_obj });
+        if (result.isAbrupt()) return result;
+        if (result.normal == .object) return .{ .normal = result.normal }; // explicit object return wins
+        return .{ .normal = .{ .object = new_obj } };
     }
 
     fn evalFunctionExpr(self: *Interpreter, f: *const ast.Function, env: *Environment) EvalError!Completion {
@@ -334,6 +374,16 @@ pub const Interpreter = struct {
     }
 
     fn evalUnary(self: *Interpreter, op: ast.UnaryOp, operand: *const ast.Node, env: *Environment) EvalError!Completion {
+        if (op == .typeof_) {
+            // §13.5.3: typeof of an *unresolved* identifier is "undefined" — it must NOT throw
+            // (this is how assert.js probes `typeof JSON !== "undefined"`).
+            if (operand.* == .identifier and env.lookup(operand.identifier) == null) {
+                return .{ .normal = .{ .string = "undefined" } };
+            }
+            const c = try self.evalExpr(operand, env);
+            if (c.isAbrupt()) return c;
+            return .{ .normal = .{ .string = typeOf(c.normal) } };
+        }
         const c = try self.evalExpr(operand, env);
         if (c.isAbrupt()) return c;
         const v = c.normal;
@@ -341,6 +391,7 @@ pub const Interpreter = struct {
             .plus => .{ .normal = .{ .number = toNumber(v) } }, // §13.5.4
             .minus => .{ .normal = .{ .number = -toNumber(v) } }, // §13.5.5
             .not => .{ .normal = .{ .boolean = !toBoolean(v) } }, // §13.5.7
+            .typeof_ => unreachable,
         };
     }
 
@@ -369,6 +420,7 @@ pub const Interpreter = struct {
             .gt => return .{ .normal = .{ .boolean = relational(l, r, .gt) } },
             .le => return .{ .normal = .{ .boolean = relational(l, r, .le) } },
             .ge => return .{ .normal = .{ .boolean = relational(l, r, .ge) } },
+            .instanceof_ => return .{ .normal = .{ .boolean = instanceOf(l, r) } },
             .eq => return .{ .normal = .{ .boolean = looseEquals(l, r) } },
             .ne => return .{ .normal = .{ .boolean = !looseEquals(l, r) } },
             .seq => return .{ .normal = .{ .boolean = strictEquals(l, r) } },
@@ -446,6 +498,33 @@ fn relational(l: Value, r: Value, op: RelOp) bool {
         .le => a <= b,
         .ge => a >= b,
     };
+}
+
+/// §13.5.3 The typeof Operator.
+fn typeOf(v: Value) []const u8 {
+    return switch (v) {
+        .undefined => "undefined",
+        .null => "object", // the historical quirk
+        .boolean => "boolean",
+        .number => "number",
+        .string => "string",
+        .object => |o| if (o.kind == .function) "function" else "object",
+    };
+}
+
+/// §13.10.2 InstanceofOperator (M1: ordinary prototype-chain check; lenient on non-callable RHS).
+fn instanceOf(l: Value, r: Value) bool {
+    if (r != .object or r.object.kind != .function) return false;
+    const pv = r.object.get("prototype") orelse return false;
+    if (pv != .object) return false;
+    const target = pv.object;
+    if (l != .object) return false;
+    var p = l.object.prototype;
+    while (p) |proto| {
+        if (proto == target) return true;
+        p = proto.prototype;
+    }
+    return false;
 }
 
 /// §7.2.16 IsStrictlyEqual (===).

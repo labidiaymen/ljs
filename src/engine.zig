@@ -86,6 +86,22 @@ fn expectThrows(src: []const u8) !void {
     try testing.expect(r == .thrown);
 }
 
+fn expectStr(src: []const u8, want: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const r = try evaluate(arena_state.allocator(), src, .sloppy);
+    try testing.expect(r == .normal and r.normal == .string);
+    try testing.expectEqualStrings(want, r.normal.string);
+}
+
+fn expectBool(src: []const u8, want: bool) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const r = try evaluate(arena_state.allocator(), src, .sloppy);
+    try testing.expect(r == .normal and r.normal == .boolean);
+    try testing.expectEqual(want, r.normal.boolean);
+}
+
 test "bindings: var/let/const, assignment, block scope (US1)" {
     try expectNumber("var x = 40; x + 2", 42);
     try expectNumber("var x = 1; x = x + 5; x", 6);
@@ -142,6 +158,22 @@ test "control flow: throw / try / catch / finally (US4)" {
     try expectNumber("var x = 0; try { x = 1; } finally { x = x + 10; } x", 11);
     // finally runs even when catch rethrows is out of scope here; basic ordering:
     try expectNumber("var x = 0; try { throw 1; } catch (e) { x = e; } finally { x = x + 100; } x", 101);
+}
+
+test "E1: typeof, logical ops, new + instanceof (US5)" {
+    // typeof (incl. unresolved identifier → "undefined", no throw)
+    try expectStr("typeof 42", "number");
+    try expectStr("typeof \"x\"", "string");
+    try expectStr("typeof undefinedGlobalThing", "undefined");
+    try expectStr("function f(){} typeof f", "function");
+    // logical short-circuit (returns operand values, not coerced booleans)
+    try expectNumber("0 || 5", 5);
+    try expectNumber("7 && 9", 9);
+    try expectNumber("var hit = 0; function side(){ hit = 1; return 1; } true || side(); hit", 0); // short-circuit: side() not called
+    // new + constructor + instanceof
+    try expectNumber("function P(v){ this.v = v; } var p = new P(42); p.v", 42);
+    try expectBool("function P(){} var p = new P(); p instanceof P", true);
+    try expectBool("function P(){} function Q(){} (new P()) instanceof Q", false);
 }
 
 test "deep recursion throws RangeError, not a segfault" {

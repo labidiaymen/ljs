@@ -33,6 +33,9 @@ pub const Object = struct {
         const obj = try create(arena, null);
         obj.kind = .function;
         obj.call = data;
+        // §10.2.4: every ordinary function gets a `.prototype` object (used by `new`/`instanceof`).
+        const proto = try create(arena, null);
+        try obj.set("prototype", .{ .object = proto });
         return obj;
     }
 

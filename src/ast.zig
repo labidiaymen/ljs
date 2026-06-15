@@ -1,6 +1,8 @@
 //! Abstract syntax tree. M1 adds statements (declarations, blocks) and the identifier /
 //! assignment expressions on top of the M0 expression grammar (ECMA-262 §13–§14).
-pub const UnaryOp = enum { plus, minus, not };
+pub const UnaryOp = enum { plus, minus, not, typeof_ }; // §13.5
+
+pub const LogicalOp = enum { or_, and_ }; // §13.13 (short-circuit)
 
 pub const BinaryOp = enum {
     add, // §13.15 Additive
@@ -12,6 +14,7 @@ pub const BinaryOp = enum {
     gt,
     le,
     ge,
+    instanceof_, // §13.10.2
     eq, // §13.11 Equality (==)
     ne, // !=
     seq, // === (strict)
@@ -34,6 +37,8 @@ pub const Node = union(enum) {
     assign_index: struct { object: *const Node, key: *const Node, value: *const Node }, // a[expr] = v
     function: *const Function, // §15.2 function expression
     call: struct { callee: *const Node, args: []const *const Node }, // §13.3.6 call
+    new_expr: struct { callee: *const Node, args: []const *const Node }, // §13.3.5 new
+    logical: struct { op: LogicalOp, left: *const Node, right: *const Node }, // §13.13
     this, // §13.2.1 ThisExpression
 };
 

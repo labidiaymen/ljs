@@ -51,6 +51,45 @@ pub const Parser = struct {
         return p;
     }
 
+    /// §13.3.5 `new Callee(args)`. Callee is a member expression (no call); the argument list
+    /// binds to the `new`, so `new a.b.C(x)` constructs `a.b.C`.
+    fn parseNew(self: *Parser) ParseError!*const ast.Node {
+        _ = self.advance(); // new
+        var callee = try self.parsePrimary();
+        while (true) {
+            switch (self.peek().kind) {
+                .dot => {
+                    _ = self.advance();
+                    const name = try self.expect(.identifier);
+                    callee = try self.alloc(.{ .member = .{ .object = callee, .name = name.lexeme } });
+                },
+                .lbracket => {
+                    _ = self.advance();
+                    const key = try self.parseAssignment();
+                    _ = try self.expect(.rbracket);
+                    callee = try self.alloc(.{ .index = .{ .object = callee, .key = key } });
+                },
+                else => break,
+            }
+        }
+        var args: []const *const ast.Node = &.{};
+        if (self.peek().kind == .lparen) {
+            _ = self.advance();
+            var list: std.ArrayList(*const ast.Node) = .empty;
+            while (self.peek().kind != .rparen and self.peek().kind != .eof) {
+                try list.append(self.arena, try self.parseAssignment());
+                if (self.peek().kind == .comma) {
+                    _ = self.advance();
+                    continue;
+                }
+                break;
+            }
+            _ = try self.expect(.rparen);
+            args = list.items;
+        }
+        return self.alloc(.{ .new_expr = .{ .callee = callee, .args = args } });
+    }
+
     fn parseIf(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // if
         _ = try self.expect(.lparen);
@@ -252,16 +291,21 @@ pub const Parser = struct {
         return left;
     }
 
-    /// Precedence-climbing for binary operators. Higher number binds tighter.
+    /// Precedence-climbing for binary + logical operators. Higher number binds tighter.
+    /// Logical `||`/`&&` build short-circuiting `logical` nodes; everything else is `binary`.
     fn parseExpr(self: *Parser, min_prec: u8) ParseError!*const ast.Node {
         var left = try self.parseUnary();
         while (true) {
-            const op = binaryOpFor(self.peek().kind) orelse break;
-            const prec = precedence(op);
+            const k = self.peek().kind;
+            const prec = opPrecedence(k) orelse break;
             if (prec < min_prec) break;
             _ = self.advance();
             const right = try self.parseExpr(prec + 1);
-            left = try self.alloc(.{ .binary = .{ .op = op, .left = left, .right = right } });
+            left = switch (k) {
+                .pipe_pipe => try self.alloc(.{ .logical = .{ .op = .or_, .left = left, .right = right } }),
+                .amp_amp => try self.alloc(.{ .logical = .{ .op = .and_, .left = left, .right = right } }),
+                else => try self.alloc(.{ .binary = .{ .op = binaryOpFor(k).?, .left = left, .right = right } }),
+            };
         }
         return left;
     }
@@ -271,6 +315,7 @@ pub const Parser = struct {
             .plus => .plus,
             .minus => .minus,
             .bang => .not,
+            .kw_typeof => .typeof_,
             else => null,
         };
         if (uop) |op| {
@@ -378,6 +423,7 @@ pub const Parser = struct {
                 _ = self.advance();
                 return self.alloc(.this);
             },
+            .kw_new => return self.parseNew(),
             .lparen => {
                 _ = self.advance();
                 const inner = try self.parseAssignment();
@@ -401,6 +447,7 @@ fn binaryOpFor(kind: lex.TokenKind) ?ast.BinaryOp {
         .gt => .gt,
         .le => .le,
         .ge => .ge,
+        .kw_instanceof => .instanceof_,
         .eq => .eq,
         .ne => .ne,
         .seq => .seq,
@@ -409,11 +456,16 @@ fn binaryOpFor(kind: lex.TokenKind) ?ast.BinaryOp {
     };
 }
 
-fn precedence(op: ast.BinaryOp) u8 {
-    return switch (op) {
-        .eq, .ne, .seq, .sne => 1,
-        .lt, .gt, .le, .ge => 2,
-        .add, .sub => 3,
-        .mul, .div, .mod => 4,
+/// Precedence over token kinds (covers logical, equality, relational, additive,
+/// multiplicative). Assignment is handled separately in `parseAssignment`.
+fn opPrecedence(kind: lex.TokenKind) ?u8 {
+    return switch (kind) {
+        .pipe_pipe => 1,
+        .amp_amp => 2,
+        .eq, .ne, .seq, .sne => 3,
+        .lt, .gt, .le, .ge, .kw_instanceof => 4,
+        .plus, .minus => 5,
+        .star, .slash, .percent => 6,
+        else => null,
     };
 }

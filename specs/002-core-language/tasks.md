@@ -47,9 +47,9 @@ folded into plan.md (Phase 0/1) for M1 to avoid over-producing artifacts.
 - [x] M1-T050 [US5] Enumerated the `sta.js`/`assert.js` surface. **Finding: US5 was under-planned** — running them needs `typeof`, `||`/`&&`, `new`+constructors, `instanceof`, `String()`, `Function.prototype.call`, `Object.prototype`/`Array.prototype` methods (none exist yet), plus prototype-method assignment. Decomposed into E1/E2/E3 (the original single Cycle E was unrealistic).
 
 ### Cycle E1 — operators & construction (the language features assert.js requires)
-- [ ] M1-T051 [US5] `typeof`, `||`, `&&` (parser + interpreter, short-circuit) — §13.5.3 / §13.13
-- [ ] M1-T052 [US5] `new` + constructors (functions get a `.prototype`; `new` makes a proto-linked object and runs the body with `this`=it) — §13.3.5 / §10.2.2; `instanceof` — §13.10.2
-- [ ] M1-T053 [P] [US5] tests for typeof / logical ops / new / instanceof
+- [x] M1-T051 [US5] `typeof` (unresolved id → "undefined", no throw), `||`/`&&` short-circuit (return operand values) — §13.5.3 / §13.13
+- [x] M1-T052 [US5] `new` + constructors (functions get a `.prototype`; `new` proto-links + runs body with `this`; object-return wins) — §13.3.5; `instanceof` (proto-chain) — §13.10.2
+- [x] M1-T053 [P] [US5] E1 tests (inline): typeof/logical/new/instanceof
 
 ### Cycle E2 — core built-ins + global environment
 - [ ] M1-T054 [US5] `src/builtins.zig`: Error family (name/message), `Object`+`Object.prototype.toString`, `Array`+`map`/`join`, `String()`, `Function.prototype.call`; wire the global env — §19/§20
