@@ -4,6 +4,12 @@ description: "Task list for M4 — class definitions (§15.7, conformance-driven
 
 # Tasks: M4 — Class Definitions
 
+**Metric (from M4 Cycle 2 onward):** conformance is now reported **WITH the Test262 harness prelude**
+(`--harness-dir vendor/test262/harness`, the standard Test262 way). The prior bare-gate numbers
+undercounted positive tests that call `assert.*`. Same code at commit `9320218`: bare **27.2%** =
+harness **32.3%** on `language/expressions` (passed 4,622 → 5,484). The committed baseline
+`baseline/language-expressions.json` and all deltas below use the harness metric.
+
 **Cadence**: one cycle = one coherent slice of §15.7 = one commit (build + test + lint + **bench
 (ljs ≤ Node)** green). Re-measure `language/expressions` each cycle (the `class/*` failure bucket must
 shrink). Plan folded into the spec (parser + evaluator + object-model work; no new architecture tier).
