@@ -13,6 +13,9 @@ green, then commit). Conformance-driven: re-measure `language/expressions` each 
 - [x] M2-T012 [US1] `Array.prototype` natives: `push`/`pop`/`indexOf`/`includes`/`join`/`slice`/`forEach`/`map`; `Array` global + `Array.isArray`; literals proto-link to Array.prototype
 - [x] M2-T013 [P] [US1] array tests (14, inline). Note: `language/expressions` ~flat (3960) — arrays pay off in `built-ins/Array` (Cycle close). Bench green (ljs 0.2–0.5× Node).
 
+## Refactor (between Cycle 1 and 2) ✅
+- [x] M2-R01 Extract `src/abstract_ops.zig` (ECMA-262 §7.1/§7.2 ops) + `src/builtin_array.zig` (Array.prototype bodies); interpreter.zig 836→634 lines, now evaluator+dispatch. Behavior-preserving (23.3% unchanged, bench green). Sets up per-file built-ins → Cycles 2–4 land as siblings + parallelizable.
+
 ## Cycle 2 — US2 Strings (P1)
 - [ ] M2-T020 [US2] Primitive boxing in `getProperty` for strings (and numbers) → method/`.length` lookup without a heap wrapper
 - [ ] M2-T021 [US2] `String.prototype` natives: `charAt`, `charCodeAt`, `indexOf`, `includes`, `slice`, `substring`, `toUpperCase`, `toLowerCase`, `split`; string `.length` + index

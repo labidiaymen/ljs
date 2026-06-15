@@ -18,7 +18,9 @@ test {
     _ = @import("completion.zig");
     _ = @import("environment.zig");
     _ = @import("object.zig");
+    _ = @import("abstract_ops.zig");
     _ = @import("builtins.zig");
+    _ = @import("builtin_array.zig");
     _ = @import("ast.zig");
     _ = @import("lexer.zig");
     _ = @import("parser.zig");

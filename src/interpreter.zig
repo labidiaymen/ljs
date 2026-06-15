@@ -8,6 +8,18 @@ const Value = @import("value.zig").Value;
 const Completion = @import("completion.zig").Completion;
 const Environment = @import("environment.zig").Environment;
 const Object = @import("object.zig").Object;
+const ops = @import("abstract_ops.zig");
+const builtin_array = @import("builtin_array.zig");
+
+// ECMA-262 abstract operations live in abstract_ops.zig; alias them so call sites read naturally.
+const toNumber = ops.toNumber;
+const toBoolean = ops.toBoolean;
+const typeOf = ops.typeOf;
+const relational = ops.relational;
+const strictEquals = ops.strictEquals;
+const looseEquals = ops.looseEquals;
+const instanceOf = ops.instanceOf;
+const parseIndex = ops.parseIndex;
 
 pub const EvalError = error{ StepLimitExceeded, OutOfMemory };
 
@@ -416,7 +428,7 @@ pub const Interpreter = struct {
     }
 
     /// §10.2.1 [[Call]] — native built-in, else an ordinary AST-closure function.
-    fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
+    pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
         if (func.native != .none) return self.callNative(func, args, this_val);
         // Each call stacks several heavy native frames — count call depth too so the guard
         // fires before the native stack overflows (these frames are bigger than expr frames).
@@ -550,7 +562,7 @@ pub const Interpreter = struct {
 
     /// §20.5: throw a real Error object carrying `name`/`message`, proto-linked to the realm's
     /// matching Error constructor (so `e instanceof TypeError` and name-based classification work).
-    fn throwError(self: *Interpreter, kind: []const u8, msg: []const u8) EvalError!Completion {
+    pub fn throwError(self: *Interpreter, kind: []const u8, msg: []const u8) EvalError!Completion {
         const err = try Object.create(self.arena, self.errorProto(kind));
         try err.set("name", .{ .string = kind });
         try err.set("message", .{ .string = msg });
@@ -570,7 +582,7 @@ pub const Interpreter = struct {
         return if (pv == .object) pv.object else null;
     }
 
-    fn arrayProto(self: *Interpreter) ?*Object {
+    pub fn arrayProto(self: *Interpreter) ?*Object {
         return self.globalProto("Array");
     }
 
@@ -582,7 +594,7 @@ pub const Interpreter = struct {
                 for (args) |a| try arr.elements.append(self.arena, a);
                 return .{ .normal = .{ .object = arr } };
             },
-            .array_method => return self.arrayMethod(func.native_name, this_val, args),
+            .array_method => return builtin_array.call(self, func.native_name, this_val, args),
             else => {},
         }
         switch (func.native) {
@@ -614,223 +626,9 @@ pub const Interpreter = struct {
         }
     }
 
-    /// §23.1.3 Array.prototype.<name> (+ Array.isArray). `this` is the receiver array.
-    fn arrayMethod(self: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
-        if (std.mem.eql(u8, name, "isArray")) {
-            const v: Value = if (args.len > 0) args[0] else .undefined;
-            return .{ .normal = .{ .boolean = v == .object and v.object.kind == .array } };
-        }
-        if (this_val != .object or this_val.object.kind != .array) {
-            return self.throwError("TypeError", "Array.prototype method called on non-array");
-        }
-        const arr = this_val.object;
-        const eql = std.mem.eql;
-        if (eql(u8, name, "push")) {
-            for (args) |a| try arr.elements.append(self.arena, a);
-            return .{ .normal = .{ .number = @floatFromInt(arr.elements.items.len) } };
-        }
-        if (eql(u8, name, "pop")) {
-            if (arr.elements.pop()) |v| return .{ .normal = v };
-            return .{ .normal = .undefined };
-        }
-        if (eql(u8, name, "indexOf")) {
-            const target: Value = if (args.len > 0) args[0] else .undefined;
-            for (arr.elements.items, 0..) |el, i| {
-                if (strictEquals(el, target)) return .{ .normal = .{ .number = @floatFromInt(i) } };
-            }
-            return .{ .normal = .{ .number = -1 } };
-        }
-        if (eql(u8, name, "includes")) {
-            const target: Value = if (args.len > 0) args[0] else .undefined;
-            for (arr.elements.items) |el| {
-                if (strictEquals(el, target)) return .{ .normal = .{ .boolean = true } };
-            }
-            return .{ .normal = .{ .boolean = false } };
-        }
-        if (eql(u8, name, "join")) {
-            const sep = if (args.len > 0 and args[0] != .undefined) try self.toString(args[0]) else ",";
-            var buf: std.ArrayList(u8) = .empty;
-            for (arr.elements.items, 0..) |el, i| {
-                if (i > 0) try buf.appendSlice(self.arena, sep);
-                if (el != .undefined and el != .null) try buf.appendSlice(self.arena, try self.toString(el));
-            }
-            return .{ .normal = .{ .string = buf.items } };
-        }
-        if (eql(u8, name, "slice")) {
-            const len = arr.elements.items.len;
-            const start = relIndex(if (args.len > 0) args[0] else .undefined, len, 0);
-            const end = relIndex(if (args.len > 1) args[1] else .undefined, len, len);
-            const out = try Object.createArray(self.arena, self.arrayProto());
-            var i = start;
-            while (i < end) : (i += 1) try out.elements.append(self.arena, arr.elements.items[i]);
-            return .{ .normal = .{ .object = out } };
-        }
-        if (eql(u8, name, "forEach") or eql(u8, name, "map")) {
-            if (args.len == 0 or args[0] != .object or args[0].object.kind != .function) {
-                return self.throwError("TypeError", "callback is not a function");
-            }
-            const cb = args[0].object;
-            const is_map = eql(u8, name, "map");
-            const out: ?*Object = if (is_map) try Object.createArray(self.arena, self.arrayProto()) else null;
-            for (arr.elements.items, 0..) |el, i| {
-                const r = try self.callFunction(cb, &.{ el, .{ .number = @floatFromInt(i) }, this_val }, .undefined);
-                if (r.isAbrupt()) return r;
-                if (out) |o| try o.elements.append(self.arena, r.normal);
-            }
-            if (out) |o| return .{ .normal = .{ .object = o } };
-            return .{ .normal = .undefined };
-        }
-        return .{ .normal = .undefined };
-    }
-
     /// §7.1.17 ToString (subset; primitives only).
-    fn toString(self: *Interpreter, v: Value) EvalError![]const u8 {
-        return switch (v) {
-            .string => |s| s,
-            .undefined => "undefined",
-            .null => "null",
-            .boolean => |b| if (b) "true" else "false",
-            .number => |n| numberToString(self.arena, n),
-            .object => |o| blk: {
-                if (o.kind != .array) break :blk "[object Object]"; // §20.1.3.6 (ToPrimitive deferred)
-                // §23.1.3.x Array.prototype.toString → join(",")
-                var buf: std.ArrayList(u8) = .empty;
-                for (o.elements.items, 0..) |el, i| {
-                    if (i > 0) try buf.appendSlice(self.arena, ",");
-                    if (el != .undefined and el != .null) try buf.appendSlice(self.arena, try self.toString(el));
-                }
-                break :blk buf.items;
-            },
-        };
+    /// §7.1.17 ToString — delegates to the abstract operation (handles Array join).
+    pub fn toString(self: *Interpreter, v: Value) EvalError![]const u8 {
+        return ops.toString(self.arena, v);
     }
 };
-
-/// §7.1.4 ToNumber (subset; primitives only).
-fn toNumber(v: Value) f64 {
-    return switch (v) {
-        .number => |n| n,
-        .undefined => std.math.nan(f64),
-        .null => 0,
-        .boolean => |b| if (b) 1 else 0,
-        .string => |s| blk: {
-            const t = std.mem.trim(u8, s, " \t\r\n");
-            if (t.len == 0) break :blk 0;
-            break :blk std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
-        },
-        .object => std.math.nan(f64), // §7.1.4 ToNumber(object) → ToPrimitive; M1 stub → NaN
-    };
-}
-
-/// §7.1.2 ToBoolean.
-fn toBoolean(v: Value) bool {
-    return switch (v) {
-        .undefined, .null => false,
-        .boolean => |b| b,
-        .number => |n| n != 0 and !std.math.isNan(n),
-        .string => |s| s.len != 0,
-        .object => true, // §7.1.2 — objects are always truthy
-    };
-}
-
-const RelOp = enum { lt, gt, le, ge };
-
-/// §7.2.13 / §13.10 Relational comparison.
-fn relational(l: Value, r: Value, op: RelOp) bool {
-    if (l == .string and r == .string) {
-        const order = std.mem.order(u8, l.string, r.string);
-        return switch (op) {
-            .lt => order == .lt,
-            .gt => order == .gt,
-            .le => order != .gt,
-            .ge => order != .lt,
-        };
-    }
-    const a = toNumber(l);
-    const b = toNumber(r);
-    if (std.math.isNan(a) or std.math.isNan(b)) return false;
-    return switch (op) {
-        .lt => a < b,
-        .gt => a > b,
-        .le => a <= b,
-        .ge => a >= b,
-    };
-}
-
-/// Canonical array-index string ("0".."N") → usize, else null (so "length"/method names route
-/// to the property/prototype path).
-fn parseIndex(key: []const u8) ?usize {
-    if (key.len == 0) return null;
-    for (key) |c| if (c < '0' or c > '9') return null;
-    return std.fmt.parseInt(usize, key, 10) catch null;
-}
-
-/// §23.1.3 relative index (negative counts from the end), clamped to [0, len].
-fn relIndex(v: Value, len: usize, default: usize) usize {
-    if (v == .undefined) return default;
-    const n = toNumber(v);
-    if (std.math.isNan(n)) return 0;
-    const flen: f64 = @floatFromInt(len);
-    var idx = n;
-    if (idx < 0) idx += flen;
-    if (idx < 0) idx = 0;
-    if (idx > flen) idx = flen;
-    return @intFromFloat(idx);
-}
-
-/// §13.5.3 The typeof Operator.
-fn typeOf(v: Value) []const u8 {
-    return switch (v) {
-        .undefined => "undefined",
-        .null => "object", // the historical quirk
-        .boolean => "boolean",
-        .number => "number",
-        .string => "string",
-        .object => |o| if (o.kind == .function) "function" else "object",
-    };
-}
-
-/// §13.10.2 InstanceofOperator (M1: ordinary prototype-chain check; lenient on non-callable RHS).
-fn instanceOf(l: Value, r: Value) bool {
-    if (r != .object or r.object.kind != .function) return false;
-    const pv = r.object.get("prototype") orelse return false;
-    if (pv != .object) return false;
-    const target = pv.object;
-    if (l != .object) return false;
-    var p = l.object.prototype;
-    while (p) |proto| {
-        if (proto == target) return true;
-        p = proto.prototype;
-    }
-    return false;
-}
-
-/// §7.2.16 IsStrictlyEqual (===).
-fn strictEquals(l: Value, r: Value) bool {
-    return switch (l) {
-        .undefined => r == .undefined,
-        .null => r == .null,
-        .boolean => |b| r == .boolean and r.boolean == b,
-        .number => |n| r == .number and r.number == n,
-        .string => |s| r == .string and std.mem.eql(u8, s, r.string),
-        .object => |o| r == .object and r.object == o, // reference equality
-    };
-}
-
-/// §7.2.15 IsLooselyEqual (==) — primitive subset.
-fn looseEquals(l: Value, r: Value) bool {
-    if (@as(std.meta.Tag(Value), l) == @as(std.meta.Tag(Value), r)) return strictEquals(l, r);
-    if ((l == .null and r == .undefined) or (l == .undefined and r == .null)) return true;
-    if (l == .undefined or l == .null or r == .undefined or r == .null) return false;
-    return toNumber(l) == toNumber(r);
-}
-
-/// §6.1.6.1.21 Number::toString (subset).
-fn numberToString(arena: std.mem.Allocator, n: f64) error{OutOfMemory}![]const u8 {
-    if (std.math.isNan(n)) return "NaN";
-    if (std.math.isPositiveInf(n)) return "Infinity";
-    if (std.math.isNegativeInf(n)) return "-Infinity";
-    if (n == @floor(n) and @abs(n) < 1e21) {
-        return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
-    }
-    return std.fmt.allocPrint(arena, "{d}", .{n});
-}
