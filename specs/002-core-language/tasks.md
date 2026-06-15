@@ -13,15 +13,15 @@ folded into plan.md (Phase 0/1) for M1 to avoid over-producing artifacts.
 ---
 
 ## Phase 1: Foundational (shared, lands inside Cycle A)
-- [ ] M1-T001 Add `Value.object: *Object` + `src/object.zig` (Object: `StringHashMap(Property)`, `prototype`, `kind`) — §10
-- [ ] M1-T002 Add `src/environment.zig` (Environment scope chain, `Binding{value,mutable,initialized}`, Reference resolution) — §9
-- [ ] M1-T003 Extend `Completion` to `normal/throw/return/break/continue` — §6.2.4
+- [ ] M1-T001 `Value.object` + `src/object.zig` — **moved to Cycle C (objects)**; not needed for bindings
+- [x] M1-T002 `src/environment.zig` (Environment scope chain, `Binding{value,mutable,initialized}`, lookup) — §9
+- [x] M1-T003 Extended `Completion` to `normal/throw/ret/brk/cont` — §6.2.4
 
 ## Phase A — US1 Bindings & statements (P1) 🎯  [Cycle A]
 **Goal**: `var`/`let`/`const`, assignment, blocks, statement sequencing. **Test**: `ljs eval "var x=40; x+2"` → 42.
-- [ ] M1-T010 [US1] Lexer/parser: keywords `var/let/const`, `=`, `;`, `{ }` blocks, statement & declaration grammar — §13/§14
-- [ ] M1-T011 [US1] Interpreter: declarations + assignment via References; block (lexical) scope; TDZ + `const` reassignment → TypeError/ReferenceError
-- [ ] M1-T012 [P] [US1] `tests/bindings_test.zig` (var/let/const, reassignment, scope, TDZ) — SC-001 slice
+- [x] M1-T010 [US1] Lexer/parser: keywords `var/let/const`, `=`, `;`, `{ }` blocks, identifiers, statement & declaration grammar — §13/§14
+- [x] M1-T011 [US1] Interpreter: declarations + assignment + block (lexical) scope; `const` reassignment → TypeError, unresolved → ReferenceError. (var = block-scoped + true TDZ = documented M1 cuts, later cycles)
+- [x] M1-T012 [P] [US1] Binding tests (inline in `engine.zig`): var/let/const, reassignment, block scope, error cases — SC-001 slice
 
 ## Phase B — US2 Functions, calls & closures (P1)  [Cycle B]
 **Goal**: function decl/expr, params, `return`, calls, closures, basic `this`. **Test**: `add(40,2)` → 42; closure captures.

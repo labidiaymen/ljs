@@ -1,6 +1,6 @@
-//! Recursive-descent / precedence-climbing parser for the M0 expression grammar
-//! (ECMA-262 §13). Produces an arena-allocated `ast.Program`. Reports SyntaxError on
-//! malformed input (the parse-phase error used by negative Test262 cases).
+//! Recursive-descent / precedence-climbing parser (ECMA-262 §13–§14). M1 adds statements
+//! (declarations, blocks, expression statements) and identifier / assignment expressions.
+//! Reports SyntaxError on malformed input (the parse-phase error for negative Test262 cases).
 const std = @import("std");
 const ast = @import("ast.zig");
 const lex = @import("lexer.zig");
@@ -45,18 +45,78 @@ pub const Parser = struct {
         return p;
     }
 
+    // ── statements ──────────────────────────────────────────────────────────
+
     fn parseProgram(self: *Parser) ParseError!ast.Program {
-        var stmts: std.ArrayList(*const ast.Node) = .empty;
+        var stmts: std.ArrayList(ast.Stmt) = .empty;
         while (self.peek().kind != .eof) {
-            const expr = try self.parseExpr(0);
-            try stmts.append(self.arena, expr);
-            // Optional statement terminator.
-            if (self.peek().kind == .semicolon) _ = self.advance();
+            try stmts.append(self.arena, try self.parseStmt());
         }
         return .{ .statements = stmts.items };
     }
 
-    /// Precedence-climbing. Higher number binds tighter.
+    fn parseStmt(self: *Parser) ParseError!ast.Stmt {
+        switch (self.peek().kind) {
+            .lbrace => return .{ .block = try self.parseBlock() },
+            .kw_var, .kw_let, .kw_const => return self.parseDecl(),
+            else => {
+                const e = try self.parseAssignment();
+                if (self.peek().kind == .semicolon) _ = self.advance();
+                return .{ .expr = e };
+            },
+        }
+    }
+
+    fn parseBlock(self: *Parser) ParseError![]const ast.Stmt {
+        _ = try self.expect(.lbrace);
+        var stmts: std.ArrayList(ast.Stmt) = .empty;
+        while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
+            try stmts.append(self.arena, try self.parseStmt());
+        }
+        _ = try self.expect(.rbrace);
+        return stmts.items;
+    }
+
+    fn parseDecl(self: *Parser) ParseError!ast.Stmt {
+        const kind: ast.DeclKind = switch (self.advance().kind) {
+            .kw_var => .var_decl,
+            .kw_let => .let_decl,
+            else => .const_decl,
+        };
+        var decls: std.ArrayList(ast.Declarator) = .empty;
+        while (true) {
+            const name_tok = try self.expect(.identifier);
+            var init_expr: ?*const ast.Node = null;
+            if (self.peek().kind == .assign) {
+                _ = self.advance();
+                init_expr = try self.parseAssignment();
+            }
+            try decls.append(self.arena, .{ .name = name_tok.lexeme, .init = init_expr });
+            if (self.peek().kind == .comma) {
+                _ = self.advance();
+                continue;
+            }
+            break;
+        }
+        if (self.peek().kind == .semicolon) _ = self.advance();
+        return .{ .declaration = .{ .kind = kind, .decls = decls.items } };
+    }
+
+    // ── expressions ─────────────────────────────────────────────────────────
+
+    /// §13.15 Assignment (right-associative). Only identifier targets in M1 Cycle A.
+    fn parseAssignment(self: *Parser) ParseError!*const ast.Node {
+        const left = try self.parseExpr(0);
+        if (self.peek().kind == .assign) {
+            if (left.* != .identifier) return ParseError.UnexpectedToken;
+            _ = self.advance();
+            const value = try self.parseAssignment();
+            return self.alloc(.{ .assign = .{ .name = left.identifier, .value = value } });
+        }
+        return left;
+    }
+
+    /// Precedence-climbing for binary operators. Higher number binds tighter.
     fn parseExpr(self: *Parser, min_prec: u8) ParseError!*const ast.Node {
         var left = try self.parseUnary();
         while (true) {
@@ -64,15 +124,14 @@ pub const Parser = struct {
             const prec = precedence(op);
             if (prec < min_prec) break;
             _ = self.advance();
-            const right = try self.parseExpr(prec + 1); // left-associative
+            const right = try self.parseExpr(prec + 1);
             left = try self.alloc(.{ .binary = .{ .op = op, .left = left, .right = right } });
         }
         return left;
     }
 
     fn parseUnary(self: *Parser) ParseError!*const ast.Node {
-        const k = self.peek().kind;
-        const uop: ?ast.UnaryOp = switch (k) {
+        const uop: ?ast.UnaryOp = switch (self.peek().kind) {
             .plus => .plus,
             .minus => .minus,
             .bang => .not,
@@ -110,9 +169,13 @@ pub const Parser = struct {
                 _ = self.advance();
                 return self.alloc(.null);
             },
+            .identifier => {
+                _ = self.advance();
+                return self.alloc(.{ .identifier = t.lexeme });
+            },
             .lparen => {
                 _ = self.advance();
-                const inner = try self.parseExpr(0);
+                const inner = try self.parseAssignment();
                 _ = try self.expect(.rparen);
                 return inner;
             },

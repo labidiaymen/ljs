@@ -9,6 +9,10 @@ pub const TokenKind = enum {
     kw_true,
     kw_false,
     kw_null,
+    kw_var,
+    kw_let,
+    kw_const,
+    identifier,
     plus,
     minus,
     star,
@@ -17,6 +21,10 @@ pub const TokenKind = enum {
     bang,
     lparen,
     rparen,
+    lbrace,
+    rbrace,
+    comma,
+    assign, // =
     semicolon,
     lt,
     gt,
@@ -107,7 +115,10 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, word, "true")) return .{ .kind = .kw_true, .lexeme = word };
             if (std.mem.eql(u8, word, "false")) return .{ .kind = .kw_false, .lexeme = word };
             if (std.mem.eql(u8, word, "null")) return .{ .kind = .kw_null, .lexeme = word };
-            return LexError.UnexpectedCharacter; // identifiers/bindings not in M0
+            if (std.mem.eql(u8, word, "var")) return .{ .kind = .kw_var, .lexeme = word };
+            if (std.mem.eql(u8, word, "let")) return .{ .kind = .kw_let, .lexeme = word };
+            if (std.mem.eql(u8, word, "const")) return .{ .kind = .kw_const, .lexeme = word };
+            return .{ .kind = .identifier, .lexeme = word };
         }
 
         // String literals. §12.9.4 (subset: no escapes beyond the basics).
@@ -123,6 +134,9 @@ pub const Lexer = struct {
             '%' => return tok(.percent, self.src[start..self.pos]),
             '(' => return tok(.lparen, self.src[start..self.pos]),
             ')' => return tok(.rparen, self.src[start..self.pos]),
+            '{' => return tok(.lbrace, self.src[start..self.pos]),
+            '}' => return tok(.rbrace, self.src[start..self.pos]),
+            ',' => return tok(.comma, self.src[start..self.pos]),
             ';' => return tok(.semicolon, self.src[start..self.pos]),
             '<' => return self.maybeEq(.lt, .le, start),
             '>' => return self.maybeEq(.gt, .ge, start),
@@ -132,7 +146,7 @@ pub const Lexer = struct {
             },
             '=' => {
                 if (self.peek() == '=') return self.lexEqEq(start);
-                return LexError.UnexpectedCharacter; // assignment not in M0
+                return tok(.assign, self.src[start..self.pos]);
             },
             else => return LexError.UnexpectedCharacter,
         }

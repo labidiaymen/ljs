@@ -4,6 +4,7 @@ const std = @import("std");
 const Value = @import("value.zig").Value;
 const Parser = @import("parser.zig").Parser;
 const Interpreter = @import("interpreter.zig").Interpreter;
+const Environment = @import("environment.zig").Environment;
 
 /// ECMA-262 distinguishes strict and sloppy mode. The M0 expression subset has no
 /// observable difference yet; the parameter is threaded now so the harness can run both.
@@ -30,14 +31,18 @@ pub fn evaluateWithLimit(arena: std.mem.Allocator, source: []const u8, mode: Run
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .syntax_error = @errorName(e) },
     };
+    const global = Environment.create(arena, null) catch return error.OutOfMemory;
     var interp = Interpreter{ .arena = arena, .step_limit = step_limit };
-    const completion = interp.run(program) catch |e| switch (e) {
+    const completion = interp.run(program, global) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.StepLimitExceeded => return .step_limit,
     };
     return switch (completion) {
         .normal => |v| .{ .normal = v },
         .throw => |v| .{ .thrown = v },
+        .ret => |v| .{ .normal = v }, // stray top-level return → its value
+        // TODO(Cycle B/D): top-level return/break/continue should be parse-phase SyntaxErrors.
+        .brk, .cont => .{ .normal = .undefined },
     };
 }
 
@@ -72,4 +77,24 @@ test "syntax error is reported, not crashed" {
     defer arena_state.deinit();
     const r = try evaluate(arena_state.allocator(), "1 +", .sloppy);
     try testing.expect(r == .syntax_error);
+}
+
+fn expectThrows(src: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const r = try evaluate(arena_state.allocator(), src, .sloppy);
+    try testing.expect(r == .thrown);
+}
+
+test "bindings: var/let/const, assignment, block scope (US1)" {
+    try expectNumber("var x = 40; x + 2", 42);
+    try expectNumber("var x = 1; x = x + 5; x", 6);
+    try expectNumber("let a = 3; { let a = 10; } a", 3); // inner block shadows, outer unchanged
+    try expectNumber("const c = 7; c", 7);
+}
+
+test "bindings: errors (US1)" {
+    try expectThrows("const c = 1; c = 2; c"); // assignment to constant → TypeError
+    try expectThrows("missingVar"); // ReferenceError
+    try expectThrows("{ let y = 1; } y"); // out of scope → ReferenceError
 }
