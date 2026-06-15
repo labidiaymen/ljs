@@ -16,8 +16,22 @@ pub const Parser = struct {
     /// parenthesized expression's AST node is indistinguishable from its content — so we record the
     /// paren here at parse time and consult it in `parseShortCircuit`.
     last_was_paren: bool = false,
+    /// §11.2.2 strict-mode context. True once the enclosing Script/FunctionBody is strict (an
+    /// explicit `"use strict"` directive prologue) — and, per the lexical-inheritance rule, stays
+    /// true for every nested function/arrow/method body (strict-ness is never un-set going inward).
+    /// Gates the §13.x strict-only Early Errors (reserved BindingIdentifiers, `delete` of a bare
+    /// reference, `eval`/`arguments` assignment targets, duplicate params in normal functions).
+    /// Saved/restored around each function body in `parseFunction`/`finishArrow`/method parsing.
+    strict: bool = false,
 
+    /// `mode == .strict` starts the whole Script in strict context (the Test262 runner runs each
+    /// test in both modes, expecting the engine to honor `RunMode`). An explicit `"use strict"`
+    /// directive prologue is detected independently in `parseProgram`.
     pub fn parse(arena: std.mem.Allocator, src: []const u8) ParseError!ast.Program {
+        return parseMode(arena, src, false);
+    }
+
+    pub fn parseMode(arena: std.mem.Allocator, src: []const u8, strict: bool) ParseError!ast.Program {
         var lexer = lex.Lexer.init(arena, src);
         var toks: std.ArrayList(lex.Token) = .empty;
         while (true) {
@@ -25,7 +39,7 @@ pub const Parser = struct {
             try toks.append(arena, t);
             if (t.kind == .eof) break;
         }
-        var p = Parser{ .tokens = toks.items, .arena = arena };
+        var p = Parser{ .tokens = toks.items, .arena = arena, .strict = strict };
         return p.parseProgram();
     }
 
@@ -181,7 +195,7 @@ pub const Parser = struct {
                     }
                     i += 1;
                 }
-                const prog = try Parser.parse(self.arena, raw[expr_start..i]);
+                const prog = try Parser.parseMode(self.arena, raw[expr_start..i], self.strict);
                 const node = if (prog.statements.len > 0 and prog.statements[0] == .expr)
                     prog.statements[0].expr
                 else
@@ -324,7 +338,11 @@ pub const Parser = struct {
             _ = self.advance();
             if (self.peek().kind == .lparen) {
                 _ = self.advance();
-                catch_param = (try self.expect(.identifier)).lexeme;
+                const cp = try self.expect(.identifier);
+                // §13.1.1 Early Error: in strict, a catch parameter (a BindingIdentifier) may not be
+                // `eval`/`arguments` or a future-reserved word.
+                if (self.strict and isStrictReservedBindingName(cp.lexeme)) return ParseError.UnexpectedToken;
+                catch_param = cp.lexeme;
                 _ = try self.expect(.rparen);
             }
             catch_block = try self.parseBlock();
@@ -339,6 +357,10 @@ pub const Parser = struct {
     // ── statements ──────────────────────────────────────────────────────────
 
     fn parseProgram(self: *Parser) ParseError!ast.Program {
+        // §11.2.1 / §15.1.1: a Script is strict if it carries a "use strict" directive prologue.
+        // Detect it on the token stream before parsing statements so the §13.x Early Errors below
+        // fire for the whole Script. (`self.strict` may already be true from a strict `RunMode`.)
+        if (directivePrologueIsStrict(self.tokens[self.idx..])) self.strict = true;
         var stmts: std.ArrayList(ast.Stmt) = .empty;
         while (self.peek().kind != .eof) {
             try stmts.append(self.arena, try self.parseStmt());
@@ -395,9 +417,27 @@ pub const Parser = struct {
 
     /// §15.2: `function [name] (params) { body }` — shared by declarations and expressions.
     fn parseFunction(self: *Parser) ParseError!*const ast.Function {
+        const enclosing_strict = self.strict;
+        defer self.strict = enclosing_strict; // §11.2.2: never un-strict an inner scope on the way out
         var name: ?[]const u8 = null;
         if (self.peek().kind == .identifier) name = self.advance().lexeme;
+        // §13.1.1: a strict function's name (BindingIdentifier) may not be `eval`/`arguments`/a
+        // future-reserved word. Checked against the *enclosing* strictness (the name is declared
+        // in the outer scope).
+        if (enclosing_strict) if (name) |nm| if (isStrictReservedBindingName(nm)) return ParseError.UnexpectedToken;
         const pl = try self.parseParams();
+        // §11.2.2 lexical inheritance: the body is strict if the enclosing scope is, OR it carries
+        // its own "use strict" prologue. Prescan the body tokens (current token is `{`) so the
+        // param/body Early Errors below see the function's own strictness.
+        const body_strict = enclosing_strict or
+            (self.peek().kind == .lbrace and directivePrologueIsStrict(self.tokens[self.idx + 1 ..]));
+        // §13.1.1 / §15.1.1: in strict, the parameter BindingIdentifiers may not be reserved and
+        // must be unique. (Arrows/methods already enforce uniqueness in every mode.)
+        if (body_strict) {
+            if (paramsHaveStrictReserved(pl)) return ParseError.UnexpectedToken;
+            if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
+        }
+        self.strict = body_strict;
         const body = try self.parseBlock();
         // §15.1.1 Early Error: a "use strict" directive is forbidden when the parameter list is
         // non-simple (has defaults, patterns, or a rest element).
@@ -495,6 +535,9 @@ pub const Parser = struct {
         while (true) {
             // §14.3 LexicalBinding: target is a BindingIdentifier or a BindingPattern.
             const target = try self.parsePattern();
+            // §13.1.1 Early Error: in strict, a bound name may not be `eval`/`arguments` or a
+            // future-reserved word (applies to every identifier the pattern binds).
+            if (self.strict and patternHasStrictReserved(target)) return ParseError.UnexpectedToken;
             var init_expr: ?*const ast.Node = null;
             if (self.peek().kind == .assign) {
                 _ = self.advance();
@@ -522,6 +565,8 @@ pub const Parser = struct {
     /// normalized to a single `return expr` statement; a `{ … }` body is a normal block.
     /// `params`/`rest` come from the already-parsed (or about-to-parse) formal list.
     fn finishArrow(self: *Parser, pl: ParamList) ParseError!*const ast.Node {
+        const enclosing_strict = self.strict;
+        defer self.strict = enclosing_strict; // §11.2.2: never un-strict on the way out
         // §15.3.1 Early Error: `ArrowParameters [no LineTerminator here] =>` — a line terminator
         // between the parameters and `=>` is a SyntaxError (ASI must not insert a semicolon here).
         if (self.peek().newline_before) return ParseError.UnexpectedToken;
@@ -529,6 +574,15 @@ pub const Parser = struct {
         // non-strict ordinary function, this holds in every mode).
         if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
         _ = try self.expect(.fat_arrow);
+        // §11.2.2 lexical inheritance: a `{ … }` concise body may carry its own "use strict"; an
+        // expression body cannot. The arrow's params are subject to strict binding restrictions
+        // when the arrow is (itself or by inheritance) strict.
+        const body_strict = enclosing_strict or
+            (self.peek().kind == .lbrace and directivePrologueIsStrict(self.tokens[self.idx + 1 ..]));
+        // §13.1.1: in strict, an arrow's parameter BindingIdentifiers may not be `eval`/`arguments`
+        // or a future-reserved word.
+        if (body_strict and paramsHaveStrictReserved(pl)) return ParseError.UnexpectedToken;
+        self.strict = body_strict;
         const body: []const ast.Stmt = if (self.peek().kind == .lbrace)
             // ConciseBody : { FunctionBody }
             try self.parseBlock()
@@ -612,7 +666,11 @@ pub const Parser = struct {
         // evaluate the reference exactly once before deciding whether to evaluate the RHS.
         if (logicalAssignOp(op)) |lop| {
             switch (left.*) {
-                .identifier, .member, .index => {},
+                .identifier => |n| {
+                    // §13.15.1 Early Error: in strict, the assignment target may not be `eval`/`arguments`.
+                    if (self.strict and isEvalOrArguments(n)) return ParseError.UnexpectedToken;
+                },
+                .member, .index => {},
                 else => return ParseError.UnexpectedToken, // §13.15.1 invalid assignment target
             }
             _ = self.advance();
@@ -620,6 +678,11 @@ pub const Parser = struct {
             return self.alloc(.{ .logical_assign = .{ .op = lop, .target = left, .value = value } });
         }
         if (op == .assign or compoundBinOp(op) != null) {
+            // §13.15.1 Early Error: in strict, the assignment target may not be `eval`/`arguments`.
+            if (self.strict) switch (left.*) {
+                .identifier => |n| if (isEvalOrArguments(n)) return ParseError.UnexpectedToken,
+                else => {},
+            };
             _ = self.advance();
             const rhs = try self.parseAssignment();
             // Compound assignment `x op= v` desugars to `x = x op v` (§13.15).
@@ -722,6 +785,12 @@ pub const Parser = struct {
             const target = try self.parseUnary();
             // §13.3.9.1 Early Error: `++a?.b` — a prefix-update operand may not be an OptionalChain.
             if (target.* == .optional) return ParseError.UnexpectedToken;
+            // §13.4.1.1 Early Error: in strict, the operand of a prefix update may not be the
+            // reference `eval`/`arguments`.
+            if (self.strict) switch (target.*) {
+                .identifier => |n| if (isEvalOrArguments(n)) return ParseError.UnexpectedToken,
+                else => {},
+            };
             return self.alloc(.{ .update = .{ .op = op, .prefix = true, .target = target } });
         }
         const uop: ?ast.UnaryOp = switch (self.peek().kind) {
@@ -737,6 +806,10 @@ pub const Parser = struct {
         if (uop) |op| {
             _ = self.advance();
             const operand = try self.parseUnary();
+            // §13.5.1.1 Early Error: in strict, `delete` of an unqualified reference (a bare
+            // identifier — a direct UnresolvableReference / resolvable binding, not a property
+            // reference) is a SyntaxError. `delete obj.prop` / `delete obj[k]` stay legal.
+            if (op == .delete_ and self.strict and operand.* == .identifier) return ParseError.UnexpectedToken;
             return self.alloc(.{ .unary = .{ .op = op, .operand = operand } });
         }
         return self.parsePostfix();
@@ -805,11 +878,33 @@ pub const Parser = struct {
         // not be an OptionalChain (`a?.b++` is a SyntaxError) — the chain result isn't a Reference.
         if (self.peek().kind == .plus_plus or self.peek().kind == .minus_minus) {
             if (in_chain) return ParseError.UnexpectedToken;
+            // §13.4.1.1 Early Error: in strict, a postfix-update operand may not be the reference
+            // `eval`/`arguments`.
+            if (self.strict) switch (expr.*) {
+                .identifier => |n| if (isEvalOrArguments(n)) return ParseError.UnexpectedToken,
+                else => {},
+            };
             const op: ast.UpdateOp = if (self.peek().kind == .plus_plus) .inc else .dec;
             _ = self.advance();
             expr = try self.alloc(.{ .update = .{ .op = op, .prefix = false, .target = expr } });
         }
         return expr;
+    }
+
+    /// Parse a method / accessor `{ FunctionBody }` (current token is `{`), handling strict-mode
+    /// context the same way `parseFunction` does: the body inherits the enclosing strictness OR its
+    /// own "use strict" prologue (§11.2.2), strict params may not be reserved/`eval`/`arguments`
+    /// (§13.1.1), and a "use strict" directive is forbidden with a non-simple param list (§15.1.1).
+    fn parseMethodBody(self: *Parser, pl: ParamList) ParseError![]const ast.Stmt {
+        const enclosing_strict = self.strict;
+        defer self.strict = enclosing_strict;
+        const body_strict = enclosing_strict or
+            (self.peek().kind == .lbrace and directivePrologueIsStrict(self.tokens[self.idx + 1 ..]));
+        if (body_strict and paramsHaveStrictReserved(pl)) return ParseError.UnexpectedToken;
+        self.strict = body_strict;
+        const body = try self.parseBlock();
+        if (!isSimpleParameterList(pl) and bodyHasUseStrict(body)) return ParseError.UnexpectedToken;
+        return body;
     }
 
     /// §13.2.5 Object initializer `{ … }`. Supports every PropertyDefinition form:
@@ -850,8 +945,7 @@ pub const Parser = struct {
                 } else {
                     if (pl.params.len != 1 or pl.rest != null) return ParseError.UnexpectedToken;
                 }
-                const body = try self.parseBlock();
-                if (!isSimpleParameterList(pl) and bodyHasUseStrict(body)) return ParseError.UnexpectedToken;
+                const body = try self.parseMethodBody(pl);
                 // §13.2.5.1 UniqueFormalParameters — a method/accessor's params have no duplicates.
                 if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
                 const f = try self.arena.create(ast.Function);
@@ -876,8 +970,7 @@ pub const Parser = struct {
             if (self.peek().kind == .lparen) {
                 // §13.2.5 MethodDefinition `m(args){…}` — sugar for `m: function(args){…}`.
                 const pl = try self.parseParams();
-                const body = try self.parseBlock();
-                if (!isSimpleParameterList(pl) and bodyHasUseStrict(body)) return ParseError.UnexpectedToken;
+                const body = try self.parseMethodBody(pl);
                 // §13.2.5.1 UniqueFormalParameters — a method's parameters have no duplicates.
                 if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
                 const f = try self.arena.create(ast.Function);
@@ -1036,6 +1129,59 @@ pub const Parser = struct {
     }
 };
 
+/// §13.1.1: `eval` and `arguments` are not valid as a BindingIdentifier or as an assignment /
+/// update target in strict mode.
+fn isEvalOrArguments(name: []const u8) bool {
+    return std.mem.eql(u8, name, "eval") or std.mem.eql(u8, name, "arguments");
+}
+
+/// §13.1.1 / Table: a name that may not be used as a BindingIdentifier in strict mode — `eval`,
+/// `arguments`, and the strict future-reserved words. (`let`/`static`/`yield` are contextual; as a
+/// *binding name* they are forbidden in strict. `let` is already lexed as a keyword so it never
+/// reaches here as an identifier lexeme, but listing it keeps the set complete.)
+fn isStrictReservedBindingName(name: []const u8) bool {
+    if (isEvalOrArguments(name)) return true;
+    const reserved = [_][]const u8{
+        "implements", "interface", "let",    "package", "private",
+        "protected",  "public",    "static", "yield",
+    };
+    for (reserved) |r| {
+        if (std.mem.eql(u8, name, r)) return true;
+    }
+    return false;
+}
+
+/// Does any identifier bound by `pattern` violate the strict BindingIdentifier restrictions
+/// (§13.1.1)? Recurses through array/object binding patterns (and their rest elements).
+fn patternHasStrictReserved(pattern: *const ast.Pattern) bool {
+    switch (pattern.*) {
+        .identifier => |n| return isStrictReservedBindingName(n),
+        .array => |ap| {
+            for (ap.elements) |el| {
+                if (el.target) |t| if (patternHasStrictReserved(t)) return true;
+            }
+            if (ap.rest) |r| return patternHasStrictReserved(r);
+            return false;
+        },
+        .object => |op| {
+            for (op.properties) |prop| {
+                if (patternHasStrictReserved(prop.target)) return true;
+            }
+            if (op.rest) |r| return isStrictReservedBindingName(r);
+            return false;
+        },
+    }
+}
+
+/// §13.1.1: does any formal parameter (including the rest element) bind a strict-reserved name?
+fn paramsHaveStrictReserved(pl: Parser.ParamList) bool {
+    for (pl.params) |p| {
+        if (patternHasStrictReserved(p.pattern)) return true;
+    }
+    if (pl.rest) |r| return patternHasStrictReserved(r);
+    return false;
+}
+
 /// §15.1.3 IsSimpleParameterList — true iff every parameter is a plain BindingIdentifier with no
 /// default and there is no rest parameter (the precondition for allowing a "use strict" directive).
 fn isSimpleParameterList(pl: Parser.ParamList) bool {
@@ -1110,6 +1256,37 @@ fn bodyHasUseStrict(body: []const ast.Stmt) bool {
             },
             else => return false,
         }
+    }
+    return false;
+}
+
+/// §11.2.1 Directive Prologue → §11.2.2 strict: scan a leading token run (a Script or FunctionBody)
+/// for a `"use strict"` (or `'use strict'`) directive. A Directive Prologue is the longest leading
+/// sequence of string-literal ExpressionStatements; a directive counts only when its *source text*
+/// is exactly `"use strict"` with no escape sequences or line continuations — so we compare the raw
+/// lexeme (quotes included), NOT the cooked value (`"use strict"` does NOT trigger strict).
+/// `toks` starts at the first token of the body (after the opening `{` for functions). Token-level
+/// (not AST-level) so it can run before statement parsing and fire the §13.x Early Errors below.
+fn directivePrologueIsStrict(toks: []const lex.Token) bool {
+    var i: usize = 0;
+    while (i < toks.len and toks[i].kind == .string) {
+        // A string is a standalone ExpressionStatement (a Directive) only when the next token
+        // terminates the statement: `;`, `}`, EOF, or a line terminator (ASI). If instead the next
+        // token continues the expression on the same line (`"x" + 1`, `"x".length`, `"x", y`), the
+        // string was an operand of a larger expression — the Directive Prologue has ended.
+        const next = if (i + 1 < toks.len) toks[i + 1] else lex.Token{ .kind = .eof, .lexeme = "" };
+        const terminated = switch (next.kind) {
+            .semicolon, .rbrace, .eof => true,
+            else => next.newline_before,
+        };
+        if (!terminated) return false;
+        // §11.2.2: a directive whose *source text* is exactly `"use strict"` (no escapes / line
+        // continuations) makes the unit strict — compare the raw lexeme, not the cooked value.
+        if (std.mem.eql(u8, toks[i].lexeme, "\"use strict\"") or
+            std.mem.eql(u8, toks[i].lexeme, "'use strict'")) return true;
+        // Continue the prologue past this directive and an optional explicit `;`.
+        i += 1;
+        if (i < toks.len and toks[i].kind == .semicolon) i += 1;
     }
     return false;
 }

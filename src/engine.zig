@@ -27,8 +27,10 @@ pub fn evaluate(arena: std.mem.Allocator, source: []const u8, mode: RunMode) err
 /// Like `evaluate`, but with an explicit interpreter step cap (the watchdog, research D8).
 /// The Test262 harness uses this to bound runaway tests deterministically.
 pub fn evaluateWithLimit(arena: std.mem.Allocator, source: []const u8, mode: RunMode, step_limit: u64) error{OutOfMemory}!EvaluationResult {
-    _ = mode; // not yet observable for the M0 subset
-    const program = Parser.parse(arena, source) catch |e| switch (e) {
+    // §11.2.2: in strict RunMode the whole Script starts in strict context (the Test262 runner runs
+    // each test in both modes and expects the engine to honor this). An explicit `"use strict"`
+    // directive prologue is detected independently inside the parser.
+    const program = Parser.parseMode(arena, source, mode == .strict) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .syntax_error = @errorName(e) },
     };
@@ -109,6 +111,23 @@ fn expectSyntaxError(src: []const u8) !void {
     defer arena_state.deinit();
     const r = try evaluate(arena_state.allocator(), src, .sloppy);
     try testing.expect(r == .syntax_error);
+}
+
+/// Evaluate in strict `RunMode` (no prepended directive) and assert a parse-phase SyntaxError.
+fn expectSyntaxErrorStrict(src: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const r = try evaluate(arena_state.allocator(), src, .strict);
+    try testing.expect(r == .syntax_error);
+}
+
+/// Evaluate in strict `RunMode` and assert it parses + runs without a SyntaxError (it may still
+/// throw at runtime — we only assert the absence of a *parse* error).
+fn expectNoSyntaxErrorStrict(src: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const r = try evaluate(arena_state.allocator(), src, .strict);
+    try testing.expect(r != .syntax_error);
 }
 
 fn expectUndefined(src: []const u8) !void {
@@ -643,6 +662,78 @@ test "M3 delete operator (US8, §13.5.1)" {
     try expectBool("var x = 1; delete x", true);
     // accessing a deleted property yields undefined.
     try expectUndefined("var o = {x: 1}; delete o.x; o.x");
+}
+
+test "M3 strict-mode: \"use strict\" directive triggers Early Errors (US9, §11.2.2/§13.1.1)" {
+    // A "use strict" directive prologue makes the script strict, so a binding named `eval`/
+    // `arguments` is a SyntaxError (§13.1.1).
+    try expectSyntaxError("\"use strict\"; var eval = 1;");
+    try expectSyntaxError("\"use strict\"; var arguments = 1;");
+    try expectSyntaxError("'use strict'; let eval = 2;");
+    try expectSyntaxError("\"use strict\"; function eval() {}");
+    try expectSyntaxError("\"use strict\"; function f(eval) {}");
+    try expectSyntaxError("\"use strict\"; var f = (arguments) => 1;");
+    // Future-reserved words as a binding name (§13.1.1).
+    try expectSyntaxError("\"use strict\"; var public = 1;");
+    try expectSyntaxError("\"use strict\"; function f(static) {}");
+    try expectSyntaxError("\"use strict\"; var yield = 1;");
+    // §13.15.1 assignment / update target of eval/arguments.
+    try expectSyntaxError("\"use strict\"; eval = 1;");
+    try expectSyntaxError("\"use strict\"; arguments++;");
+    try expectSyntaxError("\"use strict\"; eval += 2;");
+    // §13.5.1.1 delete of an unqualified reference.
+    try expectSyntaxError("\"use strict\"; var y; delete y;");
+    // §15.1.1 duplicate parameter names in a strict normal function.
+    try expectSyntaxError("\"use strict\"; function f(a, a) { return a; }");
+}
+
+test "M3 strict-mode: lexical inheritance into nested functions (US9, §11.2.2)" {
+    // A nested function inherits strictness even without its own directive.
+    try expectSyntaxError("\"use strict\"; function outer() { function inner(eval) {} }");
+    try expectSyntaxError("\"use strict\"; function outer() { var f = () => { var arguments = 1; }; }");
+    // A "use strict" only inside the inner function makes the INNER strict (outer stays sloppy).
+    try expectSyntaxError("function outer() { 'use strict'; function inner() { var eval = 1; } }");
+    // …but the outer body, being sloppy, may still bind eval.
+    try expectNoSyntaxErrorStrict("function outer() { return 1; } var x = 1;"); // sanity: strict mode parses fine
+}
+
+test "M3 strict-mode via RunMode: Early Errors fire without a prepended directive (US9)" {
+    // The Test262 runner runs each test in strict RunMode (honoring the mode parameter), so the
+    // Early Errors must fire even with no explicit directive in the source.
+    try expectSyntaxErrorStrict("var eval = 1;");
+    try expectSyntaxErrorStrict("var arguments = 2;");
+    try expectSyntaxErrorStrict("function f(arguments) {}");
+    try expectSyntaxErrorStrict("eval = 1;");
+    try expectSyntaxErrorStrict("var z; delete z;");
+    try expectSyntaxErrorStrict("function f(a, a) {}");
+    try expectSyntaxErrorStrict("var f = (x, x) => 1;"); // (also a duplicate-param error in any mode)
+    try expectSyntaxErrorStrict("var public = 1;");
+}
+
+test "M3 strict-mode: NO regression in sloppy mode (US9)" {
+    // None of the strict Early Errors apply in sloppy mode.
+    try expectNumber("var eval = 1; eval", 1);
+    try expectNumber("var arguments = 2; arguments", 2);
+    try expectNumber("function f(eval) { return eval; } f(7)", 7);
+    try expectNumber("var public = 3; public", 3);
+    try expectNumber("var yield = 4; yield", 4);
+    try expectBool("var y = 1; delete y", true); // sloppy delete of a binding → true (M-subset)
+    try expectNumber("var eval = 4; eval = 5; eval", 5); // sloppy assignment to eval is fine
+    // A function with its own duplicate params is legal in sloppy mode (no directive).
+    try expectNumber("function f(a, a) { return a; } f(1, 9)", 9); // last wins
+    // `"use strict"` as a non-directive (an operand) does NOT make the script strict.
+    try expectNumber("(\"use strict\"); var eval = 6; eval", 6);
+    try expectNumber("\"use strict\" + \"\"; var arguments = 7; arguments", 7);
+}
+
+test "M3 strict-mode: member delete & qualified targets stay legal in strict (US9)" {
+    // §13.5.1.1 only forbids delete of an *unqualified* reference; property deletes are fine.
+    try expectNoSyntaxErrorStrict("var o = {x: 1}; delete o.x;");
+    try expectNoSyntaxErrorStrict("var o = {x: 1}; delete o['x'];");
+    // Assignment / update of non-eval/arguments identifiers and members is fine in strict.
+    try expectNoSyntaxErrorStrict("var x = 1; x = 2; x++; var o = {}; o.p = 3; o.p++;");
+    // eval/arguments are usable as property names / member accesses in strict (not bindings).
+    try expectNoSyntaxErrorStrict("var o = {eval: 1, arguments: 2}; o.eval + o.arguments;");
 }
 
 test "deep recursion throws RangeError, not a segfault" {
