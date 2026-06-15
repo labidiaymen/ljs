@@ -774,6 +774,39 @@ test "M4 classes: private-name early errors (Cycle 4, §15.7.1)" {
     try expectSyntaxError("var o = { get #x() {} };");
 }
 
+test "M4 classes: §15.7.1 class early errors + legal positives (Cycle 5, close)" {
+    // ----- Early Errors (parse-phase SyntaxError) — these MUST keep rejecting -----
+    // §15.7.1 ClassBody may declare at most one (non-static) `constructor`.
+    try expectSyntaxError("class C { constructor() {} constructor() {} }");
+    // `constructor` may not be a getter/setter/field (only an ordinary method).
+    try expectSyntaxError("class C { get constructor() {} }");
+    try expectSyntaxError("class C { set constructor(v) {} }");
+    try expectSyntaxError("class C { constructor = 1; }");
+    try expectSyntaxError("class C { \"constructor\" = 1; }"); // string-named field `constructor`
+    // a `static` member named `prototype` is forbidden (method/accessor/field).
+    try expectSyntaxError("class C { static prototype() {} }");
+    try expectSyntaxError("class C { static get prototype() {} }");
+    try expectSyntaxError("class C { static prototype = 1; }");
+
+    // ----- Legal positives — these MUST NOT be rejected (over-rejection guard) -----
+    // §15.7 ClassBody `;` empty elements are legal and ignored.
+    try expectNumber("var C = class { ; ; m() { return 5; } ; }; new C().m()", 5);
+    // `static constructor` is a legal STATIC method (the §15.7.1 ctor restriction is non-static only).
+    try expectNumber("var C = class { static constructor() { return 9; } }; C.constructor()", 9);
+    // one non-static `constructor` PLUS a `static constructor` is legal (only one non-static counts).
+    try expectNoSyntaxErrorStrict("var C = class { constructor() {} static constructor() {} }");
+    // a STATIC accessor named `constructor` is legal (only `prototype` is forbidden when static).
+    try expectNumber("var C = class { static get constructor() { return 3; } }; C.constructor", 3);
+    // a non-static method/accessor named `prototype` is legal (only `static prototype` is barred).
+    try expectNumber("var C = class { prototype() { return 8; } }; new C().prototype()", 8);
+    try expectNumber("var C = class { get prototype() { return 6; } }; new C().prototype", 6);
+    // a computed `[\"constructor\"]` method is NOT the constructor (§15.7.1 keys off the *static*
+    // StringValue), so it does not clash with the real `constructor` — legal.
+    try expectNoSyntaxErrorStrict("var C = class { constructor() {} [\"constructor\"]() {} }");
+    // `extends` an invalid target is a RUNTIME TypeError, not a parse Early Error.
+    try expectNoSyntaxErrorStrict("var C = class extends 5 {}");
+}
+
 test "M3 object literal sugar: shorthand, computed, method (US6, §13.2.5)" {
     // shorthand `{x}` ≡ `{x: x}`
     try expectNumber("var x = 42; var o = {x}; o.x", 42);

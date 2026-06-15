@@ -232,12 +232,74 @@ specific Early Errors / unsupported-syntax parse rejections so those tests still
     static block). **Deferred:** the remaining §15.7.1 Early Errors (Cycle 5); generator/async methods
     (separate milestone — kept parse-rejecting); `for (#x in obj;;)` rejection (needs for-in support).
 
-## Cycle 5 — Early Errors + close (US5)
-- [ ] M4-T050 §15.7.1 Early Errors that newly-parseable class syntax exposes: duplicate `constructor`;
-  `constructor` as a getter/setter/generator/async/field; `prototype` as a static method name;
-  `#constructor` as a private name; an unresolved private-name reference; etc.
-- [ ] M4-T051 Record the conformance baseline (SC-001), update README/roadmap, confirm bench green and
-  no M0–M3 regression; close M4.
+## Cycle 5 — Early Errors + close (US5) 🎯 (DONE — harness metric: passed 6077 → 6077, 0 net, 0 true regressions; conformance 35.8% → 35.8%)
+- [x] M4-T050 **§15.7.1 class Early Errors audit — already complete.** A `grep`-driven sweep of the
+  remaining failing `class/*` negative tests (the prompted methodology) found that **every §15.7.1
+  parse-phase Early Error the now-parseable class syntax exposes was already enforced across Cycles
+  1/2/4**, and the `class/elements/syntax/early-errors` subtree passes **444/444 (100%)**. Each candidate
+  from the §15.7.1 / §15.7.5.1 list was probed directly and confirmed rejecting (parse SyntaxError):
+  - duplicate (non-static) `constructor` — `parser.zig` ClassBody post-parse scan (Cycle 1);
+  - `constructor` as a getter/setter — `parseClassAccessor` name check (Cycle 3);
+  - `constructor` as a field (incl. string-named `"constructor" = …`) — `parseClassElement` field check (Cycle 1);
+  - `static prototype` as method / accessor / field — `parseClassElement` + `parseClassAccessor` (Cycles 1/3);
+  - `#constructor` private name + duplicate private names + unresolved `#x` (AllPrivateNamesValid) — Cycle 4.
+  These were confirmed as **correct positives, NOT rejected** (over-rejection guards): a `static
+  constructor` STATIC method, a `static get constructor` accessor, a non-static method/accessor named
+  `prototype`, a computed `["constructor"]()` method (keys off the *static* StringValue, so it is an
+  ordinary method, no clash), `;` empty class-body elements, and `extends <bad target>` (a **runtime**
+  TypeError, not a parse Early Error). No new parser code was needed; Cycle 5 adds a dedicated
+  `engine.zig` test block ("§15.7.1 class early errors + legal positives (Cycle 5, close)") asserting
+  both the Early-Error rejections and the legal-positive non-rejections so the boundary stays pinned.
+  - **Investigated but DEFERRED (out of M4 scope):** the large residual `class/*` `parse_error` bucket is
+    blocked by `vendor/test262/harness/propertyHelper.js`, which uses a **`for (… in …)` loop** the engine
+    does not yet parse (for-in is its own milestone). A `§14.4 EmptyStatement` (`;`) fix was prototyped (a
+    lone statement-level `;` is currently parse-rejected) — it is spec-correct but **un-masks** out-of-scope
+    async-function and `for`-header `[In]`-grammar gaps, netting −8 (12 negative tests that were passing only
+    *incidentally* via a trailing-`;` parse error flip to genuine runtime failures), and it recovers **zero**
+    `class/*` tests (the class positives that use `;` are all also for-in-harness-blocked). Per the gate
+    ("do NOT commit a net regression"; "don't chase async/for-in"), the EmptyStatement change was reverted and
+    is left for the §14.4 / async / for-in milestones.
+- [x] M4-T051 Refreshed the conformance baseline (SC-001, `baseline/language-expressions.json`), updated
+  README/roadmap (M4 marked done at 35.8%), confirmed all gates green (build/test/lint 0/0; bench
+  `perf: ok (no ljs-vs-self regression)`, ljs 0.2–0.5× Node) and **0 true regressions vs HEAD `b514b79`
+  by `mode+path`**; M4 closed.
+
+## M4 milestone — CLOSED ✅
+**Class conformance journey (`language/expressions`, harness metric):**
+| Cycle | Slice | passed | conformance | net |
+|------|-------|-------:|------------:|----:|
+| (start, `9320218`) | M3 close, classes parse-rejected | 5484 | 32.3% | — |
+| C1 | class core (decl/expr, ctor, methods, fields, static, `new`) | 5484 | 32.3% | +0* |
+| C2 | `extends` + `super(…)` / `super.x` | 5526 | 32.6% | +42 |
+| C3 | accessors `get`/`set` + computed names | 5766 | 34.0% | +240 |
+| C4 | private `#x` (fields/methods/accessors) + `static {}` blocks | 6077 | 35.8% | +311 |
+| C5 | §15.7.1 Early-Errors audit + close | 6077 | 35.8% | +0 |
+| **Total** | **M4 classes** | **5484 → 6077** | **32.3% → 35.8%** | **+593** |
+
+\* C1 measured +0 on the harness metric line at the cadence-change commit; the class subtree gained
+~+230 once re-measured (the bare-vs-harness metric switch landed the same cycle). The **+593** total is
+the honest M4 delta on the harness metric from M3 close to M4 close.
+
+**Landed (full §15.7 surface):** ClassDeclaration + ClassExpression; explicit/default `constructor`
+(base + derived); instance methods on `.prototype`; instance fields (pre-ctor init order); `static`
+methods/fields; `new C(args)`; `extends Expr` + prototype/static inheritance + `extends null`;
+`super(…)` / `super.x` / `super[k]` / `super.m()` via [[HomeObject]] (lexical in arrows); instance +
+static `get`/`set` accessors (get/set merge); computed method/field/accessor names (definition-order
+key eval); private fields/methods/accessors `#x` with TypeError brand checks; `#x in obj` brand check;
+`static { … }` initialization blocks; named-class-expression self-reference; class body always strict;
+and the §13.3.5.1/§13.3.7.1/§15.7.1 parse-phase Early Errors the new syntax exposes.
+
+**Known deferred gaps (separate future milestones):**
+- Generator (`* m`) and `async` methods inside classes — still parse-reject (preserves their negatives).
+- `for (#x in obj)` / `for (… in …)` — the engine has no for-in yet (4 `in/private-field-in*` true-
+  regressions from C4 still stand; also blocks the positive `class/*` tests whose harness include
+  `propertyHelper.js` uses `for-in`, and the `§14.4 EmptyStatement` recovery).
+- `async function` / `async` arrow at statement/expression level — parse as a bare `async` identifier
+  rather than rejecting; rejecting them would recover the C5 EmptyStatement async un-masking but is
+  async-milestone work.
+- Subclassing built-ins links the prototype chains but does not install exotic internal slots.
+- Unicode-escape identifiers (`\u{6F}` etc.) and the `accessor` auto-accessor keyword — lexer features,
+  not class Early Errors.
 
 ## Dependencies / order
 Ordered by impact-to-effort and spec layering: class core first (the constructor/method/field/static

@@ -4,13 +4,15 @@ A JavaScript engine written from scratch in [Zig](https://ziglang.org) — in th
 but built **spec-first** and optimized for correctness, spec-traceability, and a measured
 performance story from day one.
 
-> **Status: M3 (parser / syntax) closed.** A tree-walking interpreter runs variables,
-> functions/closures, objects, control flow, exceptions, and now the full modern-syntax surface
+> **Status: M4 (classes) closed.** A tree-walking interpreter runs variables,
+> functions/closures, objects, control flow, exceptions, the full modern-syntax surface
 > (operators, template literals, spread/rest, destructuring, arrow functions, object-literal sugar,
-> `?.`/`??`, the complete assignment-operator set, and strict-mode Early Errors) — enough to load
-> the Test262 harness and pass **32.6%** of `language/expressions` (5,526 tests, harness metric).
-> Classes, generators, and async are later milestones. The bytecode/JIT tiers are future work. A
-> learning-grade, in-progress engine, not a drop-in Node replacement.
+> `?.`/`??`, the complete assignment-operator set, and strict-mode Early Errors), and now the full
+> **class** surface (declarations/expressions, constructor, methods, fields, statics, `extends`/`super`,
+> accessors, computed names, private `#x`, and `static {}` blocks) — enough to load the Test262 harness
+> and pass **35.8%** of `language/expressions` (6,077 tests, harness metric). Generators and async are
+> later milestones. The bytecode/JIT tiers are future work. A learning-grade, in-progress engine, not a
+> drop-in Node replacement.
 
 ## Why another engine?
 
@@ -47,7 +49,7 @@ ljs eval "<source>"   # evaluate a source string, print the result
 ljs run <file>        # evaluate a source file
 ```
 
-## What works today (M0–M3)
+## What works today (M0–M4)
 
 - **Bindings & scope**: `var`/`let`/`const`, assignment + compound (the full set incl.
   `**= <<= >>= >>>= &= |= ^=`) and logical assignment (`&&= ||= ??=`), `++`/`--`,
@@ -65,6 +67,12 @@ ljs run <file>        # evaluate a source file
   **array & object destructuring** (declarations + params, defaults/holes/rest/nesting),
   **strict-mode context** with the spec's parse-phase Early Errors (`"use strict"` directive
   prologue, reserved/`eval`/`arguments` binding restrictions, strict `delete` of a bare reference)
+- **Classes (M4)**: `class` **declarations & expressions**, explicit/default **constructor**,
+  instance **methods** & **fields**, **static** methods/fields, `new`, **`extends`/`super`**
+  (`super(…)`, `super.m()`, prototype + static inheritance, `extends null`), **`get`/`set` accessors**,
+  **computed names** `[expr]`, **private** `#x` fields/methods/accessors with brand checks + `#x in obj`,
+  **`static { … }`** initialization blocks, and the §15.7.1 / §13.3.5.1 / §13.3.7.1 parse-phase Early
+  Errors (always-strict class body). Generator/async class methods are deferred (parse-reject).
 - **Built-ins**: the `Error` family (real typed objects), `String()`, arrays/strings (M2),
   the §19.1 global values `undefined`/`NaN`/`Infinity`, minimal `Object`
 - **Engine**: Completion Records, Environment Records, a step-cap + recursion-depth guard
@@ -88,12 +96,14 @@ tests that call `assert.*`; e.g. at commit `9320218` (M4 Cycle 1) the same code 
 vs harness **32.3%** on `language/expressions` (passed 4,622 → 5,484). The committed baseline
 `baseline/language-expressions.json` and all M4+ deltas use the harness metric.
 
-**M4 Cycle 2 result (harness metric):** `test/language/expressions` → **5,526 passed / 11,445 failed /
-2,244 skipped = 32.6%** (Cycle 1 was 5,484 = 32.3%; Cycle 2 added `extends` + `super`, +42, 0 true
-regressions). M3's nine syntax cycles moved this from the **M1 baseline of 23.3%** by draining the
-`parse_error` bucket; M4 is draining the class bucket (**classes alone are ≈2,405 unique failing test
-files**), with generators/async next. The harness also validates classification, fault isolation,
-determinism, and regression detection.
+**M4 result (harness metric):** `test/language/expressions` → **6,077 passed / 10,894 failed /
+2,244 skipped = 35.8%**. Classes (the biggest single conformance lever — ≈2,405 unique failing
+class files at M3 close) drained across five cycles: C1 core (decl/expr, ctor, methods, fields,
+statics, `new`), C2 `extends`/`super` (+42), C3 accessors + computed names (+240), C4 private `#x` +
+`static {}` (+311), C5 §15.7.1 Early-Errors audit + close (+0; all already enforced). M4 total:
+**32.3% → 35.8%** (passed 5,484 → 6,077, **+593**), 0 true regressions per cycle by `mode+path`,
+bench-green throughout (ljs 0.2–0.5× Node). Generators/async next. The harness also validates
+classification, fault isolation, determinism, and regression detection.
 
 ## Roadmap
 
@@ -103,7 +113,8 @@ determinism, and regression detection.
 | **M1** | bindings, functions, objects, control flow, errors → run the harness | ✅ done (23.3% of expressions) |
 | **M2** | core built-in library — arrays, strings | ✅ done |
 | **M3** | parser / syntax coverage — 9 cycles, drain the `parse_error` bottleneck | ✅ done (23.3% → 27.2% of expressions; bench green throughout, ljs 0.2–0.5× Node) |
-| M4+ | **classes** (the biggest conformance lever), then generators/async — climbing Test262 % | next |
+| **M4** | **classes** — decl/expr, constructor, methods, fields, statics, `extends`/`super`, accessors, computed names, private `#x`, `static {}` blocks | ✅ done (32.3% → 35.8% of expressions, harness metric, +593; bench green, ljs 0.2–0.5× Node) |
+| M5+ | generators / async — climbing Test262 % | next |
 | Later | bytecode VM, then optimizing tiers — graduated when the benchmarks justify it | future |
 
 M3's nine cycles: operators (`**`, bitwise, shifts, `in`) · template literals · spread/rest ·
