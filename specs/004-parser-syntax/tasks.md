@@ -102,8 +102,33 @@ spec (this is parser/evaluator work; no new architecture).
   - **Conformance:** passed 4542 → 4611 (+69 net), **0 true regressions** (mode+path comm), 69 recoveries — 63 strict + 6 sloppy. The 6 sloppy are `function/param-*-strict-body-*` + `object/setter-param-*-strict-inside` (a `"use strict"` directive *inside* the body → strict in both modes, now correctly detected even in sloppy RunMode). Recovery dirs match the deferred gaps exactly: `compound-assignment` (23), `function` (10), `arrow-function/syntax/early-errors` (7), `logical-assignment` (6), `object` (5), `assignmenttargettype`/`prefix-*`/`postfix-*`/`delete`/`assignment`. Bench green (loop_mix -12.1%, loop_sum -4.1%, str_build -3.2%; ljs ≤ Node — strict detection is parse-time only, no eval-hot-path cost).
   - **Known gaps:** strict-mode *runtime* semantics (a sloppy `delete` of a binding still returns true without removing it; assignment to an undeclared name; `this` defaulting) are unchanged — this cycle is parse-phase Early Errors only. Class names (deferred, classes still parse-rejected) and `with`/octal-literal strict errors are out of scope.
 
-## Close
-- [ ] M3-T090 Record conformance baseline (SC-001, target ≥35%); README/roadmap; bench green; no M0/M1 regression
+## Close (DONE — M3 milestone closed)
+- [x] M3-T090 Record conformance baseline (SC-001); README/roadmap; bench green; no M0/M1 regression.
+  - **SC-001 ACTUAL vs TARGET — target ≥35%, reached 27.2% (NOT MET).** M3 moved
+    `language/expressions` from **23.3% → 27.2%** (bare gate, no harness prelude: passed
+    4611 / failed 12360 / skipped 2244 of 19215, commit 1715818) across 9 cycles
+    (operators, templates, spread/rest, destructuring, arrows, object sugar + `?.`/`??`,
+    assignment operators, comma/void/delete, strict-mode context + Early Errors). The
+    `parse_error` bucket dropped substantially as intended, but the headline 35% was not
+    reached because the largest remaining levers are **out of M3's scope (parser/syntax)**:
+    - **Classes** are the single biggest lever — **2405 unique failing `class/*` test files
+      (≈4762 strict+sloppy executions, ≈39% of all `language/expressions` failures)**. Classes
+      are deliberately parse-rejected today (Cycles 5/6: `class`/`super` reserved + rejected,
+      §15.7) and belong to a dedicated **M4+ classes** milestone, not M3.
+    - **Generators / async** (`function*`, `yield`, `async`/`await`) add ≈1067 + ≈767 more
+      failing executions — also separate later milestones (iteration protocol, async).
+    Honest read: M3 cleared the syntax/`parse_error` bottleneck it was scoped for; crossing
+    35% requires **classes first** (the ≈39% failure share above), which is M4 work, not a
+    shortfall in M3 syntax coverage.
+  - **SC-002 (≥40 syntax unit tests):** met — operator/template/spread/destructuring/arrow/
+    object-sugar/assignment/comma-void-delete/strict tests across the 9 cycles, all green via
+    `zig build test`.
+  - **SC-003 (M0/M1/M2 + bench + leaks):** met — `zig build test` exit 0 (no M0/M1/M2
+    regression), `zig build bench` = "perf: ok (no ljs-vs-self regression)" (ljs 0.3–0.5× Node),
+    no leaks under the testing allocator.
+  - **Baseline recorded:** `baseline/language-expressions.json` (4611 passing `<file>#<mode>`
+    ids, bare-gate metric) via `ljs-test262 --path … --update-baseline …`; the `--baseline`
+    regression gate passes (exit 0, "conformance: ok (no regression vs baseline)").
 
 ## Dependencies / order
 Ordered by impact-to-effort: operators first (cheap, common), then template literals, then the

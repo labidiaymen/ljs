@@ -4,9 +4,12 @@ A JavaScript engine written from scratch in [Zig](https://ziglang.org) — in th
 but built **spec-first** and optimized for correctness, spec-traceability, and a measured
 performance story from day one.
 
-> **Status: M1 (core language).** A tree-walking interpreter runs variables, functions/closures,
-> objects, control flow, and exceptions — enough to load the Test262 harness and pass **~23%**
-> of `language/expressions` (3,954 tests). The bytecode/JIT tiers are future work. A
+> **Status: M3 (parser / syntax) closed.** A tree-walking interpreter runs variables,
+> functions/closures, objects, control flow, exceptions, and now the full modern-syntax surface
+> (operators, template literals, spread/rest, destructuring, arrow functions, object-literal sugar,
+> `?.`/`??`, the complete assignment-operator set, and strict-mode Early Errors) — enough to load
+> the Test262 harness and pass **27.2%** of `language/expressions` (4,611 tests, bare gate).
+> Classes, generators, and async are later milestones. The bytecode/JIT tiers are future work. A
 > learning-grade, in-progress engine, not a drop-in Node replacement.
 
 ## Why another engine?
@@ -44,16 +47,26 @@ ljs eval "<source>"   # evaluate a source string, print the result
 ljs run <file>        # evaluate a source file
 ```
 
-## What works today (M1)
+## What works today (M0–M3)
 
-- **Bindings & scope**: `var`/`let`/`const`, assignment + compound (`+= -= *= /= %=`), `++`/`--`,
+- **Bindings & scope**: `var`/`let`/`const`, assignment + compound (the full set incl.
+  `**= <<= >>= >>>= &= |= ^=`) and logical assignment (`&&= ||= ??=`), `++`/`--`,
   block (lexical) scope; `const`-reassign → TypeError, unresolved → ReferenceError
-- **Functions**: declarations/expressions, parameters, `return`, calls, **closures**, basic `this`
-- **Objects**: literals, `a.b` / `a[k]` access + assignment, prototype chain, `new` + constructors,
-  `instanceof`, `typeof`
+- **Functions**: declarations/expressions, parameters, `return`, calls, **closures**, basic `this`,
+  **arrow functions** (`=>`, lexical `this`), rest params, destructuring params
+- **Objects**: literals + sugar (shorthand `{x}`, computed `{[k]:v}`, method `{m(){…}}`, spread
+  `{...o}`, getters/setters), `a.b` / `a[k]` access + assignment, **optional chaining `?.`**,
+  prototype chain, `new` + constructors, `instanceof`, `typeof`
 - **Control flow**: `if`/`else`, `while`, `for`, `break`/`continue`, `switch`, `throw`/`try`/`catch`/`finally`
-- **Operators**: arithmetic, comparisons, `=== !==`, logical `||`/`&&` (short-circuit), ternary `?:`
-- **Built-ins**: the `Error` family (real typed objects), `String()`, minimal `Object`
+- **Operators**: arithmetic + **exponent `**`**, bitwise `& | ^ ~`, shifts `<< >> >>>`, comparisons,
+  `=== !==`, logical `||`/`&&` (short-circuit), **nullish `??`**, ternary `?:`, comma/sequence,
+  `void`/`delete`/`in`
+- **Syntax (M3)**: **template literals** (`` `a${x}b` ``), **spread/rest** `...` in arrays/calls/params,
+  **array & object destructuring** (declarations + params, defaults/holes/rest/nesting),
+  **strict-mode context** with the spec's parse-phase Early Errors (`"use strict"` directive
+  prologue, reserved/`eval`/`arguments` binding restrictions, strict `delete` of a bare reference)
+- **Built-ins**: the `Error` family (real typed objects), `String()`, arrays/strings (M2),
+  the §19.1 global values `undefined`/`NaN`/`Infinity`, minimal `Object`
 - **Engine**: Completion Records, Environment Records, a step-cap + recursion-depth guard
   (deep recursion → `RangeError`, never a crash); inline ECMA-262 clause citations throughout
 - Runs the **Test262 harness** (`sta.js`/`assert.js`) and passes real conformance tests
@@ -69,9 +82,12 @@ zig build test262 -- --path <dir> --harness-dir vendor/test262/harness --update-
 zig build test262 -- --path <dir> --harness-dir vendor/test262/harness --baseline baseline/<name>.json   # exit 1 on regression
 ```
 
-**M1 result:** `test/language/expressions` → **3,954 passed / 13,017 failed / 2,244 skipped = 23.3%**
-(11,158 test files). Real positive tests pass via the loaded `assert.js`; the rest fail/skip on
-features still to come (full string/array built-ins, generators, etc.). The harness also validates
+**M3 result:** `test/language/expressions` → **4,611 passed / 12,360 failed / 2,244 skipped = 27.2%**
+(bare gate, no harness prelude; committed baseline `baseline/language-expressions.json`). M3's nine
+syntax cycles moved this from the **M1 baseline of 23.3%** (3,954 passed) by draining the
+`parse_error` bucket. The remaining failures are dominated by features outside M3's parser/syntax
+scope: **classes alone are ≈2,405 unique failing test files (≈39% of `language/expressions`
+failures)**, with generators/async next — these are M4+ milestones. The harness also validates
 classification, fault isolation, determinism, and regression detection.
 
 ## Roadmap
@@ -80,8 +96,17 @@ classification, fault isolation, determinism, and regression detection.
 |-----------|-------|--------|
 | **M0** | Test262 harness + minimal eval + ljs-vs-Node benchmarking | ✅ done |
 | **M1** | bindings, functions, objects, control flow, errors → run the harness | ✅ done (23.3% of expressions) |
-| M2+ | full string/array/built-in library, more of the spec — climbing Test262 % | next |
+| **M2** | core built-in library — arrays, strings | ✅ done |
+| **M3** | parser / syntax coverage — 9 cycles, drain the `parse_error` bottleneck | ✅ done (23.3% → 27.2% of expressions; bench green throughout, ljs 0.2–0.5× Node) |
+| M4+ | **classes** (the biggest conformance lever), then generators/async — climbing Test262 % | next |
 | Later | bytecode VM, then optimizing tiers — graduated when the benchmarks justify it | future |
+
+M3's nine cycles: operators (`**`, bitwise, shifts, `in`) · template literals · spread/rest ·
+destructuring · arrow functions · object-literal sugar + `?.`/`??` · the complete
+assignment-operator set · comma/`void`/`delete` · strict-mode context + Early Errors. Each cycle
+re-measured `language/expressions` conformance and stayed bench-green (ljs ≤ Node). SC-001's ≥35%
+target was **not** reached (27.2%): the remaining levers — classes (≈39% of failures), then
+generators/async — are M4+ scope, not M3 syntax.
 
 **Performance note:** built with `ReleaseFast`, ljs is currently **2–5× faster than Node** on
 the benchmark workloads — its native binary starts in ~0 ms vs V8's ~24 ms boot, which dominates
