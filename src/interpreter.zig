@@ -368,6 +368,17 @@ pub const Interpreter = struct {
                         if (sc.isAbrupt()) return sc;
                         return .{ .normal = .{ .number = if (u.prefix) old + delta else old } };
                     },
+                    .private_member => |pm| {
+                        // §13.4 `obj.#x++` — brand-checked read, ToNumber, write back.
+                        const oc = try self.evalExpr(pm.object, env);
+                        if (oc.isAbrupt()) return oc;
+                        const cur = try self.getPrivate(oc.normal, pm.name);
+                        if (cur.isAbrupt()) return cur;
+                        const old = toNumber(cur.normal);
+                        const sc = try self.setPrivate(oc.normal, pm.name, .{ .number = old + delta });
+                        if (sc.isAbrupt()) return sc;
+                        return .{ .normal = .{ .number = if (u.prefix) old + delta else old } };
+                    },
                     else => return self.throwError("SyntaxError", "Invalid update expression target"),
                 }
             },
@@ -396,7 +407,73 @@ pub const Interpreter = struct {
                 } else sm.name;
                 return self.getSuperProperty(key);
             },
+            .private_member => |pm| {
+                // §13.3.2 `obj.#x` — read a private member from `obj`'s private slot.
+                const oc = try self.evalExpr(pm.object, env);
+                if (oc.isAbrupt()) return oc;
+                return self.getPrivate(oc.normal, pm.name);
+            },
+            .private_assign => |pa| {
+                // §13.3.2 `obj.#x = v` — write a private member.
+                const oc = try self.evalExpr(pa.object, env);
+                if (oc.isAbrupt()) return oc;
+                const vc = try self.evalExpr(pa.value, env);
+                if (vc.isAbrupt()) return vc;
+                return self.setPrivate(oc.normal, pa.name, vc.normal);
+            },
+            .private_in => |pi| {
+                // §13.10.1 `#x in obj` — the ergonomic brand check. False (no throw) for a non-object
+                // or an object lacking the brand; true iff `obj` carries the private name.
+                const oc = try self.evalExpr(pi.object, env);
+                if (oc.isAbrupt()) return oc;
+                const has = oc.normal == .object and oc.normal.object.hasPrivate(pi.name);
+                return .{ .normal = .{ .boolean = has } };
+            },
             .spread => return self.throwError("SyntaxError", "Unexpected token '...'"), // only valid in array/call/new lists
+        }
+    }
+
+    /// §15.7 PrivateGet — read PrivateName `key` from `base`'s own private slot. Accessing a private
+    /// name on a non-object, or on an object lacking the brand, is a TypeError (§15.7 — the brand
+    /// check). A private accessor invokes its getter with `this` = `base`; a getter-less accessor
+    /// (set-only) is a TypeError on read.
+    fn getPrivate(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
+        if (base != .object) return self.throwError("TypeError", "Cannot read private member from an object whose class did not declare it");
+        const o = base.object;
+        const pv = o.getPrivate(key) orelse
+            return self.throwError("TypeError", "Cannot read private member from an object whose class did not declare it");
+        switch (pv) {
+            .data => |v| return .{ .normal = v },
+            .accessor => |a| {
+                const getter = a.get orelse return self.throwError("TypeError", "'#x' was defined without a getter");
+                return self.callFunction(getter, &.{}, base);
+            },
+        }
+    }
+
+    /// §15.7 PrivateSet — write PrivateName `key` on `base`'s own private slot. The brand must exist
+    /// (TypeError otherwise). A private field is writable; a private method is read-only (TypeError on
+    /// assignment); a private accessor invokes its setter with `this` = `base` (set-less → TypeError).
+    fn setPrivate(self: *Interpreter, base: Value, key: []const u8, value: Value) EvalError!Completion {
+        if (base != .object) return self.throwError("TypeError", "Cannot write private member to an object whose class did not declare it");
+        const o = base.object;
+        const pv = o.getPrivate(key) orelse
+            return self.throwError("TypeError", "Cannot write private member to an object whose class did not declare it");
+        switch (pv) {
+            .data => |v| {
+                // A private METHOD slot holds a function and is not assignable; a private FIELD is.
+                if (v == .object and v.object.kind == .function and v.object.call != null and v.object.call.?.is_private_method) {
+                    return self.throwError("TypeError", "Cannot write to private method");
+                }
+                try o.setPrivate(key, value);
+                return .{ .normal = value };
+            },
+            .accessor => |a| {
+                const setter = a.set orelse return self.throwError("TypeError", "'#x' was defined without a setter");
+                const sc = try self.callFunction(setter, &.{value}, base);
+                if (sc.isAbrupt()) return sc;
+                return .{ .normal = value };
+            },
         }
     }
 
@@ -496,6 +573,18 @@ pub const Interpreter = struct {
                 if (rc.isAbrupt()) return rc;
                 return self.setProperty(oc.normal, key, rc.normal);
             },
+            .private_member => |pm| {
+                // §13.15.2 `obj.#x ||= v` etc. — base evaluated once, brand-checked read, then the
+                // guard decides whether to write the RHS to the private slot.
+                const oc = try self.evalExpr(pm.object, env);
+                if (oc.isAbrupt()) return oc;
+                const cur = try self.getPrivate(oc.normal, pm.name);
+                if (cur.isAbrupt()) return cur;
+                if (!shouldAssign(la.op, cur.normal)) return cur;
+                const rc = try self.evalExpr(la.value, env);
+                if (rc.isAbrupt()) return rc;
+                return self.setPrivate(oc.normal, pm.name, rc.normal);
+            },
             else => return self.throwError("SyntaxError", "Invalid assignment target"),
         }
     }
@@ -573,11 +662,16 @@ pub const Interpreter = struct {
         return self.callFunction(sup, args, .{ .object = instance });
     }
 
-    /// §15.7.14 InitializeInstanceElements — define each instance FieldDefinition on `instance`, in
+    /// §15.7.14 InitializeInstanceElements — add this class's PrivateName brand (private fields /
+    /// methods / accessors) to `instance`, then define each instance FieldDefinition on `instance`, in
     /// declaration order, evaluating its initializer with `this` = the instance, in a scope child of
     /// the class's defining environment (so an initializer may reference the class name / outer
     /// bindings). A field with no initializer is created with value `undefined`.
     fn initInstanceFields(self: *Interpreter, fd: @import("object.zig").FunctionData, instance: *Object) EvalError!Completion {
+        // §15.7: install the private brand first — private methods/accessors are shared (recorded at
+        // class definition), and private fields' initializers run with `this` = the instance below.
+        const pc = try self.installPrivateElements(fd, instance);
+        if (pc.isAbrupt()) return pc;
         if (fd.fields.len == 0) return .{ .normal = .undefined };
         const field_env = try Environment.create(self.arena, fd.closure);
         const saved_this = self.this_val;
@@ -596,6 +690,38 @@ pub const Interpreter = struct {
                 v = ic.normal;
             }
             try instance.set(field.key, v);
+        }
+        return .{ .normal = .undefined };
+    }
+
+    /// §15.7 install this class's instance PrivateName elements on `instance` (its brand): private
+    /// methods/accessors (shared function objects, copied/merged into the private slot) and private
+    /// fields (initializer run with `this` = the instance, in the class's defining scope). Done in
+    /// declaration order so a later field initializer may call an earlier private method.
+    fn installPrivateElements(self: *Interpreter, fd: @import("object.zig").FunctionData, instance: *Object) EvalError!Completion {
+        if (fd.private_elements.len == 0) return .{ .normal = .undefined };
+        const env = try Environment.create(self.arena, fd.closure);
+        const saved_this = self.this_val;
+        const saved_home = self.home_object;
+        self.this_val = .{ .object = instance };
+        self.home_object = fd.home_object; // the class `.prototype` (so `super.x` resolves)
+        defer self.this_val = saved_this;
+        defer self.home_object = saved_home;
+        for (fd.private_elements) |pe| {
+            switch (pe.kind) {
+                .method => try instance.setPrivate(pe.key, .{ .object = pe.func.? }),
+                .get => try instance.definePrivateAccessor(pe.key, pe.func.?, null),
+                .set => try instance.definePrivateAccessor(pe.key, null, pe.func.?),
+                .field => {
+                    var v: Value = .undefined;
+                    if (pe.init) |ie| {
+                        const ic = try self.evalExpr(ie, env);
+                        if (ic.isAbrupt()) return ic;
+                        v = ic.normal;
+                    }
+                    try instance.setPrivate(pe.key, v);
+                },
+            }
         }
         return .{ .normal = .undefined };
     }
@@ -856,39 +982,103 @@ pub const Interpreter = struct {
         // evaluated HERE (definition order, ToPropertyKey → ToString in the M-subset), so its
         // side-effects interleave with the other elements. Each method/accessor's [[HomeObject]] is its
         // install target (so `super.x` inside it looks up `home_object.[[Prototype]]`).
+        var private_elements: std.ArrayListUnmanaged(@import("object.zig").PrivateElement) = .empty;
         for (c.elements) |el| {
             switch (el.kind) {
                 .constructor => {}, // already the [[Call]] body
+                .static_block => {
+                    // §15.7.11: a ClassStaticBlock runs once at class definition with `this` = the
+                    // constructor, in a scope child of the class scope. Its [[HomeObject]] is the
+                    // constructor (so `super.x` resolves against `Super`).
+                    const block_env = try Environment.create(self.arena, class_env);
+                    const saved_this = self.this_val;
+                    const saved_home = self.home_object;
+                    self.this_val = .{ .object = ctor };
+                    self.home_object = ctor;
+                    const bc = self.runBlockBody(el.value.block, block_env);
+                    self.this_val = saved_this;
+                    self.home_object = saved_home;
+                    const r = try bc;
+                    if (r.isAbrupt()) return r;
+                },
                 .method => {
-                    const key = try self.classElementKey(el, class_env);
-                    if (key.isAbrupt()) return key.completion;
+                    const target = if (el.is_static) ctor else proto;
                     const fc = try self.evalFunctionExpr(el.value.func, class_env);
                     if (fc.isAbrupt()) return fc;
-                    const target = if (el.is_static) ctor else proto;
+                    const f = fc.normal.object;
                     // §9.2.5: a method's [[HomeObject]] is the object it is defined on.
-                    if (fc.normal == .object) {
-                        if (fc.normal.object.call) |*mfd| mfd.home_object = target;
+                    if (f.call) |*mfd| mfd.home_object = target;
+                    if (el.is_private) {
+                        // §15.7: a private method. Static → install on the ctor's private slot now;
+                        // instance → record for per-instance install (the brand is added on each `new`).
+                        if (f.call) |*mfd| mfd.is_private_method = true;
+                        if (el.is_static) {
+                            try ctor.setPrivate(el.key, fc.normal);
+                        } else {
+                            try private_elements.append(self.arena, .{ .key = el.key, .kind = .method, .func = f });
+                        }
+                    } else {
+                        const key = try self.classElementKey(el, class_env);
+                        if (key.isAbrupt()) return key.completion;
+                        try target.set(key.key, fc.normal);
                     }
-                    try target.set(key.key, fc.normal);
                 },
                 .get, .set => {
                     // §15.7 accessor (§13.2.5.6 model): merge a get/set pair for the same key into one
                     // accessor property on `.prototype` (instance) or the constructor (static).
-                    const key = try self.classElementKey(el, class_env);
-                    if (key.isAbrupt()) return key.completion;
+                    const target = if (el.is_static) ctor else proto;
                     const fc = try self.evalFunctionExpr(el.value.func, class_env);
                     if (fc.isAbrupt()) return fc;
-                    const target = if (el.is_static) ctor else proto;
                     const f = fc.normal.object;
                     // §9.2.5: the accessor carries [[HomeObject]] too (so `super.x` works inside it).
                     if (f.call) |*mfd| mfd.home_object = target;
-                    if (el.kind == .get) {
-                        try target.defineAccessor(key.key, f, null);
+                    if (el.is_private) {
+                        // §15.7: a private accessor. Static → merge into the ctor's private slot now;
+                        // instance → record (merged per-instance at construction).
+                        if (el.is_static) {
+                            if (el.kind == .get) {
+                                try ctor.definePrivateAccessor(el.key, f, null);
+                            } else {
+                                try ctor.definePrivateAccessor(el.key, null, f);
+                            }
+                        } else {
+                            try private_elements.append(self.arena, .{
+                                .key = el.key,
+                                .kind = if (el.kind == .get) .get else .set,
+                                .func = f,
+                            });
+                        }
                     } else {
-                        try target.defineAccessor(key.key, null, f);
+                        const key = try self.classElementKey(el, class_env);
+                        if (key.isAbrupt()) return key.completion;
+                        if (el.kind == .get) {
+                            try target.defineAccessor(key.key, f, null);
+                        } else {
+                            try target.defineAccessor(key.key, null, f);
+                        }
                     }
                 },
                 .field => {
+                    if (el.is_private) {
+                        if (el.is_static) {
+                            // §15.7.14: a static private field initializes at class definition with
+                            // `this` = the constructor, into the ctor's private slot.
+                            var v: Value = .undefined;
+                            if (el.value.field_init) |ie| {
+                                const saved_this = self.this_val;
+                                self.this_val = .{ .object = ctor };
+                                const ic = try self.evalExpr(ie, class_env);
+                                self.this_val = saved_this;
+                                if (ic.isAbrupt()) return ic;
+                                v = ic.normal;
+                            }
+                            try ctor.setPrivate(el.key, v);
+                        } else {
+                            // §15.7.14: an instance private field — recorded; initializer runs per `new`.
+                            try private_elements.append(self.arena, .{ .key = el.key, .kind = .field, .init = el.value.field_init });
+                        }
+                        continue;
+                    }
                     const key = try self.classElementKey(el, class_env);
                     if (key.isAbrupt()) return key.completion;
                     if (el.is_static) {
@@ -912,13 +1102,32 @@ pub const Interpreter = struct {
                 },
             }
         }
-        // §15.7.14: stash the resolved instance-field records on the constructor (run per `new`).
-        if (ctor.call) |*fd| fd.fields = fields.items;
+        // §15.7.14: stash the resolved instance-field + private-element records on the constructor.
+        if (ctor.call) |*fd| {
+            fd.fields = fields.items;
+            fd.private_elements = private_elements.items;
+        }
 
         // §15.7.14: bind the class name immutably in the inner scope for self-reference.
         if (c.name) |name| try class_env.declare(name, .{ .object = ctor }, false, true);
 
         return .{ .normal = .{ .object = ctor } };
+    }
+
+    /// Run a sequence of statements (a static block / function body) in `env`, returning the first
+    /// abrupt completion (a `throw` propagates; `return`/`break`/`continue` are not produced at the
+    /// top of a static block body in the M-subset). Used by §15.7.11 ClassStaticBlock evaluation.
+    fn runBlockBody(self: *Interpreter, body: []const ast.Stmt, env: *Environment) EvalError!Completion {
+        for (body) |stmt| {
+            const cmp = try self.evalStmt(stmt, env);
+            if (cmp.isAbrupt()) {
+                switch (cmp) {
+                    .throw => return cmp,
+                    else => {}, // ret/brk/cont not meaningful at static-block top level
+                }
+            }
+        }
+        return .{ .normal = .undefined };
     }
 
     fn evalFunctionExpr(self: *Interpreter, f: *const ast.Function, env: *Environment) EvalError!Completion {
@@ -996,6 +1205,16 @@ pub const Interpreter = struct {
                 const got = try self.getSuperProperty(key);
                 if (got.isAbrupt()) return got;
                 this_for_call = self.this_val;
+                callee = got.normal;
+            },
+            .private_member => |pm| {
+                // §13.3.2 `obj.#m(args)` — resolve the private member (brand-checked), call with
+                // `this` = `obj`.
+                const oc = try self.evalExpr(pm.object, env);
+                if (oc.isAbrupt()) return oc;
+                this_for_call = oc.normal;
+                const got = try self.getPrivate(oc.normal, pm.name);
+                if (got.isAbrupt()) return got;
                 callee = got.normal;
             },
             else => {

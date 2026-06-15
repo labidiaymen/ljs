@@ -78,6 +78,15 @@ pub const Node = union(enum) {
     /// static IdentifierName; `key` (non-null) is the computed `super[expr]` index. Parse-restricted
     /// to method bodies.
     super_member: struct { name: []const u8 = "", key: ?*const Node = null },
+    /// §13.3.2 MemberExpression `.` PrivateIdentifier — a private member access `obj.#x`. `name`
+    /// includes the leading `#`. Resolved against `object`'s per-instance private slot (§15.7); a
+    /// missing brand is a runtime TypeError. Parse-restricted to class bodies.
+    private_member: struct { object: *const Node, name: []const u8 },
+    /// `obj.#x = v` — assignment to a private member. `name` includes the `#`.
+    private_assign: struct { object: *const Node, name: []const u8, value: *const Node },
+    /// §13.10.1 RelationalExpression PrivateIdentifier `in` ShiftExpression — the ergonomic brand
+    /// check `#x in obj` → boolean (does `obj` carry the private name `#x`?). `name` includes the `#`.
+    private_in: struct { name: []const u8, object: *const Node },
 };
 
 /// One link of an optional chain: the access applied to the (non-nullish) base. `call` carries the
@@ -169,16 +178,20 @@ pub const Class = struct {
 
 /// §15.7 ClassElement kind. `constructor` is the special method that becomes the class's [[Call]]
 /// body; `method` is a normal prototype/static method; `get`/`set` are accessors (Cycle 3);
-/// `field` is an instance/static field with an optional initializer.
-pub const ClassElementKind = enum { constructor, method, get, set, field };
+/// `field` is an instance/static field with an optional initializer; `static_block` is a §15.7.11
+/// ClassStaticBlock `static { … }` (Cycle 4), run once at class definition with `this` = the ctor.
+pub const ClassElementKind = enum { constructor, method, get, set, field, static_block };
 
 /// §15.7 One ClassBody member. A `method`/`get`/`set`/`constructor` carries `value.func`; a `field`
-/// carries `value.field_init` (the optional `= expr`). `is_static` selects the constructor object
-/// (static) vs the `.prototype` (instance). `computed_key` (non-null) supersedes the static `key`
-/// (Cycle 3); for Cycle 1 every key is a static identifier/string/number name.
+/// carries `value.field_init` (the optional `= expr`); a `static_block` carries `value.block`.
+/// `is_static` selects the constructor object (static) vs the `.prototype` (instance). `computed_key`
+/// (non-null) supersedes the static `key` (Cycle 3). `is_private` (Cycle 4) marks a PrivateName member
+/// (`#x`): its `key` includes the leading `#` and it is installed in the per-instance private slot
+/// (§15.7) rather than as an ordinary property — `computed_key` is always null for a private member.
 pub const ClassElement = struct {
     kind: ClassElementKind,
     is_static: bool = false,
+    is_private: bool = false,
     key: []const u8 = "",
     computed_key: ?*const Node = null,
     value: ClassElementValue,
@@ -187,6 +200,7 @@ pub const ClassElement = struct {
 pub const ClassElementValue = union(enum) {
     func: *const Function, // method / accessor / constructor body
     field_init: ?*const Node, // §15.7 FieldDefinition initializer (`x = init` / bare `x`)
+    block: []const Stmt, // §15.7.11 ClassStaticBlock body (static_block only)
 };
 
 pub const DeclKind = enum { var_decl, let_decl, const_decl };

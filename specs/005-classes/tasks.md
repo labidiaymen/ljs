@@ -165,10 +165,72 @@ specific Early Errors / unsupported-syntax parse rejections so those tests still
     private `#x` + static blocks (Cycle 4); the remaining §15.7.1 Early Errors (Cycle 5); generator/async
     methods (separate future milestone — kept parse-rejecting).
 
-## Cycle 4 — Private names + static blocks (US4)
-- [ ] M4-T040 Private fields/methods `#x` (private names lexically scoped to the class body, accessed
-  via `this.#x`; §15.7.x PrivateName semantics) and `static { … }` initialization blocks (§15.7.11,
-  run once in order at class definition with `this` = the constructor).
+## Cycle 4 — Private names + static blocks (US4) 🎯 (DONE — harness metric: passed 5766 → 6077, +311 net, 4 true regressions far outweighed by 315 recoveries; conformance 34.0% → 35.8%)
+- [x] M4-T040 Private fields/methods `#x` (private names lexically scoped to the class body, accessed
+  via `this.#x` / `obj.#x`; §15.7 PrivateName semantics) and `static { … }` initialization blocks
+  (§15.7.11, run once in order at class definition with `this` = the constructor).
+  - **Lexer (`src/lexer.zig`):** a new `private_identifier` token for `#name` (a `#` immediately
+    followed by an IdentifierName; the lexeme INCLUDES the `#`, so private and public keys never
+    collide). A bare `#` not followed by an identifier start is an `UnexpectedCharacter` (→ SyntaxError).
+  - **AST (`src/ast.zig`):** `Node.private_member` (`obj.#x` read), `Node.private_assign` (`obj.#x = v`),
+    `Node.private_in` (the §13.10.1 brand check `#x in obj`); `ClassElementKind.static_block`;
+    `ClassElement.is_private` + `ClassElementValue.block` (static-block body).
+  - **Object model (`src/object.zig`):** `Object.private_fields` — a per-object `StringHashMapUnmanaged`
+    keyed by `#name`, LAZILY allocated (only objects with private members ever pay for it, so the
+    ordinary `obj.x` path is untouched — bench-confirmed). Private members are stored as `PropertyValue`
+    (data for fields/methods, accessor for get/set) and are NEVER reachable via `[[Get]]`/`[[Set]]`/`in`
+    (privacy by storage). Helpers `hasPrivate`/`getPrivate`/`setPrivate`/`definePrivate(Accessor)`.
+    `FunctionData` gains `private_elements: []const PrivateElement` (the ctor's per-instance brand —
+    fields/methods/accessors, installed on each `new`) and `is_private_method` (a private method slot is
+    read-only). `PrivateElement` carries the `#name`, a kind, an init node (field) or a shared `*Object`
+    (method/getter/setter, [[HomeObject]] set).
+  - **Parser (`src/parser.zig`):** `#name` class elements (instance/static `#x` field, `#m(){}` method,
+    `get/set #x(){}` accessor); `static { … }` blocks (`parseStaticBlock`, a method-like context —
+    `super.x` ok, `super()` not). `obj.#x` member access in `continuePostfix`; `obj.#x = v` /
+    `obj.#x op= v` / `obj.#x++` assignment targets; `#x in obj` in `parseExpr` (relational level).
+    Two context flags: `in_class_body` (a `#x` reference outside a class is a SyntaxError) and
+    `in_static_block` (§15.7.11 — `await` is reserved as a BindingIdentifier/IdentifierReference inside
+    a static block; reset in nested ordinary functions, inherited by arrows). §15.7.1 Early Errors that
+    the now-parseable `#` exposes — all added to keep the parse-negatives rejecting: **AllPrivateNamesValid**
+    (every `#x` reference must resolve to a declared private name in an enclosing class — a per-class-body
+    token PRE-SCAN `collectClassPrivateNames` collects PrivateBoundNames so forward references resolve);
+    `#constructor` forbidden; duplicate private names (one PrivateEnvironment per class shared by
+    static+instance — only a same-placement get/set pair may repeat); `delete obj.#x` (even covered
+    `delete (obj.#x)`) is a SyntaxError (§13.5.1.1); a `#x` in an object literal rejects.
+  - **Interpreter (`src/interpreter.zig`):** `evalClass` installs static private members on the ctor's
+    private slot at definition time, runs `static { }` blocks in source order (interleaved with static
+    fields, `this` = ctor, [[HomeObject]] = ctor), and records instance private elements +
+    instance-field records on the ctor's `FunctionData`. `initInstanceFields` now first installs the
+    private brand (`installPrivateElements` — private methods/accessors are shared, private fields' inits
+    run with `this` = the instance, in declaration order so a field init can call an earlier `#m`).
+    `getPrivate`/`setPrivate` enforce the brand: a missing private slot (or a non-object) is a runtime
+    **TypeError**; a private method slot is read-only; private accessors invoke get/set with `this` =
+    receiver. `private_in` is the no-throw boolean brand check. `obj.#m()` calls with `this` = `obj`.
+  - **Tests (`src/engine.zig`):** private fields (read/reassign/compound, undefined default, no
+    collision with same-named public prop, not enumerable); brand-check TypeError on a foreign
+    object/primitive (read + write); private methods (read-only) + private get/set accessors (incl. a
+    field init calling an earlier `#m`, and inheritance adding each class's own brand); static private
+    members (method/field/accessor); static `{ }` blocks (order, interleave with static fields,
+    `super.x`); `#x in obj` (true/false/non-object, private-method name); private-name early errors
+    (`#x` outside a class, bare `#`, `#constructor`, duplicates, get/set-pair allowed, object-literal `#x`).
+  - **Conformance + regression hunt (harness metric, ReleaseFast):** `passed 5766 → 6077` (+311 net),
+    conformance 34.0% → 35.8%. **4 true regressions** by `mode+path` (`in/private-field-in{,-nested}`
+    ×2 modes — `for (#field in value;;)` needs the for-in `[~In]` grammar, and this engine has no
+    for-in; deferred), far outweighed by **315 recoveries** — `class/dstr` (192, class-destructuring
+    positives that now parse cleanly), `class/elements` private features (28 + 12 private-accessor-name),
+    `logical-assignment` (34) / `compound-assignment` (24) reaching private-member targets,
+    `class/elements/syntax/valid` (10), `in` brand-check positives (8). The naive un-rejection of `#` /
+    `static{}` FIRST measured 238 regressions (newly-parseable `#` un-rejected the §15.7.1 Early-Error
+    negatives); adding AllPrivateNamesValid + `delete #x` + duplicate-across-placement + `await`-in-
+    static-block dropped it to 4. Generator/async class negatives still parse-reject (in the 4-regression
+    set, untouched). Bench green (loop_mix −13.6%, loop_sum −13.2%, str_build −13.2%; perf ok, ljs
+    0.2–0.5× Node — private storage is a separate lazily-allocated map, off the ordinary property path).
+  - **Landed:** instance + static private fields/methods/accessors (`#x`, `#m(){}`, `get/set #x(){}`)
+    via a per-instance private slot with TypeError brand checks; `static { }` initialization blocks (in
+    source order, `this` = ctor); `#x in obj` brand check; the §15.7.1 Early Errors the new syntax
+    exposes (AllPrivateNamesValid, `#constructor`, duplicate private names, `delete #x`, `await` in a
+    static block). **Deferred:** the remaining §15.7.1 Early Errors (Cycle 5); generator/async methods
+    (separate milestone — kept parse-rejecting); `for (#x in obj;;)` rejection (needs for-in support).
 
 ## Cycle 5 — Early Errors + close (US5)
 - [ ] M4-T050 §15.7.1 Early Errors that newly-parseable class syntax exposes: duplicate `constructor`;

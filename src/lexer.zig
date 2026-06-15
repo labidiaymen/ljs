@@ -48,6 +48,7 @@ pub const TokenKind = enum {
     shr, // >>
     shr_un, // >>>
     template, // `...${}...` (raw inner stored in string_value)
+    private_identifier, // §12.7 PrivateIdentifier `#name` (only valid inside a class body; §15.7)
     ellipsis, // ...
     fat_arrow, // => (ArrowFunction, §15.3)
     kw_in, // in
@@ -226,6 +227,17 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, word, "extends")) return .{ .kind = .kw_extends, .lexeme = word };
             if (std.mem.eql(u8, word, "super")) return .{ .kind = .kw_super, .lexeme = word };
             return .{ .kind = .identifier, .lexeme = word };
+        }
+
+        // §12.7 PrivateIdentifier `#name` — a `#` immediately followed by an IdentifierName. The
+        // lexeme INCLUDES the leading `#` (so `#x` and `x` never collide as map keys). A bare `#`
+        // not followed by an identifier start is an UnexpectedCharacter (the parser further restricts
+        // private identifiers to class-body member contexts, §15.7).
+        if (c == '#') {
+            if (!isIdentStart(self.peek2())) return LexError.UnexpectedCharacter;
+            self.pos += 1; // '#'
+            while (self.pos < self.src.len and isIdentPart(self.src[self.pos])) self.pos += 1;
+            return .{ .kind = .private_identifier, .lexeme = self.src[start..self.pos] };
         }
 
         // String literals. §12.9.4 (subset: no escapes beyond the basics).

@@ -656,6 +656,124 @@ test "M4 classes: computed names (Cycle 3, §15.7)" {
     try expectNumber("class C { [1 + 1]() { return 3; } } new C()[2]()", 3);
 }
 
+test "M4 classes: private fields (Cycle 4, §15.7 PrivateName)" {
+    // a private field read back through a method (`this.#x`)
+    try expectNumber("class C { #x = 1; getX() { return this.#x; } } new C().getX()", 1);
+    // a bare private field defaults to undefined
+    try expectStr("class C { #x; peek() { return typeof this.#x; } } new C().peek()", "undefined");
+    // private field reassignment via `this.#x = …`
+    try expectNumber("class C { #x = 1; bump() { this.#x = this.#x + 10; return this.#x; } } new C().bump()", 11);
+    // compound assignment to a private field
+    try expectNumber("class C { #x = 5; go() { this.#x += 3; return this.#x; } } new C().go()", 8);
+    // a private field initializer may reference an outer binding + `this`
+    try expectNumber("var k = 9; class C { #x = k; getX() { return this.#x; } } new C().getX()", 9);
+    // private names do NOT collide with same-named public properties
+    try expectNumber("class C { #x = 1; constructor() { this.x = 100; } both() { return this.x + this.#x; } } new C().both()", 101);
+    // a private name is NOT reachable as an ordinary property / not enumerable via `in`
+    try expectBool("class C { #x = 1; static probe(o) { return 'x' in o; } } C.probe(new C())", false);
+}
+
+test "M4 classes: private name brand check — TypeError on a foreign object (Cycle 4, §15.7)" {
+    // reading `o.#x` on an object that never got the brand is a TypeError
+    try expectThrows("class C { #x = 1; static read(o) { return o.#x; } } C.read({})");
+    // writing `o.#x` on a foreign object is a TypeError too
+    try expectThrows("class C { #x = 1; static write(o) { o.#x = 2; } } C.write({})");
+    // the thrown error is specifically a TypeError; an instance of the class is fine
+    try expectStr(
+        "class C { #x = 1; static read(o) { return o.#x; } } " ++
+            "var n = ''; try { C.read({}); } catch (e) { n = e.name; } n",
+        "TypeError",
+    );
+    try expectNumber("class C { #x = 7; static read(o) { return o.#x; } } C.read(new C())", 7);
+    // reading a private name on a primitive is a TypeError
+    try expectThrows("class C { #x = 1; static read(o) { return o.#x; } } C.read(5)");
+}
+
+test "M4 classes: private methods and accessors (Cycle 4, §15.7)" {
+    // a private method, called via `this.#m()`
+    try expectNumber("class C { #m() { return 42; } call() { return this.#m(); } } new C().call()", 42);
+    // a private method is shared but read-only: assigning to it is a TypeError
+    try expectThrows("class C { #m() {} go() { this.#m = 1; } } new C().go()");
+    // a private getter
+    try expectNumber("class C { get #v() { return 5; } read() { return this.#v; } } new C().read()", 5);
+    // a private get/set pair round-trips
+    try expectNumber(
+        "class C { set #v(x) { this._x = x; } get #v() { return this._x; } go() { this.#v = 9; return this.#v; } } new C().go()",
+        9,
+    );
+    // a private field initializer may call an earlier private method (brand installed in order)
+    try expectNumber(
+        "class C { #m() { return 5; } #x = this.#m() + 1; read() { return this.#x; } } new C().read()",
+        6,
+    );
+    // private members survive inheritance (each class adds its own brand)
+    try expectStr(
+        "class A { #a = 1; ga() { return this.#a; } } " ++
+            "class B extends A { #b = 2; gb() { return this.#b; } } " ++
+            "var o = new B(); o.ga() + ',' + o.gb()",
+        "1,2",
+    );
+}
+
+test "M4 classes: static private members (Cycle 4, §15.7)" {
+    // a static private method, called via the constructor
+    try expectNumber("class C { static #m() { return 8; } static call() { return C.#m(); } } C.call()", 8);
+    // a static private field
+    try expectNumber("class C { static #n = 3; static read() { return C.#n; } } C.read()", 3);
+    // a static private accessor
+    try expectNumber("class C { static get #v() { return 6; } static read() { return C.#v; } } C.read()", 6);
+}
+
+test "M4 classes: static initialization blocks (Cycle 4, §15.7.11)" {
+    // a static block runs at class definition with `this` = the constructor
+    try expectNumber("class C { static y; static { this.y = 7; } } C.y", 7);
+    // multiple static blocks run in source order, interleaved with static fields
+    try expectStr(
+        "class C { static a = 1; static { this.b = this.a + 1; } static c = this.b + 1; } " ++
+            "C.a + ',' + C.b + ',' + C.c",
+        "1,2,3",
+    );
+    try expectStr(
+        "class C { static log = ''; static { this.log += '1'; } static { this.log += '2'; } } C.log",
+        "12",
+    );
+    // a static block can use `super.x` (its [[HomeObject]] is the constructor)
+    try expectNumber(
+        "class A { static v() { return 9; } } " ++
+            "class B extends A { static r; static { this.r = super.v(); } } B.r",
+        9,
+    );
+}
+
+test "M4 classes: `#x in obj` ergonomic brand check (Cycle 4, §13.10.1)" {
+    // true for an instance carrying the brand, false for a foreign object (no throw)
+    try expectBool("class C { #x = 1; static has(o) { return #x in o; } } C.has(new C())", true);
+    try expectBool("class C { #x = 1; static has(o) { return #x in o; } } C.has({})", false);
+    // false for a non-object (no throw, unlike ordinary `in`)
+    try expectBool("class C { #x = 1; static has(o) { return #x in o; } } C.has(5)", false);
+    // the brand check works for a private method's name too
+    try expectBool("class C { #m() {} static has(o) { return #m in o; } } C.has(new C())", true);
+}
+
+test "M4 classes: private-name early errors (Cycle 4, §15.7.1)" {
+    // a PrivateIdentifier outside any class body is a SyntaxError
+    try expectSyntaxError("var o = {}; o.#x");
+    try expectSyntaxError("#x");
+    try expectSyntaxError("#x in {}");
+    // a bare `#` (not a private identifier) is a lexer error → SyntaxError
+    try expectSyntaxError("var x = # 1;");
+    // `#constructor` is not a legal private name
+    try expectSyntaxError("class C { #constructor() {} }");
+    try expectSyntaxError("class C { #constructor = 1; }");
+    // a duplicate private name is a SyntaxError (but a get/set pair may share a name)
+    try expectSyntaxError("class C { #x = 1; #x = 2; }");
+    try expectSyntaxError("class C { #m() {} #m() {} }");
+    try expectNoSyntaxErrorStrict("class C { get #v() {} set #v(x) {} }");
+    // a private name in an object literal is a SyntaxError
+    try expectSyntaxError("var o = { #x: 1 };");
+    try expectSyntaxError("var o = { get #x() {} };");
+}
+
 test "M3 object literal sugar: shorthand, computed, method (US6, §13.2.5)" {
     // shorthand `{x}` ≡ `{x: x}`
     try expectNumber("var x = 42; var o = {x}; o.x", 42);

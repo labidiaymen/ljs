@@ -33,6 +33,23 @@ pub const Parser = struct {
     /// class with an `extends` heritage). `super(...)` is a SyntaxError anywhere else — including a
     /// non-derived constructor and any non-constructor method. Saved/restored like `in_method`.
     in_derived_ctor: bool = false,
+    /// §15.7 PrivateName context: true while parsing anything lexically inside a ClassBody (any
+    /// nesting). A PrivateIdentifier (`#x`) — as a member access `obj.#x` or the brand check
+    /// `#x in obj` — is a SyntaxError outside a class body. Set true around a ClassBody and inherited
+    /// by nested functions/arrows; never un-set going inward, mirroring `strict`.
+    in_class_body: bool = false,
+    /// §15.7.1 AllPrivateNamesValid — the declared PrivateName names (`#x`, `#` included) of all
+    /// enclosing ClassBodies. A `#x` reference (member access / `#x in`) must be a member of this set
+    /// or it is a SyntaxError. Each class body pre-scans its PrivateBoundNames and appends them on
+    /// entry (so a method may forward-reference a private name declared later in the same body),
+    /// truncating back on exit. A flat list across nesting is sufficient — validity only needs union
+    /// membership. Empty outside any class (so a `#x` outside a class is rejected by `in_class_body`).
+    private_names: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// §15.7.11: inside a ClassStaticBlock body, `await` is a reserved word — it may not be used as a
+    /// BindingIdentifier or IdentifierReference (`class await {}`, `({ await })`, …). True only
+    /// directly within a static block; a nested ordinary function/arrow body un-reserves it (reset in
+    /// `parseFunction`/`finishArrow`, like `in_method`).
+    in_static_block: bool = false,
 
     /// `mode == .strict` starts the whole Script in strict context (the Test262 runner runs each
     /// test in both modes, expecting the engine to honor `RunMode`). An explicit `"use strict"`
@@ -92,7 +109,11 @@ pub const Parser = struct {
         switch (self.peek().kind) {
             .lbracket => return self.parseArrayPattern(),
             .lbrace => return self.parseObjectPattern(),
-            .identifier => return self.allocPattern(.{ .identifier = self.advance().lexeme }),
+            .identifier => {
+                // §15.7.11: `await` is reserved as a BindingIdentifier inside a static block.
+                if (self.in_static_block and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
+                return self.allocPattern(.{ .identifier = self.advance().lexeme });
+            },
             else => return ParseError.UnexpectedToken,
         }
     }
@@ -436,10 +457,13 @@ pub const Parser = struct {
         // DO inherit `super` lexically, like `this`; `finishArrow` deliberately keeps these flags.)
         const saved_in_method = self.in_method;
         const saved_in_derived = self.in_derived_ctor;
+        const saved_in_static = self.in_static_block;
         defer self.in_method = saved_in_method;
         defer self.in_derived_ctor = saved_in_derived;
+        defer self.in_static_block = saved_in_static;
         self.in_method = false;
         self.in_derived_ctor = false;
+        self.in_static_block = false; // §15.7.11: a nested ordinary function un-reserves `await`
         var name: ?[]const u8 = null;
         if (self.peek().kind == .identifier) name = self.advance().lexeme;
         // §13.1.1: a strict function's name (BindingIdentifier) may not be `eval`/`arguments`/a
@@ -481,6 +505,8 @@ pub const Parser = struct {
             // §13.1.1: a class name may not be a strict-reserved word — and a class body is always
             // strict, so this holds in every mode.
             if (isStrictReservedBindingName(self.peek().lexeme)) return ParseError.UnexpectedToken;
+            // §15.7.11: `await` is reserved inside a static block — `class await {}` there is invalid.
+            if (self.in_static_block and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
             name = self.advance().lexeme;
         } else if (is_declaration) {
             // A ClassDeclaration requires a name (the anonymous form is only a ClassExpression /
@@ -496,14 +522,25 @@ pub const Parser = struct {
             superclass = try self.parsePostfix();
         }
 
-        // §15.7 ClassBody parses in strict context; restore on the way out.
+        // §15.7 ClassBody parses in strict context; restore on the way out. The ClassBody is also a
+        // PrivateName scope (`#x` is parseable here, a SyntaxError outside); inherited by nested bodies.
         const enclosing_strict = self.strict;
+        const enclosing_in_class = self.in_class_body;
         defer self.strict = enclosing_strict;
+        defer self.in_class_body = enclosing_in_class;
         self.strict = true;
+        self.in_class_body = true;
 
         const is_derived = superclass != null; // §15.7.14: `extends`-bearing class → derived ctors
 
         _ = try self.expect(.lbrace);
+        // §15.7.1 AllPrivateNamesValid: pre-scan this ClassBody's PrivateBoundNames and add them to the
+        // in-scope set (so references — including forward references to a name declared later in the
+        // body — resolve). Remember the count to truncate on exit (the names leave scope with the body).
+        const private_base = self.private_names.items.len;
+        defer self.private_names.shrinkRetainingCapacity(private_base);
+        try self.collectClassPrivateNames();
+
         var elements: std.ArrayList(ast.ClassElement) = .empty;
         while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
             // §15.7 ClassElement : `;` — an empty element is allowed and ignored.
@@ -523,16 +560,65 @@ pub const Parser = struct {
                 seen_ctor = true;
             }
         }
+        // §15.7.1 Early Error: PrivateBoundIdentifiers of a ClassBody must be unique — EXCEPT a
+        // `get`/`set` accessor pair may share a name, and a static + non-static of the same name still
+        // clash. A method/field/accessor named `#constructor` is forbidden (`#x` can't be the ctor).
+        if (try hasDuplicatePrivateNames(self.arena, elements.items)) return ParseError.UnexpectedToken;
 
         const c = try self.arena.create(ast.Class);
         c.* = .{ .name = name, .superclass = superclass, .elements = elements.items };
         return c;
     }
 
-    /// §15.7 ClassElement — a method `m(){…}`, a `constructor(){…}`, a `static` method, or a field
-    /// `x = init;` / `x;` (instance or static). Unsupported forms parse-reject this cycle to preserve
-    /// the negative-parse class tests: generators (`* m`), `async`, accessors (`get`/`set`, Cycle 3),
-    /// private names (`#x`, Cycle 4), and static initialization blocks (`static { }`, Cycle 4).
+    /// §15.7.1 PrivateBoundNames — without consuming input, scan the current ClassBody (from the token
+    /// after its `{`, which is where `self.idx` sits) and append each private member NAME to
+    /// `self.private_names`. A PrivateIdentifier is a *declaration* (a class-element name) when it
+    /// appears at the class-body top level (brace-depth 0 relative to the body, and not inside a `(`
+    /// param list or `[` computed key) — i.e. as a `#x`, `static #x`, or `get/set #x` element key.
+    /// PrivateIdentifiers inside element bodies / initializers (brace-depth > 0) are references, not
+    /// declarations, so they are skipped. A nested class's body (`{ … }` inside this one) is also at
+    /// depth > 0, so its own private names are collected when that class is parsed (and shadow-stack via
+    /// the recursion). Does not validate — duplicate detection happens after the real parse.
+    fn collectClassPrivateNames(self: *Parser) ParseError!void {
+        var i = self.idx;
+        var depth: usize = 0; // nesting of {} ( ) [ ] relative to the class body
+        while (i < self.tokens.len) : (i += 1) {
+            const k = self.tokens[i].kind;
+            switch (k) {
+                .lbrace, .lparen, .lbracket => depth += 1,
+                .rbrace, .rparen, .rbracket => {
+                    if (depth == 0) return; // hit the class body's closing `}`
+                    depth -= 1;
+                },
+                .private_identifier => {
+                    // A declaration is a private name at the class-body top level (depth 0) that is in
+                    // element-NAME position — i.e. NOT a member reference `this.#x` (preceded by `.`)
+                    // and NOT a brand-check `#x in obj` (followed by `in`). A field initializer like
+                    // `f = this.#x` / `f = #x in o` also sits at depth 0, so these guards distinguish a
+                    // reference from a declared element name.
+                    const prev_is_dot = i > 0 and self.tokens[i - 1].kind == .dot;
+                    const next_is_in = i + 1 < self.tokens.len and self.tokens[i + 1].kind == .kw_in;
+                    if (depth == 0 and !prev_is_dot and !next_is_in) {
+                        try self.private_names.append(self.arena, self.tokens[i].lexeme);
+                    }
+                },
+                .eof => return,
+                else => {},
+            }
+        }
+    }
+
+    /// §15.7.1 AllPrivateNamesValid — is the PrivateName `name` (`#` included) declared by some
+    /// enclosing ClassBody currently in scope?
+    fn privateNameDeclared(self: *Parser, name: []const u8) bool {
+        for (self.private_names.items) |n| if (std.mem.eql(u8, n, name)) return true;
+        return false;
+    }
+
+    /// §15.7 ClassElement — a method `m(){…}`, a `constructor(){…}`, a `static` method, a field
+    /// `x = init;` / `x;` (instance or static), a §15.7.11 `static { … }` initialization block, or a
+    /// PrivateName member `#x` / `#m(){}` / `get #x(){}` (Cycle 4). Still parse-rejected (preserve the
+    /// negatives): generators (`* m`) and `async` methods (a separate future milestone).
     fn parseClassElement(self: *Parser, is_derived: bool) ParseError!ast.ClassElement {
         // §15.7 `static` modifier (contextual): it is a modifier only when followed by something that
         // begins a (non-static) element name. `static(){}`/`static = 1`/`static;`/`static }` use the
@@ -543,8 +629,14 @@ pub const Parser = struct {
             switch (next) {
                 // `static` as a key, not a modifier.
                 .lparen, .assign, .semicolon, .rbrace => {},
-                // §15.7.11 static initialization block `static { … }` — deferred to Cycle 4.
-                .lbrace => return ParseError.UnexpectedToken,
+                // §15.7.11 ClassStaticBlock `static { … }` — a block that runs once at class
+                // definition with `this` = the constructor. Parsed in a method-like context: it has a
+                // [[HomeObject]] (so `super.x` is allowed), but `super(...)`/`arguments`/`await`/`yield`
+                // restrictions apply (we model the common subset — `super.x` ok, `super()` rejected).
+                .lbrace => {
+                    _ = self.advance(); // `static`
+                    return self.parseStaticBlock();
+                },
                 else => {
                     is_static = true;
                     _ = self.advance(); // consume `static`
@@ -553,10 +645,10 @@ pub const Parser = struct {
         }
 
         // §15.7 Unsupported element prefixes parse-reject (preserve negatives): generator `* m` and
-        // `async m` (a separate future milestone), private `#x` (Cycle 4). Accessors `get`/`set`
-        // (handled just below) and computed names `[expr]` land this cycle. `get`/`set`/`async` are
-        // only a modifier when followed by something that begins a property name (else they are an
-        // ordinary element key, e.g. `get(){}` / `get = 1` / `get;`).
+        // `async m` (a separate future milestone). Accessors `get`/`set` (handled just below), computed
+        // names `[expr]`, and PrivateName members `#x` (handled below) land this cycle. `get`/`set`/
+        // `async` are only a modifier when followed by something that begins a property name (else they
+        // are an ordinary element key, e.g. `get(){}` / `get = 1` / `get;`).
         switch (self.peek().kind) {
             .star => return ParseError.UnexpectedToken, // generator method (deferred)
             .identifier => {
@@ -564,28 +656,35 @@ pub const Parser = struct {
                 if (std.mem.eql(u8, w, "async") and startsAccessorName(self.tokens[self.idx + 1].kind)) {
                     return ParseError.UnexpectedToken; // async method (deferred)
                 }
-                // §15.7 `get x(){…}` / `set x(v){…}` accessor (instance or static).
+                // §15.7 `get x(){…}` / `set x(v){…}` accessor (instance or static). A `get`/`set`
+                // followed by a PrivateIdentifier is a PRIVATE accessor `get #x(){…}`.
                 if ((std.mem.eql(u8, w, "get") or std.mem.eql(u8, w, "set")) and
                     startsAccessorName(self.tokens[self.idx + 1].kind))
                 {
                     return self.parseClassAccessor(is_static, std.mem.eql(u8, w, "get"));
                 }
             },
-            // §15.7 a private name `#x` (field/method) is Cycle 4.
             else => {},
         }
 
-        // Parse the element's PropertyName (identifier / string / number / `[computed]`).
-        const pn = try self.parsePropertyName();
+        // §15.7 a PrivateName member: a `#x` field/method/accessor. The leading `get`/`set` accessor
+        // case is handled above (it flows through parseClassAccessor, which reads the `#name`).
+        const is_private = self.peek().kind == .private_identifier;
+
+        // Parse the element's PropertyName: an identifier/string/number/`[computed]`, OR a `#name`
+        // PrivateIdentifier (Cycle 4). A private name is never computed and never `prototype`.
+        const pn = if (is_private) try self.parsePrivateName() else try self.parsePropertyName();
 
         const is_literal = pn.computed == null; // a static (non-computed) PropName we can name-check
 
         if (self.peek().kind == .lparen) {
-            // §15.7 MethodDefinition `m(params){…}` — instance (on `.prototype`) or static method.
-            // §15.7.1 Early Error: a `static` method may not be named `prototype`.
-            if (is_static and is_literal and std.mem.eql(u8, pn.key, "prototype")) return ParseError.UnexpectedToken;
-            // §15.7: a non-static method named `constructor` is the class constructor.
-            const is_ctor = !is_static and is_literal and std.mem.eql(u8, pn.key, "constructor");
+            // §15.7 MethodDefinition `m(params){…}` — instance (on `.prototype`) or static method, or
+            // a PRIVATE method `#m(){…}` (installed in the private slot). §15.7.1 Early Error: a
+            // `static` method may not be named `prototype`. A private method named `#constructor` is a
+            // SyntaxError (handled in parsePrivateName) and a private name is never the class ctor.
+            if (is_static and is_literal and !is_private and std.mem.eql(u8, pn.key, "prototype")) return ParseError.UnexpectedToken;
+            // §15.7: a non-static, non-private method named `constructor` is the class constructor.
+            const is_ctor = !is_static and is_literal and !is_private and std.mem.eql(u8, pn.key, "constructor");
             // §13.3.5/§13.3.7: every MethodDefinition body has a [[HomeObject]] (`super.x` allowed);
             // `super(...)` is allowed only in a DERIVED class's `constructor`. Saved/restored so the
             // flags don't leak to the next element (or, via the defers, to anything after the body).
@@ -604,6 +703,7 @@ pub const Parser = struct {
             return .{
                 .kind = if (is_ctor) .constructor else .method,
                 .is_static = is_static,
+                .is_private = is_private,
                 .key = pn.key,
                 .computed_key = pn.computed,
                 .value = .{ .func = f },
@@ -612,8 +712,9 @@ pub const Parser = struct {
 
         // §15.7 FieldDefinition `x = Initializer ;` or bare `x ;` (ASI). An optional `= expr`.
         // §15.7.1 Early Errors on the field's PropName: it may not be `constructor`; a `static` field
-        // may not be named `prototype`.
-        if (is_literal) {
+        // may not be named `prototype`. (A private field `#x` skips these — `#constructor` is rejected
+        // in parsePrivateName, and `#prototype` is a legal private name.)
+        if (is_literal and !is_private) {
             if (std.mem.eql(u8, pn.key, "constructor")) return ParseError.UnexpectedToken;
             if (is_static and std.mem.eql(u8, pn.key, "prototype")) return ParseError.UnexpectedToken;
         }
@@ -644,10 +745,28 @@ pub const Parser = struct {
         return .{
             .kind = .field,
             .is_static = is_static,
+            .is_private = is_private,
             .key = pn.key,
             .computed_key = pn.computed,
             .value = .{ .field_init = field_init },
         };
+    }
+
+    /// §15.7.11 ClassStaticBlock `static { … }` — the leading `static` has been consumed; the current
+    /// token is `{`. The block body parses in a method-like context: strict (the whole class body is),
+    /// with a [[HomeObject]] so `super.x` is allowed but `super(...)` is not (it is not a constructor).
+    fn parseStaticBlock(self: *Parser) ParseError!ast.ClassElement {
+        const saved_in_method = self.in_method;
+        const saved_in_derived = self.in_derived_ctor;
+        const saved_in_static = self.in_static_block;
+        defer self.in_method = saved_in_method;
+        defer self.in_derived_ctor = saved_in_derived;
+        defer self.in_static_block = saved_in_static;
+        self.in_method = true;
+        self.in_derived_ctor = false;
+        self.in_static_block = true; // §15.7.11: `await` is reserved inside the block
+        const body = try self.parseBlock();
+        return .{ .kind = .static_block, .is_static = true, .value = .{ .block = body } };
     }
 
     /// §15.7 MethodDefinition `get PropName(){…}` / `set PropName(v){…}` in a class body (the leading
@@ -657,11 +776,15 @@ pub const Parser = struct {
     /// not be named `prototype`). Computed keys `get [expr](){…}` are supported (key in `computed_key`).
     fn parseClassAccessor(self: *Parser, is_static: bool, is_get: bool) ParseError!ast.ClassElement {
         _ = self.advance(); // consume `get` / `set`
-        const pn = try self.parsePropertyName();
+        // A PRIVATE accessor `get #x(){…}` (Cycle 4): the name is a PrivateIdentifier (`#constructor`
+        // is rejected in parsePrivateName); a private accessor skips the `constructor`/`prototype`
+        // name restrictions (those names are legal as private names).
+        const is_private = self.peek().kind == .private_identifier;
+        const pn = if (is_private) try self.parsePrivateName() else try self.parsePropertyName();
         const is_literal = pn.computed == null;
         // §15.7.1 Early Errors: `constructor` may not be a getter/setter; a `static` accessor named
         // `prototype` is forbidden.
-        if (is_literal) {
+        if (is_literal and !is_private) {
             if (!is_static and std.mem.eql(u8, pn.key, "constructor")) return ParseError.UnexpectedToken;
             if (is_static and std.mem.eql(u8, pn.key, "prototype")) return ParseError.UnexpectedToken;
         }
@@ -688,10 +811,21 @@ pub const Parser = struct {
         return .{
             .kind = if (is_get) .get else .set,
             .is_static = is_static,
+            .is_private = is_private,
             .key = pn.key,
             .computed_key = pn.computed,
             .value = .{ .func = f },
         };
+    }
+
+    /// §15.7 parse a PrivateIdentifier `#name` as a class-element name. The current token is a
+    /// `private_identifier` (lexeme includes the `#`). §15.7.1 Early Error: `#constructor` may not be
+    /// used as a private member name. Returns a PropName whose `key` is the `#name` (never computed).
+    fn parsePrivateName(self: *Parser) ParseError!PropName {
+        const t = self.advance();
+        std.debug.assert(t.kind == .private_identifier);
+        if (std.mem.eql(u8, t.lexeme, "#constructor")) return ParseError.UnexpectedToken;
+        return .{ .key = t.lexeme };
     }
 
     const ParamList = struct { params: []const ast.Param, rest: ?*const ast.Pattern };
@@ -897,6 +1031,8 @@ pub const Parser = struct {
         if (self.peek().kind == .identifier and self.idx + 1 < self.tokens.len and
             self.tokens[self.idx + 1].kind == .fat_arrow)
         {
+            // §15.7.11: `await` is reserved as a BindingIdentifier inside a static block (`await => …`).
+            if (self.in_static_block and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
             const pat = try self.allocPattern(.{ .identifier = self.advance().lexeme });
             const params = try self.arena.alloc(ast.Param, 1);
             params[0] = .{ .pattern = pat, .default = null };
@@ -917,7 +1053,7 @@ pub const Parser = struct {
                     // §13.15.1 Early Error: in strict, the assignment target may not be `eval`/`arguments`.
                     if (self.strict and isEvalOrArguments(n)) return ParseError.UnexpectedToken;
                 },
-                .member, .index => {},
+                .member, .index, .private_member => {},
                 else => return ParseError.UnexpectedToken, // §13.15.1 invalid assignment target
             }
             _ = self.advance();
@@ -941,6 +1077,10 @@ pub const Parser = struct {
                 .identifier => |n| return self.alloc(.{ .assign = .{ .name = n, .value = value } }),
                 .member => |m| return self.alloc(.{ .assign_member = .{ .object = m.object, .name = m.name, .value = value } }),
                 .index => |ix| return self.alloc(.{ .assign_index = .{ .object = ix.object, .key = ix.key, .value = value } }),
+                // §13.3.2 `obj.#x = v` — assignment to a private member (TypeError at runtime if `obj`
+                // lacks the brand). Compound `obj.#x op= v` desugars with the private member as both
+                // sides; the desugared `value` already references `left` (the private_member node).
+                .private_member => |pm| return self.alloc(.{ .private_assign = .{ .object = pm.object, .name = pm.name, .value = value } }),
                 else => return ParseError.UnexpectedToken, // invalid assignment target
             }
         }
@@ -1000,6 +1140,22 @@ pub const Parser = struct {
     /// Precedence-climbing for binary + logical operators. Higher number binds tighter.
     /// Logical `||`/`&&` build short-circuiting `logical` nodes; everything else is `binary`.
     fn parseExpr(self: *Parser, min_prec: u8) ParseError!*const ast.Node {
+        // §13.10.1 RelationalExpression : PrivateIdentifier `in` ShiftExpression — the ergonomic brand
+        // check `#x in obj`. A PrivateIdentifier may ONLY appear here as a primary (everywhere else it
+        // is a member name `obj.#x`); it must be immediately followed by `in`, inside a class body.
+        if (self.peek().kind == .private_identifier) {
+            if (!self.in_class_body) return ParseError.UnexpectedToken;
+            const name = self.advance().lexeme;
+            // §15.7.1 AllPrivateNamesValid: the brand-check name must resolve to a declared private name.
+            if (!self.privateNameDeclared(name)) return ParseError.UnexpectedToken;
+            if (self.peek().kind != .kw_in) return ParseError.UnexpectedToken;
+            _ = self.advance(); // `in`
+            // The RHS binds at the shift level (prec 8 — tighter than relational `in` at 7), so the
+            // brand check is the relational operator: `#x in a || b` parses as `(#x in a) || b`.
+            const rhs = try self.parseExpr(8);
+            const node = try self.alloc(.{ .private_in = .{ .name = name, .object = rhs } });
+            return self.parseExprFrom(node, min_prec);
+        }
         const left = try self.parseUnary();
         return self.parseExprFrom(left, min_prec);
     }
@@ -1057,6 +1213,10 @@ pub const Parser = struct {
             // identifier — a direct UnresolvableReference / resolvable binding, not a property
             // reference) is a SyntaxError. `delete obj.prop` / `delete obj[k]` stay legal.
             if (op == .delete_ and self.strict and operand.* == .identifier) return ParseError.UnexpectedToken;
+            // §13.5.1.1 Early Error: `delete` of a private member reference (`delete this.#x`, even
+            // parenthesized `delete (this.#x)`) is ALWAYS a SyntaxError. A parenthesized operand is
+            // already collapsed to its inner node, so a direct `private_member` covers both forms.
+            if (op == .delete_ and operand.* == .private_member) return ParseError.UnexpectedToken;
             return self.alloc(.{ .unary = .{ .op = op, .operand = operand } });
         }
         return self.parsePostfix();
@@ -1137,6 +1297,20 @@ pub const Parser = struct {
                 },
                 .dot => {
                     _ = self.advance();
+                    // §13.3.2 `obj.#x` — a private member access. The `#name` is only legal inside a
+                    // class body (§15.7); outside one it is a SyntaxError. A private reference does not
+                    // participate in optional chaining short-circuit semantics specially — we model it
+                    // as a `private_member` node (chained private access after `?.` is rare; reject it
+                    // to keep the brand-check semantics simple rather than mis-handle it).
+                    if (self.peek().kind == .private_identifier) {
+                        // §15.7.1: a private reference must be inside a class body AND resolve to a
+                        // declared private name (AllPrivateNamesValid) — else a SyntaxError.
+                        if (!self.in_class_body or in_chain) return ParseError.UnexpectedToken;
+                        const pname = self.advance().lexeme;
+                        if (!self.privateNameDeclared(pname)) return ParseError.UnexpectedToken;
+                        expr = try self.alloc(.{ .private_member = .{ .object = expr, .name = pname } });
+                        continue;
+                    }
                     const name = try self.expectPropertyName();
                     expr = if (in_chain)
                         try self.alloc(.{ .optional = .{ .base = expr, .optional = false, .link = .{ .member = name } } })
@@ -1281,6 +1455,10 @@ pub const Parser = struct {
                 // Shorthand with a default `{x = 1}` is only legal inside a destructuring *pattern*,
                 // not an object literal — reject it here (CoverInitializedName, §13.2.5.1).
                 if (self.peek().kind == .assign) return ParseError.UnexpectedToken;
+                // §13.1.1 / §15.7.11: a shorthand IdentifierReference may not be a reserved word —
+                // `yield` in strict, `await` inside a static block (`({ yield })` / `({ await })`).
+                if (self.strict and std.mem.eql(u8, name.key, "yield")) return ParseError.UnexpectedToken;
+                if (self.in_static_block and std.mem.eql(u8, name.key, "await")) return ParseError.UnexpectedToken;
                 const ref = try self.alloc(.{ .identifier = name.key });
                 try props.append(self.arena, .{ .key = name.key, .value = ref });
             }
@@ -1362,6 +1540,8 @@ pub const Parser = struct {
                 // IdentifierReference (a primary expression, e.g. a `m(x = yield)` param default
                 // inside an always-strict class body) is a SyntaxError.
                 if (self.strict and std.mem.eql(u8, t.lexeme, "yield")) return ParseError.UnexpectedToken;
+                // §15.7.11: `await` is reserved as an IdentifierReference inside a static block body.
+                if (self.in_static_block and std.mem.eql(u8, t.lexeme, "await")) return ParseError.UnexpectedToken;
                 _ = self.advance();
                 return self.alloc(.{ .identifier = t.lexeme });
             },
@@ -1404,6 +1584,10 @@ pub const Parser = struct {
             // SuperProperty/SuperCall). Reaching it here means a bare `super` in a non-postfix
             // position (e.g. `super + 1`) — always a SyntaxError.
             .kw_super => return ParseError.UnexpectedToken,
+            // §13.10.1: a PrivateIdentifier as a primary is ONLY valid as the LHS of `#x in obj`
+            // (handled in parseExpr) — as a member name it is consumed by `continuePostfix`. Reaching
+            // it here is a bare `#x` in expression position, always a SyntaxError.
+            .private_identifier => return ParseError.UnexpectedToken,
             .lparen => {
                 // §13.2.3 ParenthesizedExpression : `(` Expression `)` — a full Expression, so the
                 // comma / sequence operator is allowed (`(a, b)` yields `b`). The arrow cover-grammar
@@ -1489,6 +1673,49 @@ fn isSimpleParameterList(pl: Parser.ParamList) bool {
 /// Walks every parameter pattern (including nested array/object patterns and the rest element),
 /// collecting bound identifiers; returns true on the first repeat. Bounded by the formal list
 /// size, so it runs only on the arrow-creation path (never the hot call path).
+/// §15.7.1 Early Error: a ClassBody's PrivateBoundIdentifiers must contain no duplicates — EXCEPT a
+/// matching `get`/`set` accessor pair (same name, same static-ness) may co-exist. Returns true on a
+/// disallowed duplicate. (The allocator is the parse arena; on exhaustion we conservatively report
+/// no duplicate — privacy still holds at runtime.)
+fn hasDuplicatePrivateNames(arena: std.mem.Allocator, elements: []const ast.ClassElement) std.mem.Allocator.Error!bool {
+    // §15.7.1: a class has ONE PrivateEnvironment shared by static and instance members, so private
+    // names must be unique across BOTH placements (a `static #m` and an instance `#m()` clash). The
+    // only allowed repeat is a matching get/set accessor pair — same name AND same static placement.
+    const Seen = struct { name: []const u8, is_static: bool, has_get: bool, has_set: bool, has_other: bool };
+    var seen: std.ArrayListUnmanaged(Seen) = .empty;
+    for (elements) |el| {
+        if (!el.is_private) continue;
+        const is_get = el.kind == .get;
+        const is_set = el.kind == .set;
+        var found = false;
+        for (seen.items) |*s| {
+            if (!std.mem.eql(u8, s.name, el.key)) continue;
+            found = true;
+            // The get+set complement (one get, one set, no plain member, SAME placement) is the only
+            // legal repeat. A differing placement, or any other overlap, is a duplicate.
+            const same_placement = s.is_static == el.is_static;
+            if (is_get and same_placement and !s.has_get and !s.has_other) {
+                s.has_get = true;
+            } else if (is_set and same_placement and !s.has_set and !s.has_other) {
+                s.has_set = true;
+            } else {
+                return true; // any other collision on the same private name
+            }
+            break;
+        }
+        if (!found) {
+            try seen.append(arena, .{
+                .name = el.key,
+                .is_static = el.is_static,
+                .has_get = is_get,
+                .has_set = is_set,
+                .has_other = !is_get and !is_set,
+            });
+        }
+    }
+    return false;
+}
+
 fn hasDuplicateBoundNames(pl: Parser.ParamList) bool {
     var names: std.ArrayList([]const u8) = .empty;
     var buf: [64][]const u8 = undefined; // formal lists are tiny; a small fixed buffer suffices
@@ -1599,6 +1826,9 @@ fn containsArguments(node: *const ast.Node) bool {
             return false;
         },
         .super_member => |sm| return if (sm.key) |k| containsArguments(k) else false,
+        .private_member => |pm| return containsArguments(pm.object),
+        .private_assign => |pa| return containsArguments(pa.object) or containsArguments(pa.value),
+        .private_in => |pi| return containsArguments(pi.object),
         // Recurse into ArrowFunction bodies (no own `arguments`); STOP at an ordinary function /
         // class (they bind/scope their own `arguments`).
         .function => |f| return f.is_arrow and bodyContainsArguments(f.body),
@@ -1702,7 +1932,7 @@ fn directivePrologueIsStrict(toks: []const lex.Token) bool {
 /// from an ordinary use of the identifiers `get`/`set` as a key (`{get: 1}`, `{get}`, `{get(){}}`).
 fn startsAccessorName(kind: lex.TokenKind) bool {
     return switch (kind) {
-        .identifier, .string, .number, .lbracket => true,
+        .identifier, .string, .number, .lbracket, .private_identifier => true,
         else => isKeywordName(kind), // `get if(){}` etc.
     };
 }

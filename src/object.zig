@@ -38,9 +38,17 @@ pub const FunctionData = struct {
     /// (`evalNew`) runs each initializer on the new instance (with `this` = instance) before the
     /// constructor body. Empty for ordinary functions and for non-constructor class methods.
     fields: []const FieldInit = &.{},
+    /// §15.7: a class constructor's instance PrivateName elements (fields/methods/accessors), added
+    /// to each `new` instance's private slot (the brand) before the field initializers / body run.
+    /// Empty for ordinary functions and non-constructor methods. (Static private members are
+    /// installed directly on the constructor object at class-definition time, not here.)
+    private_elements: []const PrivateElement = &.{},
     /// §15.7: a class constructor (explicit or default) is flagged so a plain `C()` call (without
     /// `new`) throws a TypeError per §15.7.14 ([[Call]] of a class constructor is not allowed).
     is_class_ctor: bool = false,
+    /// §15.7: a private METHOD `#m(){}` (vs a private field holding a function). A private method slot
+    /// is read-only — `this.#m = …` is a TypeError (a brand on the instance, not a mutable field).
+    is_private_method: bool = false,
     /// §9.2.5 / §15.7.14 [[HomeObject]]: for a class/object method the object the method is defined
     /// on — its `.prototype` (instance method) or the constructor (static method). `super.x` inside
     /// the method resolves against `home_object.[[Prototype]]`. Null for ordinary functions/arrows.
@@ -60,6 +68,21 @@ pub const FieldInit = struct {
     init: ?*const ast.Node,
 };
 
+/// §15.7 one instance PrivateName element to install on each `new` instance (adding its brand).
+///   • `.field` — a private field `#x = init` / `#x` (per-instance value via `init`, run with
+///     `this` = the instance, like an ordinary instance field).
+///   • `.method` — a private method `#m(){}`: the SHARED method object (`func`), copied into each
+///     instance's private slot as a data value (so `this.#m` reads the same function on every
+///     instance, matching the spec's per-instance brand of a shared method).
+///   • `.get`/`.set` — a private accessor `get/set #x(){}`: the shared getter/setter objects merged
+///     into one accessor descriptor in the instance's private slot.
+pub const PrivateElement = struct {
+    key: []const u8, // the `#name` (the `#` is part of the key)
+    kind: enum { field, method, get, set },
+    init: ?*const ast.Node = null, // field initializer
+    func: ?*Object = null, // method body / getter / setter (shared, [[HomeObject]] set)
+};
+
 /// A property's stored shape (§6.1.7.1 Property Attributes, M3 subset). Most properties are plain
 /// data (`{ value }`); §13.2.5.6 getters/setters are accessor pairs. The map stores this tagged
 /// union so the hot data-property path stays a single branch (see `get`/`getAccessor`/`set`).
@@ -77,6 +100,13 @@ pub const Object = struct {
     native: NativeId = .none,
     native_name: []const u8 = "",
     elements: std.ArrayListUnmanaged(Value) = .empty, // backing store iff kind == .array
+    /// §15.7 PrivateName slots — a per-object map keyed by the `#name` (the `#` is part of the key,
+    /// so private names never collide with string-keyed properties). Distinct from `properties` so a
+    /// PrivateName is NEVER reachable via `[[Get]]`/`[[Set]]`/`in`/enumeration (privacy by storage).
+    /// Lazily populated (only objects with private members ever allocate it) so the ordinary property
+    /// path pays nothing. A private method/accessor stores a function descriptor here; a field stores
+    /// data. Accessing a private name on an object missing the brand is a runtime TypeError (caller).
+    private_fields: std.StringHashMapUnmanaged(PropertyValue) = .{},
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);
@@ -164,5 +194,43 @@ pub const Object = struct {
         if (getter) |g| acc.get = g;
         if (setter) |s| acc.set = s;
         try self.properties.put(self.arena, key, .{ .accessor = .{ .get = acc.get, .set = acc.set } });
+    }
+
+    // ── §15.7 PrivateName slots (Cycle 4) ──────────────────────────────────────
+    // Private members live ONLY on the object that has the brand (never the prototype chain): a
+    // PrivateName is added per-instance at construction. So lookups are own-slot only (no chain walk).
+
+    /// True iff `self` carries the PrivateName `key` (the `#name`, `#` included) — the brand check.
+    pub fn hasPrivate(self: *Object, key: []const u8) bool {
+        return self.private_fields.contains(key);
+    }
+
+    /// The stored descriptor for PrivateName `key` (own slot only), or null if the brand is absent.
+    pub fn getPrivate(self: *Object, key: []const u8) ?PropertyValue {
+        return self.private_fields.get(key);
+    }
+
+    /// Install/replace the data slot for PrivateName `key`. Used for private fields (per-instance)
+    /// and private methods (the shared method object, copied into each instance's slot).
+    pub fn setPrivate(self: *Object, key: []const u8, value: Value) std.mem.Allocator.Error!void {
+        try self.private_fields.put(self.arena, key, .{ .data = value });
+    }
+
+    /// Install a private descriptor verbatim (data or accessor) — for private accessors `get/set #x`.
+    pub fn definePrivate(self: *Object, key: []const u8, pv: PropertyValue) std.mem.Allocator.Error!void {
+        try self.private_fields.put(self.arena, key, pv);
+    }
+
+    /// Merge a private `get`/`set` accessor half into the private slot `key` (mirrors `defineAccessor`
+    /// for the private map): a matching get+set pair becomes one accessor descriptor.
+    pub fn definePrivateAccessor(self: *Object, key: []const u8, getter: ?*Object, setter: ?*Object) std.mem.Allocator.Error!void {
+        var acc: struct { get: ?*Object = null, set: ?*Object = null } = .{};
+        if (self.private_fields.get(key)) |existing| switch (existing) {
+            .accessor => |a| acc = .{ .get = a.get, .set = a.set },
+            .data => {},
+        };
+        if (getter) |g| acc.get = g;
+        if (setter) |s| acc.set = s;
+        try self.private_fields.put(self.arena, key, .{ .accessor = .{ .get = acc.get, .set = acc.set } });
     }
 };
