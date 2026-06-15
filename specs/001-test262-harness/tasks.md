@@ -31,7 +31,7 @@ Foundational + US1 + US4** (you can measure both conformance *and* ljs-vs-Node p
 - [ ] T003 [P] Create the source skeleton (empty/stub files): `src/`, `test262/`, `tests/`, `scripts/`, `baseline/`
 - [ ] T004 [P] Create `scripts/vendor-test262.sh` (clone tc39/test262 at the pinned commit into `vendor/test262/`, write `vendor/test262/.pinned-commit`)
 - [ ] T005 [P] Confirm `.gitignore` covers `vendor/test262/`, `.zig-cache/`, `zig-out/` (already present — verify)
-- [x] T005b [P] Add code-quality gate: `zig build fmt` / `fmt-check` (`zig fmt`) + `zig build lint` (`scripts/lint.sh`: fmt-check + ZLint if installed) — constitution merge gate 1
+- [x] T005b [P] Add code-quality gate: `zig build fmt` / `fmt-check` (`zig fmt`) + `zig build lint` (`scripts/lint.sh`: fmt-check + `zlint --deny-warnings`) — constitution merge gate 1. ZLint v0.8.1 installed from the prebuilt release (its source build fails under Zig 0.16); lint.sh skips it gracefully if absent.
 
 ---
 
@@ -142,7 +142,7 @@ deliberately slowed case is flagged as a regression (SC-007, SC-008).
 - [ ] T030 [P] Audit inline spec-clause comments across `src/` (Principle III)
 - [ ] T031 [P] Add `std.testing.allocator` leak checks to every test; ensure zero leaks (constitution gate)
 - [ ] T032 Run `quickstart.md` §2–§6 end-to-end; record the baseline conformance % for the curated subset (SC-006)
-- [ ] T033 [P] Write `README.md` (build, vendor Test262, run, test)
+- [x] T033 [P] Write `README.md` (build, run, test, lint, roadmap, layout)
 - [ ] T034 Determinism check: run the harness twice, `diff` the JSON reports (SC-003)
 - [ ] T040 Record the initial ljs-vs-Node benchmark ratios in the milestone report and set `bench/baseline.json` (SC-007); confirm the perf gate is wired into the workflow
 

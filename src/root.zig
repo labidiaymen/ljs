@@ -1,6 +1,5 @@
 //! Root of the `ljs` module — the engine's public surface, imported by the CLI (`main.zig`),
 //! the Test262 harness, and the benchmark runner.
-const std = @import("std");
 
 pub const Value = @import("value.zig").Value;
 pub const Completion = @import("completion.zig").Completion;
