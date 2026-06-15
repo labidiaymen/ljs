@@ -26,6 +26,8 @@ pub const TokenKind = enum {
     kw_break,
     kw_continue,
     kw_typeof,
+    kw_void, // void (UnaryExpression, §13.5.2)
+    kw_delete, // delete (UnaryExpression, §13.5.1)
     kw_new,
     kw_instanceof,
     kw_switch,
@@ -210,6 +212,8 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, word, "break")) return .{ .kind = .kw_break, .lexeme = word };
             if (std.mem.eql(u8, word, "continue")) return .{ .kind = .kw_continue, .lexeme = word };
             if (std.mem.eql(u8, word, "typeof")) return .{ .kind = .kw_typeof, .lexeme = word };
+            if (std.mem.eql(u8, word, "void")) return .{ .kind = .kw_void, .lexeme = word };
+            if (std.mem.eql(u8, word, "delete")) return .{ .kind = .kw_delete, .lexeme = word };
             if (std.mem.eql(u8, word, "new")) return .{ .kind = .kw_new, .lexeme = word };
             if (std.mem.eql(u8, word, "instanceof")) return .{ .kind = .kw_instanceof, .lexeme = word };
             if (std.mem.eql(u8, word, "in")) return .{ .kind = .kw_in, .lexeme = word };

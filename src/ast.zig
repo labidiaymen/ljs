@@ -1,6 +1,6 @@
 //! Abstract syntax tree. M1 adds statements (declarations, blocks) and the identifier /
 //! assignment expressions on top of the M0 expression grammar (ECMA-262 §13–§14).
-pub const UnaryOp = enum { plus, minus, not, typeof_, bit_not }; // §13.5
+pub const UnaryOp = enum { plus, minus, not, typeof_, void_, delete_, bit_not }; // §13.5
 
 pub const LogicalOp = enum { or_, and_, coalesce }; // §13.13 (short-circuit; `coalesce` = `??`)
 
@@ -36,6 +36,11 @@ pub const Node = union(enum) {
     null,
     identifier: []const u8, // §13.1 IdentifierReference
     unary: struct { op: UnaryOp, operand: *const Node },
+    /// §13.16 Comma / sequence operator `a, b` — evaluate `left` (for side effects, discarding its
+    /// value), then `right`, yielding `right`. Only produced where a full *Expression* is allowed
+    /// (expression statements, parenthesized expressions, `for` clauses); NOT for the comma-separated
+    /// AssignmentExpression lists of call args / array elements / params / declarators.
+    comma: struct { left: *const Node, right: *const Node },
     binary: struct { op: BinaryOp, left: *const Node, right: *const Node },
     assign: struct { name: []const u8, value: *const Node }, // §13.15 Assignment (identifier target)
     object_literal: []const Property, // §13.2.5  { k: v, ... }

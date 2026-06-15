@@ -111,6 +111,13 @@ fn expectSyntaxError(src: []const u8) !void {
     try testing.expect(r == .syntax_error);
 }
 
+fn expectUndefined(src: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const r = try evaluate(arena_state.allocator(), src, .sloppy);
+    try testing.expect(r == .normal and r.normal == .undefined);
+}
+
 test "bindings: var/let/const, assignment, block scope (US1)" {
     try expectNumber("var x = 40; x + 2", 42);
     try expectNumber("var x = 1; x = x + 5; x", 6);
@@ -585,6 +592,57 @@ test "M3 logical assignment: member base evaluated exactly once (US7, §13.15.2)
         "var calls = 0; var o = {}; function obj() { calls = calls + 1; return o; } obj().p ??= 5; calls",
         1,
     );
+}
+
+test "M3 comma / sequence operator (US8, §13.16)" {
+    // `(a, b, c)` evaluates each and yields the last.
+    try expectNumber("(1, 2, 3)", 3);
+    // Side effects of the discarded left operand are observable.
+    try expectNumber("var a = 0; (a = 1, a = 2); a", 2);
+    try expectNumber("var a = 0; var b = (a = 5, a + 1); b", 6);
+    // Comma is allowed as a top-level expression statement.
+    try expectNumber("var x = 0; x = 1, x = 7; x", 7);
+    // Comma in the `for` init/update clauses (full Expression positions).
+    try expectNumber("var s = 0; for (var i = 0, j = 10; i < 3; i++, j--) { s += j; } s", 27);
+}
+
+test "M3 comma does NOT hijack arg/element/declarator commas (US8 regression)" {
+    // Call arguments are an AssignmentExpression list — `f(1, 2)` is two args, not a sequence.
+    try expectNumber("function f(a, b) { return a + b; } f(1, 2)", 3);
+    try expectNumber("function f(a, b, c) { return c; } f(1, 2, 3)", 3);
+    // Array elements likewise — `[1, 2]` has length 2, not a single sequence value.
+    try expectNumber("[1, 2].length", 2);
+    try expectNumber("[1, 2, 3][1]", 2);
+    // Declarator list — `var a = 1, b = 2;` declares two bindings.
+    try expectNumber("var a = 1, b = 2; a + b", 3);
+    // Object property list.
+    try expectNumber("var o = {a: 1, b: 2}; o.a + o.b", 3);
+    // Arrow cover-grammar still wins over the sequence operator: `(a, b) => …` are params.
+    try expectNumber("var f = (a, b) => a + b; f(40, 2)", 42);
+}
+
+test "M3 void operator (US8, §13.5.2)" {
+    try expectUndefined("void 0");
+    try expectUndefined("void \"anything\"");
+    // The operand is evaluated for side effects; the result is undefined.
+    try expectNumber("var a = 0; void (a = 9); a", 9);
+}
+
+test "M3 delete operator (US8, §13.5.1)" {
+    // delete an own property → property gone, `in` reports false, returns true.
+    try expectBool("var o = {x: 1}; delete o.x; \"x\" in o", false);
+    try expectBool("var o = {x: 1}; delete o.x", true);
+    try expectBool("var o = {x: 1, y: 2}; delete o.x; \"y\" in o", true);
+    // computed/index form.
+    try expectBool("var o = {x: 1}; var k = \"x\"; delete o[k]; \"x\" in o", false);
+    // delete of a non-Reference evaluates the operand and returns true.
+    try expectBool("delete 5", true);
+    try expectBool("var a = 0; delete (a = 3)", true);
+    try expectNumber("var a = 0; delete (a = 3); a", 3); // operand side effect observed
+    // delete of an unqualified identifier returns true (sloppy M-subset).
+    try expectBool("var x = 1; delete x", true);
+    // accessing a deleted property yields undefined.
+    try expectUndefined("var o = {x: 1}; delete o.x; o.x");
 }
 
 test "deep recursion throws RangeError, not a segfault" {

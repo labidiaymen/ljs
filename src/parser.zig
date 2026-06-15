@@ -267,15 +267,17 @@ pub const Parser = struct {
             .semicolon => _ = self.advance(),
             .kw_var, .kw_let, .kw_const => init_stmt = try self.allocStmt(try self.parseDecl()), // parseDecl eats the ;
             else => {
-                init_stmt = try self.allocStmt(.{ .expr = try self.parseAssignment() });
+                // §14.7.4 `for(Expression; …)` — the init/test/update clauses are full Expressions,
+                // so the comma / sequence operator is permitted (`for(i=0, j=n; …; i++, j--)`).
+                init_stmt = try self.allocStmt(.{ .expr = try self.parseExpression() });
                 _ = try self.expect(.semicolon);
             },
         }
         var cond: ?*const ast.Node = null;
-        if (self.peek().kind != .semicolon) cond = try self.parseAssignment();
+        if (self.peek().kind != .semicolon) cond = try self.parseExpression();
         _ = try self.expect(.semicolon);
         var update: ?*const ast.Node = null;
-        if (self.peek().kind != .rparen) update = try self.parseAssignment();
+        if (self.peek().kind != .rparen) update = try self.parseExpression();
         _ = try self.expect(.rparen);
         const body = try self.allocStmt(try self.parseStmt());
         return .{ .for_stmt = .{ .init = init_stmt, .cond = cond, .update = update, .body = body } };
@@ -382,7 +384,9 @@ pub const Parser = struct {
                 return .continue_stmt;
             },
             else => {
-                const e = try self.parseAssignment();
+                // §14.5 ExpressionStatement : Expression `;` — a full Expression, so the comma /
+                // sequence operator is permitted here.
+                const e = try self.parseExpression();
                 if (self.peek().kind == .semicolon) _ = self.advance();
                 return .{ .expr = e };
             },
@@ -566,6 +570,24 @@ pub const Parser = struct {
         return false;
     }
 
+    /// §13.16 Expression — the comma / sequence operator layer that wraps AssignmentExpression.
+    /// `a, b, c` left-associates into nested `comma` nodes; each operand is a full
+    /// AssignmentExpression. This is ONLY valid where the grammar allows an *Expression* (expression
+    /// statements, parenthesized expressions, and the `for(init; test; update)` clauses) — it must
+    /// NOT be used for the comma-separated AssignmentExpression *lists* of call args, array elements,
+    /// object properties, parameters, or declarators (those keep using `parseAssignment` /
+    /// `parseSpreadable`). The arrow cover-grammar is unaffected: `parseAssignment` still fires its
+    /// `( … ) =>` lookahead first, so `(a, b) => …` parses as params while `(a, b)` is a sequence.
+    fn parseExpression(self: *Parser) ParseError!*const ast.Node {
+        var left = try self.parseAssignment();
+        while (self.peek().kind == .comma) {
+            _ = self.advance();
+            const right = try self.parseAssignment();
+            left = try self.alloc(.{ .comma = .{ .left = left, .right = right } });
+        }
+        return left;
+    }
+
     /// §13.15 Assignment (right-associative). Only identifier targets in M1 Cycle A.
     fn parseAssignment(self: *Parser) ParseError!*const ast.Node {
         // §15.3 ArrowFunction (cover grammar, checked before the precedence climb):
@@ -707,6 +729,8 @@ pub const Parser = struct {
             .minus => .minus,
             .bang => .not,
             .kw_typeof => .typeof_,
+            .kw_void => .void_, // §13.5.2
+            .kw_delete => .delete_, // §13.5.1
             .bit_not => .bit_not,
             else => null,
         };
@@ -817,6 +841,15 @@ pub const Parser = struct {
                 _ = self.advance(); // get / set
                 const name = try self.parsePropertyName();
                 const pl = try self.parseParams();
+                // §13.2.5.1 accessor arity Early Errors: a getter takes an empty parameter list
+                // (`get x()`); a setter takes exactly one PropertySetParameter (`set x(v)`). The
+                // setter parameter is a FormalParameter — a default initializer is allowed
+                // (`set x(v = 1)`), but a rest element is NOT (`set x(...v)` is a SyntaxError).
+                if (is_get) {
+                    if (pl.params.len != 0 or pl.rest != null) return ParseError.UnexpectedToken;
+                } else {
+                    if (pl.params.len != 1 or pl.rest != null) return ParseError.UnexpectedToken;
+                }
                 const body = try self.parseBlock();
                 if (!isSimpleParameterList(pl) and bodyHasUseStrict(body)) return ParseError.UnexpectedToken;
                 // §13.2.5.1 UniqueFormalParameters — a method/accessor's params have no duplicates.
@@ -987,8 +1020,12 @@ pub const Parser = struct {
             // `name-super-call-*` negatives: a direct super in a method body/param must fail to parse.)
             .kw_super => return ParseError.UnexpectedToken,
             .lparen => {
+                // §13.2.3 ParenthesizedExpression : `(` Expression `)` — a full Expression, so the
+                // comma / sequence operator is allowed (`(a, b)` yields `b`). The arrow cover-grammar
+                // `( … ) =>` is already handled in `parseAssignment` (its lookahead fires before we
+                // reach here), so this path only sees a genuine parenthesized expression.
                 _ = self.advance();
-                const inner = try self.parseAssignment();
+                const inner = try self.parseExpression();
                 _ = try self.expect(.rparen);
                 self.last_was_paren = true; // §13.13.1: a parenthesized operand defuses the mix check
                 return inner;
@@ -1090,7 +1127,7 @@ fn startsAccessorName(kind: lex.TokenKind) bool {
 /// ReservedWord is a valid IdentifierName key.
 fn isKeywordName(kind: lex.TokenKind) bool {
     return switch (kind) {
-        .kw_true, .kw_false, .kw_null, .kw_var, .kw_let, .kw_const, .kw_function, .kw_return, .kw_this, .kw_if, .kw_else, .kw_while, .kw_for, .kw_throw, .kw_try, .kw_catch, .kw_finally, .kw_break, .kw_continue, .kw_typeof, .kw_new, .kw_instanceof, .kw_switch, .kw_case, .kw_default, .kw_import, .kw_class, .kw_super, .kw_in => true,
+        .kw_true, .kw_false, .kw_null, .kw_var, .kw_let, .kw_const, .kw_function, .kw_return, .kw_this, .kw_if, .kw_else, .kw_while, .kw_for, .kw_throw, .kw_try, .kw_catch, .kw_finally, .kw_break, .kw_continue, .kw_typeof, .kw_void, .kw_delete, .kw_new, .kw_instanceof, .kw_switch, .kw_case, .kw_default, .kw_import, .kw_class, .kw_super, .kw_in => true,
         else => false,
     };
 }

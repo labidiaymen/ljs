@@ -253,6 +253,14 @@ pub const Interpreter = struct {
                 return .{ .normal = c.normal };
             },
             .unary => |u| return self.evalUnary(u.op, u.operand, env),
+            .comma => |c| {
+                // §13.16.1 Expression : Expression `,` AssignmentExpression — evaluate the left
+                // operand for its side effects (discarding its value via GetValue), then evaluate and
+                // yield the right operand.
+                const lc = try self.evalExpr(c.left, env);
+                if (lc.isAbrupt()) return lc;
+                return self.evalExpr(c.right, env);
+            },
             .binary => |b| return self.evalBinary(b.op, b.left, b.right, env),
             .object_literal => |props| return self.evalObjectLiteral(props, env),
             .array_literal => |elems| {
@@ -937,6 +945,13 @@ pub const Interpreter = struct {
             if (c.isAbrupt()) return c;
             return .{ .normal = .{ .string = typeOf(c.normal) } };
         }
+        // §13.5.1.2 `delete` — operates on a Reference, not a value, so resolve the target rather
+        // than calling GetValue. A property reference (`a.b` / `a[k]`) deletes the own property and
+        // returns true (M-subset: every own property is configurable). A non-Reference operand
+        // (`delete 5`, `delete f()`, a parenthesized non-reference) evaluates its operand for side
+        // effects and returns true. An unqualified identifier returns true in sloppy mode (we don't
+        // yet enforce the §13.5.1.1 strict-mode SyntaxError — see gap note).
+        if (op == .delete_) return self.evalDelete(operand, env);
         const c = try self.evalExpr(operand, env);
         if (c.isAbrupt()) return c;
         const v = c.normal;
@@ -944,9 +959,63 @@ pub const Interpreter = struct {
             .plus => .{ .normal = .{ .number = toNumber(v) } }, // §13.5.4
             .minus => .{ .normal = .{ .number = -toNumber(v) } }, // §13.5.5
             .not => .{ .normal = .{ .boolean = !toBoolean(v) } }, // §13.5.7
+            .void_ => .{ .normal = .undefined }, // §13.5.2: evaluate operand (done), yield undefined
             .bit_not => .{ .normal = .{ .number = @floatFromInt(~ops.toInt32(v)) } }, // §13.5.6
-            .typeof_ => unreachable,
+            .typeof_, .delete_ => unreachable,
         };
+    }
+
+    /// §13.5.1.2 Runtime Semantics of the `delete` UnaryExpression. `delete a.b` / `delete a[k]`
+    /// resolves the base object, removes the own property `key`, and returns `true`. For an array
+    /// integer index we leave a hole by setting the element to `undefined` (M-subset; a true sparse
+    /// array model is deferred). A non-Reference operand evaluates for side effects and returns true.
+    fn evalDelete(self: *Interpreter, operand: *const ast.Node, env: *Environment) EvalError!Completion {
+        switch (operand.*) {
+            .member => |m| {
+                const oc = try self.evalExpr(m.object, env);
+                if (oc.isAbrupt()) return oc;
+                return self.deleteProperty(oc.normal, m.name);
+            },
+            .index => |ix| {
+                const oc = try self.evalExpr(ix.object, env);
+                if (oc.isAbrupt()) return oc;
+                const kc = try self.evalExpr(ix.key, env);
+                if (kc.isAbrupt()) return kc;
+                return self.deleteProperty(oc.normal, try self.toString(kc.normal));
+            },
+            // §13.5.1.2 step 3: `delete` of an unqualified IdentifierReference. In sloppy mode the
+            // binding would be deleted only if configurable; our bindings aren't deletable, so we
+            // return true without removing (a benign M-subset deviation). Strict mode is a
+            // SyntaxError (§13.5.1.1) — not yet enforced (no strict-mode context; see gap note).
+            .identifier => return .{ .normal = .{ .boolean = true } },
+            // §13.5.1.2 step 2: the operand is not a Reference — evaluate it for side effects and
+            // return true (`delete 5`, `delete f()`, `delete (x + 1)`).
+            else => {
+                const c = try self.evalExpr(operand, env);
+                if (c.isAbrupt()) return c;
+                return .{ .normal = .{ .boolean = true } };
+            },
+        }
+    }
+
+    /// Remove the own property `key` from `base`, returning `true` (M-subset: always deletable).
+    /// On a primitive base, deletion is a no-op that returns true.
+    fn deleteProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
+        switch (base) {
+            .object => |o| {
+                if (o.kind == .array) {
+                    if (parseIndex(key)) |i| {
+                        // M-subset: leave a hole by writing `undefined` (no true sparse-array model).
+                        if (i < o.elements.items.len) o.elements.items[i] = .undefined;
+                        return .{ .normal = .{ .boolean = true } };
+                    }
+                }
+                _ = o.properties.remove(key);
+                return .{ .normal = .{ .boolean = true } };
+            },
+            .undefined, .null => return self.throwError("TypeError", "Cannot convert undefined or null to object"),
+            else => return .{ .normal = .{ .boolean = true } },
+        }
     }
 
     fn evalBinary(self: *Interpreter, op: ast.BinaryOp, ln: *const ast.Node, rn: *const ast.Node, env: *Environment) EvalError!Completion {
