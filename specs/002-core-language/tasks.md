@@ -44,11 +44,21 @@ folded into plan.md (Phase 0/1) for M1 to avoid over-producing artifacts.
 
 ## Phase E — US5 Built-ins + harness execution (P2)  [Cycle E]
 **Goal**: flip the real-suite number off zero. **Test**: `assert.js` loads; a real slice passes > 0.
-- [ ] M1-T050 [US5] Read the vendored `harness/assert.js`+`sta.js` to enumerate the exact built-in surface needed
-- [ ] M1-T051 [US5] `src/builtins.zig`: `Error` family (name/message), `Object`, basic `Array`, global env wiring — §20/§19
-- [ ] M1-T052 [US5] Wire harness-include loading in `test262/runner.zig` (thread `io`, prepend sta.js+assert.js+includes for non-raw) — retires M0 T019, FR-007
-- [ ] M1-T053 [US5] Tighten negative-runtime classification: compare thrown object `name` to `negative.type` (exact-type) — FR-008
-- [ ] M1-T054 [US5] Run the target slice; record real baseline (pass > 0, SC-003); confirm M0 fixture sample still 27/6/2 and no perf regression
+- [x] M1-T050 [US5] Enumerated the `sta.js`/`assert.js` surface. **Finding: US5 was under-planned** — running them needs `typeof`, `||`/`&&`, `new`+constructors, `instanceof`, `String()`, `Function.prototype.call`, `Object.prototype`/`Array.prototype` methods (none exist yet), plus prototype-method assignment. Decomposed into E1/E2/E3 (the original single Cycle E was unrealistic).
+
+### Cycle E1 — operators & construction (the language features assert.js requires)
+- [ ] M1-T051 [US5] `typeof`, `||`, `&&` (parser + interpreter, short-circuit) — §13.5.3 / §13.13
+- [ ] M1-T052 [US5] `new` + constructors (functions get a `.prototype`; `new` makes a proto-linked object and runs the body with `this`=it) — §13.3.5 / §10.2.2; `instanceof` — §13.10.2
+- [ ] M1-T053 [P] [US5] tests for typeof / logical ops / new / instanceof
+
+### Cycle E2 — core built-ins + global environment
+- [ ] M1-T054 [US5] `src/builtins.zig`: Error family (name/message), `Object`+`Object.prototype.toString`, `Array`+`map`/`join`, `String()`, `Function.prototype.call`; wire the global env — §19/§20
+- [ ] M1-T055 [P] [US5] built-in tests
+
+### Cycle E3 — harness execution (the SC-003 payoff)
+- [ ] M1-T056 [US5] Wire harness-include loading in `test262/runner.zig` (thread `io`; prepend sta.js+assert.js+includes for non-raw) — retires M0 T019, FR-007
+- [ ] M1-T057 [US5] Tighten negative-runtime classification (thrown `name` vs `negative.type`, exact-type) — FR-008
+- [ ] M1-T058 [US5] Run the target slice → record real baseline (**pass > 0**, SC-003); confirm M0 sample still 27/6/2; add a compute-heavy bench (loop/`fib`) to show the true ljs-vs-Node gap; no perf regression
 
 ## Polish (final cycle)
 - [ ] M1-T060 [P] Spec-clause comment audit on new modules; README + roadmap update (M1 done, real conformance %)

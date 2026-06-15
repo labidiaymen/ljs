@@ -25,8 +25,16 @@ Drive `specs/001-test262-harness/tasks.md` in priority order, one **cycle** at a
 4. On the user's validation → commit (author `Aymen <labidi@aymen.co>`, no Claude
    attribution) + push, then **immediately begin the next cycle** and run it to its gate.
 
-Surface significant assumptions/decisions at the gate, not mid-cycle. Never push without the
-user's per-cycle validation.
+Surface significant assumptions/decisions at the gate, not mid-cycle.
+
+### Autonomous mode
+When the user authorizes autonomous looping ("loop by yourself", "don't wait for me"), the
+per-cycle commit gate is waived: **auto-commit + push every cycle** that passes `zig build` +
+`zig build test` + `zig build lint` + **`zig build bench` (no ljs-vs-self perf regression)**.
+**Never commit a cycle that regresses the bench** — fix it or drop the change first. Run the
+bench every cycle. Keep cycling through `tasks.md` until the milestone is done or the user
+interrupts; record decisions in each commit message. Outside autonomous mode, never push
+without the user's per-cycle validation.
 
 ### Agent parallelism within a cycle
 Delegate and parallelise where tasks are **independent**, but keep ONE integration point:

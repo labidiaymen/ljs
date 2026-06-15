@@ -74,6 +74,13 @@ Functions are objects with a `[[Call]]` (an AST closure or a native Zig fn).
 - **D6 Harness loading**: thread `io` into `buildSource`; for non-`raw` tests prepend
   `sta.js`+`assert.js`+`includes` read from `--harness-dir`. Tighten negative-runtime
   classification to compare the thrown object's `name` to `negative.type` (FR-008).
+- **D7 (amendment, after M1-T050)**: reading the vendored `sta.js`/`assert.js` showed US5
+  needs far more than first planned — `typeof`, `||`/`&&`, `new`+constructors (`.prototype`),
+  `instanceof`, `String()`, `Function.prototype.call`, `Object.prototype`/`Array.prototype`
+  methods. US5 is therefore split into **E1** (operators + construction), **E2** (core
+  built-ins + global env), **E3** (wire harness + tighten classification + first real passes).
+  `JSON` is NOT needed (assert.js guards `typeof JSON !== "undefined"`). One cycle per
+  sub-phase, each gated as usual.
 
 ## Phase 1 — Design artifacts
 - `data-model.md`: Value(+object), Object, Property/Descriptor, Environment, Binding, Reference, Completion(extended), Function, Error.
