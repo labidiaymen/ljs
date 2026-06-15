@@ -17,7 +17,7 @@ pub const Options = struct {
     path: []const u8,
     mode_filter: ?Mode = null, // null → run both modes where applicable
     harness_dir: ?[]const u8 = null,
-    step_limit: u64 = 10_000_000, // accepted; not yet threaded into the interpreter
+    step_limit: u64 = ljs.default_step_limit, // threaded into the interpreter via evaluateWithLimit (research D8)
 };
 
 pub const RunError = error{ OpenFailed, OutOfMemory };
@@ -60,14 +60,14 @@ fn runOne(arena: Allocator, opts: Options, source: []const u8, path: []const u8,
         run_sloppy = run_sloppy and m == .sloppy;
     }
 
-    if (run_strict) try execOne(arena, meta, source, path, .strict, report);
-    if (run_sloppy) try execOne(arena, meta, source, path, .sloppy, report);
+    if (run_strict) try execOne(arena, meta, source, path, .strict, opts.step_limit, report);
+    if (run_sloppy) try execOne(arena, meta, source, path, .sloppy, opts.step_limit, report);
 }
 
-fn execOne(arena: Allocator, meta: md.Metadata, source: []const u8, path: []const u8, mode: Mode, report: *rep.Report) RunError!void {
+fn execOne(arena: Allocator, meta: md.Metadata, source: []const u8, path: []const u8, mode: Mode, step_limit: u64, report: *rep.Report) RunError!void {
     const full = try buildSource(arena, meta, source, mode);
     const engine_mode: ljs.RunMode = if (mode == .strict) .strict else .sloppy;
-    const result = try ljs.evaluate(arena, full, engine_mode);
+    const result = try ljs.evaluateWithLimit(arena, full, engine_mode, step_limit);
     try report.add(classify(meta, result, mode, path));
 }
 

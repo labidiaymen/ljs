@@ -61,6 +61,11 @@ Test262  subset=test/language/expressions/addition  commit=<short-hash>
 > A non-zero exit from a *test* (a failing test) does **not** fail the harness process — only a
 > regression vs baseline or a setup error does. One crashing test never aborts the run (FR-006).
 
+> **M0 baseline format:** `--update-baseline` currently writes only a flat JSON array of passing
+> ids (`["path#mode", …]`) — a subset of [report-schema.json](./report-schema.json)'s
+> `passing_ids`. The full object schema (counts, `pinned_commit`, `improvements`, …) is adopted
+> in a later milestone. `improvements` are not yet computed/printed.
+
 ## 3. Benchmark — `zig build bench -- [options]`
 
 Run the shared benchmark set on **both** ljs and Node.js and report the comparison (US4,

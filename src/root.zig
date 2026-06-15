@@ -7,6 +7,8 @@ const engine = @import("engine.zig");
 pub const RunMode = engine.RunMode;
 pub const EvaluationResult = engine.EvaluationResult;
 pub const evaluate = engine.evaluate;
+pub const evaluateWithLimit = engine.evaluateWithLimit;
+pub const default_step_limit = engine.default_step_limit;
 
 test {
     // Pull in every module so `zig build test` runs their unit tests.

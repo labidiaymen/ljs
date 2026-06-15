@@ -128,13 +128,13 @@ deliberately slowed case is flagged as a regression (SC-007, SC-008).
 
 ### Tests for User Story 3 (write first, must fail)
 
-- [ ] T026 [P] [US3] Add a faulty fixture (infinite-loop / step-limit) in `tests/fixtures/faulty/` + a fault-isolation test (SC-002)
-- [ ] T027 [P] [US3] Write `tests/baseline_test.zig` (record → inject regression → detect — SC-004)
+- [x] T026 [P] [US3] Faulty fixture `tests/fixtures/faulty/steplimit.js` + threaded the interpreter step-cap (`evaluateWithLimit`, `--step-limit`). Verified: tight limit → 2 step_limit fails, run completes, no hang (SC-002)
+- [x] T027 [P] [US3] Regression-detection test (inline in `test262/report.zig`) — record → regress → detect (SC-004)
 
 ### Implementation for User Story 3
 
-- [ ] T028 [US3] Implement baseline JSON read/write per `contracts/report-schema.json` in `test262/report.zig`
-- [ ] T029 [US3] Implement regression/improvement compute (passing-id diff) + `--baseline`/`--update-baseline` flags + exit codes 0/1/2 in `test262/runner.zig` + `build.zig` — FR-009 (depends T021, T028)
+- [x] T028 [US3] Baseline read/write in `test262/report.zig` (`baselineBytes` emits a JSON id array; `parseIds` reads it) via `Io.Dir` writeFile/readFileAlloc — M0 subset of report-schema.json
+- [x] T029 [US3] `regressionsVs` (passing-id diff) + `--baseline`/`--update-baseline` flags + exit codes 0/1/2 in `test262/main.zig` — FR-009. Verified: clean run ok; injected regression → exit 1
 
 **Checkpoint**: all three stories independently functional.
 

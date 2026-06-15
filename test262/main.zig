@@ -18,6 +18,8 @@ pub fn main(init: std.process.Init) !void {
     const err = &err_fw.interface;
 
     var opts: runner.Options = .{ .path = "" };
+    var baseline_path: ?[]const u8 = null;
+    var update_baseline_path: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -33,11 +35,17 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--step-limit")) {
             i += 1;
             if (i < args.len) opts.step_limit = std.fmt.parseInt(u64, args[i], 10) catch opts.step_limit;
+        } else if (std.mem.eql(u8, a, "--baseline")) {
+            i += 1;
+            if (i < args.len) baseline_path = args[i];
+        } else if (std.mem.eql(u8, a, "--update-baseline")) {
+            i += 1;
+            if (i < args.len) update_baseline_path = args[i];
         }
     }
 
     if (opts.path.len == 0) {
-        try err.writeAll("usage: ljs-test262 --path <dir> [--mode strict|sloppy] [--harness-dir <dir>] [--step-limit N]\n");
+        try err.writeAll("usage: ljs-test262 --path <dir> [--mode strict|sloppy] [--harness-dir <dir>] [--step-limit N] [--baseline <file>] [--update-baseline <file>]\n");
         try err.flush();
         std.process.exit(2);
     }
@@ -54,6 +62,36 @@ pub fn main(init: std.process.Init) !void {
 
     try report.writeSummary(out, opts.path);
     try report.writeDetail(out);
+
+    if (update_baseline_path) |bp| {
+        const bytes = try report.baselineBytes(arena);
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = bp, .data = bytes }) catch {
+            try err.print("setup error: cannot write baseline '{s}'\n", .{bp});
+            try err.flush();
+            std.process.exit(2);
+        };
+        try out.print("  baseline written: {s}\n", .{bp});
+        try out.flush();
+        return;
+    }
+
+    if (baseline_path) |bp| {
+        const bytes = Io.Dir.cwd().readFileAlloc(io, bp, arena, .limited(8 << 20)) catch {
+            try err.print("setup error: cannot read baseline '{s}'\n", .{bp});
+            try err.flush();
+            std.process.exit(2);
+        };
+        const base_ids = try rep.parseIds(arena, bytes);
+        const regs = try report.regressionsVs(arena, base_ids);
+        if (regs.len > 0) {
+            try out.print("  REGRESSION: {d} test(s) no longer pass:\n", .{regs.len});
+            for (regs) |id| try out.print("    {s}\n", .{id});
+            try out.flush();
+            std.process.exit(1);
+        }
+        try out.writeAll("  conformance: ok (no regression vs baseline)\n");
+    }
+
     try out.flush();
 }
 

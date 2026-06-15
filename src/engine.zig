@@ -16,13 +16,21 @@ pub const EvaluationResult = union(enum) {
     step_limit,
 };
 
+pub const default_step_limit: u64 = 10_000_000;
+
 pub fn evaluate(arena: std.mem.Allocator, source: []const u8, mode: RunMode) error{OutOfMemory}!EvaluationResult {
+    return evaluateWithLimit(arena, source, mode, default_step_limit);
+}
+
+/// Like `evaluate`, but with an explicit interpreter step cap (the watchdog, research D8).
+/// The Test262 harness uses this to bound runaway tests deterministically.
+pub fn evaluateWithLimit(arena: std.mem.Allocator, source: []const u8, mode: RunMode, step_limit: u64) error{OutOfMemory}!EvaluationResult {
     _ = mode; // not yet observable for the M0 subset
     const program = Parser.parse(arena, source) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .syntax_error = @errorName(e) },
     };
-    var interp = Interpreter{ .arena = arena };
+    var interp = Interpreter{ .arena = arena, .step_limit = step_limit };
     const completion = interp.run(program) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.StepLimitExceeded => return .step_limit,

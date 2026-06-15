@@ -88,4 +88,91 @@ pub const Report = struct {
             });
         }
     }
+
+    // ── baseline / regression detection (US3, FR-009) ────────────────────────
+
+    fn isPassing(self: Report, arena: std.mem.Allocator, id: []const u8) std.mem.Allocator.Error!bool {
+        for (self.results.items) |r| {
+            if (r.outcome != .pass) continue;
+            const rid = try idFor(arena, r);
+            if (std.mem.eql(u8, rid, id)) return true;
+        }
+        return false;
+    }
+
+    /// Serialize the set of currently-passing test ids ("path#mode") as a JSON string array.
+    pub fn baselineBytes(self: Report, arena: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        try buf.appendSlice(arena, "[\n");
+        var first = true;
+        for (self.results.items) |r| {
+            if (r.outcome != .pass) continue;
+            if (!first) try buf.appendSlice(arena, ",\n");
+            first = false;
+            const line = try std.fmt.allocPrint(arena, "  \"{s}\"", .{try idFor(arena, r)});
+            try buf.appendSlice(arena, line);
+        }
+        try buf.appendSlice(arena, "\n]\n");
+        return buf.items;
+    }
+
+    /// Baseline ids that are no longer passing in this run (regressions). A baseline id that
+    /// now fails OR is skipped/absent counts as a regression (strict "a baseline pass must
+    /// still pass" definition, FR-009). O(baseline × results) — fine at M0 scale; switch to a
+    /// hash set of passing ids when the corpus grows.
+    pub fn regressionsVs(self: Report, arena: std.mem.Allocator, baseline_ids: []const []const u8) std.mem.Allocator.Error![]const []const u8 {
+        var regressed: std.ArrayList([]const u8) = .empty;
+        for (baseline_ids) |bid| {
+            if (!try self.isPassing(arena, bid)) try regressed.append(arena, bid);
+        }
+        return regressed.toOwnedSlice(arena);
+    }
 };
+
+fn idFor(arena: std.mem.Allocator, r: TestResult) std.mem.Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}#{s}", .{ r.path, @tagName(r.mode) });
+}
+
+/// Extract every JSON quoted string from `bytes` — the baseline is a flat string array,
+/// so each quoted token is a passing-test id. M0 assumption: ids are quote-free (`path#mode`)
+/// and the file is exactly what `baselineBytes` emits — no JSON-escape handling. Revisit if
+/// the full report-schema.json baseline (an object with keys) is ever adopted.
+pub fn parseIds(arena: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error![]const []const u8 {
+    var ids: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        if (bytes[i] != '"') continue;
+        i += 1;
+        const start = i;
+        while (i < bytes.len and bytes[i] != '"') i += 1;
+        try ids.append(arena, try arena.dupe(u8, bytes[start..i]));
+    }
+    return ids.toOwnedSlice(arena);
+}
+
+// ── tests (T027 / SC-004 logic) ─────────────────────────────────────────────
+const testing = std.testing;
+
+test "regression detection: baseline id no longer passing is flagged" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var report: Report = .{ .arena = a };
+    try report.add(.{ .path = "a.js", .mode = .strict, .outcome = .pass });
+    try report.add(.{ .path = "b.js", .mode = .strict, .outcome = .fail, .reason = .parse_error });
+
+    const baseline = try parseIds(a, try report.baselineBytes(a)); // currently only a.js#strict
+    try testing.expectEqual(@as(usize, 1), baseline.len);
+    try testing.expectEqualStrings("a.js#strict", baseline[0]);
+
+    // No regression when the same test still passes.
+    try testing.expectEqual(@as(usize, 0), (try report.regressionsVs(a, baseline)).len);
+
+    // Now a.js regresses → flagged.
+    var report2: Report = .{ .arena = a };
+    try report2.add(.{ .path = "a.js", .mode = .strict, .outcome = .fail, .reason = .parse_error });
+    const regs = try report2.regressionsVs(a, baseline);
+    try testing.expectEqual(@as(usize, 1), regs.len);
+    try testing.expectEqualStrings("a.js#strict", regs[0]);
+}
