@@ -65,13 +65,7 @@ pub const Interpreter = struct {
             },
             .block => |stmts| {
                 // §14.2 Block — runs in a fresh declarative environment (lexical scope).
-                const child = try Environment.create(self.arena, env);
-                var last: Completion = .{ .normal = .undefined };
-                for (stmts) |s| {
-                    last = try self.evalStmt(s, child);
-                    if (last.isAbrupt()) return last;
-                }
-                return last;
+                return self.runBlock(stmts, try Environment.create(self.arena, env));
             },
             .func_decl => |f| {
                 // §15.2 — bind a function object to its name in the current scope.
@@ -88,7 +82,87 @@ pub const Interpreter = struct {
                 }
                 return .{ .ret = .undefined };
             },
+            .if_stmt => |s| {
+                // §14.6 IfStatement.
+                const cc = try self.evalExpr(s.cond, env);
+                if (cc.isAbrupt()) return cc;
+                if (toBoolean(cc.normal)) return self.evalStmt(s.then.*, env);
+                if (s.otherwise) |els| return self.evalStmt(els.*, env);
+                return .{ .normal = .undefined };
+            },
+            .while_stmt => |s| {
+                // §14.7.3 WhileStatement.
+                while (true) {
+                    const cc = try self.evalExpr(s.cond, env);
+                    if (cc.isAbrupt()) return cc;
+                    if (!toBoolean(cc.normal)) break;
+                    const bc = try self.evalStmt(s.body.*, env);
+                    switch (bc) {
+                        .normal, .cont => {},
+                        .brk => break,
+                        .ret, .throw => return bc,
+                    }
+                }
+                return .{ .normal = .undefined };
+            },
+            .for_stmt => |s| {
+                // §14.7.4 ForStatement — loop bindings in a fresh scope.
+                const loop_env = try Environment.create(self.arena, env);
+                if (s.init) |i| {
+                    const ic = try self.evalStmt(i.*, loop_env);
+                    if (ic.isAbrupt()) return ic;
+                }
+                while (true) {
+                    if (s.cond) |t| {
+                        const tc = try self.evalExpr(t, loop_env);
+                        if (tc.isAbrupt()) return tc;
+                        if (!toBoolean(tc.normal)) break;
+                    }
+                    const bc = try self.evalStmt(s.body.*, loop_env);
+                    switch (bc) {
+                        .normal, .cont => {}, // continue falls through to the update
+                        .brk => break,
+                        .ret, .throw => return bc,
+                    }
+                    if (s.update) |u| {
+                        const uc = try self.evalExpr(u, loop_env);
+                        if (uc.isAbrupt()) return uc;
+                    }
+                }
+                return .{ .normal = .undefined };
+            },
+            .throw_stmt => |e| {
+                // §14.14 ThrowStatement.
+                const c = try self.evalExpr(e, env);
+                if (c.isAbrupt()) return c;
+                return .{ .throw = c.normal };
+            },
+            .try_stmt => |s| {
+                // §14.15 TryStatement — catch handles a throw; finally's abrupt completion wins.
+                var result = try self.runBlock(s.block, try Environment.create(self.arena, env));
+                if (result == .throw and s.catch_block != null) {
+                    const catch_env = try Environment.create(self.arena, env);
+                    if (s.catch_param) |p| try catch_env.declare(p, result.throw, true, true);
+                    result = try self.runBlock(s.catch_block.?, catch_env);
+                }
+                if (s.finally_block) |fb| {
+                    const fc = try self.runBlock(fb, try Environment.create(self.arena, env));
+                    if (fc.isAbrupt()) return fc;
+                }
+                return result;
+            },
+            .break_stmt => return .brk,
+            .continue_stmt => return .cont,
         }
+    }
+
+    fn runBlock(self: *Interpreter, stmts: []const ast.Stmt, env: *Environment) EvalError!Completion {
+        var last: Completion = .{ .normal = .undefined };
+        for (stmts) |s| {
+            last = try self.evalStmt(s, env);
+            if (last.isAbrupt()) return last;
+        }
+        return last;
     }
 
     // ── expressions ─────────────────────────────────────────────────────────

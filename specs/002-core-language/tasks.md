@@ -38,9 +38,9 @@ folded into plan.md (Phase 0/1) for M1 to avoid over-producing artifacts.
 
 ## Phase D — US4 Control flow & exceptions (P2)  [Cycle D]
 **Goal**: `if/else`, `while`, `for`, `throw`/`try`/`catch`/`finally`. **Test**: `for` sum 0..9 → 45; throw caught.
-- [ ] M1-T040 [US4] Parser: `if/else`, `while`, `for(;;)`, `throw`, `try/catch/finally`
-- [ ] M1-T041 [US4] Interpreter: thread break/continue/return/throw completions; `try` runs matching `catch`, `finally` always runs — §14
-- [ ] M1-T042 [P] [US4] `tests/controlflow_test.zig` (loops, if, throw/catch/finally ordering)
+- [x] M1-T040 [US4] Parser: `if/else`, `while`, `for(;;)`, `throw`, `try/catch/finally`, `break`, `continue`
+- [x] M1-T041 [US4] Interpreter: break/continue/return/throw completions threaded through loops; `try` runs matching `catch` (binds param), `finally` always runs and its abrupt completion wins — §14. Terminating recursion (fib) now works.
+- [x] M1-T042 [P] [US4] Control-flow tests (inline in engine.zig): if/else, while, for, break, fib recursion, throw/catch/finally ordering
 
 ## Phase E — US5 Built-ins + harness execution (P2)  [Cycle E]
 **Goal**: flip the real-suite number off zero. **Test**: `assert.js` loads; a real slice passes > 0.

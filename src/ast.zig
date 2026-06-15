@@ -55,6 +55,18 @@ pub const Stmt = union(enum) {
     block: []const Stmt, // §14.2
     func_decl: *const Function, // §15.2 function declaration
     ret: ?*const Node, // §14.10 return statement
+    if_stmt: struct { cond: *const Node, then: *const Stmt, otherwise: ?*const Stmt }, // §14.6
+    while_stmt: struct { cond: *const Node, body: *const Stmt }, // §14.7.3
+    for_stmt: struct { init: ?*const Stmt, cond: ?*const Node, update: ?*const Node, body: *const Stmt }, // §14.7.4
+    throw_stmt: *const Node, // §14.14
+    try_stmt: struct { // §14.15
+        block: []const Stmt,
+        catch_param: ?[]const u8,
+        catch_block: ?[]const Stmt,
+        finally_block: ?[]const Stmt,
+    },
+    break_stmt, // §14.9
+    continue_stmt, // §14.8
 };
 
 pub const Program = struct { statements: []const Stmt };

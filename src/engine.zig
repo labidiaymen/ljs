@@ -125,6 +125,25 @@ test "functions: calling a non-function throws; runaway recursion → RangeError
     try expectThrows("function f() { return f(); } f()"); // unbounded recursion → RangeError (depth guard)
 }
 
+test "control flow: if/while/for, break/continue (US4)" {
+    try expectNumber("var x = 5; if (x > 3) x = 100; x", 100);
+    try expectNumber("var x = 1; if (x > 3) { x = 100; } else { x = 2; } x", 2);
+    try expectNumber("var s = 0; var i = 0; while (i < 5) { s = s + i; i = i + 1; } s", 10);
+    try expectNumber("var s = 0; for (var i = 0; i < 10; i = i + 1) { s = s + i; } s", 45);
+    try expectNumber("var s = 0; for (var i = 0; i < 10; i = i + 1) { if (i > 4) break; s = s + i; } s", 10);
+}
+
+test "control flow: terminating recursion now works (fib)" {
+    try expectNumber("function fib(n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); } fib(10)", 55);
+}
+
+test "control flow: throw / try / catch / finally (US4)" {
+    try expectNumber("var x = 0; try { throw 7; } catch (e) { x = e; } x", 7);
+    try expectNumber("var x = 0; try { x = 1; } finally { x = x + 10; } x", 11);
+    // finally runs even when catch rethrows is out of scope here; basic ordering:
+    try expectNumber("var x = 0; try { throw 1; } catch (e) { x = e; } finally { x = x + 100; } x", 101);
+}
+
 test "deep recursion throws RangeError, not a segfault" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

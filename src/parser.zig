@@ -45,6 +45,79 @@ pub const Parser = struct {
         return p;
     }
 
+    fn allocStmt(self: *Parser, stmt: ast.Stmt) ParseError!*const ast.Stmt {
+        const p = try self.arena.create(ast.Stmt);
+        p.* = stmt;
+        return p;
+    }
+
+    fn parseIf(self: *Parser) ParseError!ast.Stmt {
+        _ = self.advance(); // if
+        _ = try self.expect(.lparen);
+        const cond = try self.parseAssignment();
+        _ = try self.expect(.rparen);
+        const then = try self.allocStmt(try self.parseStmt());
+        var otherwise: ?*const ast.Stmt = null;
+        if (self.peek().kind == .kw_else) {
+            _ = self.advance();
+            otherwise = try self.allocStmt(try self.parseStmt());
+        }
+        return .{ .if_stmt = .{ .cond = cond, .then = then, .otherwise = otherwise } };
+    }
+
+    fn parseWhile(self: *Parser) ParseError!ast.Stmt {
+        _ = self.advance(); // while
+        _ = try self.expect(.lparen);
+        const cond = try self.parseAssignment();
+        _ = try self.expect(.rparen);
+        const body = try self.allocStmt(try self.parseStmt());
+        return .{ .while_stmt = .{ .cond = cond, .body = body } };
+    }
+
+    fn parseFor(self: *Parser) ParseError!ast.Stmt {
+        _ = self.advance(); // for
+        _ = try self.expect(.lparen);
+        var init_stmt: ?*const ast.Stmt = null;
+        switch (self.peek().kind) {
+            .semicolon => _ = self.advance(),
+            .kw_var, .kw_let, .kw_const => init_stmt = try self.allocStmt(try self.parseDecl()), // parseDecl eats the ;
+            else => {
+                init_stmt = try self.allocStmt(.{ .expr = try self.parseAssignment() });
+                _ = try self.expect(.semicolon);
+            },
+        }
+        var cond: ?*const ast.Node = null;
+        if (self.peek().kind != .semicolon) cond = try self.parseAssignment();
+        _ = try self.expect(.semicolon);
+        var update: ?*const ast.Node = null;
+        if (self.peek().kind != .rparen) update = try self.parseAssignment();
+        _ = try self.expect(.rparen);
+        const body = try self.allocStmt(try self.parseStmt());
+        return .{ .for_stmt = .{ .init = init_stmt, .cond = cond, .update = update, .body = body } };
+    }
+
+    fn parseTry(self: *Parser) ParseError!ast.Stmt {
+        _ = self.advance(); // try
+        const block = try self.parseBlock();
+        var catch_param: ?[]const u8 = null;
+        var catch_block: ?[]const ast.Stmt = null;
+        var finally_block: ?[]const ast.Stmt = null;
+        if (self.peek().kind == .kw_catch) {
+            _ = self.advance();
+            if (self.peek().kind == .lparen) {
+                _ = self.advance();
+                catch_param = (try self.expect(.identifier)).lexeme;
+                _ = try self.expect(.rparen);
+            }
+            catch_block = try self.parseBlock();
+        }
+        if (self.peek().kind == .kw_finally) {
+            _ = self.advance();
+            finally_block = try self.parseBlock();
+        }
+        return .{ .try_stmt = .{ .block = block, .catch_param = catch_param, .catch_block = catch_block, .finally_block = finally_block } };
+    }
+
     // ── statements ──────────────────────────────────────────────────────────
 
     fn parseProgram(self: *Parser) ParseError!ast.Program {
@@ -70,6 +143,26 @@ pub const Parser = struct {
                 if (k != .semicolon and k != .rbrace and k != .eof) arg = try self.parseAssignment();
                 if (self.peek().kind == .semicolon) _ = self.advance();
                 return .{ .ret = arg };
+            },
+            .kw_if => return self.parseIf(),
+            .kw_while => return self.parseWhile(),
+            .kw_for => return self.parseFor(),
+            .kw_try => return self.parseTry(),
+            .kw_throw => {
+                _ = self.advance();
+                const e = try self.parseAssignment();
+                if (self.peek().kind == .semicolon) _ = self.advance();
+                return .{ .throw_stmt = e };
+            },
+            .kw_break => {
+                _ = self.advance();
+                if (self.peek().kind == .semicolon) _ = self.advance();
+                return .break_stmt;
+            },
+            .kw_continue => {
+                _ = self.advance();
+                if (self.peek().kind == .semicolon) _ = self.advance();
+                return .continue_stmt;
             },
             else => {
                 const e = try self.parseAssignment();

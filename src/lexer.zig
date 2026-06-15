@@ -15,6 +15,16 @@ pub const TokenKind = enum {
     kw_function,
     kw_return,
     kw_this,
+    kw_if,
+    kw_else,
+    kw_while,
+    kw_for,
+    kw_throw,
+    kw_try,
+    kw_catch,
+    kw_finally,
+    kw_break,
+    kw_continue,
     identifier,
     plus,
     minus,
@@ -128,6 +138,16 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, word, "function")) return .{ .kind = .kw_function, .lexeme = word };
             if (std.mem.eql(u8, word, "return")) return .{ .kind = .kw_return, .lexeme = word };
             if (std.mem.eql(u8, word, "this")) return .{ .kind = .kw_this, .lexeme = word };
+            if (std.mem.eql(u8, word, "if")) return .{ .kind = .kw_if, .lexeme = word };
+            if (std.mem.eql(u8, word, "else")) return .{ .kind = .kw_else, .lexeme = word };
+            if (std.mem.eql(u8, word, "while")) return .{ .kind = .kw_while, .lexeme = word };
+            if (std.mem.eql(u8, word, "for")) return .{ .kind = .kw_for, .lexeme = word };
+            if (std.mem.eql(u8, word, "throw")) return .{ .kind = .kw_throw, .lexeme = word };
+            if (std.mem.eql(u8, word, "try")) return .{ .kind = .kw_try, .lexeme = word };
+            if (std.mem.eql(u8, word, "catch")) return .{ .kind = .kw_catch, .lexeme = word };
+            if (std.mem.eql(u8, word, "finally")) return .{ .kind = .kw_finally, .lexeme = word };
+            if (std.mem.eql(u8, word, "break")) return .{ .kind = .kw_break, .lexeme = word };
+            if (std.mem.eql(u8, word, "continue")) return .{ .kind = .kw_continue, .lexeme = word };
             return .{ .kind = .identifier, .lexeme = word };
         }
 
