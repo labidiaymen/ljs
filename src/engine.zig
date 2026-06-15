@@ -205,6 +205,23 @@ test "E4: ternary, switch, compound assignment (US5)" {
     try expectNumber("var s = 0; for (var i = 0; i < 5; i++) { s += i; } s", 10);
 }
 
+test "M2 arrays: literals, index, length, methods (US1)" {
+    try expectNumber("[10, 20, 30].length", 3);
+    try expectNumber("[10, 20, 30][1]", 20);
+    try expectNumber("var a = [1, 2]; a.push(3); a[2]", 3);
+    try expectNumber("var a = [1, 2, 3]; a.push(4); a.length", 4);
+    try expectNumber("[1, 2, 3].indexOf(2)", 1);
+    try expectNumber("[5, 6, 7].pop()", 7);
+    try expectBool("[1, 2, 3].includes(2)", true);
+    try expectBool("Array.isArray([1, 2])", true);
+    try expectBool("Array.isArray(5)", false);
+    try expectStr("[1, 2, 3].join(\"-\")", "1-2-3");
+    try expectNumber("var a = []; a[3] = 9; a.length", 4); // index assignment extends length
+    try expectNumber("[1, 2, 3, 4].slice(1, 3).length", 2);
+    try expectNumber("[1, 2, 3].map(function (x) { return x * 2; })[2]", 6);
+    try expectNumber("var s = 0; [1, 2, 3, 4].forEach(function (x) { s += x; }); s", 10);
+}
+
 test "deep recursion throws RangeError, not a segfault" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

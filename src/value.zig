@@ -25,7 +25,14 @@ pub const Value = union(enum) {
             .number => |n| try writeNumber(w, n),
             .string => |s| try w.print("\"{s}\"", .{s}),
             .object => |o| {
-                if (o.kind == .function) {
+                if (o.kind == .array) {
+                    try w.writeAll("[");
+                    for (o.elements.items, 0..) |el, i| {
+                        if (i > 0) try w.writeAll(", ");
+                        try el.writeDisplay(w);
+                    }
+                    try w.writeAll("]");
+                } else if (o.kind == .function) {
                     try w.writeAll("[Function (anonymous)]");
                 } else if (o.get("name")) |nv| { // error-like: "Name: message"
                     if (nv == .string) {

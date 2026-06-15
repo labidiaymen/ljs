@@ -31,6 +31,7 @@ pub const Node = union(enum) {
     binary: struct { op: BinaryOp, left: *const Node, right: *const Node },
     assign: struct { name: []const u8, value: *const Node }, // §13.15 Assignment (identifier target)
     object_literal: []const Property, // §13.2.5  { k: v, ... }
+    array_literal: []const *const Node, // §13.2.4  [ a, b, ... ]
     member: struct { object: *const Node, name: []const u8 }, // §13.3.2  a.b
     index: struct { object: *const Node, key: *const Node }, // §13.3.3  a[expr]
     assign_member: struct { object: *const Node, name: []const u8, value: *const Node }, // a.b = v

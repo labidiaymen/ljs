@@ -7,17 +7,20 @@ const ast = @import("ast.zig");
 const Value = @import("value.zig").Value;
 const Environment = @import("environment.zig").Environment;
 
-pub const Kind = enum { ordinary, function };
+pub const Kind = enum { ordinary, function, array };
 
 /// Built-in (Zig-implemented) function identity. Dispatched by the interpreter's callNative;
 /// `none` means an ordinary AST-closure function. Avoids an fn-pointer ↔ interpreter import
-/// cycle — the behavior lives in the interpreter, keyed by this id.
+/// cycle — the behavior lives in the interpreter, keyed by this id (+ `native_name` within a
+/// family, e.g. array_method "push").
 pub const NativeId = enum {
     none,
     error_ctor, // Error / TypeError / … — `native_name` is the error name
     string_ctor, // String(x)
     object_ctor, // Object()
     object_to_string, // Object.prototype.toString
+    array_ctor, // Array(...)
+    array_method, // Array.prototype.<native_name> / Array.isArray
 };
 
 /// The closure captured by a function object: parameter names, body, and defining scope.
@@ -35,6 +38,7 @@ pub const Object = struct {
     call: ?FunctionData = null, // present iff kind == .function (and native == .none)
     native: NativeId = .none,
     native_name: []const u8 = "",
+    elements: std.ArrayListUnmanaged(Value) = .empty, // backing store iff kind == .array
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);
@@ -49,6 +53,13 @@ pub const Object = struct {
         // §10.2.4: every ordinary function gets a `.prototype` object (used by `new`/`instanceof`).
         const proto = try create(arena, null);
         try obj.set("prototype", .{ .object = proto });
+        return obj;
+    }
+
+    /// §23.1 An Array exotic object (backed by `elements`), proto-linked to Array.prototype.
+    pub fn createArray(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
+        const obj = try create(arena, prototype);
+        obj.kind = .array;
         return obj;
     }
 

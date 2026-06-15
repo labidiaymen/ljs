@@ -479,6 +479,20 @@ pub const Parser = struct {
                 return self.alloc(.{ .identifier = t.lexeme });
             },
             .lbrace => return self.parseObjectLiteral(),
+            .lbracket => { // §13.2.4 array literal
+                _ = self.advance();
+                var elems: std.ArrayList(*const ast.Node) = .empty;
+                while (self.peek().kind != .rbracket and self.peek().kind != .eof) {
+                    try elems.append(self.arena, try self.parseAssignment());
+                    if (self.peek().kind == .comma) {
+                        _ = self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                _ = try self.expect(.rbracket);
+                return self.alloc(.{ .array_literal = elems.items });
+            },
             .kw_function => {
                 _ = self.advance();
                 return self.alloc(.{ .function = try self.parseFunction() });

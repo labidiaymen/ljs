@@ -240,6 +240,16 @@ pub const Interpreter = struct {
                 }
                 return .{ .normal = .{ .object = obj } };
             },
+            .array_literal => |elems| {
+                // §13.2.4 ArrayLiteral
+                const arr = try Object.createArray(self.arena, self.arrayProto());
+                for (elems) |e| {
+                    const c = try self.evalExpr(e, env);
+                    if (c.isAbrupt()) return c;
+                    try arr.elements.append(self.arena, c.normal);
+                }
+                return .{ .normal = .{ .object = arr } };
+            },
             .member => |m| {
                 const oc = try self.evalExpr(m.object, env);
                 if (oc.isAbrupt()) return oc;
@@ -439,7 +449,16 @@ pub const Interpreter = struct {
     /// have no own properties in M1 (no boxing yet) → undefined.
     fn getProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
         switch (base) {
-            .object => |o| return .{ .normal = o.get(key) orelse .undefined },
+            .object => |o| {
+                if (o.kind == .array) {
+                    if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(o.elements.items.len) } };
+                    if (parseIndex(key)) |i| {
+                        return .{ .normal = if (i < o.elements.items.len) o.elements.items[i] else .undefined };
+                    }
+                    // else fall through to the prototype chain (Array.prototype methods)
+                }
+                return .{ .normal = o.get(key) orelse .undefined };
+            },
             .undefined, .null => return self.throwError("TypeError", "Cannot read properties of null or undefined"),
             else => return .{ .normal = .undefined },
         }
@@ -449,6 +468,23 @@ pub const Interpreter = struct {
     fn setProperty(self: *Interpreter, base: Value, key: []const u8, value: Value) EvalError!Completion {
         switch (base) {
             .object => |o| {
+                if (o.kind == .array) {
+                    if (std.mem.eql(u8, key, "length")) {
+                        const n = toNumber(value);
+                        const new_len: usize = if (n >= 0 and n < 1e9) @intFromFloat(n) else o.elements.items.len;
+                        if (new_len < o.elements.items.len) {
+                            o.elements.shrinkRetainingCapacity(new_len);
+                        } else {
+                            while (o.elements.items.len < new_len) try o.elements.append(o.arena, .undefined);
+                        }
+                        return .{ .normal = value };
+                    }
+                    if (parseIndex(key)) |i| {
+                        while (o.elements.items.len <= i) try o.elements.append(o.arena, .undefined);
+                        o.elements.items[i] = value;
+                        return .{ .normal = value };
+                    }
+                }
                 try o.set(key, value);
                 return .{ .normal = value };
             },
@@ -522,16 +558,33 @@ pub const Interpreter = struct {
     }
 
     fn errorProto(self: *Interpreter, kind: []const u8) ?*Object {
+        return self.globalProto(kind);
+    }
+
+    /// The `.prototype` object of a named global constructor (Error/Array/…), or null.
+    fn globalProto(self: *Interpreter, name: []const u8) ?*Object {
         const g = self.globals orelse return null;
-        const b = g.lookup(kind) orelse return null;
+        const b = g.lookup(name) orelse return null;
         if (b.value != .object) return null;
         const pv = b.value.object.get("prototype") orelse return null;
         return if (pv == .object) pv.object else null;
     }
 
+    fn arrayProto(self: *Interpreter) ?*Object {
+        return self.globalProto("Array");
+    }
+
     /// Dispatch a built-in function (§19/§20). Behavior keyed by `func.native`.
     fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
-        _ = this_val;
+        switch (func.native) {
+            .array_ctor => {
+                const arr = try Object.createArray(self.arena, self.arrayProto());
+                for (args) |a| try arr.elements.append(self.arena, a);
+                return .{ .normal = .{ .object = arr } };
+            },
+            .array_method => return self.arrayMethod(func.native_name, this_val, args),
+            else => {},
+        }
         switch (func.native) {
             .error_ctor => {
                 const proto: ?*Object = blk: {
@@ -556,8 +609,78 @@ pub const Interpreter = struct {
                 return .{ .normal = .{ .object = try Object.create(self.arena, null) } };
             },
             .object_to_string => return .{ .normal = .{ .string = "[object Object]" } },
+            .array_ctor, .array_method => unreachable, // handled in the first switch
             .none => unreachable,
         }
+    }
+
+    /// §23.1.3 Array.prototype.<name> (+ Array.isArray). `this` is the receiver array.
+    fn arrayMethod(self: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
+        if (std.mem.eql(u8, name, "isArray")) {
+            const v: Value = if (args.len > 0) args[0] else .undefined;
+            return .{ .normal = .{ .boolean = v == .object and v.object.kind == .array } };
+        }
+        if (this_val != .object or this_val.object.kind != .array) {
+            return self.throwError("TypeError", "Array.prototype method called on non-array");
+        }
+        const arr = this_val.object;
+        const eql = std.mem.eql;
+        if (eql(u8, name, "push")) {
+            for (args) |a| try arr.elements.append(self.arena, a);
+            return .{ .normal = .{ .number = @floatFromInt(arr.elements.items.len) } };
+        }
+        if (eql(u8, name, "pop")) {
+            if (arr.elements.pop()) |v| return .{ .normal = v };
+            return .{ .normal = .undefined };
+        }
+        if (eql(u8, name, "indexOf")) {
+            const target: Value = if (args.len > 0) args[0] else .undefined;
+            for (arr.elements.items, 0..) |el, i| {
+                if (strictEquals(el, target)) return .{ .normal = .{ .number = @floatFromInt(i) } };
+            }
+            return .{ .normal = .{ .number = -1 } };
+        }
+        if (eql(u8, name, "includes")) {
+            const target: Value = if (args.len > 0) args[0] else .undefined;
+            for (arr.elements.items) |el| {
+                if (strictEquals(el, target)) return .{ .normal = .{ .boolean = true } };
+            }
+            return .{ .normal = .{ .boolean = false } };
+        }
+        if (eql(u8, name, "join")) {
+            const sep = if (args.len > 0 and args[0] != .undefined) try self.toString(args[0]) else ",";
+            var buf: std.ArrayList(u8) = .empty;
+            for (arr.elements.items, 0..) |el, i| {
+                if (i > 0) try buf.appendSlice(self.arena, sep);
+                if (el != .undefined and el != .null) try buf.appendSlice(self.arena, try self.toString(el));
+            }
+            return .{ .normal = .{ .string = buf.items } };
+        }
+        if (eql(u8, name, "slice")) {
+            const len = arr.elements.items.len;
+            const start = relIndex(if (args.len > 0) args[0] else .undefined, len, 0);
+            const end = relIndex(if (args.len > 1) args[1] else .undefined, len, len);
+            const out = try Object.createArray(self.arena, self.arrayProto());
+            var i = start;
+            while (i < end) : (i += 1) try out.elements.append(self.arena, arr.elements.items[i]);
+            return .{ .normal = .{ .object = out } };
+        }
+        if (eql(u8, name, "forEach") or eql(u8, name, "map")) {
+            if (args.len == 0 or args[0] != .object or args[0].object.kind != .function) {
+                return self.throwError("TypeError", "callback is not a function");
+            }
+            const cb = args[0].object;
+            const is_map = eql(u8, name, "map");
+            const out: ?*Object = if (is_map) try Object.createArray(self.arena, self.arrayProto()) else null;
+            for (arr.elements.items, 0..) |el, i| {
+                const r = try self.callFunction(cb, &.{ el, .{ .number = @floatFromInt(i) }, this_val }, .undefined);
+                if (r.isAbrupt()) return r;
+                if (out) |o| try o.elements.append(self.arena, r.normal);
+            }
+            if (out) |o| return .{ .normal = .{ .object = o } };
+            return .{ .normal = .undefined };
+        }
+        return .{ .normal = .undefined };
     }
 
     /// §7.1.17 ToString (subset; primitives only).
@@ -568,7 +691,16 @@ pub const Interpreter = struct {
             .null => "null",
             .boolean => |b| if (b) "true" else "false",
             .number => |n| numberToString(self.arena, n),
-            .object => "[object Object]", // §20.1.3.6 (M1 stub; ToPrimitive deferred)
+            .object => |o| blk: {
+                if (o.kind != .array) break :blk "[object Object]"; // §20.1.3.6 (ToPrimitive deferred)
+                // §23.1.3.x Array.prototype.toString → join(",")
+                var buf: std.ArrayList(u8) = .empty;
+                for (o.elements.items, 0..) |el, i| {
+                    if (i > 0) try buf.appendSlice(self.arena, ",");
+                    if (el != .undefined and el != .null) try buf.appendSlice(self.arena, try self.toString(el));
+                }
+                break :blk buf.items;
+            },
         };
     }
 };
@@ -622,6 +754,27 @@ fn relational(l: Value, r: Value, op: RelOp) bool {
         .le => a <= b,
         .ge => a >= b,
     };
+}
+
+/// Canonical array-index string ("0".."N") → usize, else null (so "length"/method names route
+/// to the property/prototype path).
+fn parseIndex(key: []const u8) ?usize {
+    if (key.len == 0) return null;
+    for (key) |c| if (c < '0' or c > '9') return null;
+    return std.fmt.parseInt(usize, key, 10) catch null;
+}
+
+/// §23.1.3 relative index (negative counts from the end), clamped to [0, len].
+fn relIndex(v: Value, len: usize, default: usize) usize {
+    if (v == .undefined) return default;
+    const n = toNumber(v);
+    if (std.math.isNan(n)) return 0;
+    const flen: f64 = @floatFromInt(len);
+    var idx = n;
+    if (idx < 0) idx += flen;
+    if (idx < 0) idx = 0;
+    if (idx > flen) idx = flen;
+    return @intFromFloat(idx);
 }
 
 /// §13.5.3 The typeof Operator.

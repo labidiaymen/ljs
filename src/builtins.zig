@@ -34,4 +34,18 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         }
     }
     try env.declare("Object", .{ .object = object_fn }, true, true);
+
+    // §23.1 Array — constructor, Array.prototype methods, Array.isArray. Array literals
+    // proto-link to this Array.prototype (interpreter.arrayProto looks it up here).
+    const array_fn = try Object.createNative(arena, .array_ctor, "Array");
+    const array_methods = [_][]const u8{ "push", "pop", "indexOf", "includes", "join", "slice", "forEach", "map" };
+    if (array_fn.get("prototype")) |pv| {
+        if (pv == .object) {
+            for (array_methods) |m| {
+                try pv.object.set(m, .{ .object = try Object.createNative(arena, .array_method, m) });
+            }
+        }
+    }
+    try array_fn.set("isArray", .{ .object = try Object.createNative(arena, .array_method, "isArray") });
+    try env.declare("Array", .{ .object = array_fn }, true, true);
 }
