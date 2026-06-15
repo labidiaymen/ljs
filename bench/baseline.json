@@ -2,16 +2,20 @@
   "tolerance_pct": 15.0,
   "cases": {
     "arith_mix.js": {
-      "ljs_ms_median": 9.119,
-      "ljs_ms_min": 8.598
+      "ljs_ms_median": 9.073,
+      "ljs_ms_min": 8.845
     },
     "arith_sum.js": {
-      "ljs_ms_median": 8.972,
-      "ljs_ms_min": 8.285
+      "ljs_ms_median": 9.293,
+      "ljs_ms_min": 8.126
+    },
+    "loop_sum.js": {
+      "ljs_ms_median": 38.43,
+      "ljs_ms_min": 37.844
     },
     "string_cat.js": {
-      "ljs_ms_median": 9.395,
-      "ljs_ms_min": 9.036
+      "ljs_ms_median": 9.817,
+      "ljs_ms_min": 8.902
     }
   }
 }

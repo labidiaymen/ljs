@@ -81,6 +81,11 @@ Functions are objects with a `[[Call]]` (an AST closure or a native Zig fn).
   built-ins + global env), **E3** (wire harness + tighten classification + first real passes).
   `JSON` is NOT needed (assert.js guards `typeof JSON !== "undefined"`). One cycle per
   sub-phase, each gated as usual.
+- **D7 (further amendment, after E3 wired the harness)**: loading the prelude revealed
+  `sta.js`/`assert.js` ALSO use ternary `?:`, `switch`, and compound assignment (`+=`) — the
+  prelude doesn't even parse without them. Added **Cycle E4** (those operators); the
+  conformance flip (SC-003, pass > 0) moves to E4. E3 still delivered real value: harness
+  loading + io threading + name-based negative classification + the compute bench.
 
 ## Phase 1 — Design artifacts
 - `data-model.md`: Value(+object), Object, Property/Descriptor, Environment, Binding, Reference, Completion(extended), Function, Error.

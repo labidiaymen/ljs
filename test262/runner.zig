@@ -23,6 +23,14 @@ pub const Options = struct {
 pub const RunError = error{ OpenFailed, OutOfMemory };
 
 pub fn run(io: std.Io, arena: Allocator, opts: Options, report: *rep.Report) RunError!void {
+    // Read the default harness prelude (sta.js + assert.js) once; reused for every non-raw test.
+    var prelude: []const u8 = "";
+    if (opts.harness_dir) |hdir| {
+        const sta = readHarness(io, arena, hdir, "sta.js") catch "";
+        const assert_js = readHarness(io, arena, hdir, "assert.js") catch "";
+        prelude = std.mem.concat(arena, u8, &.{ sta, "\n", assert_js, "\n" }) catch "";
+    }
+
     var dir = std.Io.Dir.cwd().openDir(io, opts.path, .{ .iterate = true }) catch return RunError.OpenFailed;
     defer dir.close(io);
 
@@ -37,14 +45,19 @@ pub fn run(io: std.Io, arena: Allocator, opts: Options, report: *rep.Report) Run
 
         const source = dir.readFileAlloc(io, entry.path, arena, .limited(8 << 20)) catch continue;
         const path_owned = try arena.dupe(u8, entry.path); // entry.path is invalidated on next()
-        try runOne(arena, opts, source, path_owned, report);
+        try runOne(io, arena, opts, prelude, source, path_owned, report);
     }
 }
 
-fn runOne(arena: Allocator, opts: Options, source: []const u8, path: []const u8, report: *rep.Report) RunError!void {
+fn readHarness(io: std.Io, arena: Allocator, hdir: []const u8, name: []const u8) ![]const u8 {
+    const path = try std.fs.path.join(arena, &.{ hdir, name });
+    return std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 << 20));
+}
+
+fn runOne(io: std.Io, arena: Allocator, opts: Options, prelude: []const u8, source: []const u8, path: []const u8, report: *rep.Report) RunError!void {
     const meta = md.parse(arena, source) catch return; // not a test (no frontmatter) → skip silently
 
-    // Unsupported execution modes at M0 → skip (not fail).
+    // Unsupported execution modes at M1 → skip (not fail).
     if (meta.flags.module or meta.flags.is_async) {
         try report.add(.{ .path = path, .mode = .strict, .outcome = .skip, .reason = .unsupported_flag });
         return;
@@ -60,25 +73,32 @@ fn runOne(arena: Allocator, opts: Options, source: []const u8, path: []const u8,
         run_sloppy = run_sloppy and m == .sloppy;
     }
 
-    if (run_strict) try execOne(arena, meta, source, path, .strict, opts.step_limit, report);
-    if (run_sloppy) try execOne(arena, meta, source, path, .sloppy, opts.step_limit, report);
+    if (run_strict) try execOne(io, arena, opts, prelude, meta, source, path, .strict, report);
+    if (run_sloppy) try execOne(io, arena, opts, prelude, meta, source, path, .sloppy, report);
 }
 
-fn execOne(arena: Allocator, meta: md.Metadata, source: []const u8, path: []const u8, mode: Mode, step_limit: u64, report: *rep.Report) RunError!void {
-    const full = try buildSource(arena, meta, source, mode);
+fn execOne(io: std.Io, arena: Allocator, opts: Options, prelude: []const u8, meta: md.Metadata, source: []const u8, path: []const u8, mode: Mode, report: *rep.Report) RunError!void {
+    const full = try buildSource(io, arena, opts, prelude, meta, source, mode);
     const engine_mode: ljs.RunMode = if (mode == .strict) .strict else .sloppy;
-    const result = try ljs.evaluateWithLimit(arena, full, engine_mode, step_limit);
+    const result = try ljs.evaluateWithLimit(arena, full, engine_mode, opts.step_limit);
     try report.add(classify(meta, result, mode, path));
 }
 
-/// Assemble the source fed to the engine: a strict-mode prologue for non-raw strict runs, then
-/// the test source. NOTE (M0): Test262 harness helpers (sta.js/assert.js + `includes`) are NOT
-/// loaded yet — the trivial evaluator can't run them (research D7). `opts.harness_dir` is
-/// reserved for when the engine supports functions/objects.
-fn buildSource(arena: Allocator, meta: md.Metadata, source: []const u8, mode: Mode) RunError![]const u8 {
+/// Assemble the source fed to the engine (INTERPRETING.md): strict prologue (non-raw strict),
+/// then the harness prelude (sta.js+assert.js) and each `includes` file, then the test source.
+/// `raw` tests run alone.
+fn buildSource(io: std.Io, arena: Allocator, opts: Options, prelude: []const u8, meta: md.Metadata, source: []const u8, mode: Mode) RunError![]const u8 {
     if (meta.flags.raw) return source;
     var buf: std.ArrayList(u8) = .empty;
     if (mode == .strict) try buf.appendSlice(arena, "\"use strict\";\n");
+    try buf.appendSlice(arena, prelude);
+    if (opts.harness_dir) |hdir| {
+        for (meta.includes) |inc| {
+            const c = readHarness(io, arena, hdir, inc) catch "";
+            try buf.appendSlice(arena, c);
+            try buf.appendSlice(arena, "\n");
+        }
+    }
     try buf.appendSlice(arena, source);
     return buf.items;
 }
@@ -99,9 +119,15 @@ pub fn classify(meta: md.Metadata, result: ljs.EvaluationResult, mode: Mode, pat
                 else => r.mk(path, mode, .fail, .no_error_expected_throw),
             },
             .runtime => return switch (result) {
-                // M0: typed Error objects don't exist, so we can only verify that a throw
-                // occurred, not its constructor. Approximate; tightened once Errors land.
-                .thrown => r.mk(path, mode, .pass, .none),
+                // §14.15: a runtime-negative test passes only if the thrown error's name matches
+                // the expected type (FR-008; tightened now that errors are real objects).
+                .thrown => |tv| blk: {
+                    const got = errorName(tv) orelse break :blk r.mk(path, mode, .fail, .wrong_error);
+                    break :blk if (std.mem.eql(u8, got, neg.type_name))
+                        r.mk(path, mode, .pass, .none)
+                    else
+                        r.mk(path, mode, .fail, .wrong_error);
+                },
                 .syntax_error => r.mk(path, mode, .fail, .parse_error),
                 .step_limit => r.mk(path, mode, .fail, .step_limit),
                 .normal => r.mk(path, mode, .fail, .no_error_expected_throw),
@@ -116,6 +142,13 @@ pub fn classify(meta: md.Metadata, result: ljs.EvaluationResult, mode: Mode, pat
         .syntax_error => r.mk(path, mode, .fail, .parse_error),
         .step_limit => r.mk(path, mode, .fail, .step_limit),
     };
+}
+
+/// The `name` of a thrown Error object, if any (for negative-runtime classification).
+fn errorName(v: ljs.Value) ?[]const u8 {
+    if (v != .object) return null;
+    const nv = v.object.get("name") orelse return null;
+    return if (nv == .string) nv.string else null;
 }
 
 // ── classification unit tests (T016 / SC-001 logic) ─────────────────────────
@@ -142,7 +175,15 @@ test "negative parse: syntax_error → pass, normal → fail" {
     try testing.expectEqual(Outcome.fail, classify(metaNegParse(), .{ .normal = .undefined }, .strict, "p").outcome);
 }
 
-test "negative runtime: thrown → pass, normal → fail" {
-    try testing.expectEqual(Outcome.pass, classify(metaNegRuntime(), .{ .thrown = .undefined }, .sloppy, "p").outcome);
+test "negative runtime: matching error name → pass, wrong/none → fail" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const want = try ljs.Object.create(a, null); // metaNegRuntime expects "TypeError"
+    try want.set("name", .{ .string = "TypeError" });
+    try testing.expectEqual(Outcome.pass, classify(metaNegRuntime(), .{ .thrown = .{ .object = want } }, .sloppy, "p").outcome);
+    const wrong = try ljs.Object.create(a, null);
+    try wrong.set("name", .{ .string = "RangeError" });
+    try testing.expectEqual(Outcome.fail, classify(metaNegRuntime(), .{ .thrown = .{ .object = wrong } }, .sloppy, "p").outcome);
     try testing.expectEqual(Outcome.fail, classify(metaNegRuntime(), .{ .normal = .undefined }, .sloppy, "p").outcome);
 }

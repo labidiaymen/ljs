@@ -55,10 +55,15 @@ folded into plan.md (Phase 0/1) for M1 to avoid over-producing artifacts.
 - [x] M1-T054 [US5] `src/builtins.zig` + global env: Error family (typed, name/message), `String()`, minimal `Object`(+proto.toString); native dispatch via `NativeId`; `throwError` now yields **real Error objects** proto-linked to the realm constructors. **Deferred** (Test262 failure-path only): `Array`, `Function.prototype.call`, `Object.prototype.toString.call`.
 - [x] M1-T055 [P] [US5] E2 tests (inline): Error family, instanceof, String, typed engine errors via `e.name`
 
-### Cycle E3 — harness execution (the SC-003 payoff)
-- [ ] M1-T056 [US5] Wire harness-include loading in `test262/runner.zig` (thread `io`; prepend sta.js+assert.js+includes for non-raw) — retires M0 T019, FR-007
-- [ ] M1-T057 [US5] Tighten negative-runtime classification (thrown `name` vs `negative.type`, exact-type) — FR-008
-- [ ] M1-T058 [US5] Run the target slice → record real baseline (**pass > 0**, SC-003); confirm M0 sample still 27/6/2; add a compute-heavy bench (loop/`fib`) to show the true ljs-vs-Node gap; no perf regression
+### Cycle E3 — harness wiring + classification + compute bench
+- [x] M1-T056 [US5] Harness-include loading wired in `test262/runner.zig` (sta.js+assert.js prelude + `includes`, non-raw, io-threaded) — retires M0 T019, FR-007
+- [x] M1-T057 [US5] Negative-runtime classification matches thrown `.name` vs `negative.type` (FR-008); errors are now real objects
+- [x] M1-T058b [US5] Compute-heavy bench `loop_sum` added → ljs **1.6× slower** than Node (the real tree-walk-vs-JIT gap; arith/startup cases stay ~0.4×). Re-baselined.
+- [~] M1-T058 [US5] Real-slice **pass > 0 (SC-003)** — still 0: **assert.js also needs ternary `?:`, `switch`, `+=`** (the prelude fails to parse). Deferred to E4.
+
+### Cycle E4 — operators assert.js needs (to actually reach SC-003)
+- [ ] M1-T059 [US5] Ternary `?:`, `switch`/`case`/`default`, compound assignment (`+=`/`-=`/…) — §13.14 / §14.12 / §13.15
+- [ ] M1-T060b [US5] Re-run the slice with the harness → **pass > 0** (SC-003); record the real baseline; M0 still 27/6/2; no perf regression
 
 ## Polish (final cycle)
 - [ ] M1-T060 [P] Spec-clause comment audit on new modules; README + roadmap update (M1 done, real conformance %)
