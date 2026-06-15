@@ -100,6 +100,14 @@ pub const Interpreter = struct {
                 if (f.name) |name| try env.declare(name, .{ .object = obj }, true, true);
                 return .{ .normal = .undefined };
             },
+            .class_decl => |c| {
+                // §15.7.14 ClassDefinitionEvaluation — build the constructor, then bind the class
+                // name in the current (declaration) scope.
+                const cc = try self.evalClass(c, env);
+                if (cc.isAbrupt()) return cc;
+                if (c.name) |name| try env.declare(name, cc.normal, true, true);
+                return .{ .normal = .undefined };
+            },
             .ret => |maybe_expr| {
                 // §14.10 ReturnStatement.
                 if (maybe_expr) |e| {
@@ -299,6 +307,7 @@ pub const Interpreter = struct {
                 return self.setProperty(oc.normal, try self.toString(kc.normal), vc.normal);
             },
             .function => |f| return self.evalFunctionExpr(f, env),
+            .class_expr => |c| return self.evalClass(c, env),
             .call => |c| return self.evalCall(c, env),
             .new_expr => |n| return self.evalNew(n, env),
             .logical => |l| {
@@ -444,10 +453,40 @@ pub const Interpreter = struct {
         const alc = try self.evalSpreadList(n.args, env, &args);
         if (alc.isAbrupt()) return alc;
 
+        // §15.7.14: a (base, non-derived) class instantiation runs the instance FieldDefinitions on
+        // the new object BEFORE the constructor body executes. (Derived-class field ordering — after
+        // `super()` — is Cycle 2.) Ordinary functions carry no fields, so this is a no-op for them.
+        if (ctor.call) |fd| {
+            const fc = try self.initInstanceFields(fd, new_obj);
+            if (fc.isAbrupt()) return fc;
+        }
+
         const result = try self.callFunction(ctor, args.items, .{ .object = new_obj });
         if (result.isAbrupt()) return result;
         if (result.normal == .object) return .{ .normal = result.normal }; // explicit object return wins
         return .{ .normal = .{ .object = new_obj } };
+    }
+
+    /// §15.7.14 InitializeInstanceElements — define each instance FieldDefinition on `instance`, in
+    /// declaration order, evaluating its initializer with `this` = the instance, in a scope child of
+    /// the class's defining environment (so an initializer may reference the class name / outer
+    /// bindings). A field with no initializer is created with value `undefined`.
+    fn initInstanceFields(self: *Interpreter, fd: @import("object.zig").FunctionData, instance: *Object) EvalError!Completion {
+        if (fd.fields.len == 0) return .{ .normal = .undefined };
+        const field_env = try Environment.create(self.arena, fd.closure);
+        const saved_this = self.this_val;
+        self.this_val = .{ .object = instance };
+        defer self.this_val = saved_this;
+        for (fd.fields) |field| {
+            var v: Value = .undefined;
+            if (field.init) |ie| {
+                const ic = try self.evalExpr(ie, field_env);
+                if (ic.isAbrupt()) return ic;
+                v = ic.normal;
+            }
+            try instance.set(field.key, v);
+        }
+        return .{ .normal = .undefined };
     }
 
     /// §13.2.5 ObjectLiteral evaluation — a fresh ordinary object (proto-linked to Object.prototype
@@ -597,11 +636,89 @@ pub const Interpreter = struct {
                 if (base.value != .object or base.value.object.kind != .function) {
                     return .{ .completion = try self.throwError("TypeError", "value is not a function") };
                 }
+                if (base.value.object.call) |fd| {
+                    if (fd.is_class_ctor) return .{ .completion = try self.throwError("TypeError", "Class constructor cannot be invoked without 'new'") };
+                }
                 const rc = try self.callFunction(base.value.object, args.items, base.this_val);
                 if (rc.isAbrupt()) return .{ .completion = rc };
                 return .{ .value = rc.normal };
             },
         }
+    }
+
+    /// §15.7.14 ClassDefinitionEvaluation (Cycle 1 subset — no `extends`/`super` yet). Builds the
+    /// constructor function object: its body is the explicit `constructor` method (or a default empty
+    /// body), its `.prototype` carries the instance methods, and the constructor object itself carries
+    /// the static methods/fields. Instance FieldDefinitions are stashed on the constructor's
+    /// `FunctionData.fields` and run per-instance by `evalNew` before the constructor body. The class
+    /// name is bound in an inner scope so a method/field initializer can reference the class itself.
+    fn evalClass(self: *Interpreter, c: *const ast.Class, env: *Environment) EvalError!Completion {
+        // §15.7.14: a class is created in a new declarative scope that holds the (immutable) class
+        // binding for self-reference. Methods/field initializers close over this scope.
+        const class_env = try Environment.create(self.arena, env);
+
+        // Locate the explicit constructor (if any) and collect the instance field initializers.
+        var ctor_fn: ?*const ast.Function = null;
+        var fields: std.ArrayListUnmanaged(@import("object.zig").FieldInit) = .empty;
+        for (c.elements) |el| {
+            switch (el.kind) {
+                .constructor => ctor_fn = el.value.func,
+                .field => if (!el.is_static) {
+                    // Cycle 1: keys are static names (computed keys land in Cycle 3).
+                    try fields.append(self.arena, .{ .key = el.key, .init = el.value.field_init });
+                },
+                else => {},
+            }
+        }
+
+        // §15.7.14: build the constructor function object. Default constructor = empty body.
+        const ctor = try Object.createFunction(self.arena, .{
+            .params = if (ctor_fn) |f| f.params else &.{},
+            .rest = if (ctor_fn) |f| f.rest else null,
+            .body = if (ctor_fn) |f| f.body else &.{},
+            .closure = class_env,
+            .fields = fields.items,
+            .is_class_ctor = true,
+        });
+        // The constructor's `.prototype` object holds the instance methods.
+        const proto: *Object = blk: {
+            const pv = ctor.get("prototype") orelse break :blk try Object.create(self.arena, null);
+            break :blk if (pv == .object) pv.object else try Object.create(self.arena, null);
+        };
+
+        // §15.7.14: install methods (and, this cycle, static fields). Instance members → `.prototype`,
+        // static members → the constructor object.
+        for (c.elements) |el| {
+            switch (el.kind) {
+                .constructor => {}, // already the [[Call]] body
+                .method => {
+                    const fc = try self.evalFunctionExpr(el.value.func, class_env);
+                    if (fc.isAbrupt()) return fc;
+                    const target = if (el.is_static) ctor else proto;
+                    try target.set(el.key, fc.normal);
+                },
+                .field => if (el.is_static) {
+                    // §15.7.14: a static field initializer runs at class definition with `this` = the
+                    // constructor object.
+                    var v: Value = .undefined;
+                    if (el.value.field_init) |ie| {
+                        const saved_this = self.this_val;
+                        self.this_val = .{ .object = ctor };
+                        const ic = try self.evalExpr(ie, class_env);
+                        self.this_val = saved_this;
+                        if (ic.isAbrupt()) return ic;
+                        v = ic.normal;
+                    }
+                    try ctor.set(el.key, v);
+                },
+                .get, .set => {}, // accessors land in Cycle 3
+            }
+        }
+
+        // §15.7.14: bind the class name immutably in the inner scope for self-reference.
+        if (c.name) |name| try class_env.declare(name, .{ .object = ctor }, false, true);
+
+        return .{ .normal = .{ .object = ctor } };
     }
 
     fn evalFunctionExpr(self: *Interpreter, f: *const ast.Function, env: *Environment) EvalError!Completion {
@@ -680,6 +797,11 @@ pub const Interpreter = struct {
 
         if (callee != .object or callee.object.kind != .function) {
             return self.throwError("TypeError", "value is not a function");
+        }
+        // §15.7.14: a class constructor may only be invoked via `new` ([[Construct]]); a plain call
+        // `C()` is a TypeError.
+        if (callee.object.call) |fd| {
+            if (fd.is_class_ctor) return self.throwError("TypeError", "Class constructor cannot be invoked without 'new'");
         }
         return self.callFunction(callee.object, args.items, this_for_call);
     }

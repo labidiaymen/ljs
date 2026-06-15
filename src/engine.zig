@@ -420,11 +420,82 @@ test "M3 arrow functions: early errors (US5, §15.3.1)" {
     try expectNumber("var f = (a, b) =>\n a + b; f(2, 3)", 5);
 }
 
-test "M3 class definitions rejected at parse (§15.7, unsupported)" {
-    // classes are unsupported — `class` is reserved, so any class form is a parse-phase error
-    try expectSyntaxError("class C {}");
-    try expectSyntaxError("var C = class {};");
-    try expectSyntaxError("var C = class { x = () => 1; };");
+test "M4 classes: declaration, constructor, new (Cycle 1, §15.7.14)" {
+    // empty class declaration constructs an instance
+    try expectStr("class C {} typeof new C()", "object");
+    try expectStr("class C {} typeof C", "function");
+    // constructor binds fields on `this`
+    try expectNumber("class C { constructor(x) { this.x = x; } } new C(7).x", 7);
+    try expectNumber("class C { constructor(a, b) { this.s = a + b; } } new C(40, 2).s", 42);
+    // a class constructor cannot be called without `new` (§15.7.14)
+    try expectThrows("class C {} C()");
+    // a class is an instanceof itself
+    try expectBool("class C {} (new C()) instanceof C", true);
+}
+
+test "M4 classes: instance methods on the prototype (Cycle 1, §15.7.14)" {
+    try expectNumber("class C { m() { return 1; } } new C().m()", 1);
+    // method `this` is the receiver
+    try expectNumber("class C { constructor() { this.v = 5; } get() { return this.v; } } new C().get()", 5);
+    // method takes params
+    try expectNumber("class C { add(a, b) { return a + b; } } new C().add(40, 2)", 42);
+    // methods live on the prototype (shared), not per-instance
+    try expectBool("class C { m() {} } var a = new C(); var b = new C(); a.m === b.m", true);
+}
+
+test "M4 classes: instance fields (Cycle 1, §15.7.14)" {
+    // field with initializer
+    try expectNumber("class C { x = 5; } new C().x", 5);
+    // bare field defaults to undefined
+    try expectStr("class C { x; } typeof new C().x", "undefined");
+    // multiple fields, initialized in order; an initializer may reference `this`
+    try expectNumber("class C { a = 1; b = 2; } var o = new C(); o.a + o.b", 3);
+    // fields initialize BEFORE the constructor body runs
+    try expectNumber("class C { x = 10; constructor() { this.x = this.x + 1; } } new C().x", 11);
+    // a field initializer can reference an outer binding
+    try expectNumber("var k = 9; class C { x = k; } new C().x", 9);
+}
+
+test "M4 classes: static methods and fields (Cycle 1, §15.7.14)" {
+    // static method on the constructor object
+    try expectNumber("class C { static s() { return 9; } } C.s()", 9);
+    // static field on the constructor object
+    try expectNumber("class C { static n = 3; } C.n", 3);
+    // static field initializer sees `this` = the constructor
+    try expectNumber("class C { static a = 2; static b = 40; } C.a + C.b", 42);
+    // a static member is NOT on instances
+    try expectStr("class C { static s() {} } typeof new C().s", "undefined");
+}
+
+test "M4 classes: class expression (Cycle 1, §15.7)" {
+    // anonymous class expression
+    try expectNumber("var C = class { m() { return 1; } }; new C().m()", 1);
+    // named class expression — the name is bound inside the body for self-reference
+    try expectBool("var K = class C { who() { return C; } }; new K().who() === K", true);
+    // class expression with a field
+    try expectNumber("var C = class { x = 7; }; new C().x", 7);
+    // immediately constructed
+    try expectNumber("new (class { constructor() { this.v = 42; } })().v", 42);
+}
+
+test "M4 classes: body is strict (Cycle 1, §15.7)" {
+    // §15.7: a class body is always strict, so a method binding `eval`/`arguments` as a param is a
+    // SyntaxError even with no directive and in sloppy RunMode.
+    try expectSyntaxError("class C { m(eval) {} }");
+    try expectSyntaxError("class C { m(arguments) {} }");
+    // a duplicate parameter in a method is a SyntaxError (methods enforce this in every mode)
+    try expectSyntaxError("class C { m(a, a) {} }");
+}
+
+test "M4 classes: unsupported element syntax still parse-rejects (Cycle 1 scope)" {
+    // generators / async / accessors / super are deferred — they must still parse-reject so the
+    // negative-parse class tests that use them keep passing.
+    try expectSyntaxError("class C { *m() {} }"); // generator method (deferred)
+    try expectSyntaxError("class C { get x() { return 1; } }"); // accessor (Cycle 3)
+    try expectSyntaxError("class C { set x(v) {} }"); // accessor (Cycle 3)
+    try expectSyntaxError("class C extends Object { constructor() { super(); } }"); // super (Cycle 2)
+    // a ClassDeclaration requires a name
+    try expectSyntaxError("class {}");
 }
 
 test "M3 object literal sugar: shorthand, computed, method (US6, §13.2.5)" {

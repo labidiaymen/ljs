@@ -63,6 +63,7 @@ pub const Node = union(enum) {
     template: struct { quasis: []const []const u8, exprs: []const *const Node }, // §13.2.8 `a${x}b`
     spread: *const Node, // §13.2.4 / §13.3 spread element `...expr` (in array literals & call args)
     this, // §13.2.1 ThisExpression
+    class_expr: *const Class, // §15.7 ClassExpression
     /// §13.3.9 OptionalExpression — one access link of an optional chain applied to `base`.
     /// `optional` is true for the `?.` form (this link short-circuits when `base` is nullish);
     /// false for a plain `.`/`[]`/`()` that *follows* a `?.` in the same chain (it rides the chain
@@ -148,6 +149,38 @@ pub const Function = struct {
     is_arrow: bool = false,
 };
 
+/// §15.7 Class Definitions. A `Class` is the shared shape of a ClassDeclaration (statement) and a
+/// ClassExpression (primary). `name` is the optional binding identifier; `superclass` is the optional
+/// `extends LeftHandSideExpression` (parsed in Cycle 1, linked in Cycle 2); `elements` are the
+/// ClassBody members in source order.
+pub const Class = struct {
+    name: ?[]const u8,
+    superclass: ?*const Node = null, // §15.7 ClassHeritage `extends LHS` (link deferred to Cycle 2)
+    elements: []const ClassElement,
+};
+
+/// §15.7 ClassElement kind. `constructor` is the special method that becomes the class's [[Call]]
+/// body; `method` is a normal prototype/static method; `get`/`set` are accessors (Cycle 3);
+/// `field` is an instance/static field with an optional initializer.
+pub const ClassElementKind = enum { constructor, method, get, set, field };
+
+/// §15.7 One ClassBody member. A `method`/`get`/`set`/`constructor` carries `value.func`; a `field`
+/// carries `value.field_init` (the optional `= expr`). `is_static` selects the constructor object
+/// (static) vs the `.prototype` (instance). `computed_key` (non-null) supersedes the static `key`
+/// (Cycle 3); for Cycle 1 every key is a static identifier/string/number name.
+pub const ClassElement = struct {
+    kind: ClassElementKind,
+    is_static: bool = false,
+    key: []const u8 = "",
+    computed_key: ?*const Node = null,
+    value: ClassElementValue,
+};
+
+pub const ClassElementValue = union(enum) {
+    func: *const Function, // method / accessor / constructor body
+    field_init: ?*const Node, // §15.7 FieldDefinition initializer (`x = init` / bare `x`)
+};
+
 pub const DeclKind = enum { var_decl, let_decl, const_decl };
 
 /// §14.3 LexicalBinding / VariableDeclaration. `target` is a binding pattern (commonly a single
@@ -159,6 +192,7 @@ pub const Stmt = union(enum) {
     declaration: struct { kind: DeclKind, decls: []const Declarator }, // §14.3
     block: []const Stmt, // §14.2
     func_decl: *const Function, // §15.2 function declaration
+    class_decl: *const Class, // §15.7 ClassDeclaration
     ret: ?*const Node, // §14.10 return statement
     if_stmt: struct { cond: *const Node, then: *const Stmt, otherwise: ?*const Stmt }, // §14.6
     while_stmt: struct { cond: *const Node, body: *const Stmt }, // §14.7.3

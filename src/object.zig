@@ -34,6 +34,21 @@ pub const FunctionData = struct {
     closure: *Environment,
     is_arrow: bool = false,
     captured_this: Value = .undefined, // §15.3: the enclosing `this` (arrows only)
+    /// §15.7.14: a class constructor carries its instance FieldDefinitions; [[Construct]]
+    /// (`evalNew`) runs each initializer on the new instance (with `this` = instance) before the
+    /// constructor body. Empty for ordinary functions and for non-constructor class methods.
+    fields: []const FieldInit = &.{},
+    /// §15.7: a class constructor (explicit or default) is flagged so a plain `C()` call (without
+    /// `new`) throws a TypeError per §15.7.14 ([[Call]] of a class constructor is not allowed).
+    is_class_ctor: bool = false,
+};
+
+/// §15.7.14 one resolved instance FieldDefinition: the property key (computed keys are evaluated at
+/// class-definition time and stored here as a string) and the optional `= expr` initializer
+/// (evaluated per instance in the class's defining scope).
+pub const FieldInit = struct {
+    key: []const u8,
+    init: ?*const ast.Node,
 };
 
 /// A property's stored shape (§6.1.7.1 Property Attributes, M3 subset). Most properties are plain

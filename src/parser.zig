@@ -376,6 +376,8 @@ pub const Parser = struct {
                 _ = self.advance();
                 return .{ .func_decl = try self.parseFunction() };
             },
+            // §15.7 ClassDeclaration (statement position). Requires a binding name.
+            .kw_class => return .{ .class_decl = try self.parseClass(true) },
             .kw_return => {
                 _ = self.advance();
                 var arg: ?*const ast.Node = null;
@@ -445,6 +447,167 @@ pub const Parser = struct {
         const f = try self.arena.create(ast.Function);
         f.* = .{ .name = name, .params = pl.params, .rest = pl.rest, .body = body };
         return f;
+    }
+
+    /// §15.7 ClassDeclaration / ClassExpression. The current token is `class`. A declaration requires
+    /// a binding name; an expression's name is optional. The ClassBody parses in STRICT context
+    /// (§15.7 — classes are always strict), lexically inherited like a function body.
+    /// `extends LeftHandSideExpression` is parsed (so heritage syntax doesn't parse-reject); the
+    /// superclass link + `super` are wired in Cycle 2.
+    fn parseClass(self: *Parser, is_declaration: bool) ParseError!*const ast.Class {
+        _ = self.advance(); // class
+        var name: ?[]const u8 = null;
+        // §15.7: a class name is a BindingIdentifier. `extends`/`{` end the (optional) name.
+        if (self.peek().kind == .identifier) {
+            // §13.1.1: a class name may not be a strict-reserved word — and a class body is always
+            // strict, so this holds in every mode.
+            if (isStrictReservedBindingName(self.peek().lexeme)) return ParseError.UnexpectedToken;
+            name = self.advance().lexeme;
+        } else if (is_declaration) {
+            // A ClassDeclaration requires a name (the anonymous form is only a ClassExpression /
+            // `export default`); reject `class { }` in statement position.
+            return ParseError.UnexpectedToken;
+        }
+
+        // §15.7 ClassHeritage : `extends` LeftHandSideExpression (optional).
+        var superclass: ?*const ast.Node = null;
+        if (self.peek().kind == .kw_extends) {
+            _ = self.advance();
+            // LeftHandSideExpression — `parsePostfix` covers `A`, `a.b`, `f()`, member/call chains.
+            superclass = try self.parsePostfix();
+        }
+
+        // §15.7 ClassBody parses in strict context; restore on the way out.
+        const enclosing_strict = self.strict;
+        defer self.strict = enclosing_strict;
+        self.strict = true;
+
+        _ = try self.expect(.lbrace);
+        var elements: std.ArrayList(ast.ClassElement) = .empty;
+        while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
+            // §15.7 ClassElement : `;` — an empty element is allowed and ignored.
+            if (self.peek().kind == .semicolon) {
+                _ = self.advance();
+                continue;
+            }
+            try elements.append(self.arena, try self.parseClassElement());
+        }
+        _ = try self.expect(.rbrace);
+
+        // §15.7.1 Early Error: a ClassBody may declare at most one `constructor` method.
+        var seen_ctor = false;
+        for (elements.items) |el| {
+            if (el.kind == .constructor) {
+                if (seen_ctor) return ParseError.UnexpectedToken;
+                seen_ctor = true;
+            }
+        }
+
+        const c = try self.arena.create(ast.Class);
+        c.* = .{ .name = name, .superclass = superclass, .elements = elements.items };
+        return c;
+    }
+
+    /// §15.7 ClassElement — a method `m(){…}`, a `constructor(){…}`, a `static` method, or a field
+    /// `x = init;` / `x;` (instance or static). Unsupported forms parse-reject this cycle to preserve
+    /// the negative-parse class tests: generators (`* m`), `async`, accessors (`get`/`set`, Cycle 3),
+    /// private names (`#x`, Cycle 4), and static initialization blocks (`static { }`, Cycle 4).
+    fn parseClassElement(self: *Parser) ParseError!ast.ClassElement {
+        // §15.7 `static` modifier (contextual): it is a modifier only when followed by something that
+        // begins a (non-static) element name. `static(){}`/`static = 1`/`static;`/`static }` use the
+        // identifier `static` as the element key instead.
+        var is_static = false;
+        if (self.peek().kind == .identifier and std.mem.eql(u8, self.peek().lexeme, "static")) {
+            const next = self.tokens[self.idx + 1].kind;
+            switch (next) {
+                // `static` as a key, not a modifier.
+                .lparen, .assign, .semicolon, .rbrace => {},
+                // §15.7.11 static initialization block `static { … }` — deferred to Cycle 4.
+                .lbrace => return ParseError.UnexpectedToken,
+                else => {
+                    is_static = true;
+                    _ = self.advance(); // consume `static`
+                },
+            }
+        }
+
+        // §15.7 Unsupported element prefixes parse-reject (preserve negatives): generator `* m`,
+        // `async m`, private `#x`, and accessors `get`/`set` (Cycle 3). `get`/`set` are only a
+        // modifier when followed by a property name (else they are an ordinary element key).
+        switch (self.peek().kind) {
+            .star => return ParseError.UnexpectedToken, // generator method (deferred)
+            .kw_super => return ParseError.UnexpectedToken, // `super` element (Cycle 2)
+            .identifier => {
+                const w = self.peek().lexeme;
+                if (std.mem.eql(u8, w, "async") and startsAccessorName(self.tokens[self.idx + 1].kind)) {
+                    return ParseError.UnexpectedToken; // async method (deferred)
+                }
+                if ((std.mem.eql(u8, w, "get") or std.mem.eql(u8, w, "set")) and
+                    startsAccessorName(self.tokens[self.idx + 1].kind))
+                {
+                    return ParseError.UnexpectedToken; // accessor (Cycle 3)
+                }
+            },
+            // §15.7 a private name `#x` (field/method) is Cycle 4.
+            else => {},
+        }
+
+        // Parse the element's PropertyName (identifier / string / number / `[computed]`).
+        const pn = try self.parsePropertyName();
+
+        const is_literal = pn.computed == null; // a static (non-computed) PropName we can name-check
+
+        if (self.peek().kind == .lparen) {
+            // §15.7 MethodDefinition `m(params){…}` — instance (on `.prototype`) or static method.
+            // §15.7.1 Early Error: a `static` method may not be named `prototype`.
+            if (is_static and is_literal and std.mem.eql(u8, pn.key, "prototype")) return ParseError.UnexpectedToken;
+            const pl = try self.parseParams();
+            const body = try self.parseMethodBody(pl);
+            // §15.7 / §13.2.5.1 UniqueFormalParameters — a method's parameters have no duplicates.
+            if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
+            const f = try self.arena.create(ast.Function);
+            f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body };
+            // §15.7: a non-static method named `constructor` is the class constructor.
+            const is_ctor = !is_static and is_literal and std.mem.eql(u8, pn.key, "constructor");
+            return .{
+                .kind = if (is_ctor) .constructor else .method,
+                .is_static = is_static,
+                .key = pn.key,
+                .computed_key = pn.computed,
+                .value = .{ .func = f },
+            };
+        }
+
+        // §15.7 FieldDefinition `x = Initializer ;` or bare `x ;` (ASI). An optional `= expr`.
+        // §15.7.1 Early Errors on the field's PropName: it may not be `constructor`; a `static` field
+        // may not be named `prototype`.
+        if (is_literal) {
+            if (std.mem.eql(u8, pn.key, "constructor")) return ParseError.UnexpectedToken;
+            if (is_static and std.mem.eql(u8, pn.key, "prototype")) return ParseError.UnexpectedToken;
+        }
+        var field_init: ?*const ast.Node = null;
+        if (self.peek().kind == .assign) {
+            _ = self.advance();
+            field_init = try self.parseAssignment();
+            // §15.7.1 Early Error: a FieldDefinition Initializer may not contain `arguments`
+            // (ContainsArguments) — `x = arguments` / `[k] = f(arguments)` are SyntaxErrors.
+            if (containsArguments(field_init.?)) return ParseError.UnexpectedToken;
+        }
+        // §15.7 ClassElement grammar: a FieldDefinition is terminated by `;` (consumed) or ASI — a
+        // `}` or a LineTerminator before the next token. Two fields on one line (`x y`, `x = 1 m(){}`)
+        // with no `;` and no newline is a SyntaxError (no ASI here).
+        if (self.peek().kind == .semicolon) {
+            _ = self.advance();
+        } else if (self.peek().kind != .rbrace and !self.peek().newline_before) {
+            return ParseError.UnexpectedToken;
+        }
+        return .{
+            .kind = .field,
+            .is_static = is_static,
+            .key = pn.key,
+            .computed_key = pn.computed,
+            .value = .{ .field_init = field_init },
+        };
     }
 
     const ParamList = struct { params: []const ast.Param, rest: ?*const ast.Pattern };
@@ -1067,6 +1230,10 @@ pub const Parser = struct {
                 return self.alloc(.null);
             },
             .identifier => {
+                // §13.1.1: `yield` is a reserved word in strict mode — using it as an
+                // IdentifierReference (a primary expression, e.g. a `m(x = yield)` param default
+                // inside an always-strict class body) is a SyntaxError.
+                if (self.strict and std.mem.eql(u8, t.lexeme, "yield")) return ParseError.UnexpectedToken;
                 _ = self.advance();
                 return self.alloc(.{ .identifier = t.lexeme });
             },
@@ -1103,11 +1270,8 @@ pub const Parser = struct {
             // also keeps spread support honest: ImportCall forbids `...` (a Forbidden Extension), so
             // `import(...x)` must not parse as an ordinary spread call.
             .kw_import => return ParseError.UnexpectedToken,
-            // §15.7 Class definitions are unsupported — `class` is a reserved word, so any
-            // ClassExpression / ClassDeclaration is a parse-phase SyntaxError. (Rejecting at parse
-            // is spec-correct for an engine without classes and keeps negative parse tests honest:
-            // e.g. `class { x = () => arguments }` must fail to *parse*, not at runtime.)
-            .kw_class => return ParseError.UnexpectedToken,
+            // §15.7 ClassExpression (primary position). The name is optional (`class { … }`).
+            .kw_class => return self.alloc(.{ .class_expr = try self.parseClass(false) }),
             // §13.3.5 SuperProperty / §13.3.7 SuperCall are unsupported — `super` is reserved, so any
             // `super(...)` / `super.x` is a parse-phase SyntaxError. (Recovers the object method
             // `name-super-call-*` negatives: a direct super in a method body/param must fail to parse.)
@@ -1245,6 +1409,116 @@ fn collectBoundNames(pattern: *const ast.Pattern, names: *std.ArrayList([]const 
     }
 }
 
+/// §15.7.1 Static Semantics: ContainsArguments — true iff the expression references the identifier
+/// `arguments` outside any nested ordinary-function (which binds its own `arguments`). Per the spec,
+/// recursion continues through ArrowFunction bodies (arrows have no own `arguments`) but stops at an
+/// ordinary FunctionExpression. Used to reject `arguments` inside a class FieldDefinition Initializer.
+fn containsArguments(node: *const ast.Node) bool {
+    switch (node.*) {
+        .identifier => |n| return std.mem.eql(u8, n, "arguments"),
+        .number, .string, .boolean, .null, .this => return false,
+        .unary => |u| return containsArguments(u.operand),
+        .update => |u| return containsArguments(u.target),
+        .comma => |c| return containsArguments(c.left) or containsArguments(c.right),
+        .binary => |b| return containsArguments(b.left) or containsArguments(b.right),
+        .logical => |l| return containsArguments(l.left) or containsArguments(l.right),
+        .conditional => |c| return containsArguments(c.cond) or containsArguments(c.then) or containsArguments(c.otherwise),
+        .assign => |a| return containsArguments(a.value),
+        .assign_member => |a| return containsArguments(a.object) or containsArguments(a.value),
+        .assign_index => |a| return containsArguments(a.object) or containsArguments(a.key) or containsArguments(a.value),
+        .logical_assign => |a| return containsArguments(a.target) or containsArguments(a.value),
+        .member => |m| return containsArguments(m.object),
+        .index => |ix| return containsArguments(ix.object) or containsArguments(ix.key),
+        .spread => |s| return containsArguments(s),
+        .call => |c| {
+            if (containsArguments(c.callee)) return true;
+            for (c.args) |a| if (containsArguments(a)) return true;
+            return false;
+        },
+        .new_expr => |n| {
+            if (containsArguments(n.callee)) return true;
+            for (n.args) |a| if (containsArguments(a)) return true;
+            return false;
+        },
+        .array_literal => |elems| {
+            for (elems) |e| if (containsArguments(e)) return true;
+            return false;
+        },
+        .object_literal => |props| {
+            for (props) |p| {
+                if (p.computed_key) |ck| if (containsArguments(ck)) return true;
+                if (containsArguments(p.value)) return true;
+            }
+            return false;
+        },
+        .template => |t| {
+            for (t.exprs) |e| if (containsArguments(e)) return true;
+            return false;
+        },
+        .optional => |o| {
+            if (containsArguments(o.base)) return true;
+            switch (o.link) {
+                .member => return false,
+                .index => |k| return containsArguments(k),
+                .call => |args| {
+                    for (args) |a| if (containsArguments(a)) return true;
+                    return false;
+                },
+            }
+        },
+        // Recurse into ArrowFunction bodies (no own `arguments`); STOP at an ordinary function /
+        // class (they bind/scope their own `arguments`).
+        .function => |f| return f.is_arrow and bodyContainsArguments(f.body),
+        .class_expr => return false,
+    }
+}
+
+fn bodyContainsArguments(body: []const ast.Stmt) bool {
+    for (body) |s| if (stmtContainsArguments(s)) return true;
+    return false;
+}
+
+fn stmtContainsArguments(stmt: ast.Stmt) bool {
+    switch (stmt) {
+        .expr => |e| return containsArguments(e),
+        .ret => |maybe| return if (maybe) |e| containsArguments(e) else false,
+        .throw_stmt => |e| return containsArguments(e),
+        .block => |stmts| return bodyContainsArguments(stmts),
+        .declaration => |d| {
+            for (d.decls) |dec| if (dec.init) |ie| if (containsArguments(ie)) return true;
+            return false;
+        },
+        .if_stmt => |s| {
+            if (containsArguments(s.cond)) return true;
+            if (stmtContainsArguments(s.then.*)) return true;
+            if (s.otherwise) |els| return stmtContainsArguments(els.*);
+            return false;
+        },
+        .while_stmt => |s| return containsArguments(s.cond) or stmtContainsArguments(s.body.*),
+        .for_stmt => |s| {
+            if (s.init) |i| if (stmtContainsArguments(i.*)) return true;
+            if (s.cond) |c| if (containsArguments(c)) return true;
+            if (s.update) |u| if (containsArguments(u)) return true;
+            return stmtContainsArguments(s.body.*);
+        },
+        .switch_stmt => |s| {
+            if (containsArguments(s.discriminant)) return true;
+            for (s.cases) |case| {
+                if (case.test_expr) |te| if (containsArguments(te)) return true;
+                if (bodyContainsArguments(case.body)) return true;
+            }
+            return false;
+        },
+        .try_stmt => |s| {
+            if (bodyContainsArguments(s.block)) return true;
+            if (s.catch_block) |cb| if (bodyContainsArguments(cb)) return true;
+            if (s.finally_block) |fb| if (bodyContainsArguments(fb)) return true;
+            return false;
+        },
+        .func_decl, .class_decl, .break_stmt, .continue_stmt => return false,
+    }
+}
+
 /// Does the function body's directive prologue (§11.2.1) contain a "use strict" directive? The
 /// prologue is the leading run of string-literal ExpressionStatements.
 fn bodyHasUseStrict(body: []const ast.Stmt) bool {
@@ -1304,7 +1578,7 @@ fn startsAccessorName(kind: lex.TokenKind) bool {
 /// ReservedWord is a valid IdentifierName key.
 fn isKeywordName(kind: lex.TokenKind) bool {
     return switch (kind) {
-        .kw_true, .kw_false, .kw_null, .kw_var, .kw_let, .kw_const, .kw_function, .kw_return, .kw_this, .kw_if, .kw_else, .kw_while, .kw_for, .kw_throw, .kw_try, .kw_catch, .kw_finally, .kw_break, .kw_continue, .kw_typeof, .kw_void, .kw_delete, .kw_new, .kw_instanceof, .kw_switch, .kw_case, .kw_default, .kw_import, .kw_class, .kw_super, .kw_in => true,
+        .kw_true, .kw_false, .kw_null, .kw_var, .kw_let, .kw_const, .kw_function, .kw_return, .kw_this, .kw_if, .kw_else, .kw_while, .kw_for, .kw_throw, .kw_try, .kw_catch, .kw_finally, .kw_break, .kw_continue, .kw_typeof, .kw_void, .kw_delete, .kw_new, .kw_instanceof, .kw_switch, .kw_case, .kw_default, .kw_import, .kw_class, .kw_extends, .kw_super, .kw_in => true,
         else => false,
     };
 }

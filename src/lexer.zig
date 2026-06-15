@@ -34,8 +34,9 @@ pub const TokenKind = enum {
     kw_case,
     kw_default,
     kw_import, // import (modules / dynamic ImportCall — unsupported, parse-rejected)
-    kw_class, // class (ClassDeclaration / ClassExpression — unsupported, parse-rejected)
-    kw_super, // super (SuperCall / SuperProperty — unsupported, parse-rejected)
+    kw_class, // class (ClassDeclaration / ClassExpression, §15.7)
+    kw_extends, // extends (ClassHeritage, §15.7)
+    kw_super, // super (SuperCall / SuperProperty — unsupported, parse-rejected until Cycle 2)
     pipe_pipe, // ||
     amp_amp, // &&
     star_star, // **
@@ -222,6 +223,7 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, word, "default")) return .{ .kind = .kw_default, .lexeme = word };
             if (std.mem.eql(u8, word, "import")) return .{ .kind = .kw_import, .lexeme = word };
             if (std.mem.eql(u8, word, "class")) return .{ .kind = .kw_class, .lexeme = word };
+            if (std.mem.eql(u8, word, "extends")) return .{ .kind = .kw_extends, .lexeme = word };
             if (std.mem.eql(u8, word, "super")) return .{ .kind = .kw_super, .lexeme = word };
             return .{ .kind = .identifier, .lexeme = word };
         }
