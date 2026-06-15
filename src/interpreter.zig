@@ -68,6 +68,7 @@ pub const Interpreter = struct {
                 //       initialized, so the `!initialized` check below is staged, not yet live;
                 //   (c) duplicate lexical declarations are not yet a SyntaxError (§14.3.1).
                 // Tightened in later M1 cycles. None of these affect the US1 acceptance scenarios.
+                const mutable = d.kind != .const_decl;
                 for (d.decls) |dec| {
                     var v: Value = .undefined;
                     if (dec.init) |ie| {
@@ -75,7 +76,14 @@ pub const Interpreter = struct {
                         if (c.isAbrupt()) return c;
                         v = c.normal;
                     }
-                    try env.declare(dec.name, v, d.kind != .const_decl, true);
+                    // Fast path: a plain `var x = …` binds directly, skipping pattern matching so
+                    // the common case pays no destructuring cost (perf gate).
+                    if (dec.target.* == .identifier) {
+                        try env.declare(dec.target.identifier, v, mutable, true);
+                    } else {
+                        const bc = try self.bindPattern(dec.target, v, env, mutable);
+                        if (bc.isAbrupt()) return bc;
+                    }
                 }
                 return .{ .normal = .undefined };
             },
@@ -472,16 +480,35 @@ pub const Interpreter = struct {
         const fd = func.call orelse return self.throwError("TypeError", "value is not a function");
         const call_env = try Environment.create(self.arena, fd.closure);
         for (fd.params, 0..) |param, i| {
-            const v: Value = if (i < args.len) args[i] else .undefined; // missing args → undefined
-            try call_env.declare(param, v, true, true);
+            var v: Value = if (i < args.len) args[i] else .undefined; // missing args → undefined
+            if (v == .undefined) {
+                if (param.default) |dn| { // §15.1 default value applied when the arg is undefined
+                    const dc = try self.evalExpr(dn, call_env);
+                    if (dc.isAbrupt()) return dc;
+                    v = dc.normal;
+                }
+            }
+            // Fast path: a plain identifier parameter binds directly (no pattern matching).
+            if (param.pattern.* == .identifier) {
+                try call_env.declare(param.pattern.identifier, v, true, true);
+            } else {
+                const bc = try self.bindPattern(param.pattern, v, call_env, true);
+                if (bc.isAbrupt()) return bc;
+            }
         }
-        if (fd.rest) |rest_name| {
-            // §15.1 rest parameter — bind leftover args (beyond the fixed params) as an Array.
+        if (fd.rest) |rest_pat| {
+            // §15.1 rest parameter — bind leftover args (beyond the fixed params) as an Array,
+            // then destructure that Array into the rest pattern (commonly a single identifier).
             const rest_arr = try Object.createArray(self.arena, self.arrayProto());
             if (args.len > fd.params.len) {
                 for (args[fd.params.len..]) |a| try rest_arr.elements.append(self.arena, a);
             }
-            try call_env.declare(rest_name, .{ .object = rest_arr }, true, true);
+            if (rest_pat.* == .identifier) {
+                try call_env.declare(rest_pat.identifier, .{ .object = rest_arr }, true, true);
+            } else {
+                const bc = try self.bindPattern(rest_pat, .{ .object = rest_arr }, call_env, true);
+                if (bc.isAbrupt()) return bc;
+            }
         }
         const saved_this = self.this_val;
         self.this_val = this_val;
@@ -497,6 +524,108 @@ pub const Interpreter = struct {
             }
         }
         return .{ .normal = .undefined }; // implicit return
+    }
+
+    /// §8.6.2 BindingInitialization / §13.15.5.2 — destructure `value` into the bindings of
+    /// `pattern`, declaring each leaf binding in `env`. Used by both declarations (§14.3) and
+    /// parameter binding (§15.1). `mutable` is false for `const` targets.
+    fn bindPattern(self: *Interpreter, pattern: *const ast.Pattern, value: Value, env: *Environment, mutable: bool) EvalError!Completion {
+        switch (pattern.*) {
+            .identifier => |name| {
+                // §8.6.2 single-name binding — InitializeBoundName.
+                try env.declare(name, value, mutable, true);
+                return .{ .normal = .undefined };
+            },
+            .array => |ap| {
+                // §13.15.5.3 ArrayBindingPattern: pull values positionally from an iterable.
+                // We support Arrays and Strings as iterables (matching the engine's spread model).
+                const items = try self.iterableToSlice(value);
+                if (items == null) return self.throwError("TypeError", "value is not iterable");
+                const slice = items.?;
+                for (ap.elements, 0..) |el, i| {
+                    if (el.target == null) continue; // elision / hole — skip this position
+                    var v: Value = if (i < slice.len) slice[i] else .undefined;
+                    if (v == .undefined) {
+                        if (el.default) |dn| { // §8.6.2 apply the `= default` when undefined
+                            const dc = try self.evalExpr(dn, env);
+                            if (dc.isAbrupt()) return dc;
+                            v = dc.normal;
+                        }
+                    }
+                    const bc = try self.bindPattern(el.target.?, v, env, mutable);
+                    if (bc.isAbrupt()) return bc;
+                }
+                if (ap.rest) |rest_pat| {
+                    // §13.15.5.3 BindingRestElement — leftover items become a fresh Array.
+                    const rest_arr = try Object.createArray(self.arena, self.arrayProto());
+                    if (slice.len > ap.elements.len) {
+                        for (slice[ap.elements.len..]) |a| try rest_arr.elements.append(self.arena, a);
+                    }
+                    const bc = try self.bindPattern(rest_pat, .{ .object = rest_arr }, env, mutable);
+                    if (bc.isAbrupt()) return bc;
+                }
+                return .{ .normal = .undefined };
+            },
+            .object => |op| {
+                // §13.15.5.5 ObjectBindingPattern — requires a coercible value (§13.15.5.4).
+                if (value == .undefined or value == .null) {
+                    return self.throwError("TypeError", "Cannot destructure null or undefined");
+                }
+                for (op.properties) |prop| {
+                    const gc = try self.getProperty(value, prop.key);
+                    if (gc.isAbrupt()) return gc;
+                    var v = gc.normal;
+                    if (v == .undefined) {
+                        if (prop.default) |dn| {
+                            const dc = try self.evalExpr(dn, env);
+                            if (dc.isAbrupt()) return dc;
+                            v = dc.normal;
+                        }
+                    }
+                    const bc = try self.bindPattern(prop.target, v, env, mutable);
+                    if (bc.isAbrupt()) return bc;
+                }
+                if (op.rest) |rest_name| {
+                    // §14.3.3 BindingRestProperty — own enumerable props not already destructured,
+                    // copied into a fresh ordinary object.
+                    const rest_obj = try Object.create(self.arena, null);
+                    if (value == .object) {
+                        var it = value.object.properties.iterator();
+                        while (it.next()) |entry| {
+                            const k = entry.key_ptr.*;
+                            var taken = false;
+                            for (op.properties) |prop| {
+                                if (std.mem.eql(u8, prop.key, k)) {
+                                    taken = true;
+                                    break;
+                                }
+                            }
+                            if (!taken) try rest_obj.set(k, entry.value_ptr.*);
+                        }
+                    }
+                    try env.declare(rest_name, .{ .object = rest_obj }, mutable, true);
+                }
+                return .{ .normal = .undefined };
+            },
+        }
+    }
+
+    /// Materialize an iterable `value` into a slice of element Values, for array destructuring
+    /// (§13.15.5.3 IteratorBindingInitialization). Supports Arrays and Strings (the engine's
+    /// iterable model); returns null for non-iterables so the caller can throw a TypeError.
+    fn iterableToSlice(self: *Interpreter, value: Value) EvalError!?[]const Value {
+        switch (value) {
+            .object => |o| {
+                if (o.kind != .array) return null;
+                return o.elements.items;
+            },
+            .string => |s| {
+                var list: std.ArrayListUnmanaged(Value) = .empty;
+                for (0..s.len) |i| try list.append(self.arena, .{ .string = s[i .. i + 1] });
+                return list.items;
+            },
+            else => return null,
+        }
     }
 
     /// §10.1.8 [[Get]]. Property access on null/undefined throws (§13.3); other primitives

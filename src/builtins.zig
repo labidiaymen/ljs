@@ -13,6 +13,13 @@ pub const error_names = [_][]const u8{
 };
 
 pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Error!void {
+    // §19.1 Value properties of the global object — `undefined`/`NaN`/`Infinity`. These are
+    // non-writable, non-configurable in the spec, so we declare them immutable. Many programs
+    // (and the Test262 `assert` harness, e.g. `message === undefined`) depend on these.
+    try env.declare("undefined", .undefined, false, true); // §19.1.4
+    try env.declare("NaN", .{ .number = std.math.nan(f64) }, false, true); // §19.1.1
+    try env.declare("Infinity", .{ .number = std.math.inf(f64) }, false, true); // §19.1.2
+
     // §20.5 The Error family — each a native constructor; `name` is the error name.
     for (error_names) |name| {
         const ctor = try Object.createNative(arena, .error_ctor, name);

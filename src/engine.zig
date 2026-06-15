@@ -279,6 +279,64 @@ test "M3 spread & rest (US3)" {
     try expectNumber("function f(...xs) { return xs[1]; } f(...[5, 6, 7])", 6);
 }
 
+test "M3 destructuring: array patterns (US4)" {
+    // basic + multiple bindings (§13.3.3 ArrayBindingPattern)
+    try expectNumber("var [a, b] = [1, 2]; a + b", 3);
+    try expectNumber("let [a, b, c] = [10, 20, 30]; a + b + c", 60);
+    // elision / hole
+    try expectNumber("var [a, , c] = [1, 2, 3]; a + c", 4);
+    // default values (applied only when undefined)
+    try expectNumber("const [a, b = 5] = [1]; a + b", 6);
+    try expectNumber("const [a, b = 5] = [1, 2]; a + b", 3);
+    // rest element in pattern
+    try expectNumber("var [a, ...rest] = [1, 2, 3, 4]; rest.length", 3);
+    try expectNumber("var [a, ...rest] = [1, 2, 3, 4]; rest[1]", 3);
+    try expectNumber("var [a, ...rest] = [9]; rest.length", 0);
+    // missing values → undefined unless a default is present
+    try expectStr("var [a, b] = [1]; typeof b", "undefined");
+    // string is iterable
+    try expectStr("var [a, b] = \"hi\"; a + b", "hi");
+}
+
+test "M3 destructuring: object patterns (US4)" {
+    // shorthand (§13.3.3 ObjectBindingPattern)
+    try expectNumber("var {x, y} = {x: 1, y: 2}; x + y", 3);
+    // renaming `key: target`
+    try expectNumber("let {x: a, y: b} = {x: 10, y: 20}; a + b", 30);
+    // default value
+    try expectNumber("const {x = 1} = {}; x", 1);
+    try expectNumber("const {x = 1} = {x: 7}; x", 7);
+    // rest property
+    try expectNumber("var {x, ...rest} = {x: 1, y: 2, z: 3}; rest.y + rest.z", 5);
+    // destructuring null/undefined throws
+    try expectThrows("var {x} = null;");
+    try expectThrows("var {x} = undefined;");
+}
+
+test "M3 destructuring: nested patterns (US4)" {
+    try expectNumber("var [{a}, [b]] = [{a: 5}, [7]]; a + b", 12);
+    try expectNumber("var {p: [a, b]} = {p: [3, 4]}; a + b", 7);
+    try expectNumber("var [{x: y = 9}] = [{}]; y", 9);
+    try expectNumber("var {a: {b}} = {a: {b: 42}}; b", 42);
+}
+
+test "M3 destructuring: function parameters (US4)" {
+    // array pattern param
+    try expectNumber("function f([a, b]) { return a + b; } f([3, 4])", 7);
+    // object pattern param
+    try expectNumber("function f({x, y}) { return x * y; } f({x: 3, y: 4})", 12);
+    // default param value
+    try expectNumber("function f(a, b = 10) { return a + b; } f(5)", 15);
+    try expectNumber("function f(a, b = 10) { return a + b; } f(5, 1)", 6);
+    // mixed array + object pattern params
+    try expectNumber("function f([a, b], {x}) { return a + b + x; } f([1, 2], {x: 3})", 6);
+    // pattern param with default + nested
+    try expectNumber("function f({a = 1, b = 2} = {}) { return a + b; } f()", 3);
+    try expectNumber("function f({a = 1, b = 2} = {}) { return a + b; } f({a: 10})", 12);
+    // rest param destructured
+    try expectNumber("function f(...[a, b]) { return a + b; } f(4, 5)", 9);
+}
+
 test "deep recursion throws RangeError, not a segfault" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

@@ -59,16 +59,58 @@ pub const UpdateOp = enum { inc, dec };
 
 pub const Property = struct { key: []const u8, value: *const Node };
 
+/// §13.3.3 BindingPattern (also reused for parameter binding, §15.1). A `Pattern` is the LHS of a
+/// destructuring binding. The common case — a plain identifier — stays `.identifier` so simple
+/// declarations/params never pay the recursive matching cost (see interpreter fast paths).
+pub const Pattern = union(enum) {
+    identifier: []const u8, // §13.3.3 BindingIdentifier
+    array: ArrayPattern, // §13.3.3 ArrayBindingPattern  `[a, , b = 1, ...rest]`
+    object: ObjectPattern, // §13.3.3 ObjectBindingPattern `{x, y: a, z = 1, ...rest}`
+};
+
+/// One slot of an array binding pattern. `target == null` ⇒ an elision/hole (`[a, , b]`).
+/// `default` is the `= expr` initializer applied when the matched value is `undefined`.
+pub const BindingElement = struct {
+    target: ?*const Pattern,
+    default: ?*const Node = null,
+};
+
+pub const ArrayPattern = struct {
+    elements: []const BindingElement, // holes carried as `.target == null`
+    rest: ?*const Pattern = null, // §13.3.3 BindingRestElement `...rest`
+};
+
+/// One `key: target = default` property of an object binding pattern. `computed` keys are not yet
+/// supported (deferred with object-literal computed keys); keys are identifier/string literals.
+pub const ObjectBindingProperty = struct {
+    key: []const u8,
+    target: *const Pattern,
+    default: ?*const Node = null,
+};
+
+pub const ObjectPattern = struct {
+    properties: []const ObjectBindingProperty,
+    rest: ?[]const u8 = null, // §14.3.3 BindingRestProperty `...rest` (identifier only)
+};
+
+/// A function/method parameter: a binding pattern plus an optional `= expr` default (§15.1).
+pub const Param = struct {
+    pattern: *const Pattern,
+    default: ?*const Node = null,
+};
+
 pub const Function = struct {
     name: ?[]const u8,
-    params: []const []const u8,
-    rest: ?[]const u8 = null, // §15.1 rest parameter `...xs`
+    params: []const Param,
+    rest: ?*const Pattern = null, // §15.1 rest parameter `...xs` (may itself be a pattern)
     body: []const Stmt,
 };
 
 pub const DeclKind = enum { var_decl, let_decl, const_decl };
 
-pub const Declarator = struct { name: []const u8, init: ?*const Node };
+/// §14.3 LexicalBinding / VariableDeclaration. `target` is a binding pattern (commonly a single
+/// identifier); `init` is the optional `= expr` initializer.
+pub const Declarator = struct { target: *const Pattern, init: ?*const Node };
 
 pub const Stmt = union(enum) {
     expr: *const Node,

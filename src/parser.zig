@@ -51,6 +51,99 @@ pub const Parser = struct {
         return p;
     }
 
+    fn allocPattern(self: *Parser, pat: ast.Pattern) ParseError!*const ast.Pattern {
+        const p = try self.arena.create(ast.Pattern);
+        p.* = pat;
+        return p;
+    }
+
+    /// §13.3.3 BindingPattern — a binding identifier, an ArrayBindingPattern `[ … ]`, or an
+    /// ObjectBindingPattern `{ … }`. Used by both declarations (§14.3) and parameters (§15.1).
+    fn parsePattern(self: *Parser) ParseError!*const ast.Pattern {
+        switch (self.peek().kind) {
+            .lbracket => return self.parseArrayPattern(),
+            .lbrace => return self.parseObjectPattern(),
+            .identifier => return self.allocPattern(.{ .identifier = self.advance().lexeme }),
+            else => return ParseError.UnexpectedToken,
+        }
+    }
+
+    /// §13.3.3 ArrayBindingPattern `[a, , b = 1, ...rest]` — elisions are holes, each element may
+    /// carry a `= default`, and an optional trailing `...rest` (itself a pattern).
+    fn parseArrayPattern(self: *Parser) ParseError!*const ast.Pattern {
+        _ = try self.expect(.lbracket);
+        var elements: std.ArrayList(ast.BindingElement) = .empty;
+        var rest: ?*const ast.Pattern = null;
+        while (self.peek().kind != .rbracket and self.peek().kind != .eof) {
+            if (self.peek().kind == .comma) { // elision / hole — no target
+                _ = self.advance();
+                try elements.append(self.arena, .{ .target = null, .default = null });
+                continue;
+            }
+            if (self.peek().kind == .ellipsis) { // §13.3.3 BindingRestElement (must be last)
+                _ = self.advance();
+                rest = try self.parsePattern();
+                break;
+            }
+            const target = try self.parsePattern();
+            var default: ?*const ast.Node = null;
+            if (self.peek().kind == .assign) {
+                _ = self.advance();
+                default = try self.parseAssignment();
+            }
+            try elements.append(self.arena, .{ .target = target, .default = default });
+            if (self.peek().kind == .comma) {
+                _ = self.advance();
+                continue;
+            }
+            break;
+        }
+        _ = try self.expect(.rbracket);
+        return self.allocPattern(.{ .array = .{ .elements = elements.items, .rest = rest } });
+    }
+
+    /// §13.3.3 / §14.3.3 ObjectBindingPattern `{x, y: a, z = 1, ...rest}` — shorthand `{x}` binds
+    /// `x`, `key: target` renames, `= default` applies when the property is undefined, and an
+    /// optional `...rest` (identifier) collects the remaining own enumerable properties.
+    fn parseObjectPattern(self: *Parser) ParseError!*const ast.Pattern {
+        _ = try self.expect(.lbrace);
+        var props: std.ArrayList(ast.ObjectBindingProperty) = .empty;
+        var rest: ?[]const u8 = null;
+        while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
+            if (self.peek().kind == .ellipsis) { // §14.3.3 BindingRestProperty (must be last)
+                _ = self.advance();
+                rest = (try self.expect(.identifier)).lexeme;
+                break;
+            }
+            const kt = self.advance();
+            const key = switch (kt.kind) {
+                .identifier => kt.lexeme,
+                .string => kt.string_value,
+                else => return ParseError.UnexpectedToken,
+            };
+            const target: *const ast.Pattern = if (self.peek().kind == .colon) blk: {
+                // `key: target` (renaming / nested)
+                _ = self.advance();
+                break :blk try self.parsePattern();
+            } else
+                // shorthand `{x}` — key doubles as the binding identifier
+                try self.allocPattern(.{ .identifier = key });
+            var default: ?*const ast.Node = null;
+            if (self.peek().kind == .assign) {
+                _ = self.advance();
+                default = try self.parseAssignment();
+            }
+            try props.append(self.arena, .{ .key = key, .target = target, .default = default });
+            if (self.peek().kind == .comma) {
+                _ = self.advance();
+                continue;
+            }
+            break;
+        }
+        _ = try self.expect(.rbrace);
+        return self.allocPattern(.{ .object = .{ .properties = props.items, .rest = rest } });
+    }
+
     /// §13.2.8 Template literal: split raw inner text into cooked quasis + expression sources,
     /// sub-parsing each `${...}`. quasis.len == exprs.len + 1.
     fn parseTemplate(self: *Parser, raw: []const u8) ParseError!*const ast.Node {
@@ -297,25 +390,35 @@ pub const Parser = struct {
         if (self.peek().kind == .identifier) name = self.advance().lexeme;
         const pl = try self.parseParams();
         const body = try self.parseBlock();
+        // §15.1.1 Early Error: a "use strict" directive is forbidden when the parameter list is
+        // non-simple (has defaults, patterns, or a rest element).
+        if (!isSimpleParameterList(pl) and bodyHasUseStrict(body)) return ParseError.UnexpectedToken;
         const f = try self.arena.create(ast.Function);
         f.* = .{ .name = name, .params = pl.params, .rest = pl.rest, .body = body };
         return f;
     }
 
-    const ParamList = struct { params: []const []const u8, rest: ?[]const u8 };
+    const ParamList = struct { params: []const ast.Param, rest: ?*const ast.Pattern };
 
+    /// §15.1 FormalParameters — each parameter is a binding pattern with an optional `= default`;
+    /// an optional trailing `...rest` (itself a pattern) collects the leftover arguments.
     fn parseParams(self: *Parser) ParseError!ParamList {
         _ = try self.expect(.lparen);
-        var params: std.ArrayList([]const u8) = .empty;
-        var rest: ?[]const u8 = null;
+        var params: std.ArrayList(ast.Param) = .empty;
+        var rest: ?*const ast.Pattern = null;
         while (self.peek().kind != .rparen and self.peek().kind != .eof) {
             if (self.peek().kind == .ellipsis) { // §15.1 rest parameter (must be last)
                 _ = self.advance();
-                rest = (try self.expect(.identifier)).lexeme;
+                rest = try self.parsePattern();
                 break;
             }
-            const p = try self.expect(.identifier);
-            try params.append(self.arena, p.lexeme);
+            const pattern = try self.parsePattern();
+            var default: ?*const ast.Node = null;
+            if (self.peek().kind == .assign) { // §15.1 default value `a = expr`
+                _ = self.advance();
+                default = try self.parseAssignment();
+            }
+            try params.append(self.arena, .{ .pattern = pattern, .default = default });
             if (self.peek().kind == .comma) {
                 _ = self.advance();
                 continue;
@@ -353,13 +456,19 @@ pub const Parser = struct {
         };
         var decls: std.ArrayList(ast.Declarator) = .empty;
         while (true) {
-            const name_tok = try self.expect(.identifier);
+            // §14.3 LexicalBinding: target is a BindingIdentifier or a BindingPattern.
+            const target = try self.parsePattern();
             var init_expr: ?*const ast.Node = null;
             if (self.peek().kind == .assign) {
                 _ = self.advance();
                 init_expr = try self.parseAssignment();
             }
-            try decls.append(self.arena, .{ .name = name_tok.lexeme, .init = init_expr });
+            // §14.3.1.1 / §14.3.2: a BindingPattern declaration (and any `const`) requires an
+            // initializer — `let {x};`, `const [a];`, `var {y};` are Early SyntaxErrors.
+            if (init_expr == null and (target.* != .identifier or kind == .const_decl)) {
+                return ParseError.UnexpectedToken;
+            }
+            try decls.append(self.arena, .{ .target = target, .init = init_expr });
             if (self.peek().kind == .comma) {
                 _ = self.advance();
                 continue;
@@ -589,6 +698,32 @@ pub const Parser = struct {
         }
     }
 };
+
+/// §15.1.3 IsSimpleParameterList — true iff every parameter is a plain BindingIdentifier with no
+/// default and there is no rest parameter (the precondition for allowing a "use strict" directive).
+fn isSimpleParameterList(pl: Parser.ParamList) bool {
+    if (pl.rest != null) return false;
+    for (pl.params) |p| {
+        if (p.default != null) return false;
+        if (p.pattern.* != .identifier) return false;
+    }
+    return true;
+}
+
+/// Does the function body's directive prologue (§11.2.1) contain a "use strict" directive? The
+/// prologue is the leading run of string-literal ExpressionStatements.
+fn bodyHasUseStrict(body: []const ast.Stmt) bool {
+    for (body) |s| {
+        switch (s) {
+            .expr => |e| switch (e.*) {
+                .string => |str| if (std.mem.eql(u8, str, "use strict")) return true,
+                else => return false, // first non-string-literal ends the directive prologue
+            },
+            else => return false,
+        }
+    }
+    return false;
+}
 
 fn binaryOpFor(kind: lex.TokenKind) ?ast.BinaryOp {
     return switch (kind) {

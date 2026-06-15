@@ -24,10 +24,10 @@ pub const NativeId = enum {
     string_method, // String.prototype.<native_name>
 };
 
-/// The closure captured by a function object: parameter names, body, and defining scope.
+/// The closure captured by a function object: parameter patterns, body, and defining scope.
 pub const FunctionData = struct {
-    params: []const []const u8,
-    rest: ?[]const u8 = null,
+    params: []const ast.Param,
+    rest: ?*const ast.Pattern = null,
     body: []const ast.Stmt,
     closure: *Environment,
 };
