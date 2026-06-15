@@ -24,7 +24,21 @@ pub const Value = union(enum) {
             .boolean => |b| try w.writeAll(if (b) "true" else "false"),
             .number => |n| try writeNumber(w, n),
             .string => |s| try w.print("\"{s}\"", .{s}),
-            .object => |o| try w.writeAll(if (o.kind == .function) "[Function (anonymous)]" else "[object Object]"),
+            .object => |o| {
+                if (o.kind == .function) {
+                    try w.writeAll("[Function (anonymous)]");
+                } else if (o.get("name")) |nv| { // error-like: "Name: message"
+                    if (nv == .string) {
+                        try w.writeAll(nv.string);
+                        if (o.get("message")) |mv| {
+                            if (mv == .string and mv.string.len > 0) {
+                                try w.writeAll(": ");
+                                try w.writeAll(mv.string);
+                            }
+                        }
+                    } else try w.writeAll("[object Object]");
+                } else try w.writeAll("[object Object]");
+            },
         }
     }
 };

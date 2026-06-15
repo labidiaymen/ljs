@@ -5,6 +5,7 @@ const Value = @import("value.zig").Value;
 const Parser = @import("parser.zig").Parser;
 const Interpreter = @import("interpreter.zig").Interpreter;
 const Environment = @import("environment.zig").Environment;
+const builtins = @import("builtins.zig");
 
 /// ECMA-262 distinguishes strict and sloppy mode. The M0 expression subset has no
 /// observable difference yet; the parameter is threaded now so the harness can run both.
@@ -32,7 +33,8 @@ pub fn evaluateWithLimit(arena: std.mem.Allocator, source: []const u8, mode: Run
         else => return .{ .syntax_error = @errorName(e) },
     };
     const global = Environment.create(arena, null) catch return error.OutOfMemory;
-    var interp = Interpreter{ .arena = arena, .step_limit = step_limit };
+    builtins.setup(arena, global) catch return error.OutOfMemory;
+    var interp = Interpreter{ .arena = arena, .step_limit = step_limit, .globals = global };
     const completion = interp.run(program, global) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.StepLimitExceeded => return .step_limit,
@@ -174,6 +176,18 @@ test "E1: typeof, logical ops, new + instanceof (US5)" {
     try expectNumber("function P(v){ this.v = v; } var p = new P(42); p.v", 42);
     try expectBool("function P(){} var p = new P(); p instanceof P", true);
     try expectBool("function P(){} function Q(){} (new P()) instanceof Q", false);
+}
+
+test "E2: Error family, String, Object, typed engine errors (US5)" {
+    try expectStr("new TypeError(\"boom\").name", "TypeError");
+    try expectStr("new RangeError(\"x\").message", "x");
+    try expectBool("(new TypeError(\"y\")) instanceof TypeError", true);
+    try expectBool("(new RangeError()) instanceof TypeError", false);
+    try expectStr("String(42)", "42");
+    try expectStr("typeof Object", "function");
+    // engine-thrown errors are now real objects, classifiable by `.name`:
+    try expectStr("var n = \"\"; try { null.x; } catch (e) { n = e.name; } n", "TypeError");
+    try expectStr("var n = \"\"; try { missingThing; } catch (e) { n = e.name; } n", "ReferenceError");
 }
 
 test "deep recursion throws RangeError, not a segfault" {

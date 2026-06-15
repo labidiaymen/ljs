@@ -24,6 +24,9 @@ pub const Interpreter = struct {
     /// The current `this` binding (§9.4.5 GetThisEnvironment, M1 subset): set by method calls,
     /// undefined otherwise. Saved/restored around each [[Call]].
     this_val: Value = .undefined,
+    /// The realm's global environment — used to resolve the Error family for engine-thrown
+    /// errors (so they carry the right prototype + name). Set by the engine after setup.
+    globals: ?*Environment = null,
 
     pub fn run(self: *Interpreter, program: ast.Program, env: *Environment) EvalError!Completion {
         var last: Completion = .{ .normal = .undefined };
@@ -327,9 +330,10 @@ pub const Interpreter = struct {
         return self.callFunction(callee.object, args.items, this_for_call);
     }
 
-    /// §10.2.1 [[Call]] for an ordinary function object.
+    /// §10.2.1 [[Call]] — native built-in, else an ordinary AST-closure function.
     fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
-        const fd = func.call.?;
+        if (func.native != .none) return self.callNative(func, args, this_val);
+        const fd = func.call orelse return self.throwError("TypeError", "value is not a function");
         const call_env = try Environment.create(self.arena, fd.closure);
         for (fd.params, 0..) |param, i| {
             const v: Value = if (i < args.len) args[i] else .undefined; // missing args → undefined
@@ -428,12 +432,52 @@ pub const Interpreter = struct {
         }
     }
 
-    /// M1: typed Error objects don't exist yet (Cycle E), so a thrown error is a string
-    /// "<Kind>: <message>". Classification in the harness still sees a throw; exact-type
-    /// matching is tightened once real Error objects land.
+    /// §20.5: throw a real Error object carrying `name`/`message`, proto-linked to the realm's
+    /// matching Error constructor (so `e instanceof TypeError` and name-based classification work).
     fn throwError(self: *Interpreter, kind: []const u8, msg: []const u8) EvalError!Completion {
-        const s = try std.fmt.allocPrint(self.arena, "{s}: {s}", .{ kind, msg });
-        return .{ .throw = .{ .string = s } };
+        const err = try Object.create(self.arena, self.errorProto(kind));
+        try err.set("name", .{ .string = kind });
+        try err.set("message", .{ .string = msg });
+        return .{ .throw = .{ .object = err } };
+    }
+
+    fn errorProto(self: *Interpreter, kind: []const u8) ?*Object {
+        const g = self.globals orelse return null;
+        const b = g.lookup(kind) orelse return null;
+        if (b.value != .object) return null;
+        const pv = b.value.object.get("prototype") orelse return null;
+        return if (pv == .object) pv.object else null;
+    }
+
+    /// Dispatch a built-in function (§19/§20). Behavior keyed by `func.native`.
+    fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
+        _ = this_val;
+        switch (func.native) {
+            .error_ctor => {
+                const proto: ?*Object = blk: {
+                    const pv = func.get("prototype") orelse break :blk null;
+                    break :blk if (pv == .object) pv.object else null;
+                };
+                const err = try Object.create(self.arena, proto);
+                try err.set("name", .{ .string = func.native_name });
+                const msg: Value = if (args.len > 0 and args[0] != .undefined)
+                    .{ .string = try self.toString(args[0]) }
+                else
+                    .{ .string = "" };
+                try err.set("message", msg);
+                return .{ .normal = .{ .object = err } };
+            },
+            .string_ctor => {
+                const v: Value = if (args.len > 0) args[0] else .undefined;
+                return .{ .normal = .{ .string = try self.toString(v) } };
+            },
+            .object_ctor => {
+                if (args.len > 0 and args[0] == .object) return .{ .normal = args[0] };
+                return .{ .normal = .{ .object = try Object.create(self.arena, null) } };
+            },
+            .object_to_string => return .{ .normal = .{ .string = "[object Object]" } },
+            .none => unreachable,
+        }
     }
 
     /// §7.1.17 ToString (subset; primitives only).

@@ -9,6 +9,17 @@ const Environment = @import("environment.zig").Environment;
 
 pub const Kind = enum { ordinary, function };
 
+/// Built-in (Zig-implemented) function identity. Dispatched by the interpreter's callNative;
+/// `none` means an ordinary AST-closure function. Avoids an fn-pointer ↔ interpreter import
+/// cycle — the behavior lives in the interpreter, keyed by this id.
+pub const NativeId = enum {
+    none,
+    error_ctor, // Error / TypeError / … — `native_name` is the error name
+    string_ctor, // String(x)
+    object_ctor, // Object()
+    object_to_string, // Object.prototype.toString
+};
+
 /// The closure captured by a function object: parameter names, body, and defining scope.
 pub const FunctionData = struct {
     params: []const []const u8,
@@ -21,7 +32,9 @@ pub const Object = struct {
     properties: std.StringHashMapUnmanaged(Value),
     prototype: ?*Object,
     kind: Kind = .ordinary,
-    call: ?FunctionData = null, // present iff kind == .function
+    call: ?FunctionData = null, // present iff kind == .function (and native == .none)
+    native: NativeId = .none,
+    native_name: []const u8 = "",
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);
@@ -34,6 +47,17 @@ pub const Object = struct {
         obj.kind = .function;
         obj.call = data;
         // §10.2.4: every ordinary function gets a `.prototype` object (used by `new`/`instanceof`).
+        const proto = try create(arena, null);
+        try obj.set("prototype", .{ .object = proto });
+        return obj;
+    }
+
+    /// A built-in function object (kind=function, dispatched by `native` id).
+    pub fn createNative(arena: std.mem.Allocator, id: NativeId, name: []const u8) std.mem.Allocator.Error!*Object {
+        const obj = try create(arena, null);
+        obj.kind = .function;
+        obj.native = id;
+        obj.native_name = name;
         const proto = try create(arena, null);
         try obj.set("prototype", .{ .object = proto });
         return obj;

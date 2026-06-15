@@ -52,8 +52,8 @@ folded into plan.md (Phase 0/1) for M1 to avoid over-producing artifacts.
 - [x] M1-T053 [P] [US5] E1 tests (inline): typeof/logical/new/instanceof
 
 ### Cycle E2 — core built-ins + global environment
-- [ ] M1-T054 [US5] `src/builtins.zig`: Error family (name/message), `Object`+`Object.prototype.toString`, `Array`+`map`/`join`, `String()`, `Function.prototype.call`; wire the global env — §19/§20
-- [ ] M1-T055 [P] [US5] built-in tests
+- [x] M1-T054 [US5] `src/builtins.zig` + global env: Error family (typed, name/message), `String()`, minimal `Object`(+proto.toString); native dispatch via `NativeId`; `throwError` now yields **real Error objects** proto-linked to the realm constructors. **Deferred** (Test262 failure-path only): `Array`, `Function.prototype.call`, `Object.prototype.toString.call`.
+- [x] M1-T055 [P] [US5] E2 tests (inline): Error family, instanceof, String, typed engine errors via `e.name`
 
 ### Cycle E3 — harness execution (the SC-003 payoff)
 - [ ] M1-T056 [US5] Wire harness-include loading in `test262/runner.zig` (thread `io`; prepend sta.js+assert.js+includes for non-raw) — retires M0 T019, FR-007
