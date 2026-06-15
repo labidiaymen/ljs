@@ -41,6 +41,7 @@ pub const TokenKind = enum {
     shl, // <<
     shr, // >>
     shr_un, // >>>
+    template, // `...${}...` (raw inner stored in string_value)
     kw_in, // in
     plus_plus, // ++
     minus_minus, // --
@@ -186,6 +187,9 @@ pub const Lexer = struct {
         // String literals. §12.9.4 (subset: no escapes beyond the basics).
         if (c == '"' or c == '\'') return self.lexString(c);
 
+        // Template literals. §12.9.6 — capture the raw inner text; the parser splits quasis/exprs.
+        if (c == '`') return self.lexTemplate();
+
         // Punctuators.
         self.pos += 1;
         switch (c) {
@@ -302,6 +306,39 @@ pub const Lexer = struct {
             return tok(.sne, self.src[start..self.pos]);
         }
         return tok(.ne, self.src[start..self.pos]);
+    }
+
+    /// Scan a template literal; returns its raw inner text (between backticks) in `string_value`.
+    /// `${...}` substitutions are kept raw (brace-depth tracked so a `}` inside an expr doesn't
+    /// end the template); the parser splits quasis from expression sources.
+    fn lexTemplate(self: *Lexer) LexError!Token {
+        self.pos += 1; // opening backtick
+        const start = self.pos;
+        var depth: usize = 0;
+        while (self.pos < self.src.len) {
+            const c = self.src[self.pos];
+            if (c == '\\' and self.pos + 1 < self.src.len) {
+                self.pos += 2;
+                continue;
+            }
+            if (c == '$' and self.pos + 1 < self.src.len and self.src[self.pos + 1] == '{') {
+                depth += 1;
+                self.pos += 2;
+                continue;
+            }
+            if (c == '}' and depth > 0) {
+                depth -= 1;
+                self.pos += 1;
+                continue;
+            }
+            if (c == '`' and depth == 0) {
+                const inner = self.src[start..self.pos];
+                self.pos += 1; // closing backtick
+                return .{ .kind = .template, .lexeme = inner, .string_value = inner };
+            }
+            self.pos += 1;
+        }
+        return LexError.UnterminatedString;
     }
 
     fn lexString(self: *Lexer, quote: u8) LexError!Token {

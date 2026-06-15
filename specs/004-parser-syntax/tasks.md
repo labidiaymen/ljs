@@ -15,8 +15,9 @@ spec (this is parser/evaluator work; no new architecture).
 - [x] M3-T013 [P] operator tests (12, inline) + re-measure: **24.2%** (+147 tests). Bench green (ljs ≤ Node).
 > Deferred from US1: comma operator, `void`/`delete` (lower frequency; need an expression-comma layer / assignable-target delete — revisit if the breakdown shows them dominant).
 
-## Cycle 2 — US2 Template literals
-- [ ] M3-T020 Lexer: backtick template tokens (quasi chunks + `${`/`}`); Parser: template node; Interpreter: concat ToString of substitutions
+## Cycle 2 — US2 Template literals (DONE)
+- [x] M3-T020 `a${x}b` template literals: lexer raw-scan (brace-tracked), parser quasi/expr split + sub-parse (nested + escapes), interpreter ToString-concat. Conformance flat on expressions (24.2%) — templates are rare there.
+- [x] M3-T021 **Perf fix** (bench gate caught a real ~15% loop slowdown across M2/M3): blocks allocate a child scope only when they lexically declare (let/const/function); declaration-free bodies reuse the parent env → no per-iteration alloc. loop_sum now *beats* its baseline. Behavior-preserving.
 
 ## Cycle 3 — US3 Spread & rest
 - [ ] M3-T030 `...` in array literals + call args (flatten iterables/arrays); rest params (`function f(...xs)`)

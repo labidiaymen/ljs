@@ -50,6 +50,7 @@ pub const Node = union(enum) {
     logical: struct { op: LogicalOp, left: *const Node, right: *const Node }, // §13.13
     conditional: struct { cond: *const Node, then: *const Node, otherwise: *const Node }, // §13.14 ?:
     update: struct { op: UpdateOp, prefix: bool, target: *const Node }, // §13.4 ++ / --
+    template: struct { quasis: []const []const u8, exprs: []const *const Node }, // §13.2.8 `a${x}b`
     this, // §13.2.1 ThisExpression
 };
 

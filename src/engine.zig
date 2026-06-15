@@ -251,6 +251,15 @@ test "M3 operators: **, bitwise, shifts, in (US1)" {
     try expectBool("0 in [9]", true);
 }
 
+test "M3 template literals (US2)" {
+    try expectStr("`hello`", "hello");
+    try expectStr("`a${1 + 1}b`", "a2b");
+    try expectStr("var x = 5; `x is ${x}`", "x is 5");
+    try expectStr("`${1}${2}${3}`", "123");
+    try expectStr("`nested ${`in${\"ner\"}`}`", "nested inner");
+    try expectStr("`line\\nbreak`", "line\nbreak");
+}
+
 test "deep recursion throws RangeError, not a segfault" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

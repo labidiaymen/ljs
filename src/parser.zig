@@ -51,6 +51,54 @@ pub const Parser = struct {
         return p;
     }
 
+    /// §13.2.8 Template literal: split raw inner text into cooked quasis + expression sources,
+    /// sub-parsing each `${...}`. quasis.len == exprs.len + 1.
+    fn parseTemplate(self: *Parser, raw: []const u8) ParseError!*const ast.Node {
+        var quasis: std.ArrayList([]const u8) = .empty;
+        var exprs: std.ArrayList(*const ast.Node) = .empty;
+        var cooked: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < raw.len) {
+            if (raw[i] == '\\' and i + 1 < raw.len) {
+                const d: u8 = switch (raw[i + 1]) {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    else => raw[i + 1], // \\, \`, \$, \", \' → literal
+                };
+                try cooked.append(self.arena, d);
+                i += 2;
+                continue;
+            }
+            if (raw[i] == '$' and i + 1 < raw.len and raw[i + 1] == '{') {
+                try quasis.append(self.arena, cooked.items);
+                cooked = .empty;
+                i += 2;
+                const expr_start = i;
+                var depth: usize = 1;
+                while (i < raw.len and depth > 0) {
+                    if (raw[i] == '{') depth += 1 else if (raw[i] == '}') {
+                        depth -= 1;
+                        if (depth == 0) break;
+                    }
+                    i += 1;
+                }
+                const prog = try Parser.parse(self.arena, raw[expr_start..i]);
+                const node = if (prog.statements.len > 0 and prog.statements[0] == .expr)
+                    prog.statements[0].expr
+                else
+                    try self.alloc(.{ .string = "" });
+                try exprs.append(self.arena, node);
+                i += 1; // skip closing }
+                continue;
+            }
+            try cooked.append(self.arena, raw[i]);
+            i += 1;
+        }
+        try quasis.append(self.arena, cooked.items);
+        return self.alloc(.{ .template = .{ .quasis = quasis.items, .exprs = exprs.items } });
+    }
+
     /// §13.3.5 `new Callee(args)`. Callee is a member expression (no call); the argument list
     /// binds to the `new`, so `new a.b.C(x)` constructs `a.b.C`.
     fn parseNew(self: *Parser) ParseError!*const ast.Node {
@@ -502,6 +550,10 @@ pub const Parser = struct {
             .kw_this => {
                 _ = self.advance();
                 return self.alloc(.this);
+            },
+            .template => {
+                _ = self.advance();
+                return self.parseTemplate(t.string_value);
             },
             .kw_new => return self.parseNew(),
             .lparen => {

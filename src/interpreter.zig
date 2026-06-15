@@ -80,8 +80,11 @@ pub const Interpreter = struct {
                 return .{ .normal = .undefined };
             },
             .block => |stmts| {
-                // §14.2 Block — runs in a fresh declarative environment (lexical scope).
-                return self.runBlock(stmts, try Environment.create(self.arena, env));
+                // §14.2 Block. Allocate a child scope only when the block actually has lexical
+                // declarations (let/const/function); declaration-free blocks (e.g. hot loop
+                // bodies) reuse the parent env — avoids a per-iteration allocation.
+                if (blockNeedsScope(stmts)) return self.runBlock(stmts, try Environment.create(self.arena, env));
+                return self.runBlock(stmts, env);
             },
             .func_decl => |f| {
                 // §15.2 — bind a function object to its name in the current scope.
@@ -346,6 +349,19 @@ pub const Interpreter = struct {
                     },
                     else => return self.throwError("SyntaxError", "Invalid update expression target"),
                 }
+            },
+            .template => |t| {
+                // §13.2.8 — concatenate quasis with ToString of each substitution.
+                var buf: std.ArrayList(u8) = .empty;
+                for (t.quasis, 0..) |q, idx| {
+                    try buf.appendSlice(self.arena, q);
+                    if (idx < t.exprs.len) {
+                        const c = try self.evalExpr(t.exprs[idx], env);
+                        if (c.isAbrupt()) return c;
+                        try buf.appendSlice(self.arena, try self.toString(c.normal));
+                    }
+                }
+                return .{ .normal = .{ .string = buf.items } };
             },
             .this => return .{ .normal = self.this_val },
         }
@@ -674,9 +690,19 @@ pub const Interpreter = struct {
         }
     }
 
-    /// §7.1.17 ToString (subset; primitives only).
     /// §7.1.17 ToString — delegates to the abstract operation (handles Array join).
     pub fn toString(self: *Interpreter, v: Value) EvalError![]const u8 {
         return ops.toString(self.arena, v);
     }
 };
+
+/// A block needs its own declarative scope only if it lexically declares (let/const/function);
+/// `var` is function-scoped and declaration-free blocks can reuse the parent env (hot-loop win).
+fn blockNeedsScope(stmts: []const ast.Stmt) bool {
+    for (stmts) |s| switch (s) {
+        .declaration => |d| if (d.kind != .var_decl) return true,
+        .func_decl => return true,
+        else => {},
+    };
+    return false;
+}
