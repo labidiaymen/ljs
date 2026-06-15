@@ -56,17 +56,35 @@ pub const Lexer = struct {
         return if (self.pos + 1 < self.src.len) self.src[self.pos + 1] else 0;
     }
 
-    fn skipWhitespace(self: *Lexer) void {
+    // §12.2 White Space / §12.3 Line Terminators / §12.4 Comments.
+    fn skipTrivia(self: *Lexer) void {
         while (self.pos < self.src.len) {
-            switch (self.src[self.pos]) {
-                ' ', '\t', '\r', '\n' => self.pos += 1,
-                else => break,
+            const c = self.src[self.pos];
+            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+                self.pos += 1;
+                continue;
             }
+            if (c == '/' and self.pos + 1 < self.src.len) {
+                const c2 = self.src[self.pos + 1];
+                if (c2 == '/') { // single-line comment
+                    self.pos += 2;
+                    while (self.pos < self.src.len and self.src[self.pos] != '\n') self.pos += 1;
+                    continue;
+                }
+                if (c2 == '*') { // block comment
+                    self.pos += 2;
+                    while (self.pos + 1 < self.src.len and
+                        !(self.src[self.pos] == '*' and self.src[self.pos + 1] == '/')) self.pos += 1;
+                    self.pos = @min(self.pos + 2, self.src.len);
+                    continue;
+                }
+            }
+            break;
         }
     }
 
     pub fn next(self: *Lexer) LexError!Token {
-        self.skipWhitespace();
+        self.skipTrivia();
         if (self.pos >= self.src.len) return .{ .kind = .eof, .lexeme = "" };
 
         const c = self.src[self.pos];

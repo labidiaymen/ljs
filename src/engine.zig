@@ -53,6 +53,12 @@ test "arithmetic" {
     try expectNumber("-5 + 8", 3);
 }
 
+test "comments are skipped (§12.4)" {
+    try expectNumber("/* block */ 1 + 2", 3);
+    try expectNumber("1 + 2 // trailing line comment", 3);
+    try expectNumber("/*---\ndescription: frontmatter\n---*/\n40 + 2", 42);
+}
+
 test "syntax error is reported, not crashed" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

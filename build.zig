@@ -170,6 +170,26 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Benchmark ljs vs Node (perf gate)");
     bench_step.dependOn(&bench.step);
 
+    // ── Test262 conformance harness ──────────────────────────────────────────
+    // `zig build test262 -- --path <dir> [--mode strict|sloppy] [--harness-dir <dir>]`
+    const t262_mod = b.createModule(.{
+        .root_source_file = b.path("test262/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ljs", .module = mod }},
+    });
+    const t262 = b.addExecutable(.{ .name = "ljs-test262", .root_module = t262_mod });
+    b.installArtifact(t262); // so `zig build` compiles the harness (build gate covers it)
+    const run_t262 = b.addRunArtifact(t262);
+    if (b.args) |t262_args| run_t262.addArgs(t262_args);
+    const t262_step = b.step("test262", "Run the Test262 conformance harness");
+    t262_step.dependOn(&run_t262.step);
+
+    // Harness unit tests (metadata parsing, classification) run as part of `zig build test`.
+    const t262_tests = b.addTest(.{ .root_module = t262_mod });
+    const run_t262_tests = b.addRunArtifact(t262_tests);
+    test_step.dependOn(&run_t262_tests.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

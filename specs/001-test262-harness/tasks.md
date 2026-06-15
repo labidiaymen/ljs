@@ -60,18 +60,19 @@ Foundational + US1 + US4** (you can measure both conformance *and* ljs-vs-Node p
 
 ### Tests for User Story 1 (write first, must fail)
 
-- [ ] T014 [P] [US1] Add curated classification fixtures + manual labels in `tests/fixtures/sample/` (≥20: positive, negative-parse, negative-runtime, `onlyStrict`, `includes`-using)
-- [ ] T015 [P] [US1] Write `tests/metadata_test.zig` (frontmatter parsing — FR-002)
-- [ ] T016 [P] [US1] Write `tests/classify_test.zig` (harness classification vs manual labels — SC-001)
+- [x] T014 [P] [US1] 20 curated fixtures in `tests/fixtures/sample/` (positive, negative-parse pass/fail, negative-runtime, onlyStrict/noStrict/raw, module/async skip)
+- [x] T015 [P] [US1] Metadata frontmatter tests (inline in `test262/metadata.zig`) — FR-002
+- [x] T016 [P] [US1] Classification tests (inline in `test262/runner.zig`) + end-to-end on fixtures = **27/6/2 (81.8%)**, matches hand-tally — SC-001
 
 ### Implementation for User Story 1
 
-- [ ] T017 [US1] Implement the frontmatter parser in `test262/metadata.zig` (negative type/phase, includes, flags, features, description) → makes T015 pass
-- [ ] T018 [US1] Implement discovery + applicable-mode computation in `test262/runner.zig` (recurse, exclude `_FIXTURE`) — FR-001, FR-003
-- [ ] T019 [US1] Implement per-test execution: fresh realm, strict+sloppy, load `harness/sta.js`+`assert.js`+`includes` for non-`raw` tests, via the engine entry point — FR-004 (depends T013, T017, T018)
-- [ ] T020 [US1] Implement classification (positive; negative parse|runtime; skip unsupported) + fault isolation (catch errors, step-limit) in `test262/runner.zig` → makes T016 pass — FR-005, FR-006
-- [ ] T021 [US1] Implement report aggregation (counts, conformance %) + human summary in `test262/report.zig` — FR-007
-- [ ] T022 [US1] Wire `zig build test262 -- --path/--mode/--report/--step-limit` in `build.zig` + `test262` main, per `contracts/cli.md` — FR-008
+- [x] T017 [US1] Frontmatter parser `test262/metadata.zig` (negative type/phase, includes, flags, features, description)
+- [x] T018 [US1] Discovery + applicable-mode in `test262/runner.zig` (recursive `Io.Dir.Walker`, skip `_FIXTURE`/`harness/`) — FR-001, FR-003
+- [~] T019 [US1] Per-test execution: fresh realm per eval, strict+sloppy, strict prologue. **Harness-include loading (sta.js/assert.js) DEFERRED** — the trivial evaluator can't run them yet (research D7); `--harness-dir` reserved.
+- [x] T020 [US1] Classification (positive; negative parse|runtime; skip module/async) + fault isolation (engine surfaces parse/runtime/step-limit as result variants, never crashes) — FR-005, FR-006
+- [x] T021 [US1] Report aggregation (counts, conformance %) + summary/detail in `test262/report.zig` — FR-007
+- [x] T022 [US1] Wired `zig build test262 -- --path/--mode/--harness-dir/--step-limit` — FR-008
+- [x] T022b [US1] Engine: added §12.4 comment support to the lexer (line + block) — required so Test262 frontmatter parses; `ljs eval/run` now skip comments too
 
 **Checkpoint**: MVP — conformance is measurable and reproducible on a subset.
 

@@ -26,3 +26,16 @@ Drive `specs/001-test262-harness/tasks.md` in priority order, one **cycle** at a
 
 Surface significant assumptions/decisions at the gate, not mid-cycle. Never push without the
 user's per-cycle validation.
+
+### Agent parallelism within a cycle
+Delegate and parallelise where tasks are **independent**, but keep ONE integration point:
+- **Fan out** (parallel sub-agents; worktree isolation if they write files) for independent
+  leaf work — separate non-importing modules, fixtures/test data, research/design, docs.
+- **Integrate + `zig build`/`test`/`lint`/`bench` SEQUENTIALLY** — a single compiling codebase
+  has one build gate; never parallelise edits to the same file or interdependent files.
+- **Parallel review** before the gate: fan out reviewer agents on the diff (correctness /
+  spec-fidelity / Zig-idioms) and fold their findings.
+Dependent chains (foundational → dependents) stay sequential. Prefer the Workflow tool to
+orchestrate fan-out → integrate → review deterministically. Parallelism pays off most in large
+cycles (e.g. M1's many independent built-ins); for small cycles, the overhead can exceed the
+gain — use judgement.
