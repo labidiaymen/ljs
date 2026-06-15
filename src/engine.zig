@@ -98,3 +98,27 @@ test "bindings: errors (US1)" {
     try expectThrows("missingVar"); // ReferenceError
     try expectThrows("{ let y = 1; } y"); // out of scope → ReferenceError
 }
+
+test "objects: literals, member/index access & assignment (US3)" {
+    try expectNumber("var o = {x: 41}; o.x = o.x + 1; o.x", 42);
+    try expectNumber("var o = {a: 1, b: 2}; o.a + o.b", 3);
+    try expectNumber("var o = {}; o[\"k\"] = 7; o[\"k\"]", 7);
+    try expectNumber("var o = {nested: {v: 10}}; o.nested.v", 10); // member chain
+}
+
+test "objects: access on null/undefined throws TypeError (US3)" {
+    try expectThrows("var x = null; x.y");
+    try expectThrows("undefined.z");
+}
+
+test "deep recursion throws RangeError, not a segfault" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(a, "1");
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) try buf.appendSlice(a, "+1"); // 2001-deep > max_depth
+    const r = try evaluate(a, buf.items, .sloppy);
+    try testing.expect(r == .thrown);
+}

@@ -108,10 +108,14 @@ pub const Parser = struct {
     fn parseAssignment(self: *Parser) ParseError!*const ast.Node {
         const left = try self.parseExpr(0);
         if (self.peek().kind == .assign) {
-            if (left.* != .identifier) return ParseError.UnexpectedToken;
             _ = self.advance();
             const value = try self.parseAssignment();
-            return self.alloc(.{ .assign = .{ .name = left.identifier, .value = value } });
+            switch (left.*) {
+                .identifier => |n| return self.alloc(.{ .assign = .{ .name = n, .value = value } }),
+                .member => |m| return self.alloc(.{ .assign_member = .{ .object = m.object, .name = m.name, .value = value } }),
+                .index => |ix| return self.alloc(.{ .assign_index = .{ .object = ix.object, .key = ix.key, .value = value } }),
+                else => return ParseError.UnexpectedToken, // invalid assignment target
+            }
         }
         return left;
     }
@@ -142,7 +146,53 @@ pub const Parser = struct {
             const operand = try self.parseUnary();
             return self.alloc(.{ .unary = .{ .op = op, .operand = operand } });
         }
-        return self.parsePrimary();
+        return self.parsePostfix();
+    }
+
+    /// §13.3 Member access postfix: `a.b` and `a[expr]`, left-associative, highest precedence.
+    fn parsePostfix(self: *Parser) ParseError!*const ast.Node {
+        var expr = try self.parsePrimary();
+        while (true) {
+            switch (self.peek().kind) {
+                .dot => {
+                    _ = self.advance();
+                    const name = try self.expect(.identifier);
+                    expr = try self.alloc(.{ .member = .{ .object = expr, .name = name.lexeme } });
+                },
+                .lbracket => {
+                    _ = self.advance();
+                    const key = try self.parseAssignment();
+                    _ = try self.expect(.rbracket);
+                    expr = try self.alloc(.{ .index = .{ .object = expr, .key = key } });
+                },
+                else => break,
+            }
+        }
+        return expr;
+    }
+
+    /// §13.2.5 Object initializer `{ key: value, ... }` (identifier or string keys, M1).
+    fn parseObjectLiteral(self: *Parser) ParseError!*const ast.Node {
+        _ = try self.expect(.lbrace);
+        var props: std.ArrayList(ast.Property) = .empty;
+        while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
+            const kt = self.advance();
+            const key = switch (kt.kind) {
+                .identifier => kt.lexeme,
+                .string => kt.string_value,
+                else => return ParseError.UnexpectedToken,
+            };
+            _ = try self.expect(.colon);
+            const value = try self.parseAssignment();
+            try props.append(self.arena, .{ .key = key, .value = value });
+            if (self.peek().kind == .comma) {
+                _ = self.advance();
+                continue;
+            }
+            break;
+        }
+        _ = try self.expect(.rbrace);
+        return self.alloc(.{ .object_literal = props.items });
     }
 
     fn parsePrimary(self: *Parser) ParseError!*const ast.Node {
@@ -173,6 +223,7 @@ pub const Parser = struct {
                 _ = self.advance();
                 return self.alloc(.{ .identifier = t.lexeme });
             },
+            .lbrace => return self.parseObjectLiteral(),
             .lparen => {
                 _ = self.advance();
                 const inner = try self.parseAssignment();

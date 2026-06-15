@@ -7,6 +7,7 @@ const ast = @import("ast.zig");
 const Value = @import("value.zig").Value;
 const Completion = @import("completion.zig").Completion;
 const Environment = @import("environment.zig").Environment;
+const Object = @import("object.zig").Object;
 
 pub const EvalError = error{ StepLimitExceeded, OutOfMemory };
 
@@ -14,6 +15,12 @@ pub const Interpreter = struct {
     arena: std.mem.Allocator,
     steps: u64 = 0,
     step_limit: u64 = 10_000_000,
+    depth: u32 = 0,
+    // Recursion-depth guard: a tree-walker recurses on the native stack, so deeply nested
+    // expressions would overflow it and SIGSEGV. We throw RangeError first (as V8 does:
+    // "Maximum call stack size exceeded"). Conservative for the larger M1 frames; raise once
+    // eval runs on a dedicated large-stack thread.
+    max_depth: u32 = 1000,
 
     pub fn run(self: *Interpreter, program: ast.Program, env: *Environment) EvalError!Completion {
         var last: Completion = .{ .normal = .undefined };
@@ -70,6 +77,9 @@ pub const Interpreter = struct {
 
     fn evalExpr(self: *Interpreter, node: *const ast.Node, env: *Environment) EvalError!Completion {
         try self.tick();
+        self.depth += 1;
+        defer self.depth -= 1;
+        if (self.depth > self.max_depth) return self.throwError("RangeError", "Maximum call stack size exceeded");
         switch (node.*) {
             .number => |n| return .{ .normal = .{ .number = n } },
             .string => |s| return .{ .normal = .{ .string = s } },
@@ -92,6 +102,66 @@ pub const Interpreter = struct {
             },
             .unary => |u| return self.evalUnary(u.op, u.operand, env),
             .binary => |b| return self.evalBinary(b.op, b.left, b.right, env),
+            .object_literal => |props| {
+                // §13.2.5 ObjectLiteral evaluation — fresh ordinary object, no proto for M1.
+                const obj = try Object.create(self.arena, null);
+                for (props) |p| {
+                    const c = try self.evalExpr(p.value, env);
+                    if (c.isAbrupt()) return c;
+                    try obj.set(p.key, c.normal);
+                }
+                return .{ .normal = .{ .object = obj } };
+            },
+            .member => |m| {
+                const oc = try self.evalExpr(m.object, env);
+                if (oc.isAbrupt()) return oc;
+                return self.getProperty(oc.normal, m.name);
+            },
+            .index => |ix| {
+                const oc = try self.evalExpr(ix.object, env);
+                if (oc.isAbrupt()) return oc;
+                const kc = try self.evalExpr(ix.key, env);
+                if (kc.isAbrupt()) return kc;
+                return self.getProperty(oc.normal, try self.toString(kc.normal));
+            },
+            .assign_member => |am| {
+                const oc = try self.evalExpr(am.object, env);
+                if (oc.isAbrupt()) return oc;
+                const vc = try self.evalExpr(am.value, env);
+                if (vc.isAbrupt()) return vc;
+                return self.setProperty(oc.normal, am.name, vc.normal);
+            },
+            .assign_index => |ai| {
+                const oc = try self.evalExpr(ai.object, env);
+                if (oc.isAbrupt()) return oc;
+                const kc = try self.evalExpr(ai.key, env);
+                if (kc.isAbrupt()) return kc;
+                const vc = try self.evalExpr(ai.value, env);
+                if (vc.isAbrupt()) return vc;
+                return self.setProperty(oc.normal, try self.toString(kc.normal), vc.normal);
+            },
+        }
+    }
+
+    /// §10.1.8 [[Get]]. Property access on null/undefined throws (§13.3); other primitives
+    /// have no own properties in M1 (no boxing yet) → undefined.
+    fn getProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
+        switch (base) {
+            .object => |o| return .{ .normal = o.get(key) orelse .undefined },
+            .undefined, .null => return self.throwError("TypeError", "Cannot read properties of null or undefined"),
+            else => return .{ .normal = .undefined },
+        }
+    }
+
+    /// §10.1.9 [[Set]]. Setting on null/undefined throws; on other primitives is a no-op in M1.
+    fn setProperty(self: *Interpreter, base: Value, key: []const u8, value: Value) EvalError!Completion {
+        switch (base) {
+            .object => |o| {
+                try o.set(key, value);
+                return .{ .normal = value };
+            },
+            .undefined, .null => return self.throwError("TypeError", "Cannot set properties of null or undefined"),
+            else => return .{ .normal = value },
         }
     }
 
@@ -154,6 +224,7 @@ pub const Interpreter = struct {
             .null => "null",
             .boolean => |b| if (b) "true" else "false",
             .number => |n| numberToString(self.arena, n),
+            .object => "[object Object]", // §20.1.3.6 (M1 stub; ToPrimitive deferred)
         };
     }
 };
@@ -170,6 +241,7 @@ fn toNumber(v: Value) f64 {
             if (t.len == 0) break :blk 0;
             break :blk std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
         },
+        .object => std.math.nan(f64), // §7.1.4 ToNumber(object) → ToPrimitive; M1 stub → NaN
     };
 }
 
@@ -180,6 +252,7 @@ fn toBoolean(v: Value) bool {
         .boolean => |b| b,
         .number => |n| n != 0 and !std.math.isNan(n),
         .string => |s| s.len != 0,
+        .object => true, // §7.1.2 — objects are always truthy
     };
 }
 
@@ -215,6 +288,7 @@ fn strictEquals(l: Value, r: Value) bool {
         .boolean => |b| r == .boolean and r.boolean == b,
         .number => |n| r == .number and r.number == n,
         .string => |s| r == .string and std.mem.eql(u8, s, r.string),
+        .object => |o| r == .object and r.object == o, // reference equality
     };
 }
 

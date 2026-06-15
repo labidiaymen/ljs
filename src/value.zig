@@ -1,6 +1,7 @@
-//! ECMAScript language values (ECMA-262 §6.1). M0 supports the primitive subset only;
-//! Object, Symbol, and BigInt arrive in later milestones.
+//! ECMAScript language values (ECMA-262 §6.1). M1 adds the Object reference; Symbol and
+//! BigInt arrive in later milestones.
 const std = @import("std");
+const Object = @import("object.zig").Object;
 
 pub const Value = union(enum) {
     undefined,
@@ -8,8 +9,10 @@ pub const Value = union(enum) {
     boolean: bool,
     /// §6.1.6.1 Number — IEEE-754 double.
     number: f64,
-    /// §6.1.4 String — UTF-8 bytes owned by the evaluation arena for M0.
+    /// §6.1.4 String — UTF-8 bytes owned by the evaluation arena.
     string: []const u8,
+    /// §6.1.7 Object — reference into the realm arena.
+    object: *Object,
 
     /// Observable display form used by the CLI and tests. This is a pragmatic subset of
     /// Number::toString (§6.1.6.1.21) / ToString (§7.1.17) sufficient for M0; full
@@ -21,6 +24,7 @@ pub const Value = union(enum) {
             .boolean => |b| try w.writeAll(if (b) "true" else "false"),
             .number => |n| try writeNumber(w, n),
             .string => |s| try w.print("\"{s}\"", .{s}),
+            .object => try w.writeAll("[object Object]"), // §20.1.3.6 Object.prototype.toString (M1 stub)
         }
     }
 };

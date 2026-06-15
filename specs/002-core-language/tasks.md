@@ -13,7 +13,7 @@ folded into plan.md (Phase 0/1) for M1 to avoid over-producing artifacts.
 ---
 
 ## Phase 1: Foundational (shared, lands inside Cycle A)
-- [ ] M1-T001 `Value.object` + `src/object.zig` — **moved to Cycle C (objects)**; not needed for bindings
+- [x] M1-T001 `Value.object` + `src/object.zig` (ordinary `[[Get]]`/`[[Set]]` + prototype walk) — done in Cycle C
 - [x] M1-T002 `src/environment.zig` (Environment scope chain, `Binding{value,mutable,initialized}`, lookup) — §9
 - [x] M1-T003 Extended `Completion` to `normal/throw/ret/brk/cont` — §6.2.4
 
@@ -31,9 +31,10 @@ folded into plan.md (Phase 0/1) for M1 to avoid over-producing artifacts.
 
 ## Phase C — US3 Objects & property access (P1)  [Cycle C]
 **Goal**: object literals, `a.b`/`a[b]` read/write, prototype chain. **Test**: `var o={x:41}; o.x=o.x+1; o.x` → 42.
-- [ ] M1-T030 [US3] Parser: object literal `{k: v}`, member access (dot + computed), property assignment
-- [ ] M1-T031 [US3] Ordinary `[[Get]]`/`[[Set]]` with prototype walk; access on `null`/`undefined` → TypeError; call non-function → TypeError — §10
-- [ ] M1-T032 [P] [US3] `tests/objects_test.zig` (read/write, missing → undefined, prototype resolution, TypeError cases)
+- [x] M1-T030 [US3] Parser: object literal `{k:v}`, member access (dot `a.b` + computed `a[e]`), assignment to member/index targets
+- [x] M1-T031 [US3] Ordinary `[[Get]]`/`[[Set]]` + prototype walk (object.zig); access/set on null/undefined → TypeError. (Default `Object.prototype` + call-non-function TypeError land with Cycle B/E)
+- [x] M1-T032 [P] [US3] Object tests (inline in engine.zig): literals, member/index r/w, member chain, null/undefined TypeError
+- [x] M1-T033 [US3] **Recursion-depth guard**: deep expressions throw `RangeError` instead of segfaulting — surfaced by the perf gate (the 40× "regression" was a stack-overflow crash, not slow eval). Bench cases resized within the safe depth + re-baselined.
 
 ## Phase D — US4 Control flow & exceptions (P2)  [Cycle D]
 **Goal**: `if/else`, `while`, `for`, `throw`/`try`/`catch`/`finally`. **Test**: `for` sum 0..9 → 45; throw caught.

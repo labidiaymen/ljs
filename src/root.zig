@@ -4,6 +4,7 @@
 pub const Value = @import("value.zig").Value;
 pub const Completion = @import("completion.zig").Completion;
 pub const Environment = @import("environment.zig").Environment;
+pub const Object = @import("object.zig").Object;
 const engine = @import("engine.zig");
 pub const RunMode = engine.RunMode;
 pub const EvaluationResult = engine.EvaluationResult;
@@ -16,6 +17,7 @@ test {
     _ = @import("value.zig");
     _ = @import("completion.zig");
     _ = @import("environment.zig");
+    _ = @import("object.zig");
     _ = @import("ast.zig");
     _ = @import("lexer.zig");
     _ = @import("parser.zig");
