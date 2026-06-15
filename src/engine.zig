@@ -1127,3 +1127,67 @@ test "deep recursion throws RangeError, not a segfault" {
     const r = try evaluate(a, buf.items, .sloppy);
     try testing.expect(r == .thrown);
 }
+
+test "M5 for-in: object property-name enumeration (Cycle 1, §14.7.5)" {
+    // Single own key → exact name (the M-subset enumerates own string keys; order is the property
+    // map's iteration order, so multi-key string assertions below use order-independent checks).
+    try expectStr("var s=''; for (var k in {a:1}) s+=k; s", "a");
+    // Both keys visited (order-independent: concat sorted-insensitive via a membership count).
+    try expectNumber("var n=0; for (var k in {a:1,b:2}) n++; n", 2);
+    try expectStr("var got=''; for (var k in {a:1,b:2}) { if (k==='a'||k==='b') got+='x'; } got", "xx");
+    // for-in over an array yields the index strings (NOT "length", NOT Array.prototype methods).
+    try expectStr("var s=''; for (var k in ['x','y','z']) s+=k; s", "012");
+    try expectNumber("var n=0; for (var k in [10,20]) { if (k==='length') n+=100; n++; } n", 2);
+    // Inherited *user* prototype keys are enumerable; built-in prototype methods are not.
+    try expectNumber("function P(){} P.prototype.z=1; var o=new P(); o.a=2; var n=0; for (var k in o) n++; n", 2);
+    try expectNumber("var n=0; for (var k in {}) n++; n", 0); // empty object → 0 iterations
+    try expectNumber("var n=0; for (var k in []) n++; n", 0); // empty array → 0, no proto methods
+    // A null/undefined operand runs the body zero times (no throw, §14.7.5.6 step 7.a).
+    try expectNumber("var n=0; for (var k in null) n++; n", 0);
+    try expectNumber("var n=0; for (var k in undefined) n++; n", 0);
+    // Shadowing: a name owned lower on the chain is visited once (not again from the prototype).
+    try expectNumber("function P(){} P.prototype.a=1; var o=new P(); o.a=2; var n=0; for (var k in o) n++; n", 1);
+}
+
+test "M5 for-of: value iteration over arrays & strings (Cycle 1, §14.7.5)" {
+    try expectNumber("var t=0; for (var v of [1,2,3]) t+=v; t", 6);
+    try expectStr("var s=''; for (var c of 'abc') s+=c; s", "abc");
+    try expectNumber("var n=0; for (var v of []) n++; n", 0); // empty array → 0 iterations
+    try expectNumber("var n=0; for (var v of '') n++; n", 0); // empty string → 0 iterations
+    // A non-iterable operand is a TypeError (§14.7.5.6 → GetIterator throws).
+    try expectThrows("for (var v of 5) {}");
+    try expectThrows("for (var v of {}) {}");
+    try expectThrows("for (var v of null) {}");
+    try expectThrows("for (var v of undefined) {}");
+    try expectThrows("for (var v of true) {}");
+}
+
+test "M5 for-in/of: break, continue, per-iteration binding (Cycle 1, §14.7.5.7)" {
+    // break / continue in for-of.
+    try expectNumber("var t=0; for (var v of [1,2,3,4]) { if (v===3) break; t+=v; } t", 3);
+    try expectNumber("var t=0; for (var v of [1,2,3,4]) { if (v===2) continue; t+=v; } t", 8);
+    // break / continue in for-in (over an array's index strings).
+    try expectNumber("var n=0; for (var k in [1,2,3,4,5]) { if (k==='2') break; n++; } n", 2);
+    try expectNumber("var n=0; for (var k in [1,2,3,4]) { if (k==='1') continue; n++; } n", 3);
+    // §14.7.5.7 CreatePerIterationEnvironment: a `let` head gives each iteration its own binding,
+    // so closures capture distinct values.
+    try expectStr(
+        \\var fns=[]; for (let v of ['a','b','c']) fns.push(function(){ return v; });
+        \\fns[0]() + fns[1]() + fns[2]()
+    , "abc");
+}
+
+test "M5 for-in/of: assignment-target heads + [~In] disambiguation (Cycle 1, §14.7.5)" {
+    // An existing identifier / member / index assignment target as the loop head.
+    try expectStr("var i; var s=''; for (i of [1,2,3]) s+=i; s", "123");
+    try expectNumber("var o={}; for (o.k of [1,2,3]) {} o.k", 3);
+    try expectNumber("var a=[0,0,0]; var j=0; for (a[j] of [7,8,9]) j++; a[0]+a[1]+a[2]", 24);
+    try expectStr("var s=''; var x; for (x in {p:1,q:2}) { if (x==='p'||x==='q') s+='y'; } s", "yy");
+    // §14.7.5 `[~In]`: `for (a in b)` is for-in, but a *parenthesized* `in` in a C-style header stays
+    // a normal relational operator, and `in` inside a subscript is a normal operator too.
+    try expectNumber("var b={x:1}; var n=0; for (('x' in b); n<2; n++) {} n", 2);
+    try expectNumber("var a=[10,20]; var o={t:1}; a['t' in o ? 0 : 1]", 10);
+    // A multi-declarator C-style `for` (the non-for-in path) is unaffected.
+    try expectNumber("var s=0; for (var i=0, j=10; i<3; i++) s += i + j; s", 33);
+    try expectNumber("var s=0; for (var i=0; i<3; i++) s+=i; s", 3);
+}

@@ -11,6 +11,7 @@ const Object = @import("object.zig").Object;
 const ops = @import("abstract_ops.zig");
 const builtin_array = @import("builtin_array.zig");
 const builtin_string = @import("builtin_string.zig");
+const builtins = @import("builtins.zig");
 
 // ECMA-262 abstract operations live in abstract_ops.zig; alias them so call sites read naturally.
 const toNumber = ops.toNumber;
@@ -21,6 +22,7 @@ const strictEquals = ops.strictEquals;
 const looseEquals = ops.looseEquals;
 const instanceOf = ops.instanceOf;
 const parseIndex = ops.parseIndex;
+const numberToString = ops.numberToString;
 
 pub const EvalError = error{ StepLimitExceeded, OutOfMemory };
 
@@ -171,6 +173,8 @@ pub const Interpreter = struct {
                 }
                 return .{ .normal = .undefined };
             },
+            .for_in_stmt => |s| return self.evalForIn(s, env),
+            .for_of_stmt => |s| return self.evalForOf(s, env),
             .throw_stmt => |e| {
                 // §14.14 ThrowStatement.
                 const c = try self.evalExpr(e, env);
@@ -236,6 +240,171 @@ pub const Interpreter = struct {
             if (last.isAbrupt()) return last;
         }
         return last;
+    }
+
+    /// §14.7.5 `for (HEAD in EXPR)` — ForIn/OfHeadEvaluation (enumerate) + ForIn/OfBodyEvaluation.
+    fn evalForIn(self: *Interpreter, s: anytype, env: *Environment) EvalError!Completion {
+        // §14.7.5.6 step 7.a: a null/undefined operand → the body never runs (no throw).
+        const rc = try self.evalExpr(s.right, env);
+        if (rc.isAbrupt()) return rc;
+        if (rc.normal == .undefined or rc.normal == .null) return .{ .normal = .undefined };
+        // EnumerateObjectProperties — the enumerable string keys to visit (computed once up front;
+        // mutations to the object during the loop are not reflected, an accepted M-subset simplification).
+        var keys: std.ArrayListUnmanaged(Value) = .empty;
+        try self.enumerateKeys(rc.normal, &keys);
+        for (keys.items) |k| {
+            const hb = try self.bindForHead(s.head, k, env);
+            if (hb.completion.isAbrupt()) return hb.completion;
+            const bc = try self.evalStmt(s.body.*, hb.env);
+            switch (bc) {
+                .normal, .cont => {},
+                .brk => break,
+                .ret, .throw => return bc,
+            }
+        }
+        return .{ .normal = .undefined };
+    }
+
+    /// §14.7.5 `for (HEAD of EXPR)` — ForIn/OfHeadEvaluation (iterate) + ForIn/OfBodyEvaluation.
+    fn evalForOf(self: *Interpreter, s: anytype, env: *Environment) EvalError!Completion {
+        const rc = try self.evalExpr(s.right, env);
+        if (rc.isAbrupt()) return rc;
+        // §14.7.5.6 → §7.4.2 GetIterator: a non-iterable operand is a TypeError. The M-subset iterates
+        // Arrays (elements) and Strings (characters) via the engine's spread model (`iterableToSlice`).
+        const items = try self.iterableToSlice(rc.normal);
+        if (items == null) return self.throwError("TypeError", "value is not iterable");
+        for (items.?) |v| {
+            const hb = try self.bindForHead(s.head, v, env);
+            if (hb.completion.isAbrupt()) return hb.completion;
+            const bc = try self.evalStmt(s.body.*, hb.env);
+            switch (bc) {
+                .normal, .cont => {},
+                .brk => break,
+                .ret, .throw => return bc,
+            }
+        }
+        return .{ .normal = .undefined };
+    }
+
+    const HeadBinding = struct { env: *Environment, completion: Completion = .{ .normal = .undefined } };
+
+    /// §14.7.5.7 ForIn/OfBodyEvaluation: bind/assign one item to the loop head, returning the
+    /// environment the body runs in (plus any abrupt completion from an assignment-target write). A
+    /// `let`/`const` head gets a FRESH per-iteration `Environment` (CreatePerIterationEnvironment), so
+    /// each iteration's binding is independent (closures capture distinct values). A `var` declaration
+    /// or an assignment-target head writes into / through `env`.
+    fn bindForHead(self: *Interpreter, head: ast.ForHead, item: Value, env: *Environment) EvalError!HeadBinding {
+        switch (head) {
+            .decl => |d| {
+                const mutable = d.kind != .const_decl;
+                // §14.7.5.7: let/const create a fresh binding each iteration; var reuses the loop env.
+                const target_env = if (d.kind == .var_decl) env else try Environment.create(self.arena, env);
+                if (d.target.* == .identifier) {
+                    try target_env.declare(d.target.identifier, item, mutable, true);
+                } else {
+                    const bc = try self.bindPattern(d.target, item, target_env, mutable);
+                    if (bc.isAbrupt()) return .{ .env = env, .completion = bc };
+                }
+                return .{ .env = target_env };
+            },
+            .target => |t| {
+                // §13.15.2 PutValue to an existing reference (identifier / member / index).
+                const wc = try self.assignToTarget(t, item, env);
+                return .{ .env = env, .completion = if (wc.isAbrupt()) wc else .{ .normal = .undefined } };
+            },
+        }
+    }
+
+    /// §6.2.5.6 PutValue — write `value` through the AssignmentTarget `node` (identifier / `a.b` /
+    /// `a[k]`). Mirrors the `assign`/`assign_member`/`assign_index` evaluation paths.
+    fn assignToTarget(self: *Interpreter, node: *const ast.Node, value: Value, env: *Environment) EvalError!Completion {
+        switch (node.*) {
+            .identifier => |name| {
+                const b = env.lookup(name) orelse return self.throwError("ReferenceError", name);
+                if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
+                b.value = value;
+                return .{ .normal = value };
+            },
+            .member => |m| {
+                const oc = try self.evalExpr(m.object, env);
+                if (oc.isAbrupt()) return oc;
+                return self.setProperty(oc.normal, m.name, value);
+            },
+            .index => |ix| {
+                const oc = try self.evalExpr(ix.object, env);
+                if (oc.isAbrupt()) return oc;
+                const kc = try self.evalExpr(ix.key, env);
+                if (kc.isAbrupt()) return kc;
+                return self.setProperty(oc.normal, try self.toString(kc.normal), value);
+            },
+            else => return self.throwError("ReferenceError", "invalid assignment target"),
+        }
+    }
+
+    /// §14.7.5 EnumerateObjectProperties — collect the enumerable string-keyed property names of
+    /// `value` and its prototype chain, each name visited once (a name shadowed lower on the chain is
+    /// not revisited). M-subset: a user object's own/inherited data & accessor properties are
+    /// enumerable; Array integer indices are enumerable (numeric order) but Array `length` is NOT (it
+    /// is synthetic — not in the property map). A built-in prototype (`Object.prototype`,
+    /// `Array.prototype`, `String.prototype`, the Error prototypes, …) holds only NON-enumerable
+    /// properties per spec, but this engine stores them as plain data — so we STOP the chain walk at
+    /// the first built-in prototype (everything above it is also built-in), which yields the correct
+    /// observable enumeration (e.g. `for (k in [])` visits nothing, not `push`/`join`/…). Strings box
+    /// to enumerable character-index keys (`length` is non-enumerable → skipped).
+    fn enumerateKeys(self: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!void {
+        var seen: std.StringHashMapUnmanaged(void) = .{};
+        switch (value) {
+            .object => |start| {
+                var obj: ?*Object = start;
+                while (obj) |o| {
+                    // Stop at a realm built-in prototype: its properties are spec-non-enumerable.
+                    if (self.isBuiltinProto(o)) break;
+                    // Array exotic integer indices (numeric order), then ordinary string keys. `length`
+                    // is never enumerated (it is not stored in `properties`).
+                    if (o.kind == .array) {
+                        for (o.elements.items, 0..) |_, i| {
+                            const key = try numberToString(self.arena, @floatFromInt(i));
+                            if (seen.contains(key)) continue;
+                            try seen.put(self.arena, key, {});
+                            try out.append(self.arena, .{ .string = key });
+                        }
+                    }
+                    var it = o.properties.iterator();
+                    while (it.next()) |entry| {
+                        const key = entry.key_ptr.*;
+                        if (seen.contains(key)) continue;
+                        try seen.put(self.arena, key, {});
+                        try out.append(self.arena, .{ .string = key });
+                    }
+                    obj = o.prototype;
+                }
+            },
+            .string => |s| {
+                // §22.1: a primitive String boxes to character-index own properties (enumerable).
+                for (0..s.len) |i| {
+                    const key = try numberToString(self.arena, @floatFromInt(i));
+                    try out.append(self.arena, .{ .string = key });
+                }
+            },
+            else => {}, // §13.5 ToObject of a number/boolean → no own enumerable string keys (M-subset)
+        }
+    }
+
+    /// Is `o` one of the realm's built-in prototype objects (`Object`/`Array`/`String`/Error-family
+    /// `.prototype`)? Their properties are spec-non-enumerable; for-in stops the chain walk at them.
+    /// Pointer-identity against the constructors seeded in `globals` (the global names map to native
+    /// constructors whose `.prototype` is the prototype object). A null `globals` (unit-test direct
+    /// eval) yields false — harmless, as those tests don't enumerate built-in protos.
+    fn isBuiltinProto(self: *Interpreter, o: *Object) bool {
+        const g = self.globals orelse return false;
+        const ctors = [_][]const u8{ "Object", "Array", "String", "Function" } ++ builtins.error_names;
+        for (ctors) |name| {
+            const b = g.lookup(name) orelse continue;
+            if (b.value != .object) continue;
+            const pv = b.value.object.get("prototype") orelse continue;
+            if (pv == .object and pv.object == o) return true;
+        }
+        return false;
     }
 
     // ── expressions ─────────────────────────────────────────────────────────

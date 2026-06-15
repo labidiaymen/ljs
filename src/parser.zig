@@ -50,6 +50,12 @@ pub const Parser = struct {
     /// directly within a static block; a nested ordinary function/arrow body un-reserves it (reset in
     /// `parseFunction`/`finishArrow`, like `in_method`).
     in_static_block: bool = false,
+    /// §14.7.5 `[~In]` grammar: while parsing the FIRST clause of a `for (…)` header, the relational
+    /// `in` operator is suppressed so `for (a in b)` is recognized as a for-in head (not the binary
+    /// expression `a in b`). Honored in `parseExprFrom` (skips `kw_in` at the relational level). Reset
+    /// to false inside any nested parenthesis/bracket/brace so `for ((a in b);;)` and `for (a[b in c];;)`
+    /// keep `in` as a normal operator. Set only around `parseFor`'s first-clause parse.
+    no_in: bool = false,
 
     /// `mode == .strict` starts the whole Script in strict context (the Test262 runner runs each
     /// test in both modes, expecting the engine to honor `RunMode`). An explicit `"use strict"`
@@ -101,6 +107,24 @@ pub const Parser = struct {
         const p = try self.arena.create(ast.Pattern);
         p.* = pat;
         return p;
+    }
+
+    /// §14.7.5 `[~In]` reset: any bracketed sub-expression (`( … )`, `[ … ]`, call args, array/object
+    /// literal contents, `${ … }`) is `[+In]` — the relational `in` is a normal operator there even
+    /// inside a for-header's first clause. These wrappers clear `no_in` for the inner parse and restore
+    /// it, so `for ((a in b);;)` / `for (a[b in c];;)` keep `in` while `for (a in b)` is a for-in head.
+    fn parseAssignmentInBrackets(self: *Parser) ParseError!*const ast.Node {
+        const saved = self.no_in;
+        self.no_in = false;
+        defer self.no_in = saved;
+        return self.parseAssignment();
+    }
+
+    fn parseExpressionInBrackets(self: *Parser) ParseError!*const ast.Node {
+        const saved = self.no_in;
+        self.no_in = false;
+        defer self.no_in = saved;
+        return self.parseExpression();
     }
 
     /// §13.3.3 BindingPattern — a binding identifier, an ArrayBindingPattern `[ … ]`, or an
@@ -256,7 +280,7 @@ pub const Parser = struct {
                 },
                 .lbracket => {
                     _ = self.advance();
-                    const key = try self.parseAssignment();
+                    const key = try self.parseAssignmentInBrackets();
                     _ = try self.expect(.rbracket);
                     callee = try self.alloc(.{ .index = .{ .object = callee, .key = key } });
                 },
@@ -304,17 +328,89 @@ pub const Parser = struct {
         return .{ .while_stmt = .{ .cond = cond, .body = body } };
     }
 
+    /// §14.7.5 contextual `of`: lexed as an identifier with lexeme `"of"`. Recognized only in a
+    /// for-header (here) as the for-of marker — everywhere else `of` is an ordinary identifier.
+    fn peekIsOf(self: *Parser) bool {
+        const t = self.peek();
+        return t.kind == .identifier and std.mem.eql(u8, t.lexeme, "of");
+    }
+
     fn parseFor(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // for
         _ = try self.expect(.lparen);
         var init_stmt: ?*const ast.Stmt = null;
         switch (self.peek().kind) {
             .semicolon => _ = self.advance(),
-            .kw_var, .kw_let, .kw_const => init_stmt = try self.allocStmt(try self.parseDecl()), // parseDecl eats the ;
+            .kw_var, .kw_let, .kw_const => {
+                // §14.7.5 ForBinding vs §14.7.4 ForStatement init: parse the declaration kind + the
+                // FIRST binding with the relational `in` suppressed (`[~In]`), then disambiguate.
+                const kind: ast.DeclKind = switch (self.advance().kind) {
+                    .kw_var => .var_decl,
+                    .kw_let => .let_decl,
+                    else => .const_decl,
+                };
+                const saved_no_in = self.no_in;
+                self.no_in = true;
+                const target = try self.parsePattern();
+                self.no_in = saved_no_in;
+                if (self.strict and patternHasStrictReserved(target)) return ParseError.UnexpectedToken;
+                // `for (var/let/const ForBinding in/of …)` — a for-in / for-of head (no initializer).
+                if (self.peek().kind == .kw_in or self.peekIsOf()) {
+                    const is_of = self.peekIsOf();
+                    _ = self.advance(); // `in` / `of`
+                    return self.finishForInOf(.{ .decl = .{ .kind = kind, .target = target } }, is_of);
+                }
+                // Otherwise a C-style `for (var x [= init] [, …]; …)` declaration. Finish the first
+                // declarator's optional initializer + any remaining comma-separated declarators.
+                var decls: std.ArrayList(ast.Declarator) = .empty;
+                {
+                    var init_expr: ?*const ast.Node = null;
+                    if (self.peek().kind == .assign) {
+                        _ = self.advance();
+                        init_expr = try self.parseAssignment();
+                    }
+                    // §14.3.1.1 / §14.3.2: a BindingPattern (and any `const`) requires an initializer.
+                    if (init_expr == null and (target.* != .identifier or kind == .const_decl)) return ParseError.UnexpectedToken;
+                    try decls.append(self.arena, .{ .target = target, .init = init_expr });
+                }
+                while (self.peek().kind == .comma) {
+                    _ = self.advance();
+                    const t2 = try self.parsePattern();
+                    if (self.strict and patternHasStrictReserved(t2)) return ParseError.UnexpectedToken;
+                    var init2: ?*const ast.Node = null;
+                    if (self.peek().kind == .assign) {
+                        _ = self.advance();
+                        init2 = try self.parseAssignment();
+                    }
+                    if (init2 == null and (t2.* != .identifier or kind == .const_decl)) return ParseError.UnexpectedToken;
+                    try decls.append(self.arena, .{ .target = t2, .init = init2 });
+                }
+                init_stmt = try self.allocStmt(.{ .declaration = .{ .kind = kind, .decls = decls.items } });
+                _ = try self.expect(.semicolon);
+            },
             else => {
-                // §14.7.4 `for(Expression; …)` — the init/test/update clauses are full Expressions,
-                // so the comma / sequence operator is permitted (`for(i=0, j=n; …; i++, j--)`).
-                init_stmt = try self.allocStmt(.{ .expr = try self.parseExpression() });
+                // §14.7.4/§14.7.5: parse the first clause as an Expression with `in` suppressed
+                // (`[~In]`), then disambiguate. `for (LHS in/of …)` is for-in/for-of (LHS must be a
+                // simple assignment target); otherwise it is a C-style init Expression.
+                const saved_no_in = self.no_in;
+                self.no_in = true;
+                const first = try self.parseAssignment();
+                self.no_in = saved_no_in;
+                if (self.peek().kind == .kw_in or self.peekIsOf()) {
+                    const is_of = self.peekIsOf();
+                    // §13.15.1: the for-in/of LHS must be a simple AssignmentTarget.
+                    if (!isSimpleAssignTarget(first)) return ParseError.UnexpectedToken;
+                    _ = self.advance(); // `in` / `of`
+                    return self.finishForInOf(.{ .target = first }, is_of);
+                }
+                // §14.7.4 C-style init Expression — the comma / sequence operator is permitted.
+                var expr = first;
+                while (self.peek().kind == .comma) {
+                    _ = self.advance();
+                    const right = try self.parseAssignment();
+                    expr = try self.alloc(.{ .comma = .{ .left = expr, .right = right } });
+                }
+                init_stmt = try self.allocStmt(.{ .expr = expr });
                 _ = try self.expect(.semicolon);
             },
         }
@@ -326,6 +422,18 @@ pub const Parser = struct {
         _ = try self.expect(.rparen);
         const body = try self.allocStmt(try self.parseStmt());
         return .{ .for_stmt = .{ .init = init_stmt, .cond = cond, .update = update, .body = body } };
+    }
+
+    /// §14.7.5: with the `in`/`of` already consumed, parse the operand, `)`, and body, building the
+    /// for-in / for-of statement. for-of's operand is an AssignmentExpression (§14.7.5: `of` takes an
+    /// AssignmentExpression — `for (x of a, b)` is a SyntaxError); for-in's operand is a full
+    /// Expression (`for (x in a, b)` is legal). The operand is `[+In]` (the suppression was only the head).
+    fn finishForInOf(self: *Parser, head: ast.ForHead, is_of: bool) ParseError!ast.Stmt {
+        const right = if (is_of) try self.parseAssignment() else try self.parseExpression();
+        _ = try self.expect(.rparen);
+        const body = try self.allocStmt(try self.parseStmt());
+        if (is_of) return .{ .for_of_stmt = .{ .head = head, .right = right, .body = body } };
+        return .{ .for_in_stmt = .{ .head = head, .right = right, .body = body } };
     }
 
     fn parseSwitch(self: *Parser) ParseError!ast.Stmt {
@@ -862,6 +970,9 @@ pub const Parser = struct {
     /// §13.3.6 Arguments `( … )` — a comma-separated list of (possibly spread) AssignmentExpressions.
     /// Assumes the current token is `(`; consumes through the matching `)`.
     fn parseArgs(self: *Parser) ParseError![]const *const ast.Node {
+        const saved_no_in = self.no_in; // §14.7.5 `[~In]` reset — arg list is `[+In]`
+        self.no_in = false;
+        defer self.no_in = saved_no_in;
         _ = try self.expect(.lparen);
         var args: std.ArrayList(*const ast.Node) = .empty;
         while (self.peek().kind != .rparen and self.peek().kind != .eof) {
@@ -889,6 +1000,9 @@ pub const Parser = struct {
 
     /// An argument or array element that may be a spread `...expr`.
     fn parseSpreadable(self: *Parser) ParseError!*const ast.Node {
+        const saved_no_in = self.no_in; // §14.7.5 `[~In]` reset — array element / arg is `[+In]`
+        self.no_in = false;
+        defer self.no_in = saved_no_in;
         if (self.peek().kind == .ellipsis) {
             _ = self.advance();
             return self.alloc(.{ .spread = try self.parseAssignment() });
@@ -1165,6 +1279,9 @@ pub const Parser = struct {
         var left = left_init;
         while (true) {
             const k = self.peek().kind;
+            // §14.7.5 `[~In]`: in a for-header's first clause, `in` is not a relational operator — it
+            // marks the for-in head. Stop the climb so `parseFor` sees the `kw_in` itself.
+            if (self.no_in and k == .kw_in) break;
             const prec = opPrecedence(k) orelse break;
             if (prec < min_prec) break;
             _ = self.advance();
@@ -1281,7 +1398,7 @@ pub const Parser = struct {
                     switch (self.peek().kind) {
                         .lbracket => { // ?.[ key ]
                             _ = self.advance();
-                            const key = try self.parseAssignment();
+                            const key = try self.parseAssignmentInBrackets();
                             _ = try self.expect(.rbracket);
                             expr = try self.alloc(.{ .optional = .{ .base = expr, .optional = true, .link = .{ .index = key } } });
                         },
@@ -1319,7 +1436,7 @@ pub const Parser = struct {
                 },
                 .lbracket => {
                     _ = self.advance();
-                    const key = try self.parseAssignment();
+                    const key = try self.parseAssignmentInBrackets();
                     _ = try self.expect(.rbracket);
                     expr = if (in_chain)
                         try self.alloc(.{ .optional = .{ .base = expr, .optional = false, .link = .{ .index = key } } })
@@ -1382,7 +1499,7 @@ pub const Parser = struct {
             // §13.2.5 PropertyDefinition : `...AssignmentExpression` (object spread).
             if (self.peek().kind == .ellipsis) {
                 _ = self.advance();
-                const src = try self.parseAssignment();
+                const src = try self.parseAssignmentInBrackets();
                 try props.append(self.arena, .{ .kind = .spread, .value = src });
                 if (self.peek().kind == .comma) {
                     _ = self.advance();
@@ -1445,7 +1562,7 @@ pub const Parser = struct {
             } else if (self.peek().kind == .colon) {
                 // PropertyDefinition : PropertyName `:` AssignmentExpression.
                 _ = self.advance();
-                const value = try self.parseAssignment();
+                const value = try self.parseAssignmentInBrackets();
                 try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = value });
             } else {
                 // §13.2.5 IdentifierReference shorthand `{x}` ≡ `{x: x}`. Only valid for a plain
@@ -1482,7 +1599,7 @@ pub const Parser = struct {
         switch (t.kind) {
             .lbracket => {
                 _ = self.advance();
-                const expr = try self.parseAssignment();
+                const expr = try self.parseAssignmentInBrackets();
                 _ = try self.expect(.rbracket);
                 return .{ .key = "", .computed = expr };
             },
@@ -1594,7 +1711,7 @@ pub const Parser = struct {
                 // `( … ) =>` is already handled in `parseAssignment` (its lookahead fires before we
                 // reach here), so this path only sees a genuine parenthesized expression.
                 _ = self.advance();
-                const inner = try self.parseExpression();
+                const inner = try self.parseExpressionInBrackets();
                 _ = try self.expect(.rparen);
                 self.last_was_paren = true; // §13.13.1: a parenthesized operand defuses the mix check
                 return inner;
@@ -1647,6 +1764,16 @@ fn patternHasStrictReserved(pattern: *const ast.Pattern) bool {
             return false;
         },
     }
+}
+
+/// §13.15.1 / §14.7.5: is `node` a simple AssignmentTarget usable as a for-in/of head? The M-subset
+/// accepts a plain identifier, a member `a.b`, or an index `a[k]` (the forms the interpreter's
+/// `bindForHead` can write). Destructuring-pattern heads (`for ([a] of …)`) are a later cycle.
+fn isSimpleAssignTarget(node: *const ast.Node) bool {
+    return switch (node.*) {
+        .identifier, .member, .index => true,
+        else => false,
+    };
 }
 
 /// §13.1.1: does any formal parameter (including the rest element) bind a strict-reserved name?
@@ -1862,6 +1989,16 @@ fn stmtContainsArguments(stmt: ast.Stmt) bool {
             if (s.init) |i| if (stmtContainsArguments(i.*)) return true;
             if (s.cond) |c| if (containsArguments(c)) return true;
             if (s.update) |u| if (containsArguments(u)) return true;
+            return stmtContainsArguments(s.body.*);
+        },
+        .for_in_stmt => |s| {
+            if (s.head == .target and containsArguments(s.head.target)) return true;
+            if (containsArguments(s.right)) return true;
+            return stmtContainsArguments(s.body.*);
+        },
+        .for_of_stmt => |s| {
+            if (s.head == .target and containsArguments(s.head.target)) return true;
+            if (containsArguments(s.right)) return true;
             return stmtContainsArguments(s.body.*);
         },
         .switch_stmt => |s| {

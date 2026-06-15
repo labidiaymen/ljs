@@ -205,6 +205,15 @@ pub const ClassElementValue = union(enum) {
 
 pub const DeclKind = enum { var_decl, let_decl, const_decl };
 
+/// §14.7.5 ForIn/ForOf head — the binding side of `for (HEAD in/of EXPR)`. Either a `var`/`let`/`const`
+/// declaration of a single ForBinding (`.decl`), or an existing assignment target expression — a plain
+/// identifier, a member `a.b`, or an index `a[k]` (`.target`). `bindForHead` in the interpreter writes
+/// each enumerated name (for-in) / iterated value (for-of) to whichever shape this is.
+pub const ForHead = union(enum) {
+    decl: struct { kind: DeclKind, target: *const Pattern }, // §14.7.5 ForBinding
+    target: *const Node, // an AssignmentTarget (identifier / member / index)
+};
+
 /// §14.3 LexicalBinding / VariableDeclaration. `target` is a binding pattern (commonly a single
 /// identifier); `init` is the optional `= expr` initializer.
 pub const Declarator = struct { target: *const Pattern, init: ?*const Node };
@@ -219,6 +228,12 @@ pub const Stmt = union(enum) {
     if_stmt: struct { cond: *const Node, then: *const Stmt, otherwise: ?*const Stmt }, // §14.6
     while_stmt: struct { cond: *const Node, body: *const Stmt }, // §14.7.3
     for_stmt: struct { init: ?*const Stmt, cond: ?*const Node, update: ?*const Node, body: *const Stmt }, // §14.7.4
+    /// §14.7.5 `for (HEAD in EXPR) BODY` — enumerate the enumerable string-keyed property names of EXPR
+    /// and its prototype chain (each once), binding each to HEAD. A null/undefined EXPR runs the body 0×.
+    for_in_stmt: struct { head: ForHead, right: *const Node, body: *const Stmt },
+    /// §14.7.5 `for (HEAD of EXPR) BODY` — iterate the values of the iterable EXPR (Array elements /
+    /// String chars in this M-subset), binding each to HEAD. A non-iterable EXPR is a TypeError.
+    for_of_stmt: struct { head: ForHead, right: *const Node, body: *const Stmt },
     throw_stmt: *const Node, // §14.14
     try_stmt: struct { // §14.15
         block: []const Stmt,
