@@ -61,9 +61,10 @@ folded into plan.md (Phase 0/1) for M1 to avoid over-producing artifacts.
 - [x] M1-T058b [US5] Compute-heavy bench `loop_sum` added → ljs **1.6× slower** than Node (the real tree-walk-vs-JIT gap; arith/startup cases stay ~0.4×). Re-baselined.
 - [~] M1-T058 [US5] Real-slice **pass > 0 (SC-003)** — still 0: **assert.js also needs ternary `?:`, `switch`, `+=`** (the prelude fails to parse). Deferred to E4.
 
-### Cycle E4 — operators assert.js needs (to actually reach SC-003)
-- [ ] M1-T059 [US5] Ternary `?:`, `switch`/`case`/`default`, compound assignment (`+=`/`-=`/…) — §13.14 / §14.12 / §13.15
-- [ ] M1-T060b [US5] Re-run the slice with the harness → **pass > 0** (SC-003); record the real baseline; M0 still 27/6/2; no perf regression
+### Cycle E4 — operators assert.js needs (reached SC-003)
+- [x] M1-T059 [US5] Ternary `?:`, `switch`/`case`/`default` (fall-through + break), compound assignment (`+=`/`-=`/`*=`/`/=`/`%=`), prefix+postfix `++`/`--` — §13.4/§13.14/§14.12/§13.15
+- [x] M1-T060b [US5] **SC-003 ACHIEVED** — addition slice with harness: **12/95 (12.6%)**, conformance OFF ZERO. assert.js/sta.js load; real positive tests pass. M0 still 27/6/2.
+- [x] M1-T061b [US5] **Bench fairness + robustness** (per the ljs≤Node gate): benchmark the **ReleaseFast** ljs build vs optimized Node → ljs **0.2–0.6× (2–5× faster)** on compute loops; gate on **min** time (stable); loop-based depth-safe cases. Safety: `max_depth` 1000→400 + callFunction depth guard (function recursion no longer segfaults → RangeError).
 
 ## Polish (final cycle)
 - [ ] M1-T060 [P] Spec-clause comment audit on new modules; README + roadmap update (M1 done, real conformance %)

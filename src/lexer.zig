@@ -28,8 +28,19 @@ pub const TokenKind = enum {
     kw_typeof,
     kw_new,
     kw_instanceof,
+    kw_switch,
+    kw_case,
+    kw_default,
     pipe_pipe, // ||
     amp_amp, // &&
+    plus_plus, // ++
+    minus_minus, // --
+    question, // ?
+    plus_assign, // +=
+    minus_assign, // -=
+    star_assign, // *=
+    slash_assign, // /=
+    percent_assign, // %=
     identifier,
     plus,
     minus,
@@ -156,6 +167,9 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, word, "typeof")) return .{ .kind = .kw_typeof, .lexeme = word };
             if (std.mem.eql(u8, word, "new")) return .{ .kind = .kw_new, .lexeme = word };
             if (std.mem.eql(u8, word, "instanceof")) return .{ .kind = .kw_instanceof, .lexeme = word };
+            if (std.mem.eql(u8, word, "switch")) return .{ .kind = .kw_switch, .lexeme = word };
+            if (std.mem.eql(u8, word, "case")) return .{ .kind = .kw_case, .lexeme = word };
+            if (std.mem.eql(u8, word, "default")) return .{ .kind = .kw_default, .lexeme = word };
             return .{ .kind = .identifier, .lexeme = word };
         }
 
@@ -165,11 +179,24 @@ pub const Lexer = struct {
         // Punctuators.
         self.pos += 1;
         switch (c) {
-            '+' => return tok(.plus, self.src[start..self.pos]),
-            '-' => return tok(.minus, self.src[start..self.pos]),
-            '*' => return tok(.star, self.src[start..self.pos]),
-            '/' => return tok(.slash, self.src[start..self.pos]),
-            '%' => return tok(.percent, self.src[start..self.pos]),
+            '+' => {
+                if (self.peek() == '+') {
+                    self.pos += 1;
+                    return tok(.plus_plus, self.src[start..self.pos]);
+                }
+                return self.maybeCompound(.plus, .plus_assign, start);
+            },
+            '-' => {
+                if (self.peek() == '-') {
+                    self.pos += 1;
+                    return tok(.minus_minus, self.src[start..self.pos]);
+                }
+                return self.maybeCompound(.minus, .minus_assign, start);
+            },
+            '*' => return self.maybeCompound(.star, .star_assign, start),
+            '/' => return self.maybeCompound(.slash, .slash_assign, start),
+            '%' => return self.maybeCompound(.percent, .percent_assign, start),
+            '?' => return tok(.question, self.src[start..self.pos]),
             '(' => return tok(.lparen, self.src[start..self.pos]),
             ')' => return tok(.rparen, self.src[start..self.pos]),
             '{' => return tok(.lbrace, self.src[start..self.pos]),
@@ -209,6 +236,15 @@ pub const Lexer = struct {
     }
 
     fn maybeEq(self: *Lexer, base: TokenKind, with_eq: TokenKind, start: usize) Token {
+        if (self.peek() == '=') {
+            self.pos += 1;
+            return tok(with_eq, self.src[start..self.pos]);
+        }
+        return tok(base, self.src[start..self.pos]);
+    }
+
+    /// `op` or `op=` (compound assignment).
+    fn maybeCompound(self: *Lexer, base: TokenKind, with_eq: TokenKind, start: usize) Token {
         if (self.peek() == '=') {
             self.pos += 1;
             return tok(with_eq, self.src[start..self.pos]);

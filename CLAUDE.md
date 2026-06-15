@@ -31,8 +31,9 @@ Surface significant assumptions/decisions at the gate, not mid-cycle.
 When the user authorizes autonomous looping ("loop by yourself", "don't wait for me"), the
 per-cycle commit gate is waived: **auto-commit + push every cycle** that passes `zig build` +
 `zig build test` + `zig build lint` + **`zig build bench` (no ljs-vs-self perf regression)**.
-**Never commit a cycle that regresses the bench** — fix it or drop the change first. Run the
-bench every cycle. Keep cycling through `tasks.md` until the milestone is done or the user
+**Bench is an absolute pre-commit gate**: run `zig build bench` immediately before EVERY
+commit. If it shows any regression (or fails), you MUST fix it — the offending code or the
+bench — BEFORE committing. Never, ever commit with a failing or regressed bench. Keep cycling through `tasks.md` until the milestone is done or the user
 interrupts; record decisions in each commit message. Outside autonomous mode, never push
 without the user's per-cycle validation.
 

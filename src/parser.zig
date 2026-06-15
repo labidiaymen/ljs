@@ -135,6 +135,37 @@ pub const Parser = struct {
         return .{ .for_stmt = .{ .init = init_stmt, .cond = cond, .update = update, .body = body } };
     }
 
+    fn parseSwitch(self: *Parser) ParseError!ast.Stmt {
+        _ = self.advance(); // switch
+        _ = try self.expect(.lparen);
+        const disc = try self.parseAssignment();
+        _ = try self.expect(.rparen);
+        _ = try self.expect(.lbrace);
+        var cases: std.ArrayList(ast.Case) = .empty;
+        while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
+            var test_expr: ?*const ast.Node = null;
+            switch (self.peek().kind) {
+                .kw_case => {
+                    _ = self.advance();
+                    test_expr = try self.parseAssignment();
+                },
+                .kw_default => _ = self.advance(),
+                else => return ParseError.UnexpectedToken,
+            }
+            _ = try self.expect(.colon);
+            var body: std.ArrayList(ast.Stmt) = .empty;
+            while (true) {
+                switch (self.peek().kind) {
+                    .kw_case, .kw_default, .rbrace, .eof => break,
+                    else => try body.append(self.arena, try self.parseStmt()),
+                }
+            }
+            try cases.append(self.arena, .{ .test_expr = test_expr, .body = body.items });
+        }
+        _ = try self.expect(.rbrace);
+        return .{ .switch_stmt = .{ .discriminant = disc, .cases = cases.items } };
+    }
+
     fn parseTry(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // try
         const block = try self.parseBlock();
@@ -186,6 +217,7 @@ pub const Parser = struct {
             .kw_if => return self.parseIf(),
             .kw_while => return self.parseWhile(),
             .kw_for => return self.parseFor(),
+            .kw_switch => return self.parseSwitch(),
             .kw_try => return self.parseTry(),
             .kw_throw => {
                 _ = self.advance();
@@ -277,10 +309,16 @@ pub const Parser = struct {
 
     /// §13.15 Assignment (right-associative). Only identifier targets in M1 Cycle A.
     fn parseAssignment(self: *Parser) ParseError!*const ast.Node {
-        const left = try self.parseExpr(0);
-        if (self.peek().kind == .assign) {
+        const left = try self.parseConditional();
+        const op = self.peek().kind;
+        if (op == .assign or compoundBinOp(op) != null) {
             _ = self.advance();
-            const value = try self.parseAssignment();
+            const rhs = try self.parseAssignment();
+            // Compound assignment `x op= v` desugars to `x = x op v`.
+            const value = if (compoundBinOp(op)) |bop|
+                try self.alloc(.{ .binary = .{ .op = bop, .left = left, .right = rhs } })
+            else
+                rhs;
             switch (left.*) {
                 .identifier => |n| return self.alloc(.{ .assign = .{ .name = n, .value = value } }),
                 .member => |m| return self.alloc(.{ .assign_member = .{ .object = m.object, .name = m.name, .value = value } }),
@@ -289,6 +327,19 @@ pub const Parser = struct {
             }
         }
         return left;
+    }
+
+    /// §13.14 Conditional `cond ? then : otherwise` (above assignment, right-associative branches).
+    fn parseConditional(self: *Parser) ParseError!*const ast.Node {
+        const cond = try self.parseExpr(0);
+        if (self.peek().kind == .question) {
+            _ = self.advance();
+            const then = try self.parseAssignment();
+            _ = try self.expect(.colon);
+            const otherwise = try self.parseAssignment();
+            return self.alloc(.{ .conditional = .{ .cond = cond, .then = then, .otherwise = otherwise } });
+        }
+        return cond;
     }
 
     /// Precedence-climbing for binary + logical operators. Higher number binds tighter.
@@ -311,6 +362,13 @@ pub const Parser = struct {
     }
 
     fn parseUnary(self: *Parser) ParseError!*const ast.Node {
+        // §13.4.4/5 prefix ++ / --
+        if (self.peek().kind == .plus_plus or self.peek().kind == .minus_minus) {
+            const op: ast.UpdateOp = if (self.peek().kind == .plus_plus) .inc else .dec;
+            _ = self.advance();
+            const target = try self.parseUnary();
+            return self.alloc(.{ .update = .{ .op = op, .prefix = true, .target = target } });
+        }
         const uop: ?ast.UnaryOp = switch (self.peek().kind) {
             .plus => .plus,
             .minus => .minus,
@@ -358,6 +416,12 @@ pub const Parser = struct {
                 },
                 else => break,
             }
+        }
+        // §13.4.2/3 postfix ++ / --
+        if (self.peek().kind == .plus_plus or self.peek().kind == .minus_minus) {
+            const op: ast.UpdateOp = if (self.peek().kind == .plus_plus) .inc else .dec;
+            _ = self.advance();
+            expr = try self.alloc(.{ .update = .{ .op = op, .prefix = false, .target = expr } });
         }
         return expr;
     }
@@ -452,6 +516,18 @@ fn binaryOpFor(kind: lex.TokenKind) ?ast.BinaryOp {
         .ne => .ne,
         .seq => .seq,
         .sne => .sne,
+        else => null,
+    };
+}
+
+/// The binary operator a compound-assignment token (`+=`, …) desugars to, else null.
+fn compoundBinOp(kind: lex.TokenKind) ?ast.BinaryOp {
+    return switch (kind) {
+        .plus_assign => .add,
+        .minus_assign => .sub,
+        .star_assign => .mul,
+        .slash_assign => .div,
+        .percent_assign => .mod,
         else => null,
     };
 }

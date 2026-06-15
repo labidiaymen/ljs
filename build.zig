@@ -163,11 +163,23 @@ pub fn build(b: *std.Build) void {
     lint_step.dependOn(&lint.step);
 
     // `zig build bench [-- --update-baseline] [-- --reps N]` — benchmark ljs vs Node and
-    // gate on ljs-vs-self regression (constitution Principle IV). Builds ljs first.
-    const bench = b.addSystemCommand(&[_][]const u8{ "python3", "scripts/bench.py" });
-    bench.step.dependOn(b.getInstallStep());
+    // gate on ljs-vs-self regression (constitution Principle IV). Uses a dedicated ReleaseFast
+    // build of ljs for a fair comparison against (optimized) Node — Debug ljs would be unfairly
+    // slow. node is also optimized, so this is apples-to-apples.
+    const ljs_bench = b.addExecutable(.{
+        .name = "ljs-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "ljs", .module = mod }},
+        }),
+    });
+    const install_ljs_bench = b.addInstallArtifact(ljs_bench, .{});
+    const bench = b.addSystemCommand(&[_][]const u8{ "python3", "scripts/bench.py", "--ljs", "zig-out/bin/ljs-bench" });
+    bench.step.dependOn(&install_ljs_bench.step);
     if (b.args) |bench_args| bench.addArgs(bench_args);
-    const bench_step = b.step("bench", "Benchmark ljs vs Node (perf gate)");
+    const bench_step = b.step("bench", "Benchmark ljs (ReleaseFast) vs Node (perf gate)");
     bench_step.dependOn(&bench.step);
 
     // ── Test262 conformance harness ──────────────────────────────────────────

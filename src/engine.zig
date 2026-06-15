@@ -190,6 +190,21 @@ test "E2: Error family, String, Object, typed engine errors (US5)" {
     try expectStr("var n = \"\"; try { missingThing; } catch (e) { n = e.name; } n", "ReferenceError");
 }
 
+test "E4: ternary, switch, compound assignment (US5)" {
+    try expectNumber("var x = 5; x > 3 ? 100 : 2", 100);
+    try expectNumber("var x = 1; x > 3 ? 100 : 2", 2);
+    try expectNumber("var s = 0; s += 10; s -= 3; s *= 2; s", 14);
+    try expectNumber("var o = {n: 1}; o.n += 41; o.n", 42);
+    // switch with fall-through + break
+    try expectNumber("var r = 0; switch (2) { case 1: r = 1; break; case 2: r = 2; break; default: r = 9; } r", 2);
+    try expectNumber("var r = 0; switch (7) { case 1: r = 1; break; default: r = 9; } r", 9);
+    // ++ / -- (prefix + postfix)
+    try expectNumber("var i = 0; i++; i++; i", 2);
+    try expectNumber("var i = 5; var j = i++; j", 5); // postfix yields old value
+    try expectNumber("var i = 5; var j = ++i; j", 6); // prefix yields new value
+    try expectNumber("var s = 0; for (var i = 0; i < 5; i++) { s += i; } s", 10);
+}
+
 test "deep recursion throws RangeError, not a segfault" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

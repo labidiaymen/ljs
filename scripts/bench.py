@@ -36,12 +36,14 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--tolerance", type=float, default=15.0, help="ljs-vs-self regression band (%%)")
     ap.add_argument("--node", default="node")
+    ap.add_argument("--ljs", default=os.path.join(ROOT, "zig-out", "bin", "ljs"),
+                    help="ljs binary to benchmark (use the ReleaseFast build for a fair vs-Node comparison)")
     ap.add_argument("--baseline", default=os.path.join(ROOT, "bench", "baseline.json"))
     ap.add_argument("--cases-dir", default=os.path.join(ROOT, "bench", "cases"))
     ap.add_argument("--update-baseline", action="store_true")
     args = ap.parse_args()
 
-    ljs = os.path.join(ROOT, "zig-out", "bin", "ljs")
+    ljs = args.ljs if os.path.isabs(args.ljs) else os.path.join(ROOT, args.ljs)
     if not os.path.exists(ljs):
         print(f"setup error: ljs binary not found at {ljs} (run `zig build`)", file=sys.stderr)
         return 2
@@ -74,10 +76,12 @@ def main():
         else:
             nstr, ratio = "n/a", "n/a"
 
-        base = baseline.get(name, {}).get("ljs_ms_median")
+        # Gate on the MIN time: jitter only ever makes a run slower, so min ≈ true best-case
+        # throughput and is the stable metric for microbenchmarks (median is noise-prone at ~ms).
+        base = baseline.get(name, {}).get("ljs_ms_min")
         status, vsbase = "ok", "-"
         if base:
-            delta = (lmed - base) / base * 100.0
+            delta = (lmin - base) / base * 100.0
             vsbase = f"{delta:+.1f}%"
             if delta > args.tolerance:
                 status = "REGRESSION"

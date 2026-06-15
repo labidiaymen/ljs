@@ -20,7 +20,7 @@ pub const Interpreter = struct {
     // expressions/calls would overflow it and SIGSEGV. We throw RangeError first (as V8 does:
     // "Maximum call stack size exceeded"). Conservative for the larger M1 frames; raise once
     // eval runs on a dedicated large-stack thread.
-    max_depth: u32 = 1000,
+    max_depth: u32 = 400,
     /// The current `this` binding (§9.4.5 GetThisEnvironment, M1 subset): set by method calls,
     /// undefined otherwise. Saved/restored around each [[Call]].
     this_val: Value = .undefined,
@@ -156,6 +156,39 @@ pub const Interpreter = struct {
             },
             .break_stmt => return .brk,
             .continue_stmt => return .cont,
+            .switch_stmt => |s| {
+                // §14.12 SwitchStatement — match by ===, fall through, `break` exits.
+                const dc = try self.evalExpr(s.discriminant, env);
+                if (dc.isAbrupt()) return dc;
+                const sw_env = try Environment.create(self.arena, env);
+                var matched = false;
+                // First pass: case clauses in order. Second pass (if no match): from default.
+                var pass: u8 = 0;
+                while (pass < 2) : (pass += 1) {
+                    for (s.cases) |case| {
+                        if (!matched) {
+                            if (pass == 0) {
+                                if (case.test_expr) |te| {
+                                    const tc = try self.evalExpr(te, sw_env);
+                                    if (tc.isAbrupt()) return tc;
+                                    if (!strictEquals(dc.normal, tc.normal)) continue;
+                                } else continue; // skip default on pass 0
+                            } else {
+                                if (case.test_expr != null) continue; // pass 1: only start at default
+                            }
+                            matched = true;
+                        }
+                        const bc = try self.runBlock(case.body, sw_env);
+                        switch (bc) {
+                            .normal => {},
+                            .brk => return .{ .normal = .undefined },
+                            .ret, .throw, .cont => return bc,
+                        }
+                    }
+                    if (matched) break;
+                }
+                return .{ .normal = .undefined };
+            },
         }
     }
 
@@ -249,6 +282,48 @@ pub const Interpreter = struct {
                 }
                 return self.evalExpr(l.right, env);
             },
+            .conditional => |c| {
+                // §13.14 cond ? then : otherwise
+                const cc = try self.evalExpr(c.cond, env);
+                if (cc.isAbrupt()) return cc;
+                return self.evalExpr(if (toBoolean(cc.normal)) c.then else c.otherwise, env);
+            },
+            .update => |u| {
+                // §13.4 ++/-- : read target → ToNumber → ±1 → write back; yield old (postfix) or new (prefix).
+                const delta: f64 = if (u.op == .inc) 1 else -1;
+                switch (u.target.*) {
+                    .identifier => |name| {
+                        const b = env.lookup(name) orelse return self.throwError("ReferenceError", name);
+                        const old = toNumber(b.value);
+                        b.value = .{ .number = old + delta };
+                        return .{ .normal = .{ .number = if (u.prefix) old + delta else old } };
+                    },
+                    .member => |m| {
+                        const oc = try self.evalExpr(m.object, env);
+                        if (oc.isAbrupt()) return oc;
+                        const cur = try self.getProperty(oc.normal, m.name);
+                        if (cur.isAbrupt()) return cur;
+                        const old = toNumber(cur.normal);
+                        const sc = try self.setProperty(oc.normal, m.name, .{ .number = old + delta });
+                        if (sc.isAbrupt()) return sc;
+                        return .{ .normal = .{ .number = if (u.prefix) old + delta else old } };
+                    },
+                    .index => |ix| {
+                        const oc = try self.evalExpr(ix.object, env);
+                        if (oc.isAbrupt()) return oc;
+                        const kc = try self.evalExpr(ix.key, env);
+                        if (kc.isAbrupt()) return kc;
+                        const key = try self.toString(kc.normal);
+                        const cur = try self.getProperty(oc.normal, key);
+                        if (cur.isAbrupt()) return cur;
+                        const old = toNumber(cur.normal);
+                        const sc = try self.setProperty(oc.normal, key, .{ .number = old + delta });
+                        if (sc.isAbrupt()) return sc;
+                        return .{ .normal = .{ .number = if (u.prefix) old + delta else old } };
+                    },
+                    else => return self.throwError("SyntaxError", "Invalid update expression target"),
+                }
+            },
             .this => return .{ .normal = self.this_val },
         }
     }
@@ -333,6 +408,11 @@ pub const Interpreter = struct {
     /// §10.2.1 [[Call]] — native built-in, else an ordinary AST-closure function.
     fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
         if (func.native != .none) return self.callNative(func, args, this_val);
+        // Each call stacks several heavy native frames — count call depth too so the guard
+        // fires before the native stack overflows (these frames are bigger than expr frames).
+        self.depth += 1;
+        defer self.depth -= 1;
+        if (self.depth > self.max_depth) return self.throwError("RangeError", "Maximum call stack size exceeded");
         const fd = func.call orelse return self.throwError("TypeError", "value is not a function");
         const call_env = try Environment.create(self.arena, fd.closure);
         for (fd.params, 0..) |param, i| {

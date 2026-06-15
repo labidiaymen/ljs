@@ -39,8 +39,12 @@ pub const Node = union(enum) {
     call: struct { callee: *const Node, args: []const *const Node }, // §13.3.6 call
     new_expr: struct { callee: *const Node, args: []const *const Node }, // §13.3.5 new
     logical: struct { op: LogicalOp, left: *const Node, right: *const Node }, // §13.13
+    conditional: struct { cond: *const Node, then: *const Node, otherwise: *const Node }, // §13.14 ?:
+    update: struct { op: UpdateOp, prefix: bool, target: *const Node }, // §13.4 ++ / --
     this, // §13.2.1 ThisExpression
 };
+
+pub const UpdateOp = enum { inc, dec };
 
 pub const Property = struct { key: []const u8, value: *const Node };
 
@@ -72,6 +76,10 @@ pub const Stmt = union(enum) {
     },
     break_stmt, // §14.9
     continue_stmt, // §14.8
+    switch_stmt: struct { discriminant: *const Node, cases: []const Case }, // §14.12
 };
+
+/// A `switch` case; `test_expr == null` for `default`.
+pub const Case = struct { test_expr: ?*const Node, body: []const Stmt };
 
 pub const Program = struct { statements: []const Stmt };

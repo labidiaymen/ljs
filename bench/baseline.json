@@ -1,21 +1,17 @@
 {
   "tolerance_pct": 15.0,
   "cases": {
-    "arith_mix.js": {
-      "ljs_ms_median": 9.073,
-      "ljs_ms_min": 8.845
-    },
-    "arith_sum.js": {
-      "ljs_ms_median": 9.293,
-      "ljs_ms_min": 8.126
+    "loop_mix.js": {
+      "ljs_ms_median": 14.167,
+      "ljs_ms_min": 13.406
     },
     "loop_sum.js": {
-      "ljs_ms_median": 38.43,
-      "ljs_ms_min": 37.844
+      "ljs_ms_median": 12.571,
+      "ljs_ms_min": 12.147
     },
-    "string_cat.js": {
-      "ljs_ms_median": 9.817,
-      "ljs_ms_min": 8.902
+    "str_build.js": {
+      "ljs_ms_median": 6.478,
+      "ljs_ms_min": 5.907
     }
   }
 }
