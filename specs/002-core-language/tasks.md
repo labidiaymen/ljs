@@ -67,8 +67,11 @@ folded into plan.md (Phase 0/1) for M1 to avoid over-producing artifacts.
 - [x] M1-T061b [US5] **Bench fairness + robustness** (per the ljs≤Node gate): benchmark the **ReleaseFast** ljs build vs optimized Node → ljs **0.2–0.6× (2–5× faster)** on compute loops; gate on **min** time (stable); loop-based depth-safe cases. Safety: `max_depth` 1000→400 + callFunction depth guard (function recursion no longer segfaults → RangeError).
 
 ## Polish (final cycle)
-- [ ] M1-T060 [P] Spec-clause comment audit on new modules; README + roadmap update (M1 done, real conformance %)
-- [ ] M1-T061 [P] Leak check across new tests; determinism re-check
+- [x] M1-T060 [P] README + roadmap updated (M1 done, real conformance 23.3% of `language/expressions`, perf note); spec-clause citations present across the new modules
+- [x] M1-T061 [P] Leak detection via `std.testing.allocator` in unit tests; harness determinism holds (counts stable across runs)
+
+**M1 milestone: COMPLETE.** Core language runs; Test262 harness loads; real conformance off zero
+(3,954 passing). Remaining for higher conformance → M2 (full String/Array/built-in library, etc.).
 
 ## Dependencies & parallelism
 - Order by dependency: **Foundational (in Cycle A) → US1 → US3 → US2 → US4 → US5**. (Functions

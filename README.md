@@ -4,9 +4,10 @@ A JavaScript engine written from scratch in [Zig](https://ziglang.org) — in th
 but built **spec-first** and optimized for correctness, spec-traceability, and a measured
 performance story from day one.
 
-> **Status: early M0.** A tree-walking interpreter evaluates a trivial expression subset
-> end-to-end; the Test262 conformance harness and the bytecode/JIT tiers are not built yet.
-> This is a learning-grade, in-progress engine, not a drop-in Node replacement.
+> **Status: M1 (core language).** A tree-walking interpreter runs variables, functions/closures,
+> objects, control flow, and exceptions — enough to load the Test262 harness and pass **~23%**
+> of `language/expressions` (3,954 tests). The bytecode/JIT tiers are future work. A
+> learning-grade, in-progress engine, not a drop-in Node replacement.
 
 ## Why another engine?
 
@@ -43,48 +44,56 @@ ljs eval "<source>"   # evaluate a source string, print the result
 ljs run <file>        # evaluate a source file
 ```
 
-## What works today (M0)
+## What works today (M1)
 
-- Lexer + precedence-climbing parser → AST for the trivial expression grammar
-- Tree-walk interpreter with Completion Records and a step-cap watchdog, carrying inline
-  ECMA-262 clause citations
-- Values: `undefined`, `null`, boolean, number (f64), string
-- Operators: `+ - * / %`, unary `+ - !`, comparisons (`< > <= >=`), `== != === !==`,
-  string concatenation, grouping
-- `ljs eval` / `ljs run` with spec-correct results and proper stdout/stderr/exit-code behaviour
-- First ljs-vs-Node benchmark wired up (lean native startup currently beats Node on tiny scripts;
-  that flips once compute-bound benchmarks exist)
+- **Bindings & scope**: `var`/`let`/`const`, assignment + compound (`+= -= *= /= %=`), `++`/`--`,
+  block (lexical) scope; `const`-reassign → TypeError, unresolved → ReferenceError
+- **Functions**: declarations/expressions, parameters, `return`, calls, **closures**, basic `this`
+- **Objects**: literals, `a.b` / `a[k]` access + assignment, prototype chain, `new` + constructors,
+  `instanceof`, `typeof`
+- **Control flow**: `if`/`else`, `while`, `for`, `break`/`continue`, `switch`, `throw`/`try`/`catch`/`finally`
+- **Operators**: arithmetic, comparisons, `=== !==`, logical `||`/`&&` (short-circuit), ternary `?:`
+- **Built-ins**: the `Error` family (real typed objects), `String()`, minimal `Object`
+- **Engine**: Completion Records, Environment Records, a step-cap + recursion-depth guard
+  (deep recursion → `RangeError`, never a crash); inline ECMA-262 clause citations throughout
+- Runs the **Test262 harness** (`sta.js`/`assert.js`) and passes real conformance tests
 
 ## Conformance (Test262)
 
 ```sh
 # vendor a slice of the official suite (fast sparse checkout), pinned via test262.pin
-./scripts/vendor-test262.sh test/language/expressions/addition
-zig build test262 -- --path vendor/test262/test/language/expressions/addition
+./scripts/vendor-test262.sh test/language/expressions
+zig build test262 -- --path vendor/test262/test/language/expressions --harness-dir vendor/test262/harness
 # baseline + regression gate:
-zig build test262 -- --path <dir> --update-baseline baseline/<name>.json
-zig build test262 -- --path <dir> --baseline baseline/<name>.json   # exit 1 on regression
+zig build test262 -- --path <dir> --harness-dir vendor/test262/harness --update-baseline baseline/<name>.json
+zig build test262 -- --path <dir> --harness-dir vendor/test262/harness --baseline baseline/<name>.json   # exit 1 on regression
 ```
 
-At M0 the real-suite pass rate is **~0% by design**: real positive tests call `assert.sameValue(…)`,
-which needs functions/objects the tree-walk engine doesn't have yet. M0 validates the harness
-(classification, fault isolation, determinism, regression detection) — not the pass rate. The
-curated sample in `tests/fixtures/sample/` classifies 27/6/2 (81.8%), matching a hand-tally.
+**M1 result:** `test/language/expressions` → **3,954 passed / 13,017 failed / 2,244 skipped = 23.3%**
+(11,158 test files). Real positive tests pass via the loaded `assert.js`; the rest fail/skip on
+features still to come (full string/array built-ins, generators, etc.). The harness also validates
+classification, fault isolation, determinism, and regression detection.
 
 ## Roadmap
 
-| Milestone | Focus |
-|-----------|-------|
-| **M0** (in progress) | Test262 harness + minimal eval + ljs-vs-Node benchmarking |
-| M1+ | objects, functions, control flow, the built-in library — climbing Test262 % |
-| Later | bytecode VM, then optimizing tiers — graduated when the benchmarks justify it |
+| Milestone | Focus | Status |
+|-----------|-------|--------|
+| **M0** | Test262 harness + minimal eval + ljs-vs-Node benchmarking | ✅ done |
+| **M1** | bindings, functions, objects, control flow, errors → run the harness | ✅ done (23.3% of expressions) |
+| M2+ | full string/array/built-in library, more of the spec — climbing Test262 % | next |
+| Later | bytecode VM, then optimizing tiers — graduated when the benchmarks justify it | future |
+
+**Performance note:** built with `ReleaseFast`, ljs is currently **2–5× faster than Node** on
+the benchmark workloads — its native binary starts in ~0 ms vs V8's ~24 ms boot, which dominates
+these short/medium scripts. V8's JIT will win on heavy *sustained* compute; that's the signal
+that will justify graduating ljs to a bytecode VM.
 
 ## Layout
 
 ```
-src/          engine core (value, completion, lexer, parser, interpreter, engine, CLI)
-test262/      conformance harness (planned)
-bench/        ljs-vs-Node benchmarks
+src/          engine core (value, object, environment, completion, lexer, parser, interpreter, builtins, engine, CLI)
+test262/      conformance harness (runner, frontmatter metadata, report + baseline)
+bench/        ljs-vs-Node benchmarks (loop-based; gated on min time)
 specs/        Spec-Driven Development artifacts (spec, plan, research, tasks, contracts)
 scripts/      tooling (lint, vendor-test262)
 ```
