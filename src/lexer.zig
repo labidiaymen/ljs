@@ -58,6 +58,16 @@ pub const TokenKind = enum {
     star_assign, // *=
     slash_assign, // /=
     percent_assign, // %=
+    star_star_assign, // **= (§13.15)
+    shl_assign, // <<=
+    shr_assign, // >>=
+    shr_un_assign, // >>>=
+    amp_assign, // &=
+    pipe_assign, // |=
+    caret_assign, // ^=
+    amp_amp_assign, // &&= (§13.15.2 logical assignment, short-circuit)
+    pipe_pipe_assign, // ||=
+    question_question_assign, // ??=
     identifier,
     plus,
     minus,
@@ -238,6 +248,11 @@ pub const Lexer = struct {
             '*' => {
                 if (self.peek() == '*') {
                     self.pos += 1;
+                    // §13.15: `**=` (maximal munch — before `**`).
+                    if (self.peek() == '=') {
+                        self.pos += 1;
+                        return tok(.star_star_assign, self.src[start..self.pos]);
+                    }
                     return tok(.star_star, self.src[start..self.pos]);
                 }
                 return self.maybeCompound(.star, .star_assign, start);
@@ -245,9 +260,14 @@ pub const Lexer = struct {
             '/' => return self.maybeCompound(.slash, .slash_assign, start),
             '%' => return self.maybeCompound(.percent, .percent_assign, start),
             '?' => {
-                // §13.13 nullish coalescing `??`. (`??=` is a later cycle; we lex only `??`.)
+                // §13.13 nullish coalescing `??` / §13.15.2 logical assignment `??=`
+                // (maximal munch — `??=` before `??`).
                 if (self.peek() == '?') {
                     self.pos += 1;
+                    if (self.peek() == '=') {
+                        self.pos += 1;
+                        return tok(.question_question_assign, self.src[start..self.pos]);
+                    }
                     return tok(.question_question, self.src[start..self.pos]);
                 }
                 // §13.3.9 optional chaining `?.` — but `?.` followed by a decimal digit is the
@@ -278,6 +298,11 @@ pub const Lexer = struct {
             '<' => {
                 if (self.peek() == '<') {
                     self.pos += 1;
+                    // §13.15: `<<=` (maximal munch — before `<<`).
+                    if (self.peek() == '=') {
+                        self.pos += 1;
+                        return tok(.shl_assign, self.src[start..self.pos]);
+                    }
                     return tok(.shl, self.src[start..self.pos]);
                 }
                 return self.maybeEq(.lt, .le, start);
@@ -287,7 +312,17 @@ pub const Lexer = struct {
                     self.pos += 1;
                     if (self.peek() == '>') {
                         self.pos += 1;
+                        // §13.15: `>>>=` (maximal munch — before `>>>`).
+                        if (self.peek() == '=') {
+                            self.pos += 1;
+                            return tok(.shr_un_assign, self.src[start..self.pos]);
+                        }
                         return tok(.shr_un, self.src[start..self.pos]);
+                    }
+                    // §13.15: `>>=` (maximal munch — before `>>`).
+                    if (self.peek() == '=') {
+                        self.pos += 1;
+                        return tok(.shr_assign, self.src[start..self.pos]);
                     }
                     return tok(.shr, self.src[start..self.pos]);
                 }
@@ -308,18 +343,30 @@ pub const Lexer = struct {
             '|' => {
                 if (self.peek() == '|') {
                     self.pos += 1;
+                    // §13.15.2: `||=` (maximal munch — before `||`).
+                    if (self.peek() == '=') {
+                        self.pos += 1;
+                        return tok(.pipe_pipe_assign, self.src[start..self.pos]);
+                    }
                     return tok(.pipe_pipe, self.src[start..self.pos]);
                 }
-                return tok(.bit_or, self.src[start..self.pos]);
+                // §13.15: `|=` (before `|`).
+                return self.maybeCompound(.bit_or, .pipe_assign, start);
             },
             '&' => {
                 if (self.peek() == '&') {
                     self.pos += 1;
+                    // §13.15.2: `&&=` (maximal munch — before `&&`).
+                    if (self.peek() == '=') {
+                        self.pos += 1;
+                        return tok(.amp_amp_assign, self.src[start..self.pos]);
+                    }
                     return tok(.amp_amp, self.src[start..self.pos]);
                 }
-                return tok(.bit_and, self.src[start..self.pos]);
+                // §13.15: `&=` (before `&`).
+                return self.maybeCompound(.bit_and, .amp_assign, start);
             },
-            '^' => return tok(.bit_xor, self.src[start..self.pos]),
+            '^' => return self.maybeCompound(.bit_xor, .caret_assign, start), // §13.15 `^=`
             '~' => return tok(.bit_not, self.src[start..self.pos]),
             else => return LexError.UnexpectedCharacter,
         }

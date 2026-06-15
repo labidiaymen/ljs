@@ -585,10 +585,22 @@ pub const Parser = struct {
         }
         const left = try self.parseConditional();
         const op = self.peek().kind;
+        // §13.15.2 LogicalAssignment (`&&=`/`||=`/`??=`) — short-circuit, NOT a binary desugar.
+        // The target node is kept intact (identifier / member / index) so the interpreter can
+        // evaluate the reference exactly once before deciding whether to evaluate the RHS.
+        if (logicalAssignOp(op)) |lop| {
+            switch (left.*) {
+                .identifier, .member, .index => {},
+                else => return ParseError.UnexpectedToken, // §13.15.1 invalid assignment target
+            }
+            _ = self.advance();
+            const value = try self.parseAssignment();
+            return self.alloc(.{ .logical_assign = .{ .op = lop, .target = left, .value = value } });
+        }
         if (op == .assign or compoundBinOp(op) != null) {
             _ = self.advance();
             const rhs = try self.parseAssignment();
-            // Compound assignment `x op= v` desugars to `x = x op v`.
+            // Compound assignment `x op= v` desugars to `x = x op v` (§13.15).
             const value = if (compoundBinOp(op)) |bop|
                 try self.alloc(.{ .binary = .{ .op = bop, .left = left, .right = rhs } })
             else
@@ -1119,7 +1131,7 @@ fn binaryOpFor(kind: lex.TokenKind) ?ast.BinaryOp {
     };
 }
 
-/// The binary operator a compound-assignment token (`+=`, …) desugars to, else null.
+/// The binary operator a compound-assignment token (`+=`, …) desugars to, else null (§13.15).
 fn compoundBinOp(kind: lex.TokenKind) ?ast.BinaryOp {
     return switch (kind) {
         .plus_assign => .add,
@@ -1127,6 +1139,24 @@ fn compoundBinOp(kind: lex.TokenKind) ?ast.BinaryOp {
         .star_assign => .mul,
         .slash_assign => .div,
         .percent_assign => .mod,
+        .star_star_assign => .exp,
+        .shl_assign => .shl,
+        .shr_assign => .shr,
+        .shr_un_assign => .shr_un,
+        .amp_assign => .bit_and,
+        .pipe_assign => .bit_or,
+        .caret_assign => .bit_xor,
+        else => null,
+    };
+}
+
+/// The logical operator a logical-assignment token (`&&=`/`||=`/`??=`) short-circuits on, else null
+/// (§13.15.2). Unlike `compoundBinOp` these are NOT a plain `x = x op v` desugar.
+fn logicalAssignOp(kind: lex.TokenKind) ?ast.LogicalOp {
+    return switch (kind) {
+        .amp_amp_assign => .and_,
+        .pipe_pipe_assign => .or_,
+        .question_question_assign => .coalesce,
         else => null,
     };
 }

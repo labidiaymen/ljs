@@ -488,6 +488,105 @@ test "M3 nullish coalescing: ?? & mixing early error (US6, §13.13)" {
     try expectNumber("(null || 2) ?? 9", 2);
 }
 
+test "M3 compound assignment: full operator set on identifiers (US7, §13.15)" {
+    // The five existing ops still work (regression guard).
+    try expectNumber("var s = 0; s += 10; s -= 3; s *= 2; s", 14);
+    try expectNumber("var s = 20; s /= 4; s", 5);
+    try expectNumber("var s = 20; s %= 7; s", 6);
+    // New compound ops: **= and the shifts.
+    try expectNumber("var s = 3; s **= 4; s", 81);
+    try expectNumber("var s = 1; s <<= 5; s", 32);
+    try expectNumber("var s = 64; s >>= 2; s", 16);
+    try expectNumber("var s = -1; s >>>= 28; s", 15); // logical (unsigned) shift
+    // New compound ops: bitwise &= |= ^=.
+    try expectNumber("var s = 12; s &= 10; s", 8);
+    try expectNumber("var s = 12; s |= 3; s", 15);
+    try expectNumber("var s = 12; s ^= 10; s", 6);
+    // Result value of a compound assignment is the assigned value.
+    try expectNumber("var s = 5; (s **= 2)", 25);
+}
+
+test "M3 compound assignment: member & index targets (US7, §13.15)" {
+    try expectNumber("var o = {n: 3}; o.n **= 3; o.n", 27);
+    try expectNumber("var o = {n: 1}; o.n <<= 4; o.n", 16);
+    try expectNumber("var o = {n: 13}; o.n &= 6; o.n", 4);
+    try expectNumber("var o = {n: 8}; o.n |= 1; o.n", 9);
+    try expectNumber("var o = {n: 8}; o.n ^= 12; o.n", 4);
+    // a[k] *= 2 (existing) and the new ops on an index target.
+    try expectNumber("var a = [1, 2, 3]; a[1] *= 2; a[1]", 4);
+    try expectNumber("var a = [1, 2, 3]; a[2] **= 3; a[2]", 27);
+    try expectNumber("var a = [4]; a[0] >>= 1; a[0]", 2);
+    try expectNumber("var a = [5]; a[0] |= 2; a[0]", 7);
+}
+
+test "M3 logical assignment: &&= ||= ??= guard semantics (US7, §13.15.2)" {
+    // &&= assigns only when the current value is truthy.
+    try expectNumber("var x = 1; x &&= 5; x", 5); // truthy → assigned
+    try expectNumber("var x = 0; x &&= 5; x", 0); // falsy → unchanged
+    // ||= assigns only when the current value is falsy.
+    try expectNumber("var x = 0; x ||= 9; x", 9); // falsy → assigned
+    try expectNumber("var x = 3; x ||= 9; x", 3); // truthy → unchanged
+    // ??= assigns only when null/undefined — 0 and '' are NOT nullish.
+    try expectNumber("var x; x ??= 7; x", 7); // undefined → assigned
+    try expectNumber("var x = null; x ??= 7; x", 7); // null → assigned
+    try expectNumber("var x = 0; x ??= 7; x", 0); // 0 is not nullish → unchanged
+    try expectStr("var x = ''; x ??= 'y'; x", ""); // '' is not nullish → unchanged
+    // Yields the final value of the target.
+    try expectNumber("var x = 0; (x ||= 4)", 4);
+    try expectNumber("var x = 2; (x &&= 8)", 8);
+    // Logical assignment on member / index targets.
+    try expectNumber("var o = {n: 0}; o.n ||= 5; o.n", 5);
+    try expectNumber("var o = {}; o.n ??= 9; o.n", 9);
+    try expectNumber("var a = [0]; a[0] ||= 6; a[0]", 6);
+}
+
+test "M3 logical assignment: short-circuit does NOT evaluate RHS (US7, §13.15.2)" {
+    // RHS is a call that bumps a counter; assert the counter only moves when the guard passes.
+    // &&= on a falsy target must NOT evaluate the RHS.
+    try expectNumber(
+        "var hits = 0; function bump() { hits = hits + 1; return 99; } var x = 0; x &&= bump(); hits",
+        0,
+    );
+    // …but on a truthy target it DOES.
+    try expectNumber(
+        "var hits = 0; function bump() { hits = hits + 1; return 99; } var x = 1; x &&= bump(); hits",
+        1,
+    );
+    // ||= on a truthy target must NOT evaluate the RHS.
+    try expectNumber(
+        "var hits = 0; function bump() { hits = hits + 1; return 99; } var x = 3; x ||= bump(); hits",
+        0,
+    );
+    // ??= on a non-nullish target must NOT evaluate the RHS.
+    try expectNumber(
+        "var hits = 0; function bump() { hits = hits + 1; return 99; } var x = 0; x ??= bump(); hits",
+        0,
+    );
+    // ??= on undefined DOES evaluate the RHS exactly once.
+    try expectNumber(
+        "var hits = 0; function bump() { hits = hits + 1; return 99; } var x; x ??= bump(); hits",
+        1,
+    );
+}
+
+test "M3 logical assignment: member base evaluated exactly once (US7, §13.15.2)" {
+    // `obj().p ??= v` must call obj() once whether or not the assignment happens.
+    // Non-nullish current value → no write, but base still evaluated once.
+    try expectNumber(
+        "var calls = 0; var o = {p: 1}; function obj() { calls = calls + 1; return o; } obj().p ??= 5; calls",
+        1,
+    );
+    // Nullish current value → write happens, base still evaluated once.
+    try expectNumber(
+        "var calls = 0; var o = {}; function obj() { calls = calls + 1; return o; } obj().p ??= 5; o.p",
+        5,
+    );
+    try expectNumber(
+        "var calls = 0; var o = {}; function obj() { calls = calls + 1; return o; } obj().p ??= 5; calls",
+        1,
+    );
+}
+
 test "deep recursion throws RangeError, not a segfault" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

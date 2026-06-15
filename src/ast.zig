@@ -44,6 +44,11 @@ pub const Node = union(enum) {
     index: struct { object: *const Node, key: *const Node }, // §13.3.3  a[expr]
     assign_member: struct { object: *const Node, name: []const u8, value: *const Node }, // a.b = v
     assign_index: struct { object: *const Node, key: *const Node, value: *const Node }, // a[expr] = v
+    /// §13.15.2 LogicalAssignment `&&=` / `||=` / `??=`. Short-circuit: the reference is evaluated
+    /// once, its current value read, and the guard (`op`) decides whether `value` is evaluated and
+    /// written. `target` is the assignment target (identifier / member `a.b` / index `a[k]`); the
+    /// interpreter destructures it to read-once / write-once without re-evaluating the base.
+    logical_assign: struct { op: LogicalOp, target: *const Node, value: *const Node },
     function: *const Function, // §15.2 function expression
     call: struct { callee: *const Node, args: []const *const Node }, // §13.3.6 call
     new_expr: struct { callee: *const Node, args: []const *const Node }, // §13.3.5 new

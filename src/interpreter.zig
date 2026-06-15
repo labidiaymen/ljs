@@ -305,6 +305,7 @@ pub const Interpreter = struct {
                 }
                 return self.evalExpr(l.right, env);
             },
+            .logical_assign => |la| return self.evalLogicalAssign(la, env),
             .optional => return self.evalOptionalChain(node, env),
             .conditional => |c| {
                 // §13.14 cond ? then : otherwise
@@ -363,6 +364,52 @@ pub const Interpreter = struct {
             },
             .this => return .{ .normal = self.this_val },
             .spread => return self.throwError("SyntaxError", "Unexpected token '...'"), // only valid in array/call/new lists
+        }
+    }
+
+    /// §13.15.2 LogicalAssignment `&&=` / `||=` / `??=`. Short-circuit, evaluating the target
+    /// reference EXACTLY ONCE: resolve the reference (binding, or base [+ key] for member/index),
+    /// read the current value, let the guard decide, and only then evaluate the RHS and write.
+    ///   • `&&=` assigns only when the current value is truthy.
+    ///   • `||=` assigns only when the current value is falsy.
+    ///   • `??=` assigns only when the current value is null/undefined (§13.13 nullish, from Cycle 6).
+    /// Yields the final value of the target (the RHS when assigned, else the unchanged value).
+    fn evalLogicalAssign(self: *Interpreter, la: anytype, env: *Environment) EvalError!Completion {
+        switch (la.target.*) {
+            .identifier => |name| {
+                const b = env.lookup(name) orelse return self.throwError("ReferenceError", name);
+                if (!b.initialized) return self.throwError("ReferenceError", name); // TDZ
+                if (!shouldAssign(la.op, b.value)) return .{ .normal = b.value };
+                const rc = try self.evalExpr(la.value, env);
+                if (rc.isAbrupt()) return rc;
+                if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
+                b.value = rc.normal;
+                return .{ .normal = rc.normal };
+            },
+            .member => |m| {
+                const oc = try self.evalExpr(m.object, env); // base evaluated once
+                if (oc.isAbrupt()) return oc;
+                const cur = try self.getProperty(oc.normal, m.name);
+                if (cur.isAbrupt()) return cur;
+                if (!shouldAssign(la.op, cur.normal)) return cur;
+                const rc = try self.evalExpr(la.value, env);
+                if (rc.isAbrupt()) return rc;
+                return self.setProperty(oc.normal, m.name, rc.normal);
+            },
+            .index => |ix| {
+                const oc = try self.evalExpr(ix.object, env); // base evaluated once
+                if (oc.isAbrupt()) return oc;
+                const kc = try self.evalExpr(ix.key, env); // key evaluated once
+                if (kc.isAbrupt()) return kc;
+                const key = try self.toString(kc.normal);
+                const cur = try self.getProperty(oc.normal, key);
+                if (cur.isAbrupt()) return cur;
+                if (!shouldAssign(la.op, cur.normal)) return cur;
+                const rc = try self.evalExpr(la.value, env);
+                if (rc.isAbrupt()) return rc;
+                return self.setProperty(oc.normal, key, rc.normal);
+            },
+            else => return self.throwError("SyntaxError", "Invalid assignment target"),
         }
     }
 
@@ -1037,6 +1084,18 @@ pub const Interpreter = struct {
         return ops.toString(self.arena, v);
     }
 };
+
+/// §13.15.2: should a LogicalAssignment write, given the operator and the target's current value?
+///   • `&&=` (and_)      — only when the current value is truthy.
+///   • `||=` (or_)       — only when the current value is falsy.
+///   • `??=` (coalesce)  — only when the current value is null/undefined (§13.13 nullish guard).
+fn shouldAssign(op: ast.LogicalOp, cur: Value) bool {
+    return switch (op) {
+        .and_ => toBoolean(cur),
+        .or_ => !toBoolean(cur),
+        .coalesce => cur == .undefined or cur == .null,
+    };
+}
 
 /// A block needs its own declarative scope only if it lexically declares (let/const/function);
 /// `var` is function-scoped and declaration-free blocks can reuse the parent env (hot-loop win).
