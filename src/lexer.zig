@@ -12,6 +12,9 @@ pub const TokenKind = enum {
     kw_var,
     kw_let,
     kw_const,
+    kw_function,
+    kw_return,
+    kw_this,
     identifier,
     plus,
     minus,
@@ -122,6 +125,9 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, word, "var")) return .{ .kind = .kw_var, .lexeme = word };
             if (std.mem.eql(u8, word, "let")) return .{ .kind = .kw_let, .lexeme = word };
             if (std.mem.eql(u8, word, "const")) return .{ .kind = .kw_const, .lexeme = word };
+            if (std.mem.eql(u8, word, "function")) return .{ .kind = .kw_function, .lexeme = word };
+            if (std.mem.eql(u8, word, "return")) return .{ .kind = .kw_return, .lexeme = word };
+            if (std.mem.eql(u8, word, "this")) return .{ .kind = .kw_this, .lexeme = word };
             return .{ .kind = .identifier, .lexeme = word };
         }
 

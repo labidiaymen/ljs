@@ -24,7 +24,7 @@ pub const Value = union(enum) {
             .boolean => |b| try w.writeAll(if (b) "true" else "false"),
             .number => |n| try writeNumber(w, n),
             .string => |s| try w.print("\"{s}\"", .{s}),
-            .object => try w.writeAll("[object Object]"), // §20.1.3.6 Object.prototype.toString (M1 stub)
+            .object => |o| try w.writeAll(if (o.kind == .function) "[Function (anonymous)]" else "[object Object]"),
         }
     }
 };

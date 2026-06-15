@@ -17,10 +17,13 @@ pub const Interpreter = struct {
     step_limit: u64 = 10_000_000,
     depth: u32 = 0,
     // Recursion-depth guard: a tree-walker recurses on the native stack, so deeply nested
-    // expressions would overflow it and SIGSEGV. We throw RangeError first (as V8 does:
+    // expressions/calls would overflow it and SIGSEGV. We throw RangeError first (as V8 does:
     // "Maximum call stack size exceeded"). Conservative for the larger M1 frames; raise once
     // eval runs on a dedicated large-stack thread.
     max_depth: u32 = 1000,
+    /// The current `this` binding (§9.4.5 GetThisEnvironment, M1 subset): set by method calls,
+    /// undefined otherwise. Saved/restored around each [[Call]].
+    this_val: Value = .undefined,
 
     pub fn run(self: *Interpreter, program: ast.Program, env: *Environment) EvalError!Completion {
         var last: Completion = .{ .normal = .undefined };
@@ -69,6 +72,21 @@ pub const Interpreter = struct {
                     if (last.isAbrupt()) return last;
                 }
                 return last;
+            },
+            .func_decl => |f| {
+                // §15.2 — bind a function object to its name in the current scope.
+                const obj = try Object.createFunction(self.arena, .{ .params = f.params, .body = f.body, .closure = env });
+                if (f.name) |name| try env.declare(name, .{ .object = obj }, true, true);
+                return .{ .normal = .undefined };
+            },
+            .ret => |maybe_expr| {
+                // §14.10 ReturnStatement.
+                if (maybe_expr) |e| {
+                    const c = try self.evalExpr(e, env);
+                    if (c.isAbrupt()) return c;
+                    return .{ .ret = c.normal };
+                }
+                return .{ .ret = .undefined };
             },
         }
     }
@@ -140,7 +158,83 @@ pub const Interpreter = struct {
                 if (vc.isAbrupt()) return vc;
                 return self.setProperty(oc.normal, try self.toString(kc.normal), vc.normal);
             },
+            .function => |f| return self.evalFunctionExpr(f, env),
+            .call => |c| return self.evalCall(c, env),
+            .this => return .{ .normal = self.this_val },
         }
+    }
+
+    fn evalFunctionExpr(self: *Interpreter, f: *const ast.Function, env: *Environment) EvalError!Completion {
+        const obj = try Object.createFunction(self.arena, .{ .params = f.params, .body = f.body, .closure = env });
+        return .{ .normal = .{ .object = obj } };
+    }
+
+    /// §13.3.6 Call. Resolves the callee (with `this` for method calls), evaluates arguments,
+    /// then invokes [[Call]].
+    fn evalCall(self: *Interpreter, c: anytype, env: *Environment) EvalError!Completion {
+        var this_for_call: Value = .undefined;
+        var callee: Value = .undefined;
+        switch (c.callee.*) {
+            .member => |m| {
+                const oc = try self.evalExpr(m.object, env);
+                if (oc.isAbrupt()) return oc;
+                this_for_call = oc.normal;
+                const got = try self.getProperty(oc.normal, m.name);
+                if (got.isAbrupt()) return got;
+                callee = got.normal;
+            },
+            .index => |ix| {
+                const oc = try self.evalExpr(ix.object, env);
+                if (oc.isAbrupt()) return oc;
+                this_for_call = oc.normal;
+                const kc = try self.evalExpr(ix.key, env);
+                if (kc.isAbrupt()) return kc;
+                const got = try self.getProperty(oc.normal, try self.toString(kc.normal));
+                if (got.isAbrupt()) return got;
+                callee = got.normal;
+            },
+            else => {
+                const cc = try self.evalExpr(c.callee, env);
+                if (cc.isAbrupt()) return cc;
+                callee = cc.normal;
+            },
+        }
+
+        var args: std.ArrayList(Value) = .empty;
+        for (c.args) |arg| {
+            const ac = try self.evalExpr(arg, env);
+            if (ac.isAbrupt()) return ac;
+            try args.append(self.arena, ac.normal);
+        }
+
+        if (callee != .object or callee.object.kind != .function) {
+            return self.throwError("TypeError", "value is not a function");
+        }
+        return self.callFunction(callee.object, args.items, this_for_call);
+    }
+
+    /// §10.2.1 [[Call]] for an ordinary function object.
+    fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
+        const fd = func.call.?;
+        const call_env = try Environment.create(self.arena, fd.closure);
+        for (fd.params, 0..) |param, i| {
+            const v: Value = if (i < args.len) args[i] else .undefined; // missing args → undefined
+            try call_env.declare(param, v, true, true);
+        }
+        const saved_this = self.this_val;
+        self.this_val = this_val;
+        defer self.this_val = saved_this;
+
+        for (fd.body) |stmt| {
+            const c = try self.evalStmt(stmt, call_env);
+            switch (c) {
+                .normal => {},
+                .ret => |v| return .{ .normal = v },
+                .throw => return c,
+                .brk, .cont => {}, // not produced inside a function body in M1
+            }
+        }
+        return .{ .normal = .undefined }; // implicit return
     }
 
     /// §10.1.8 [[Get]]. Property access on null/undefined throws (§13.3); other primitives

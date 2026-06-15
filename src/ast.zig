@@ -32,9 +32,18 @@ pub const Node = union(enum) {
     index: struct { object: *const Node, key: *const Node }, // §13.3.3  a[expr]
     assign_member: struct { object: *const Node, name: []const u8, value: *const Node }, // a.b = v
     assign_index: struct { object: *const Node, key: *const Node, value: *const Node }, // a[expr] = v
+    function: *const Function, // §15.2 function expression
+    call: struct { callee: *const Node, args: []const *const Node }, // §13.3.6 call
+    this, // §13.2.1 ThisExpression
 };
 
 pub const Property = struct { key: []const u8, value: *const Node };
+
+pub const Function = struct {
+    name: ?[]const u8,
+    params: []const []const u8,
+    body: []const Stmt,
+};
 
 pub const DeclKind = enum { var_decl, let_decl, const_decl };
 
@@ -44,6 +53,8 @@ pub const Stmt = union(enum) {
     expr: *const Node,
     declaration: struct { kind: DeclKind, decls: []const Declarator }, // §14.3
     block: []const Stmt, // §14.2
+    func_decl: *const Function, // §15.2 function declaration
+    ret: ?*const Node, // §14.10 return statement
 };
 
 pub const Program = struct { statements: []const Stmt };

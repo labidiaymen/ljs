@@ -59,12 +59,51 @@ pub const Parser = struct {
         switch (self.peek().kind) {
             .lbrace => return .{ .block = try self.parseBlock() },
             .kw_var, .kw_let, .kw_const => return self.parseDecl(),
+            .kw_function => {
+                _ = self.advance();
+                return .{ .func_decl = try self.parseFunction() };
+            },
+            .kw_return => {
+                _ = self.advance();
+                var arg: ?*const ast.Node = null;
+                const k = self.peek().kind;
+                if (k != .semicolon and k != .rbrace and k != .eof) arg = try self.parseAssignment();
+                if (self.peek().kind == .semicolon) _ = self.advance();
+                return .{ .ret = arg };
+            },
             else => {
                 const e = try self.parseAssignment();
                 if (self.peek().kind == .semicolon) _ = self.advance();
                 return .{ .expr = e };
             },
         }
+    }
+
+    /// §15.2: `function [name] (params) { body }` — shared by declarations and expressions.
+    fn parseFunction(self: *Parser) ParseError!*const ast.Function {
+        var name: ?[]const u8 = null;
+        if (self.peek().kind == .identifier) name = self.advance().lexeme;
+        const params = try self.parseParams();
+        const body = try self.parseBlock();
+        const f = try self.arena.create(ast.Function);
+        f.* = .{ .name = name, .params = params, .body = body };
+        return f;
+    }
+
+    fn parseParams(self: *Parser) ParseError![]const []const u8 {
+        _ = try self.expect(.lparen);
+        var params: std.ArrayList([]const u8) = .empty;
+        while (self.peek().kind != .rparen and self.peek().kind != .eof) {
+            const p = try self.expect(.identifier);
+            try params.append(self.arena, p.lexeme);
+            if (self.peek().kind == .comma) {
+                _ = self.advance();
+                continue;
+            }
+            break;
+        }
+        _ = try self.expect(.rparen);
+        return params.items;
     }
 
     fn parseBlock(self: *Parser) ParseError![]const ast.Stmt {
@@ -165,6 +204,20 @@ pub const Parser = struct {
                     _ = try self.expect(.rbracket);
                     expr = try self.alloc(.{ .index = .{ .object = expr, .key = key } });
                 },
+                .lparen => { // §13.3.6 call
+                    _ = self.advance();
+                    var args: std.ArrayList(*const ast.Node) = .empty;
+                    while (self.peek().kind != .rparen and self.peek().kind != .eof) {
+                        try args.append(self.arena, try self.parseAssignment());
+                        if (self.peek().kind == .comma) {
+                            _ = self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                    _ = try self.expect(.rparen);
+                    expr = try self.alloc(.{ .call = .{ .callee = expr, .args = args.items } });
+                },
                 else => break,
             }
         }
@@ -224,6 +277,14 @@ pub const Parser = struct {
                 return self.alloc(.{ .identifier = t.lexeme });
             },
             .lbrace => return self.parseObjectLiteral(),
+            .kw_function => {
+                _ = self.advance();
+                return self.alloc(.{ .function = try self.parseFunction() });
+            },
+            .kw_this => {
+                _ = self.advance();
+                return self.alloc(.this);
+            },
             .lparen => {
                 _ = self.advance();
                 const inner = try self.parseAssignment();

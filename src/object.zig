@@ -1,21 +1,38 @@
-//! Ordinary objects (ECMA-262 §10.1). M1 subset: a property map (name → Value), a
-//! `[[Prototype]]` link, and ordinary `[[Get]]`/`[[Set]]` (prototype walk on get, own-property
-//! write on set). Property descriptors (writable/enumerable/configurable), accessors, and
-//! function/array/error kinds arrive in later cycles. Allocated in the realm arena.
+//! Ordinary objects (ECMA-262 §10.1) and function objects (§10.2). M1 subset: a property map
+//! (name → Value), a `[[Prototype]]` link, ordinary `[[Get]]`/`[[Set]]`, and — for function
+//! objects — an AST closure (`FunctionData`) invoked by the interpreter's `[[Call]]`. Property
+//! descriptors, accessors, and array/error kinds arrive later. Allocated in the realm arena.
 const std = @import("std");
+const ast = @import("ast.zig");
 const Value = @import("value.zig").Value;
+const Environment = @import("environment.zig").Environment;
 
-pub const Kind = enum { ordinary };
+pub const Kind = enum { ordinary, function };
+
+/// The closure captured by a function object: parameter names, body, and defining scope.
+pub const FunctionData = struct {
+    params: []const []const u8,
+    body: []const ast.Stmt,
+    closure: *Environment,
+};
 
 pub const Object = struct {
     arena: std.mem.Allocator,
     properties: std.StringHashMapUnmanaged(Value),
     prototype: ?*Object,
     kind: Kind = .ordinary,
+    call: ?FunctionData = null, // present iff kind == .function
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);
         obj.* = .{ .arena = arena, .properties = .{}, .prototype = prototype };
+        return obj;
+    }
+
+    pub fn createFunction(arena: std.mem.Allocator, data: FunctionData) std.mem.Allocator.Error!*Object {
+        const obj = try create(arena, null);
+        obj.kind = .function;
+        obj.call = data;
         return obj;
     }
 

@@ -111,6 +111,20 @@ test "objects: access on null/undefined throws TypeError (US3)" {
     try expectThrows("undefined.z");
 }
 
+test "functions: declarations, calls, closures, arity (US2)" {
+    try expectNumber("function add(a, b) { return a + b; } add(40, 2)", 42);
+    try expectNumber("var sq = function (x) { return x * x; }; sq(7)", 49); // function expression
+    try expectNumber("function k(a, b) { return a; } k(5, 9)", 5); // extra arg ignored
+    try expectNumber("function f() { } f(); 7", 7); // no return → undefined; program continues
+    // closure captures the enclosing binding:
+    try expectNumber("function mk() { let n = 10; function inner() { return n; } return inner; } mk()()", 10);
+}
+
+test "functions: calling a non-function throws; runaway recursion → RangeError (US2)" {
+    try expectThrows("var x = 5; x()"); // not a function → TypeError
+    try expectThrows("function f() { return f(); } f()"); // unbounded recursion → RangeError (depth guard)
+}
+
 test "deep recursion throws RangeError, not a segfault" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

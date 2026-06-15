@@ -25,9 +25,9 @@ folded into plan.md (Phase 0/1) for M1 to avoid over-producing artifacts.
 
 ## Phase B — US2 Functions, calls & closures (P1)  [Cycle B]
 **Goal**: function decl/expr, params, `return`, calls, closures, basic `this`. **Test**: `add(40,2)` → 42; closure captures.
-- [ ] M1-T020 [US2] Parser: `function` decl/expr, params, call expression `f(args)` — §15
-- [ ] M1-T021 [US2] Function objects (kind `function`) holding AST body + captured environment; `[[Call]]`; arity → missing params `undefined`; `return` completion
-- [ ] M1-T022 [P] [US2] `tests/functions_test.zig` (return, closures, recursion bounded by step cap, arity)
+- [x] M1-T020 [US2] Parser: `function` decl/expr, params, `return`, call postfix `f(args)`, `this` — §15
+- [x] M1-T021 [US2] Function objects (kind `function`) holding AST body + captured env; `[[Call]]`; arity (missing → `undefined`); `return` completion; **closures**; basic `this` (method calls bind `this=receiver`); call-non-function → TypeError; runaway recursion → RangeError (depth guard)
+- [x] M1-T022 [P] [US2] Function tests (inline in engine.zig): add, function expression, arity, closure capture, non-function TypeError, unbounded recursion → RangeError
 
 ## Phase C — US3 Objects & property access (P1)  [Cycle C]
 **Goal**: object literals, `a.b`/`a[b]` read/write, prototype chain. **Test**: `var o={x:41}; o.x=o.x+1; o.x` → 42.
