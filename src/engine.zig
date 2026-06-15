@@ -236,6 +236,21 @@ test "M2 strings: length, index, methods (US2)" {
     try expectStr("\"a,b,c\".split(\",\")[2]", "c");
 }
 
+test "M3 operators: **, bitwise, shifts, in (US1)" {
+    try expectNumber("2 ** 10", 1024);
+    try expectNumber("2 ** 3 ** 2", 512); // right-assoc: 2**(3**2)=2**9
+    try expectNumber("5 & 3", 1);
+    try expectNumber("5 | 2", 7);
+    try expectNumber("5 ^ 1", 4);
+    try expectNumber("~5", -6);
+    try expectNumber("1 << 4", 16);
+    try expectNumber("256 >> 2", 64);
+    try expectNumber("-1 >>> 28", 15);
+    try expectBool("\"x\" in {x: 1}", true);
+    try expectBool("\"y\" in {x: 1}", false);
+    try expectBool("0 in [9]", true);
+}
+
 test "deep recursion throws RangeError, not a segfault" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

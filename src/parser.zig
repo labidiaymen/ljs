@@ -351,7 +351,8 @@ pub const Parser = struct {
             const prec = opPrecedence(k) orelse break;
             if (prec < min_prec) break;
             _ = self.advance();
-            const right = try self.parseExpr(prec + 1);
+            // `**` is right-associative; everything else left-associative.
+            const right = try self.parseExpr(if (k == .star_star) prec else prec + 1);
             left = switch (k) {
                 .pipe_pipe => try self.alloc(.{ .logical = .{ .op = .or_, .left = left, .right = right } }),
                 .amp_amp => try self.alloc(.{ .logical = .{ .op = .and_, .left = left, .right = right } }),
@@ -374,6 +375,7 @@ pub const Parser = struct {
             .minus => .minus,
             .bang => .not,
             .kw_typeof => .typeof_,
+            .bit_not => .bit_not,
             else => null,
         };
         if (uop) |op| {
@@ -521,11 +523,19 @@ fn binaryOpFor(kind: lex.TokenKind) ?ast.BinaryOp {
         .star => .mul,
         .slash => .div,
         .percent => .mod,
+        .star_star => .exp,
+        .bit_and => .bit_and,
+        .bit_or => .bit_or,
+        .bit_xor => .bit_xor,
+        .shl => .shl,
+        .shr => .shr,
+        .shr_un => .shr_un,
         .lt => .lt,
         .gt => .gt,
         .le => .le,
         .ge => .ge,
         .kw_instanceof => .instanceof_,
+        .kw_in => .in_op,
         .eq => .eq,
         .ne => .ne,
         .seq => .seq,
@@ -552,10 +562,15 @@ fn opPrecedence(kind: lex.TokenKind) ?u8 {
     return switch (kind) {
         .pipe_pipe => 1,
         .amp_amp => 2,
-        .eq, .ne, .seq, .sne => 3,
-        .lt, .gt, .le, .ge, .kw_instanceof => 4,
-        .plus, .minus => 5,
-        .star, .slash, .percent => 6,
+        .bit_or => 3,
+        .bit_xor => 4,
+        .bit_and => 5,
+        .eq, .ne, .seq, .sne => 6,
+        .lt, .gt, .le, .ge, .kw_instanceof, .kw_in => 7,
+        .shl, .shr, .shr_un => 8,
+        .plus, .minus => 9,
+        .star, .slash, .percent => 10,
+        .star_star => 11, // right-assoc (handled in parseExpr)
         else => null,
     };
 }

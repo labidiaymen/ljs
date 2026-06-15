@@ -33,6 +33,15 @@ pub const TokenKind = enum {
     kw_default,
     pipe_pipe, // ||
     amp_amp, // &&
+    star_star, // **
+    bit_and, // &
+    bit_or, // |
+    bit_xor, // ^
+    bit_not, // ~
+    shl, // <<
+    shr, // >>
+    shr_un, // >>>
+    kw_in, // in
     plus_plus, // ++
     minus_minus, // --
     question, // ?
@@ -167,6 +176,7 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, word, "typeof")) return .{ .kind = .kw_typeof, .lexeme = word };
             if (std.mem.eql(u8, word, "new")) return .{ .kind = .kw_new, .lexeme = word };
             if (std.mem.eql(u8, word, "instanceof")) return .{ .kind = .kw_instanceof, .lexeme = word };
+            if (std.mem.eql(u8, word, "in")) return .{ .kind = .kw_in, .lexeme = word };
             if (std.mem.eql(u8, word, "switch")) return .{ .kind = .kw_switch, .lexeme = word };
             if (std.mem.eql(u8, word, "case")) return .{ .kind = .kw_case, .lexeme = word };
             if (std.mem.eql(u8, word, "default")) return .{ .kind = .kw_default, .lexeme = word };
@@ -193,7 +203,13 @@ pub const Lexer = struct {
                 }
                 return self.maybeCompound(.minus, .minus_assign, start);
             },
-            '*' => return self.maybeCompound(.star, .star_assign, start),
+            '*' => {
+                if (self.peek() == '*') {
+                    self.pos += 1;
+                    return tok(.star_star, self.src[start..self.pos]);
+                }
+                return self.maybeCompound(.star, .star_assign, start);
+            },
             '/' => return self.maybeCompound(.slash, .slash_assign, start),
             '%' => return self.maybeCompound(.percent, .percent_assign, start),
             '?' => return tok(.question, self.src[start..self.pos]),
@@ -207,8 +223,24 @@ pub const Lexer = struct {
             ':' => return tok(.colon, self.src[start..self.pos]),
             ',' => return tok(.comma, self.src[start..self.pos]),
             ';' => return tok(.semicolon, self.src[start..self.pos]),
-            '<' => return self.maybeEq(.lt, .le, start),
-            '>' => return self.maybeEq(.gt, .ge, start),
+            '<' => {
+                if (self.peek() == '<') {
+                    self.pos += 1;
+                    return tok(.shl, self.src[start..self.pos]);
+                }
+                return self.maybeEq(.lt, .le, start);
+            },
+            '>' => {
+                if (self.peek() == '>') {
+                    self.pos += 1;
+                    if (self.peek() == '>') {
+                        self.pos += 1;
+                        return tok(.shr_un, self.src[start..self.pos]);
+                    }
+                    return tok(.shr, self.src[start..self.pos]);
+                }
+                return self.maybeEq(.gt, .ge, start);
+            },
             '!' => {
                 if (self.peek() == '=') return self.lexBangEq(start);
                 return tok(.bang, self.src[start..self.pos]);
@@ -222,15 +254,17 @@ pub const Lexer = struct {
                     self.pos += 1;
                     return tok(.pipe_pipe, self.src[start..self.pos]);
                 }
-                return LexError.UnexpectedCharacter; // bitwise OR not in M1
+                return tok(.bit_or, self.src[start..self.pos]);
             },
             '&' => {
                 if (self.peek() == '&') {
                     self.pos += 1;
                     return tok(.amp_amp, self.src[start..self.pos]);
                 }
-                return LexError.UnexpectedCharacter; // bitwise AND not in M1
+                return tok(.bit_and, self.src[start..self.pos]);
             },
+            '^' => return tok(.bit_xor, self.src[start..self.pos]),
+            '~' => return tok(.bit_not, self.src[start..self.pos]),
             else => return LexError.UnexpectedCharacter,
         }
     }

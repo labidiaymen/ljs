@@ -63,6 +63,21 @@ pub fn numberToString(arena: std.mem.Allocator, n: f64) error{OutOfMemory}![]con
     return std.fmt.allocPrint(arena, "{d}", .{n});
 }
 
+/// §7.1.6 ToInt32 — ToNumber, truncate, modulo 2^32, interpret as signed.
+pub fn toInt32(v: Value) i32 {
+    const n = toNumber(v);
+    if (std.math.isNan(n) or std.math.isInf(n)) return 0;
+    const two32 = 4294967296.0;
+    const m = @mod(std.math.trunc(n), two32); // [0, 2^32)
+    const u: u32 = @intFromFloat(m);
+    return @bitCast(u);
+}
+
+/// §7.1.7 ToUint32.
+pub fn toUint32(v: Value) u32 {
+    return @bitCast(toInt32(v));
+}
+
 /// §13.5.3 The typeof Operator.
 pub fn typeOf(v: Value) []const u8 {
     return switch (v) {

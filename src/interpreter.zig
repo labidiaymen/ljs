@@ -539,6 +539,7 @@ pub const Interpreter = struct {
             .plus => .{ .normal = .{ .number = toNumber(v) } }, // §13.5.4
             .minus => .{ .normal = .{ .number = -toNumber(v) } }, // §13.5.5
             .not => .{ .normal = .{ .boolean = !toBoolean(v) } }, // §13.5.7
+            .bit_not => .{ .normal = .{ .number = @floatFromInt(~ops.toInt32(v)) } }, // §13.5.6
             .typeof_ => unreachable,
         };
     }
@@ -564,6 +565,36 @@ pub const Interpreter = struct {
             .mul => return .{ .normal = .{ .number = toNumber(l) * toNumber(r) } },
             .div => return .{ .normal = .{ .number = toNumber(l) / toNumber(r) } },
             .mod => return .{ .normal = .{ .number = @rem(toNumber(l), toNumber(r)) } },
+            .exp => return .{ .normal = .{ .number = std.math.pow(f64, toNumber(l), toNumber(r)) } }, // §13.6
+            .bit_and => return .{ .normal = .{ .number = @floatFromInt(ops.toInt32(l) & ops.toInt32(r)) } }, // §13.12
+            .bit_or => return .{ .normal = .{ .number = @floatFromInt(ops.toInt32(l) | ops.toInt32(r)) } },
+            .bit_xor => return .{ .normal = .{ .number = @floatFromInt(ops.toInt32(l) ^ ops.toInt32(r)) } },
+            .shl => { // §13.9 — wrap via u32, result is int32
+                const sh: u5 = @intCast(ops.toUint32(r) & 31);
+                const res: i32 = @bitCast(ops.toUint32(l) << sh);
+                return .{ .normal = .{ .number = @floatFromInt(res) } };
+            },
+            .shr => { // arithmetic (sign-propagating)
+                const sh: u5 = @intCast(ops.toUint32(r) & 31);
+                return .{ .normal = .{ .number = @floatFromInt(ops.toInt32(l) >> sh) } };
+            },
+            .shr_un => { // logical (zero-fill), result is uint32
+                const sh: u5 = @intCast(ops.toUint32(r) & 31);
+                return .{ .normal = .{ .number = @floatFromInt(ops.toUint32(l) >> sh) } };
+            },
+            .in_op => { // §13.10.2 `key in obj`
+                if (r != .object) return self.throwError("TypeError", "Cannot use 'in' operator to search in a non-object");
+                const key = try self.toString(l);
+                const o = r.object;
+                const has = blk: {
+                    if (o.kind == .array) {
+                        if (std.mem.eql(u8, key, "length")) break :blk true;
+                        if (parseIndex(key)) |i| break :blk i < o.elements.items.len;
+                    }
+                    break :blk o.get(key) != null;
+                };
+                return .{ .normal = .{ .boolean = has } };
+            },
             .lt => return .{ .normal = .{ .boolean = relational(l, r, .lt) } },
             .gt => return .{ .normal = .{ .boolean = relational(l, r, .gt) } },
             .le => return .{ .normal = .{ .boolean = relational(l, r, .le) } },

@@ -8,11 +8,12 @@ description: "Task list for M3 — parser/syntax coverage (conformance-driven)"
 green). Re-measure `language/expressions` each cycle (parse_error must drop). Plan folded into the
 spec (this is parser/evaluator work; no new architecture).
 
-## Cycle 1 — US1 Operators 🎯 (highest impact/effort)
-- [ ] M3-T010 Lexer: `**`/`**=`, `&`/`|`/`^`/`~`, `<<`/`>>`/`>>>`, comma already exists; keywords `void`/`delete`/`in`
-- [ ] M3-T011 Parser: precedence for exponent (right-assoc), bitwise, shift, comma operator; `void`/`delete`/`in` unary/binary
-- [ ] M3-T012 Interpreter: `**`, bitwise (ToInt32/ToUint32), shifts, comma (eval both, yield right), `void`/`typeof`-style, `in` (has-property)
-- [ ] M3-T013 [P] operator tests + re-measure conformance
+## Cycle 1 — US1 Operators 🎯 (DONE — conformance 23.3% → 24.2%, +147)
+- [x] M3-T010 Lexer: `**`, `&`/`|`/`^`/`~`, `<<`/`>>`/`>>>`, `in` keyword
+- [x] M3-T011 Parser: full precedence table (logical→bit→eq→rel/in→shift→add→mul→exp); `**` right-assoc; `~` unary
+- [x] M3-T012 abstract_ops `ToInt32`/`ToUint32`; interpreter: `**`, bitwise (int32), shifts (wrap/arith/logical), `in` has-check, `~`
+- [x] M3-T013 [P] operator tests (12, inline) + re-measure: **24.2%** (+147 tests). Bench green (ljs ≤ Node).
+> Deferred from US1: comma operator, `void`/`delete` (lower frequency; need an expression-comma layer / assignable-target delete — revisit if the breakdown shows them dominant).
 
 ## Cycle 2 — US2 Template literals
 - [ ] M3-T020 Lexer: backtick template tokens (quasi chunks + `${`/`}`); Parser: template node; Interpreter: concat ToString of substitutions
