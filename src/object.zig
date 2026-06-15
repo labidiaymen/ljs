@@ -21,6 +21,7 @@ pub const NativeId = enum {
     object_to_string, // Object.prototype.toString
     array_ctor, // Array(...)
     array_method, // Array.prototype.<native_name> / Array.isArray
+    string_method, // String.prototype.<native_name>
 };
 
 /// The closure captured by a function object: parameter names, body, and defining scope.

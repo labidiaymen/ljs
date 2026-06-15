@@ -222,6 +222,20 @@ test "M2 arrays: literals, index, length, methods (US1)" {
     try expectNumber("var s = 0; [1, 2, 3, 4].forEach(function (x) { s += x; }); s", 10);
 }
 
+test "M2 strings: length, index, methods (US2)" {
+    try expectNumber("\"hello\".length", 5);
+    try expectStr("\"abc\".charAt(1)", "b");
+    try expectNumber("\"abc\".charCodeAt(0)", 97);
+    try expectNumber("\"hello world\".indexOf(\"world\")", 6);
+    try expectBool("\"hello\".includes(\"ell\")", true);
+    try expectStr("\"Hello\".toUpperCase()", "HELLO");
+    try expectStr("\"Hello\".toLowerCase()", "hello");
+    try expectStr("\"hello\".slice(1, 3)", "el");
+    try expectStr("\"abc\"[0]", "a");
+    try expectNumber("\"a,b,c\".split(\",\").length", 3);
+    try expectStr("\"a,b,c\".split(\",\")[2]", "c");
+}
+
 test "deep recursion throws RangeError, not a segfault" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

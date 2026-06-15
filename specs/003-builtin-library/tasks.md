@@ -17,9 +17,9 @@ green, then commit). Conformance-driven: re-measure `language/expressions` each 
 - [x] M2-R01 Extract `src/abstract_ops.zig` (ECMA-262 §7.1/§7.2 ops) + `src/builtin_array.zig` (Array.prototype bodies); interpreter.zig 836→634 lines, now evaluator+dispatch. Behavior-preserving (23.3% unchanged, bench green). Sets up per-file built-ins → Cycles 2–4 land as siblings + parallelizable.
 
 ## Cycle 2 — US2 Strings (P1)
-- [ ] M2-T020 [US2] Primitive boxing in `getProperty` for strings (and numbers) → method/`.length` lookup without a heap wrapper
-- [ ] M2-T021 [US2] `String.prototype` natives: `charAt`, `charCodeAt`, `indexOf`, `includes`, `slice`, `substring`, `toUpperCase`, `toLowerCase`, `split`; string `.length` + index
-- [ ] M2-T022 [P] [US2] string tests + re-measure
+- [x] M2-T020 [US2] Transparent string boxing in `getProperty` (`.length`, integer index, method lookup via String.prototype) — no heap wrapper; `stringProto` helper
+- [x] M2-T021 [US2] `builtin_string.zig` natives: `charAt`/`charCodeAt`/`indexOf`/`includes`/`slice`/`substring`/`toUpperCase`/`toLowerCase`/`split` (byte-oriented; full Unicode deferred)
+- [x] M2-T022 [P] [US2] string tests (11, inline). Note: `language/expressions` plateaued at 23.3% — those failures need other features; strings/arrays pay off in `built-ins/*` → measure at close (SC-003). Bench green (ljs ≤ Node).
 
 ## Cycle 3 — US3 Object statics (P2)
 - [ ] M2-T030 [US3] `Object.keys`/`getOwnPropertyNames`/`create`/`getPrototypeOf`/`assign`/`defineProperty`; `Object.prototype.hasOwnProperty`

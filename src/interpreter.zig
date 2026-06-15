@@ -10,6 +10,7 @@ const Environment = @import("environment.zig").Environment;
 const Object = @import("object.zig").Object;
 const ops = @import("abstract_ops.zig");
 const builtin_array = @import("builtin_array.zig");
+const builtin_string = @import("builtin_string.zig");
 
 // ECMA-262 abstract operations live in abstract_ops.zig; alias them so call sites read naturally.
 const toNumber = ops.toNumber;
@@ -471,9 +472,24 @@ pub const Interpreter = struct {
                 }
                 return .{ .normal = o.get(key) orelse .undefined };
             },
+            .string => |s| {
+                // §22.1: transparent boxing — `.length`, integer index, or a String.prototype method.
+                if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(s.len) } };
+                if (parseIndex(key)) |i| {
+                    return .{ .normal = if (i < s.len) .{ .string = s[i .. i + 1] } else .undefined };
+                }
+                if (self.stringProto()) |proto| {
+                    if (proto.get(key)) |m| return .{ .normal = m };
+                }
+                return .{ .normal = .undefined };
+            },
             .undefined, .null => return self.throwError("TypeError", "Cannot read properties of null or undefined"),
             else => return .{ .normal = .undefined },
         }
+    }
+
+    pub fn stringProto(self: *Interpreter) ?*Object {
+        return self.globalProto("String");
     }
 
     /// §10.1.9 [[Set]]. Setting on null/undefined throws; on other primitives is a no-op in M1.
@@ -595,6 +611,7 @@ pub const Interpreter = struct {
                 return .{ .normal = .{ .object = arr } };
             },
             .array_method => return builtin_array.call(self, func.native_name, this_val, args),
+            .string_method => return builtin_string.call(self, func.native_name, this_val, args),
             else => {},
         }
         switch (func.native) {
@@ -621,7 +638,7 @@ pub const Interpreter = struct {
                 return .{ .normal = .{ .object = try Object.create(self.arena, null) } };
             },
             .object_to_string => return .{ .normal = .{ .string = "[object Object]" } },
-            .array_ctor, .array_method => unreachable, // handled in the first switch
+            .array_ctor, .array_method, .string_method => unreachable, // handled in the first switch
             .none => unreachable,
         }
     }

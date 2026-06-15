@@ -23,8 +23,18 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         try env.declare(name, .{ .object = ctor }, true, true);
     }
 
-    // §22.1 String( x ) — ToString.
-    try env.declare("String", .{ .object = try Object.createNative(arena, .string_ctor, "String") }, true, true);
+    // §22.1 String( x ) — ToString; String.prototype methods (boxing finds them via getProperty).
+    const string_fn = try Object.createNative(arena, .string_ctor, "String");
+    const string_methods = [_][]const u8{
+        "charAt",    "charCodeAt",  "indexOf",     "includes", "slice",
+        "substring", "toUpperCase", "toLowerCase", "split",
+    };
+    if (string_fn.get("prototype")) |pv| {
+        if (pv == .object) {
+            for (string_methods) |m| try pv.object.set(m, .{ .object = try Object.createNative(arena, .string_method, m) });
+        }
+    }
+    try env.declare("String", .{ .object = string_fn }, true, true);
 
     // §20.1 Object — minimal; Object.prototype.toString provided.
     const object_fn = try Object.createNative(arena, .object_ctor, "Object");
