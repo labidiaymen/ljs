@@ -33,6 +33,7 @@ pub const TokenKind = enum {
     kw_default,
     kw_import, // import (modules / dynamic ImportCall — unsupported, parse-rejected)
     kw_class, // class (ClassDeclaration / ClassExpression — unsupported, parse-rejected)
+    kw_super, // super (SuperCall / SuperProperty — unsupported, parse-rejected)
     pipe_pipe, // ||
     amp_amp, // &&
     star_star, // **
@@ -50,6 +51,8 @@ pub const TokenKind = enum {
     plus_plus, // ++
     minus_minus, // --
     question, // ?
+    question_dot, // ?. (optional chaining, §13.3.9 — NOT before a digit)
+    question_question, // ?? (nullish coalescing, §13.13)
     plus_assign, // +=
     minus_assign, // -=
     star_assign, // *=
@@ -205,6 +208,7 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, word, "default")) return .{ .kind = .kw_default, .lexeme = word };
             if (std.mem.eql(u8, word, "import")) return .{ .kind = .kw_import, .lexeme = word };
             if (std.mem.eql(u8, word, "class")) return .{ .kind = .kw_class, .lexeme = word };
+            if (std.mem.eql(u8, word, "super")) return .{ .kind = .kw_super, .lexeme = word };
             return .{ .kind = .identifier, .lexeme = word };
         }
 
@@ -240,7 +244,21 @@ pub const Lexer = struct {
             },
             '/' => return self.maybeCompound(.slash, .slash_assign, start),
             '%' => return self.maybeCompound(.percent, .percent_assign, start),
-            '?' => return tok(.question, self.src[start..self.pos]),
+            '?' => {
+                // §13.13 nullish coalescing `??`. (`??=` is a later cycle; we lex only `??`.)
+                if (self.peek() == '?') {
+                    self.pos += 1;
+                    return tok(.question_question, self.src[start..self.pos]);
+                }
+                // §13.3.9 optional chaining `?.` — but `?.` followed by a decimal digit is the
+                // conditional `?` then a number (e.g. `a ? .5 : b`), so only consume `.` here when
+                // the char after it is NOT a digit (§12.10 punctuator lookahead).
+                if (self.peek() == '.' and !isDigit(self.peek2())) {
+                    self.pos += 1;
+                    return tok(.question_dot, self.src[start..self.pos]);
+                }
+                return tok(.question, self.src[start..self.pos]);
+            },
             '(' => return tok(.lparen, self.src[start..self.pos]),
             ')' => return tok(.rparen, self.src[start..self.pos]),
             '{' => return tok(.lbrace, self.src[start..self.pos]),

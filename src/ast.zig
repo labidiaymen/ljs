@@ -2,7 +2,7 @@
 //! assignment expressions on top of the M0 expression grammar (ECMA-262 §13–§14).
 pub const UnaryOp = enum { plus, minus, not, typeof_, bit_not }; // §13.5
 
-pub const LogicalOp = enum { or_, and_ }; // §13.13 (short-circuit)
+pub const LogicalOp = enum { or_, and_, coalesce }; // §13.13 (short-circuit; `coalesce` = `??`)
 
 pub const BinaryOp = enum {
     add, // §13.15 Additive
@@ -53,11 +53,39 @@ pub const Node = union(enum) {
     template: struct { quasis: []const []const u8, exprs: []const *const Node }, // §13.2.8 `a${x}b`
     spread: *const Node, // §13.2.4 / §13.3 spread element `...expr` (in array literals & call args)
     this, // §13.2.1 ThisExpression
+    /// §13.3.9 OptionalExpression — one access link of an optional chain applied to `base`.
+    /// `optional` is true for the `?.` form (this link short-circuits when `base` is nullish);
+    /// false for a plain `.`/`[]`/`()` that *follows* a `?.` in the same chain (it rides the chain
+    /// so the short-circuit propagates, but does not itself test for nullish). If the base short-
+    /// circuits, the WHOLE chain evaluates to `undefined` (§13.3.9.1, the `Return undefined` step).
+    optional: struct { base: *const Node, optional: bool, link: OptionalLink },
+};
+
+/// One link of an optional chain: the access applied to the (non-nullish) base. `call` carries the
+/// `(args)` form (may contain spread); `member`/`index` the property forms.
+pub const OptionalLink = union(enum) {
+    member: []const u8, // .name  /  ?.name
+    index: *const Node, // [key]  /  ?.[key]
+    call: []const *const Node, // (args)  /  ?.(args)
 };
 
 pub const UpdateOp = enum { inc, dec };
 
-pub const Property = struct { key: []const u8, value: *const Node };
+/// §13.2.5 PropertyDefinition. One entry of an object literal. The `kind` selects how `key`/`value`
+/// are interpreted:
+///   • `.init`  — `key: value` (also shorthand `{x}` and method `{m(){…}}`, both normalized here).
+///   • `.get`/`.set` — an accessor; `value` is a `function` node (the getter/setter).
+///   • `.spread` — `{...expr}`; `value` is the spread source, `key`/`computed_key` unused.
+/// `computed_key` (non-null) is a `[expr]` computed property name, evaluated at construction; when
+/// present it supersedes the static `key`.
+pub const PropertyKind = enum { init, get, set, spread };
+
+pub const Property = struct {
+    kind: PropertyKind = .init,
+    key: []const u8 = "",
+    computed_key: ?*const Node = null, // §13.2.5 ComputedPropertyName `[expr]`
+    value: *const Node,
+};
 
 /// §13.3.3 BindingPattern (also reused for parameter binding, §15.1). A `Pattern` is the LHS of a
 /// destructuring binding. The common case — a plain identifier — stays `.identifier` so simple

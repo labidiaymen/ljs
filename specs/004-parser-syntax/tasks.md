@@ -52,8 +52,31 @@ spec (this is parser/evaluator work; no new architecture).
     `[onlyStrict]`). The parser has no strict-mode context propagation yet; deferred (needs a
     strict-aware BindingIdentifier check, not arrow-specific).
 
-## Cycle 6 — US6 Object-literal extensions + access operators
-- [ ] M3-T060 Getters/setters, shorthand `{x}`, computed `{[k]:v}`, method shorthand; `?.` and `??`
+## Cycle 6 — US6 Object-literal extensions + access operators (DONE — conformance 25.9% → 26.0%, +19 net)
+- [x] M3-T060 Object-literal sugar (§13.2.5): shorthand `{x}`, computed `{[k]:v}`, method shorthand
+  `{m(){…}}`, object spread `{...o}` (CopyDataProperties of own enumerable props). Accessors
+  (§13.2.5.6): `{get x(){…}}` / `{set x(v){…}}`. Optional chaining `?.` / `?.[]` / `?.()` (§13.3.9,
+  whole-chain short-circuit on a nullish base). Nullish coalescing `??` (§13.13) with the §13.13.1
+  `||`/`&&` mixing Early SyntaxError.
+  - **Object model:** the property map value became a tagged `PropertyValue = { data: Value }` |
+    `{ accessor: {get, set} }` (`src/object.zig`). `get` keeps a single-branch data fast path; a new
+    `getProp` returns the located descriptor + holder so the interpreter invokes a getter on read
+    (`this` = receiver) and a setter on write. Data-property get/set stays a direct path — bench
+    held (loop_mix -2.6%, no regression).
+  - **Lexer:** `?.` (NOT before a digit — `a?.5:b` stays `?` + `.5`), `??` (left `??=` to US7), and
+    reserved `super` (`kw_super`, parse-rejected like `import`/`class`).
+  - **Parser:** `parseShortCircuit` layer separates the `||`/`&&` climb from the `??` chain and
+    enforces the no-mix Early Error via a `last_was_paren` flag (parenthesizing defuses it).
+    `parsePostfix` builds `optional` chain nodes; §13.3.9.1 tail restrictions (`a?.b\`tpl\``,
+    `a?.b++`, `++a?.b`) are Early Errors. Methods/accessors get §13.2.5.1 UniqueFormalParameters
+    (no duplicate params).
+  - **Regression hunt (net was −29 before fixes; gate vs a `--update-baseline` HEAD rebuild):** the
+    newly-parseable optional-chain + object-method source reached cases that need stricter parse
+    errors. Recovered 18 via the §13.3.9.1 tail restrictions, `super` rejection (the
+    `name-super-call-*` method negatives), and method duplicate-param errors. **Known gap (11
+    remaining):** 8 `identifier-shorthand-*-invalid-strict-mode` + `11.1.5-1gs` + 2
+    `name-param-redecl` need strict-mode binding restrictions / param-vs-`let` redeclaration —
+    blocked on the still-deferred strict-mode context propagation (same gap noted in Cycle 5).
 
 ## Cycle 7 — US7 Complete assignment operators (deferred from US1; nothing skipped)
 - [ ] M3-T070 Compound assignment for the full operator set: `**= <<= >>= >>>= &= |= ^=` (desugar `x op= v` → `x = x op v`, all three target kinds) + logical assignment `&&= ||= ??=` (short-circuit semantics: only assign when the guard passes). Covers `compound-assignment/*` + `logical-assignment/*`.

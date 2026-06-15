@@ -36,9 +36,17 @@ pub const FunctionData = struct {
     captured_this: Value = .undefined, // §15.3: the enclosing `this` (arrows only)
 };
 
+/// A property's stored shape (§6.1.7.1 Property Attributes, M3 subset). Most properties are plain
+/// data (`{ value }`); §13.2.5.6 getters/setters are accessor pairs. The map stores this tagged
+/// union so the hot data-property path stays a single branch (see `get`/`getAccessor`/`set`).
+pub const PropertyValue = union(enum) {
+    data: Value,
+    accessor: struct { get: ?*Object = null, set: ?*Object = null }, // §10.2 getter/setter functions
+};
+
 pub const Object = struct {
     arena: std.mem.Allocator,
-    properties: std.StringHashMapUnmanaged(Value),
+    properties: std.StringHashMapUnmanaged(PropertyValue),
     prototype: ?*Object,
     kind: Kind = .ordinary,
     call: ?FunctionData = null, // present iff kind == .function (and native == .none)
@@ -83,18 +91,54 @@ pub const Object = struct {
         return obj;
     }
 
-    /// §10.1.8 OrdinaryGet — own property, else walk the prototype chain. `null` ⇒ undefined.
+    /// §10.1.8 OrdinaryGet (data fast path) — own property, else walk the prototype chain.
+    /// Returns the value for a *data* property; an accessor yields its current `get`-less form
+    /// (`undefined` when there's no getter) so callers that don't invoke accessors stay correct.
+    /// Hot path: a direct `value` field read with no accessor branch on the common case.
+    /// Callers that must invoke getters use `getProp` (returns the full descriptor + holder).
     pub fn get(self: *Object, key: []const u8) ?Value {
         var obj: ?*Object = self;
         while (obj) |o| {
-            if (o.properties.get(key)) |v| return v;
+            if (o.properties.get(key)) |pv| switch (pv) {
+                .data => |v| return v,
+                .accessor => return .undefined, // an accessor read without a receiver → undefined
+            };
             obj = o.prototype;
         }
         return null;
     }
 
-    /// §10.1.9 OrdinarySet — create/update an own data property (M1: always writable).
+    /// A located property: the stored descriptor plus the object on the prototype chain that owns
+    /// it. Returned by `getProp` so the interpreter can invoke a getter/setter with the receiver.
+    pub const Located = struct { pv: PropertyValue, holder: *Object };
+
+    /// §10.1.8 [[GetOwnProperty]] walk — find `key` on the chain, returning the raw descriptor
+    /// (data or accessor) and its holder. `null` ⇒ absent. The interpreter invokes accessors.
+    pub fn getProp(self: *Object, key: []const u8) ?Located {
+        var obj: ?*Object = self;
+        while (obj) |o| {
+            if (o.properties.getPtr(key)) |pv| return .{ .pv = pv.*, .holder = o };
+            obj = o.prototype;
+        }
+        return null;
+    }
+
+    /// §10.1.9 OrdinarySet — create/update an own data property (M3: always writable). Replaces
+    /// any accessor with a data property (the simple definition path).
     pub fn set(self: *Object, key: []const u8, value: Value) std.mem.Allocator.Error!void {
-        try self.properties.put(self.arena, key, value);
+        try self.properties.put(self.arena, key, .{ .data = value });
+    }
+
+    /// §13.2.5.6 PropertyDefinitionEvaluation for an accessor — merge `get`/`set` into the own
+    /// property `key`, preserving the other half if it was already defined this literal.
+    pub fn defineAccessor(self: *Object, key: []const u8, getter: ?*Object, setter: ?*Object) std.mem.Allocator.Error!void {
+        var acc: struct { get: ?*Object = null, set: ?*Object = null } = .{};
+        if (self.properties.get(key)) |existing| switch (existing) {
+            .accessor => |a| acc = .{ .get = a.get, .set = a.set },
+            .data => {},
+        };
+        if (getter) |g| acc.get = g;
+        if (setter) |s| acc.set = s;
+        try self.properties.put(self.arena, key, .{ .accessor = .{ .get = acc.get, .set = acc.set } });
     }
 };

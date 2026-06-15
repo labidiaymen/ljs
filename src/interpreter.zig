@@ -254,16 +254,7 @@ pub const Interpreter = struct {
             },
             .unary => |u| return self.evalUnary(u.op, u.operand, env),
             .binary => |b| return self.evalBinary(b.op, b.left, b.right, env),
-            .object_literal => |props| {
-                // §13.2.5 ObjectLiteral evaluation — fresh ordinary object, no proto for M1.
-                const obj = try Object.create(self.arena, null);
-                for (props) |p| {
-                    const c = try self.evalExpr(p.value, env);
-                    if (c.isAbrupt()) return c;
-                    try obj.set(p.key, c.normal);
-                }
-                return .{ .normal = .{ .object = obj } };
-            },
+            .object_literal => |props| return self.evalObjectLiteral(props, env),
             .array_literal => |elems| {
                 // §13.2.4 ArrayLiteral — `...spread` elements flatten in place.
                 const arr = try Object.createArray(self.arena, self.arrayProto());
@@ -303,16 +294,18 @@ pub const Interpreter = struct {
             .call => |c| return self.evalCall(c, env),
             .new_expr => |n| return self.evalNew(n, env),
             .logical => |l| {
-                // §13.13 short-circuit: `||` returns left if truthy, `&&` returns left if falsy.
+                // §13.13 short-circuit: `||` returns left if truthy, `&&` returns left if falsy,
+                // `??` returns left unless it is null/undefined (then the right operand).
                 const lc = try self.evalExpr(l.left, env);
                 if (lc.isAbrupt()) return lc;
-                const truthy = toBoolean(lc.normal);
                 switch (l.op) {
-                    .or_ => if (truthy) return lc,
-                    .and_ => if (!truthy) return lc,
+                    .or_ => if (toBoolean(lc.normal)) return lc,
+                    .and_ => if (!toBoolean(lc.normal)) return lc,
+                    .coalesce => if (lc.normal != .undefined and lc.normal != .null) return lc,
                 }
                 return self.evalExpr(l.right, env);
             },
+            .optional => return self.evalOptionalChain(node, env),
             .conditional => |c| {
                 // §13.14 cond ? then : otherwise
                 const cc = try self.evalExpr(c.cond, env);
@@ -400,6 +393,160 @@ pub const Interpreter = struct {
         if (result.isAbrupt()) return result;
         if (result.normal == .object) return .{ .normal = result.normal }; // explicit object return wins
         return .{ .normal = .{ .object = new_obj } };
+    }
+
+    /// §13.2.5 ObjectLiteral evaluation — a fresh ordinary object (proto-linked to Object.prototype
+    /// when available). Walks PropertyDefinitions in order: data `k:v` / shorthand / method, computed
+    /// keys, accessors (`get`/`set` → `defineAccessor`), and `...spread` (CopyDataProperties).
+    fn evalObjectLiteral(self: *Interpreter, props: []const ast.Property, env: *Environment) EvalError!Completion {
+        const obj = try Object.create(self.arena, self.globalProto("Object"));
+        for (props) |p| {
+            switch (p.kind) {
+                .spread => {
+                    // §13.2.5.4 CopyDataProperties — copy own enumerable props of the source. Null /
+                    // undefined sources are ignored (no throw); arrays spread their indices + length-
+                    // independent own props.
+                    const sc = try self.evalExpr(p.value, env);
+                    if (sc.isAbrupt()) return sc;
+                    try self.copyDataProperties(obj, sc.normal);
+                },
+                .get, .set => {
+                    const key = try self.propKey(p, env);
+                    if (key.isAbrupt()) return key.completion;
+                    const fc = try self.evalExpr(p.value, env);
+                    if (fc.isAbrupt()) return fc;
+                    const f = fc.normal.object; // a `function` node always yields a function object
+                    if (p.kind == .get) {
+                        try obj.defineAccessor(key.key, f, null);
+                    } else {
+                        try obj.defineAccessor(key.key, null, f);
+                    }
+                },
+                .init => {
+                    const key = try self.propKey(p, env);
+                    if (key.isAbrupt()) return key.completion;
+                    const c = try self.evalExpr(p.value, env);
+                    if (c.isAbrupt()) return c;
+                    try obj.set(key.key, c.normal);
+                },
+            }
+        }
+        return .{ .normal = .{ .object = obj } };
+    }
+
+    const KeyResult = struct {
+        key: []const u8 = "",
+        completion: Completion = .{ .normal = .undefined },
+        fn isAbrupt(self: KeyResult) bool {
+            return self.completion.isAbrupt();
+        }
+    };
+
+    /// Resolve a PropertyDefinition's key: a computed `[expr]` (evaluated + ToString'd) or the
+    /// static identifier/string/numeric key parsed earlier.
+    fn propKey(self: *Interpreter, p: ast.Property, env: *Environment) EvalError!KeyResult {
+        if (p.computed_key) |ck| {
+            const c = try self.evalExpr(ck, env);
+            if (c.isAbrupt()) return .{ .completion = c };
+            return .{ .key = try self.toString(c.normal) };
+        }
+        return .{ .key = p.key };
+    }
+
+    /// §7.3.25 CopyDataProperties — copy `source`'s own enumerable data properties into `target`
+    /// (invoking getters to read the values). Null/undefined sources are no-ops. Used by object
+    /// spread `{...source}`.
+    fn copyDataProperties(self: *Interpreter, target: *Object, source: Value) EvalError!void {
+        switch (source) {
+            .undefined, .null => return,
+            .object => |o| {
+                if (o.kind == .array) {
+                    for (o.elements.items, 0..) |el, i| {
+                        const k = try self.toString(.{ .number = @floatFromInt(i) });
+                        try target.set(k, el);
+                    }
+                }
+                var it = o.properties.iterator();
+                while (it.next()) |entry| {
+                    const gc = try self.getProperty(source, entry.key_ptr.*);
+                    if (gc.isAbrupt()) return; // a throwing getter aborts copy (best-effort here)
+                    try target.set(entry.key_ptr.*, gc.normal);
+                }
+            },
+            .string => |s| {
+                // Strings spread their index properties + length (own enumerable: the indices).
+                for (0..s.len) |i| {
+                    const k = try self.toString(.{ .number = @floatFromInt(i) });
+                    try target.set(k, .{ .string = s[i .. i + 1] });
+                }
+            },
+            else => return,
+        }
+    }
+
+    /// §13.3.9 Optional chain evaluation — a thin wrapper returning the chain's value (the receiver
+    /// is only needed internally for `?.( )` calls). A short-circuit yields `undefined`.
+    fn evalOptionalChain(self: *Interpreter, node: *const ast.Node, env: *Environment) EvalError!Completion {
+        const r = try self.evalChain(node, env);
+        if (r.isAbrupt()) return r.completion;
+        return .{ .normal = r.value };
+    }
+
+    const ChainResult = struct {
+        value: Value = .undefined,
+        this_val: Value = .undefined, // receiver to use if the *next* link is a call
+        short: bool = false, // the chain short-circuited (a `?.` base was nullish)
+        completion: Completion = .{ .normal = .undefined },
+        fn isAbrupt(self: ChainResult) bool {
+            return self.completion.isAbrupt();
+        }
+    };
+
+    /// Walk one access link of an optional chain. `node` is either an `.optional` link (whose base
+    /// is the rest of the chain) or any other expression (the chain root). Returns the produced
+    /// value, the receiver for a following call, and whether the chain short-circuited.
+    fn evalChain(self: *Interpreter, node: *const ast.Node, env: *Environment) EvalError!ChainResult {
+        if (node.* != .optional) {
+            // Chain root: an ordinary (possibly member/call) expression.
+            const c = try self.evalExpr(node, env);
+            if (c.isAbrupt()) return .{ .completion = c };
+            return .{ .value = c.normal };
+        }
+        const opt = node.optional;
+        const base = try self.evalChain(opt.base, env);
+        if (base.isAbrupt()) return base;
+        if (base.short) return .{ .short = true }; // §13.3.9.1: propagate the short-circuit
+        // §13.3.9.1: a `?.` link whose base is null/undefined short-circuits the WHOLE chain.
+        if (opt.optional and (base.value == .undefined or base.value == .null)) {
+            return .{ .short = true };
+        }
+        switch (opt.link) {
+            .member => |name| {
+                const gc = try self.getProperty(base.value, name);
+                if (gc.isAbrupt()) return .{ .completion = gc };
+                return .{ .value = gc.normal, .this_val = base.value };
+            },
+            .index => |key_node| {
+                const kc = try self.evalExpr(key_node, env);
+                if (kc.isAbrupt()) return .{ .completion = kc };
+                const gc = try self.getProperty(base.value, try self.toString(kc.normal));
+                if (gc.isAbrupt()) return .{ .completion = gc };
+                return .{ .value = gc.normal, .this_val = base.value };
+            },
+            .call => |arg_nodes| {
+                // §13.3.6: the callee is `base.value`; `this` is the receiver carried from the
+                // previous member/index link (undefined for a bare `a?.()`).
+                var args: std.ArrayListUnmanaged(Value) = .empty;
+                const alc = try self.evalSpreadList(arg_nodes, env, &args);
+                if (alc.isAbrupt()) return .{ .completion = alc };
+                if (base.value != .object or base.value.object.kind != .function) {
+                    return .{ .completion = try self.throwError("TypeError", "value is not a function") };
+                }
+                const rc = try self.callFunction(base.value.object, args.items, base.this_val);
+                if (rc.isAbrupt()) return .{ .completion = rc };
+                return .{ .value = rc.normal };
+            },
+        }
     }
 
     fn evalFunctionExpr(self: *Interpreter, f: *const ast.Function, env: *Environment) EvalError!Completion {
@@ -602,7 +749,7 @@ pub const Interpreter = struct {
                 }
                 if (op.rest) |rest_name| {
                     // §14.3.3 BindingRestProperty — own enumerable props not already destructured,
-                    // copied into a fresh ordinary object.
+                    // copied into a fresh ordinary object (reading via [[Get]], so getters run).
                     const rest_obj = try Object.create(self.arena, null);
                     if (value == .object) {
                         var it = value.object.properties.iterator();
@@ -615,7 +762,11 @@ pub const Interpreter = struct {
                                     break;
                                 }
                             }
-                            if (!taken) try rest_obj.set(k, entry.value_ptr.*);
+                            if (!taken) {
+                                const gc = try self.getProperty(value, k);
+                                if (gc.isAbrupt()) return gc;
+                                try rest_obj.set(k, gc.normal);
+                            }
                         }
                     }
                     try env.declare(rest_name, .{ .object = rest_obj }, mutable, true);
@@ -655,7 +806,17 @@ pub const Interpreter = struct {
                     }
                     // else fall through to the prototype chain (Array.prototype methods)
                 }
-                return .{ .normal = o.get(key) orelse .undefined };
+                // §10.1.8.1 OrdinaryGet — locate the property (data or accessor) on the chain.
+                // Data-property fast path: a single descriptor read, no accessor branch.
+                const loc = o.getProp(key) orelse return .{ .normal = .undefined };
+                switch (loc.pv) {
+                    .data => |v| return .{ .normal = v },
+                    .accessor => |a| {
+                        // §10.2.x: invoke the getter with `this` = the original receiver (`base`).
+                        const getter = a.get orelse return .{ .normal = .undefined };
+                        return self.callFunction(getter, &.{}, base);
+                    },
+                }
             },
             .string => |s| {
                 // §22.1: transparent boxing — `.length`, integer index, or a String.prototype method.
@@ -695,6 +856,18 @@ pub const Interpreter = struct {
                     if (parseIndex(key)) |i| {
                         while (o.elements.items.len <= i) try o.elements.append(o.arena, .undefined);
                         o.elements.items[i] = value;
+                        return .{ .normal = value };
+                    }
+                }
+                // §10.1.9.2 OrdinarySetWithOwnDescriptor — if `key` resolves to an accessor on the
+                // chain, invoke its setter with `this` = receiver; a getter-only accessor is a silent
+                // no-op (sloppy). A data property (own or inherited) → define/overwrite an own data
+                // property. The common case (absent or own data) stays a single `set`.
+                if (o.getProp(key)) |loc| {
+                    if (loc.pv == .accessor) {
+                        const setter = loc.pv.accessor.set orelse return .{ .normal = value };
+                        const sc = try self.callFunction(setter, &.{value}, base);
+                        if (sc.isAbrupt()) return sc;
                         return .{ .normal = value };
                     }
                 }

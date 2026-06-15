@@ -401,6 +401,93 @@ test "M3 class definitions rejected at parse (§15.7, unsupported)" {
     try expectSyntaxError("var C = class { x = () => 1; };");
 }
 
+test "M3 object literal sugar: shorthand, computed, method (US6, §13.2.5)" {
+    // shorthand `{x}` ≡ `{x: x}`
+    try expectNumber("var x = 42; var o = {x}; o.x", 42);
+    try expectNumber("var a = 1, b = 2; var o = {a, b}; o.a + o.b", 3);
+    // computed key `{[expr]: v}`
+    try expectNumber("var k = 'foo'; var o = {[k]: 7}; o.foo", 7);
+    try expectStr("var o = {['a' + 'b']: 'hi'}; o.ab", "hi");
+    try expectNumber("var i = 1; var o = {[i + 1]: 9}; o[2]", 9); // numeric computed key
+    // method shorthand `{m(){…}}`
+    try expectNumber("var o = {add(a, b){ return a + b; }}; o.add(40, 2)", 42);
+    // method `this` binds to the receiver
+    try expectNumber("var o = {v: 5, get5(){ return this.v; }}; o.get5()", 5);
+    // mixed forms in one literal
+    try expectNumber("var n = 'q'; var o = {a: 1, [n]: 2, m(){ return 3; }}; o.a + o.q + o.m()", 6);
+}
+
+test "M3 object spread: copy own enumerable props (US6, §13.2.5.4)" {
+    try expectNumber("var a = {x: 1, y: 2}; var b = {...a}; b.x + b.y", 3);
+    // later properties override earlier (spread then explicit)
+    try expectNumber("var a = {x: 1}; var b = {...a, x: 9}; b.x", 9);
+    // explicit then spread (spread wins)
+    try expectNumber("var a = {x: 9}; var b = {x: 1, ...a}; b.x", 9);
+    // null/undefined sources are ignored (no throw)
+    try expectNumber("var b = {...null, ...undefined, z: 5}; b.z", 5);
+    // array spread copies index props
+    try expectStr("var o = {...[10, 20]}; '' + o[0] + o[1]", "1020");
+}
+
+test "M3 accessors: getters & setters (US6, §13.2.5.6 / §10.2.x)" {
+    // getter invoked on read
+    try expectNumber("var o = {get x(){ return 7; }}; o.x", 7);
+    // getter sees `this`
+    try expectNumber("var o = {v: 3, get x(){ return this.v * 2; }}; o.x", 6);
+    // setter invoked on write
+    try expectNumber("var o = {_v: 0, set x(val){ this._v = val; }}; o.x = 41; o._v", 41);
+    // get + set pair on the same key
+    try expectNumber(
+        "var o = {_v: 1, get x(){ return this._v; }, set x(val){ this._v = val + 1; }};" ++
+            " o.x = 10; o.x",
+        11,
+    );
+    // a getter-only property: writing is a silent no-op (sloppy), read still works
+    try expectNumber("var o = {get x(){ return 5; }}; o.x = 100; o.x", 5);
+}
+
+test "M3 optional chaining: short-circuit (US6, §13.3.9)" {
+    // a?.b on a present object
+    try expectNumber("var o = {b: 8}; o?.b", 8);
+    // a?.b on null/undefined → undefined (no throw)
+    try expectBool("var a = null; a?.b === undefined", true);
+    try expectBool("var a = undefined; a?.b === undefined", true);
+    // whole chain short-circuits: a?.b.c when a is null → undefined (does NOT throw on .c)
+    try expectBool("var a = null; a?.b.c === undefined", true);
+    try expectBool("var a = null; (a?.b.c.d.e) === undefined", true);
+    // a?.[k] index form
+    try expectNumber("var o = {x: 4}; o?.['x']", 4);
+    try expectBool("var a = null; a?.[0] === undefined", true);
+    // a?.() call form
+    try expectNumber("var f = () => 9; f?.()", 9);
+    try expectBool("var f = null; f?.() === undefined", true);
+    // method call through a chain keeps the receiver
+    try expectNumber("var o = {v: 6, m(){ return this.v; }}; o?.m()", 6);
+    // present base, then short-circuit further in: o?.miss?.deep → undefined
+    try expectBool("var o = {}; o?.miss?.deep === undefined", true);
+}
+
+test "M3 nullish coalescing: ?? & mixing early error (US6, §13.13)" {
+    // a ?? b → a unless null/undefined
+    try expectNumber("1 ?? 2", 1);
+    try expectNumber("null ?? 1", 1);
+    try expectNumber("undefined ?? 7", 7);
+    // 0 and '' are NOT nullish — `??` keeps them (unlike `||`)
+    try expectNumber("0 ?? 5", 0);
+    try expectStr("'' ?? 'x'", "");
+    try expectBool("false ?? true", false);
+    // chained ??
+    try expectNumber("null ?? undefined ?? 3", 3);
+    // §13.13.1 Early Error: mixing ?? with || / && without parens is a SyntaxError
+    try expectSyntaxError("a ?? b || c");
+    try expectSyntaxError("a || b ?? c");
+    try expectSyntaxError("a ?? b && c");
+    try expectSyntaxError("a && b ?? c");
+    // …but parentheses make it legal
+    try expectNumber("null ?? (0 || 4)", 4);
+    try expectNumber("(null || 2) ?? 9", 2);
+}
+
 test "deep recursion throws RangeError, not a segfault" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

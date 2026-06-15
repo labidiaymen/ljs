@@ -11,6 +11,11 @@ pub const Parser = struct {
     tokens: []const lex.Token,
     idx: usize = 0,
     arena: std.mem.Allocator,
+    /// §13.13.1 mixing check: set true when the most recently parsed *operand* was a parenthesized
+    /// expression `( … )`. Parentheses make `a ?? (b || c)` legal where `a ?? b || c` is not, but a
+    /// parenthesized expression's AST node is indistinguishable from its content — so we record the
+    /// paren here at parse time and consult it in `parseShortCircuit`.
+    last_was_paren: bool = false,
 
     pub fn parse(arena: std.mem.Allocator, src: []const u8) ParseError!ast.Program {
         var lexer = lex.Lexer.init(arena, src);
@@ -429,6 +434,34 @@ pub const Parser = struct {
         return .{ .params = params.items, .rest = rest };
     }
 
+    /// §13.3.6 Arguments `( … )` — a comma-separated list of (possibly spread) AssignmentExpressions.
+    /// Assumes the current token is `(`; consumes through the matching `)`.
+    fn parseArgs(self: *Parser) ParseError![]const *const ast.Node {
+        _ = try self.expect(.lparen);
+        var args: std.ArrayList(*const ast.Node) = .empty;
+        while (self.peek().kind != .rparen and self.peek().kind != .eof) {
+            try args.append(self.arena, try self.parseSpreadable());
+            if (self.peek().kind == .comma) {
+                _ = self.advance();
+                continue;
+            }
+            break;
+        }
+        _ = try self.expect(.rparen);
+        return args.items;
+    }
+
+    /// §13.3.2 MemberExpression `.` IdentifierName — the name after a `.`/`?.` is an IdentifierName,
+    /// so reserved words are valid here (`a.if`, `a?.return`). Returns the name lexeme.
+    fn expectPropertyName(self: *Parser) ParseError![]const u8 {
+        const t = self.peek();
+        if (t.kind == .identifier or isKeywordName(t.kind)) {
+            _ = self.advance();
+            return t.lexeme;
+        }
+        return ParseError.UnexpectedToken;
+    }
+
     /// An argument or array element that may be a spread `...expr`.
     fn parseSpreadable(self: *Parser) ParseError!*const ast.Node {
         if (self.peek().kind == .ellipsis) {
@@ -572,7 +605,7 @@ pub const Parser = struct {
 
     /// §13.14 Conditional `cond ? then : otherwise` (above assignment, right-associative branches).
     fn parseConditional(self: *Parser) ParseError!*const ast.Node {
-        const cond = try self.parseExpr(0);
+        const cond = try self.parseShortCircuit();
         if (self.peek().kind == .question) {
             _ = self.advance();
             const then = try self.parseAssignment();
@@ -583,10 +616,53 @@ pub const Parser = struct {
         return cond;
     }
 
+    /// §13.13 ShortCircuitExpression — the top of the binary tower: either a LogicalORExpression
+    /// (`||`/`&&` chain) or a CoalesceExpression (`??` chain). §13.13.1 Early Error: the two may not
+    /// be mixed without parentheses (`a ?? b || c`, `a && b ?? c`, … are SyntaxErrors). We parse the
+    /// head at the BitwiseOR level (prec ≥ 3, below `&&`/`||`/`??`), then dispatch on the operator.
+    fn parseShortCircuit(self: *Parser) ParseError!*const ast.Node {
+        const head_paren = blk: {
+            const h = try self.parseExpr(3);
+            break :blk .{ .node = h, .paren = self.last_was_paren };
+        };
+        const head = head_paren.node;
+        if (self.peek().kind == .question_question) {
+            // CoalesceExpression : CoalesceExpressionHead `??` BitwiseORExpression.
+            // The head must not be an un-parenthesized `||`/`&&` (it can't be — parseExpr(3) stops
+            // below them — but a parenthesized one is fine and already collapsed).
+            var left = head;
+            while (self.peek().kind == .question_question) {
+                _ = self.advance();
+                const right = try self.parseExpr(3);
+                const right_paren = self.last_was_paren;
+                // §13.13.1: a `??` operand may not itself be an un-parenthesized `||`/`&&`.
+                if (!right_paren and (self.peek().kind == .pipe_pipe or self.peek().kind == .amp_amp)) {
+                    return ParseError.UnexpectedToken;
+                }
+                left = try self.alloc(.{ .logical = .{ .op = .coalesce, .left = left, .right = right } });
+            }
+            return left;
+        }
+        if (self.peek().kind == .pipe_pipe or self.peek().kind == .amp_amp) {
+            // LogicalORExpression — continue the climb from the head at the `||` level (prec 1).
+            const result = try self.parseExprFrom(head, 1);
+            // §13.13.1: a `||`/`&&` chain may not be followed by `??` without parentheses.
+            if (self.peek().kind == .question_question) return ParseError.UnexpectedToken;
+            return result;
+        }
+        return head;
+    }
+
     /// Precedence-climbing for binary + logical operators. Higher number binds tighter.
     /// Logical `||`/`&&` build short-circuiting `logical` nodes; everything else is `binary`.
     fn parseExpr(self: *Parser, min_prec: u8) ParseError!*const ast.Node {
-        var left = try self.parseUnary();
+        const left = try self.parseUnary();
+        return self.parseExprFrom(left, min_prec);
+    }
+
+    /// Continue the precedence climb from an already-parsed `left` operand.
+    fn parseExprFrom(self: *Parser, left_init: *const ast.Node, min_prec: u8) ParseError!*const ast.Node {
+        var left = left_init;
         while (true) {
             const k = self.peek().kind;
             const prec = opPrecedence(k) orelse break;
@@ -604,11 +680,14 @@ pub const Parser = struct {
     }
 
     fn parseUnary(self: *Parser) ParseError!*const ast.Node {
+        self.last_was_paren = false; // reset; set by a parenthesized primary (§13.13.1 mix check)
         // §13.4.4/5 prefix ++ / --
         if (self.peek().kind == .plus_plus or self.peek().kind == .minus_minus) {
             const op: ast.UpdateOp = if (self.peek().kind == .plus_plus) .inc else .dec;
             _ = self.advance();
             const target = try self.parseUnary();
+            // §13.3.9.1 Early Error: `++a?.b` — a prefix-update operand may not be an OptionalChain.
+            if (target.* == .optional) return ParseError.UnexpectedToken;
             return self.alloc(.{ .update = .{ .op = op, .prefix = true, .target = target } });
         }
         const uop: ?ast.UnaryOp = switch (self.peek().kind) {
@@ -627,41 +706,69 @@ pub const Parser = struct {
         return self.parsePostfix();
     }
 
-    /// §13.3 Member access postfix: `a.b` and `a[expr]`, left-associative, highest precedence.
+    /// §13.3 Member/Call postfix: `a.b`, `a[expr]`, `a(args)`, plus §13.3.9 OptionalChain
+    /// (`a?.b`, `a?.[k]`, `a?.(args)`). Left-associative, highest precedence. Once a `?.` appears,
+    /// the chain is "optional": every following `.`/`[]`/`()` is emitted as an `optional` node so a
+    /// nullish short-circuit propagates to the end of the chain (§13.3.9.1).
     fn parsePostfix(self: *Parser) ParseError!*const ast.Node {
         var expr = try self.parsePrimary();
+        var in_chain = false; // have we seen a `?.` for the current chain root?
         while (true) {
             switch (self.peek().kind) {
+                .question_dot => {
+                    _ = self.advance();
+                    in_chain = true;
+                    switch (self.peek().kind) {
+                        .lbracket => { // ?.[ key ]
+                            _ = self.advance();
+                            const key = try self.parseAssignment();
+                            _ = try self.expect(.rbracket);
+                            expr = try self.alloc(.{ .optional = .{ .base = expr, .optional = true, .link = .{ .index = key } } });
+                        },
+                        .lparen => { // ?.( args )
+                            const args = try self.parseArgs();
+                            expr = try self.alloc(.{ .optional = .{ .base = expr, .optional = true, .link = .{ .call = args } } });
+                        },
+                        else => { // ?.name  (name is an IdentifierName — keywords allowed)
+                            const name = try self.expectPropertyName();
+                            expr = try self.alloc(.{ .optional = .{ .base = expr, .optional = true, .link = .{ .member = name } } });
+                        },
+                    }
+                },
                 .dot => {
                     _ = self.advance();
-                    const name = try self.expect(.identifier);
-                    expr = try self.alloc(.{ .member = .{ .object = expr, .name = name.lexeme } });
+                    const name = try self.expectPropertyName();
+                    expr = if (in_chain)
+                        try self.alloc(.{ .optional = .{ .base = expr, .optional = false, .link = .{ .member = name } } })
+                    else
+                        try self.alloc(.{ .member = .{ .object = expr, .name = name } });
                 },
                 .lbracket => {
                     _ = self.advance();
                     const key = try self.parseAssignment();
                     _ = try self.expect(.rbracket);
-                    expr = try self.alloc(.{ .index = .{ .object = expr, .key = key } });
+                    expr = if (in_chain)
+                        try self.alloc(.{ .optional = .{ .base = expr, .optional = false, .link = .{ .index = key } } })
+                    else
+                        try self.alloc(.{ .index = .{ .object = expr, .key = key } });
                 },
                 .lparen => { // §13.3.6 call
-                    _ = self.advance();
-                    var args: std.ArrayList(*const ast.Node) = .empty;
-                    while (self.peek().kind != .rparen and self.peek().kind != .eof) {
-                        try args.append(self.arena, try self.parseSpreadable());
-                        if (self.peek().kind == .comma) {
-                            _ = self.advance();
-                            continue;
-                        }
-                        break;
-                    }
-                    _ = try self.expect(.rparen);
-                    expr = try self.alloc(.{ .call = .{ .callee = expr, .args = args.items } });
+                    const args = try self.parseArgs();
+                    expr = if (in_chain)
+                        try self.alloc(.{ .optional = .{ .base = expr, .optional = false, .link = .{ .call = args } } })
+                    else
+                        try self.alloc(.{ .call = .{ .callee = expr, .args = args } });
                 },
                 else => break,
             }
         }
-        // §13.4.2/3 postfix ++ / --
+        // §13.3.9.1 Early Error: `OptionalChain TemplateLiteral` is a SyntaxError — a tagged
+        // template may not be applied to an optional chain (`a?.fn\`x\``).
+        if (in_chain and self.peek().kind == .template) return ParseError.UnexpectedToken;
+        // §13.4.2/3 postfix ++ / -- . §13.3.9.1 Early Error: the operand of an UpdateExpression may
+        // not be an OptionalChain (`a?.b++` is a SyntaxError) — the chain result isn't a Reference.
         if (self.peek().kind == .plus_plus or self.peek().kind == .minus_minus) {
+            if (in_chain) return ParseError.UnexpectedToken;
             const op: ast.UpdateOp = if (self.peek().kind == .plus_plus) .inc else .dec;
             _ = self.advance();
             expr = try self.alloc(.{ .update = .{ .op = op, .prefix = false, .target = expr } });
@@ -669,20 +776,86 @@ pub const Parser = struct {
         return expr;
     }
 
-    /// §13.2.5 Object initializer `{ key: value, ... }` (identifier or string keys, M1).
+    /// §13.2.5 Object initializer `{ … }`. Supports every PropertyDefinition form:
+    ///   `k: v` · shorthand `{x}` (≡ `x: x`) · computed `[expr]: v` · method `m(){…}` ·
+    ///   accessors `get x(){…}` / `set x(v){…}` · spread `...expr`.
     fn parseObjectLiteral(self: *Parser) ParseError!*const ast.Node {
         _ = try self.expect(.lbrace);
         var props: std.ArrayList(ast.Property) = .empty;
         while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
-            const kt = self.advance();
-            const key = switch (kt.kind) {
-                .identifier => kt.lexeme,
-                .string => kt.string_value,
-                else => return ParseError.UnexpectedToken,
-            };
-            _ = try self.expect(.colon);
-            const value = try self.parseAssignment();
-            try props.append(self.arena, .{ .key = key, .value = value });
+            // §13.2.5 PropertyDefinition : `...AssignmentExpression` (object spread).
+            if (self.peek().kind == .ellipsis) {
+                _ = self.advance();
+                const src = try self.parseAssignment();
+                try props.append(self.arena, .{ .kind = .spread, .value = src });
+                if (self.peek().kind == .comma) {
+                    _ = self.advance();
+                    continue;
+                }
+                break;
+            }
+
+            // §13.2.5.6 `get`/`set` accessor — only when the next token starts a property name (so
+            // `{get: 1}` and `{get(){}}` and `{get}` stay ordinary uses of the identifier `get`).
+            const w = self.peek();
+            if (w.kind == .identifier and (std.mem.eql(u8, w.lexeme, "get") or std.mem.eql(u8, w.lexeme, "set")) and
+                startsAccessorName(self.tokens[self.idx + 1].kind))
+            {
+                const is_get = std.mem.eql(u8, w.lexeme, "get");
+                _ = self.advance(); // get / set
+                const name = try self.parsePropertyName();
+                const pl = try self.parseParams();
+                const body = try self.parseBlock();
+                if (!isSimpleParameterList(pl) and bodyHasUseStrict(body)) return ParseError.UnexpectedToken;
+                // §13.2.5.1 UniqueFormalParameters — a method/accessor's params have no duplicates.
+                if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
+                const f = try self.arena.create(ast.Function);
+                f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body };
+                const fnode = try self.alloc(.{ .function = f });
+                try props.append(self.arena, .{
+                    .kind = if (is_get) .get else .set,
+                    .key = name.key,
+                    .computed_key = name.computed,
+                    .value = fnode,
+                });
+                if (self.peek().kind == .comma) {
+                    _ = self.advance();
+                    continue;
+                }
+                break;
+            }
+
+            // Ordinary / shorthand / computed / method. First parse the property name.
+            const name = try self.parsePropertyName();
+
+            if (self.peek().kind == .lparen) {
+                // §13.2.5 MethodDefinition `m(args){…}` — sugar for `m: function(args){…}`.
+                const pl = try self.parseParams();
+                const body = try self.parseBlock();
+                if (!isSimpleParameterList(pl) and bodyHasUseStrict(body)) return ParseError.UnexpectedToken;
+                // §13.2.5.1 UniqueFormalParameters — a method's parameters have no duplicates.
+                if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
+                const f = try self.arena.create(ast.Function);
+                f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body };
+                const fnode = try self.alloc(.{ .function = f });
+                try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = fnode });
+            } else if (self.peek().kind == .colon) {
+                // PropertyDefinition : PropertyName `:` AssignmentExpression.
+                _ = self.advance();
+                const value = try self.parseAssignment();
+                try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = value });
+            } else {
+                // §13.2.5 IdentifierReference shorthand `{x}` ≡ `{x: x}`. Only valid for a plain
+                // (non-computed, non-string-keyed) identifier name; a computed/string key with no
+                // `:`/`(` is a SyntaxError.
+                if (name.computed != null or !name.is_ident) return ParseError.UnexpectedToken;
+                // Shorthand with a default `{x = 1}` is only legal inside a destructuring *pattern*,
+                // not an object literal — reject it here (CoverInitializedName, §13.2.5.1).
+                if (self.peek().kind == .assign) return ParseError.UnexpectedToken;
+                const ref = try self.alloc(.{ .identifier = name.key });
+                try props.append(self.arena, .{ .key = name.key, .value = ref });
+            }
+
             if (self.peek().kind == .comma) {
                 _ = self.advance();
                 continue;
@@ -691,6 +864,44 @@ pub const Parser = struct {
         }
         _ = try self.expect(.rbrace);
         return self.alloc(.{ .object_literal = props.items });
+    }
+
+    const PropName = struct { key: []const u8, computed: ?*const ast.Node = null, is_ident: bool = false };
+
+    /// §13.2.5 PropertyName — a literal name (identifier / string / number) or a `[expr]`
+    /// ComputedPropertyName. `is_ident` flags a bare identifier (the only shorthand-eligible form).
+    fn parsePropertyName(self: *Parser) ParseError!PropName {
+        const t = self.peek();
+        switch (t.kind) {
+            .lbracket => {
+                _ = self.advance();
+                const expr = try self.parseAssignment();
+                _ = try self.expect(.rbracket);
+                return .{ .key = "", .computed = expr };
+            },
+            .identifier => {
+                _ = self.advance();
+                return .{ .key = t.lexeme, .is_ident = true };
+            },
+            .string => {
+                _ = self.advance();
+                return .{ .key = t.string_value };
+            },
+            .number => {
+                _ = self.advance();
+                // §13.2.5 numeric property names are ToString'd: `{0.5: 1}` → key "0.5".
+                const n = std.fmt.parseFloat(f64, t.lexeme) catch return ParseError.UnexpectedToken;
+                return .{ .key = try numericKey(self.arena, n) };
+            },
+            else => {
+                // Keywords are valid (non-shorthand) property names: `{if: 1}`, `{return(){}}`.
+                if (isKeywordName(t.kind)) {
+                    _ = self.advance();
+                    return .{ .key = t.lexeme };
+                }
+                return ParseError.UnexpectedToken;
+            },
+        }
     }
 
     fn parsePrimary(self: *Parser) ParseError!*const ast.Node {
@@ -759,10 +970,15 @@ pub const Parser = struct {
             // is spec-correct for an engine without classes and keeps negative parse tests honest:
             // e.g. `class { x = () => arguments }` must fail to *parse*, not at runtime.)
             .kw_class => return ParseError.UnexpectedToken,
+            // §13.3.5 SuperProperty / §13.3.7 SuperCall are unsupported — `super` is reserved, so any
+            // `super(...)` / `super.x` is a parse-phase SyntaxError. (Recovers the object method
+            // `name-super-call-*` negatives: a direct super in a method body/param must fail to parse.)
+            .kw_super => return ParseError.UnexpectedToken,
             .lparen => {
                 _ = self.advance();
                 const inner = try self.parseAssignment();
                 _ = try self.expect(.rparen);
+                self.last_was_paren = true; // §13.13.1: a parenthesized operand defuses the mix check
                 return inner;
             },
             .eof => return ParseError.UnexpectedEof,
@@ -847,6 +1063,32 @@ fn bodyHasUseStrict(body: []const ast.Stmt) bool {
         }
     }
     return false;
+}
+
+/// Does `kind` begin a PropertyName? Used to distinguish a `get`/`set` accessor (`get x(){}`)
+/// from an ordinary use of the identifiers `get`/`set` as a key (`{get: 1}`, `{get}`, `{get(){}}`).
+fn startsAccessorName(kind: lex.TokenKind) bool {
+    return switch (kind) {
+        .identifier, .string, .number, .lbracket => true,
+        else => isKeywordName(kind), // `get if(){}` etc.
+    };
+}
+
+/// Is `kind` a reserved word usable as a (non-computed) property name? Per §13.2.5 any
+/// ReservedWord is a valid IdentifierName key.
+fn isKeywordName(kind: lex.TokenKind) bool {
+    return switch (kind) {
+        .kw_true, .kw_false, .kw_null, .kw_var, .kw_let, .kw_const, .kw_function, .kw_return, .kw_this, .kw_if, .kw_else, .kw_while, .kw_for, .kw_throw, .kw_try, .kw_catch, .kw_finally, .kw_break, .kw_continue, .kw_typeof, .kw_new, .kw_instanceof, .kw_switch, .kw_case, .kw_default, .kw_import, .kw_class, .kw_super, .kw_in => true,
+        else => false,
+    };
+}
+
+/// ToString of a numeric PropertyName (§13.2.5 — `{1: x}` has key "1", `{0.5: x}` key "0.5").
+fn numericKey(arena: std.mem.Allocator, n: f64) ParseError![]const u8 {
+    if (n == @floor(n) and @abs(n) < 1e21) {
+        return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
+    }
+    return std.fmt.allocPrint(arena, "{d}", .{n});
 }
 
 fn binaryOpFor(kind: lex.TokenKind) ?ast.BinaryOp {
