@@ -104,6 +104,10 @@ pub const Function = struct {
     params: []const Param,
     rest: ?*const Pattern = null, // §15.1 rest parameter `...xs` (may itself be a pattern)
     body: []const Stmt,
+    /// §15.3 ArrowFunction: arrows have lexical `this` (no own binding) and are not constructors.
+    /// An expression-body arrow (`x => x + 1`) is normalized at parse time into a body holding a
+    /// single `return expr` statement, so `body` is uniform across function kinds.
+    is_arrow: bool = false,
 };
 
 pub const DeclKind = enum { var_decl, let_decl, const_decl };

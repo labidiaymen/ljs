@@ -104,6 +104,13 @@ fn expectBool(src: []const u8, want: bool) !void {
     try testing.expectEqual(want, r.normal.boolean);
 }
 
+fn expectSyntaxError(src: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const r = try evaluate(arena_state.allocator(), src, .sloppy);
+    try testing.expect(r == .syntax_error);
+}
+
 test "bindings: var/let/const, assignment, block scope (US1)" {
     try expectNumber("var x = 40; x + 2", 42);
     try expectNumber("var x = 1; x = x + 5; x", 6);
@@ -335,6 +342,63 @@ test "M3 destructuring: function parameters (US4)" {
     try expectNumber("function f({a = 1, b = 2} = {}) { return a + b; } f({a: 10})", 12);
     // rest param destructured
     try expectNumber("function f(...[a, b]) { return a + b; } f(4, 5)", 9);
+}
+
+test "M3 arrow functions: bodies & param forms (US5, §15.3)" {
+    // expression body (implicit return), single un-parenthesized param
+    try expectNumber("var f = x => x + 1; f(41)", 42);
+    // block body with explicit return
+    try expectNumber("var f = x => { return x * 2; }; f(21)", 42);
+    // zero params + multi params
+    try expectNumber("var f = () => 42; f()", 42);
+    try expectNumber("var add = (a, b) => a + b; add(2, 3)", 5);
+    // default param
+    try expectNumber("var f = (a = 10) => a; f()", 10);
+    try expectNumber("var f = (a = 10) => a; f(3)", 3);
+    // destructuring params (object + array)
+    try expectNumber("var f = ({x}, [y]) => x + y; f({x: 40}, [2])", 42);
+    // rest param
+    try expectNumber("var f = (...xs) => xs.length; f(1, 2, 3)", 3);
+    // immediately-invoked parenthesized arrow (cover-grammar disambiguation)
+    try expectNumber("((x) => x + 1)(41)", 42);
+    // arrows returning closures (curried)
+    try expectNumber("var mk = a => b => a + b; mk(40)(2)", 42);
+}
+
+test "M3 arrow functions: lexical this & not a constructor (US5, §15.3)" {
+    // an arrow captures the enclosing `this` at creation, regardless of how it is later called
+    try expectNumber(
+        "var o = { v: 7, get: function() { var f = () => this.v; return f(); } }; o.get()",
+        7,
+    );
+    // calling the arrow as another object's method must NOT rebind `this`
+    try expectNumber(
+        "var outer = { v: 1, make: function(){ return () => this.v; } };" ++
+            " var arrow = outer.make(); var other = { v: 99, f: arrow }; other.f()",
+        1,
+    );
+    // §15.3: arrows are not constructors
+    try expectThrows("new (() => {})");
+}
+
+test "M3 arrow functions: early errors (US5, §15.3.1)" {
+    // duplicate BoundNames are a SyntaxError in every mode (unlike a sloppy ordinary function)
+    try expectSyntaxError("var f = (x, x) => 1;");
+    try expectSyntaxError("var f = ([x], x) => 1;");
+    try expectSyntaxError("var f = ({a: x}, x) => 1;");
+    try expectSyntaxError("var f = (x, ...x) => 1;");
+    // ASI restriction: no LineTerminator between ArrowParameters and `=>`
+    try expectSyntaxError("var f = ()\n=> 1;");
+    try expectSyntaxError("var f = x\n=> 1;");
+    // distinct names + a newline *after* `=>` (before the body) are both fine
+    try expectNumber("var f = (a, b) =>\n a + b; f(2, 3)", 5);
+}
+
+test "M3 class definitions rejected at parse (§15.7, unsupported)" {
+    // classes are unsupported — `class` is reserved, so any class form is a parse-phase error
+    try expectSyntaxError("class C {}");
+    try expectSyntaxError("var C = class {};");
+    try expectSyntaxError("var C = class { x = () => 1; };");
 }
 
 test "deep recursion throws RangeError, not a segfault" {

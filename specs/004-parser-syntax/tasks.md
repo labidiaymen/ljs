@@ -27,8 +27,30 @@ spec (this is parser/evaluator work; no new architecture).
 - [x] M3-T040 Array/object binding patterns in `var`/`let`/`const` + params (with defaults/holes/rest + nesting). New AST `Pattern` union (identifier/array/object) with `BindingElement` (optional default, holes as null target) and `Param` (pattern + default); `Declarator.target` and `FunctionData.params` now carry patterns. Parser: `parsePattern`/`parseArrayPattern`/`parseObjectPattern`, pattern-aware `parseDecl`/`parseParams`. Interpreter: one recursive `bindPattern` (shared by declarations + `[[Call]]` param binding) with fast paths for plain-identifier targets/params so the common case pays no matching cost (bench stayed green). Iterable model = Arrays + Strings (matches spread). Object rest copies remaining own props.
   - **Regression hunt (net was −4 before fixes):** newly-parseable `function/dstr/*` tests reached the `assert.throws` harness path, which references the global `undefined` (and `NaN`/`Infinity`) — previously unbound → they threw `ReferenceError`. Added the §19.1 global value properties `undefined`/`NaN`/`Infinity` (immutable), recovering them + many others. Also added two Early Errors my parser newly exposed: §14.3.1.1 a BindingPattern (or any `const`) declaration requires an initializer (`let {x};` is a SyntaxError), and §15.1.1 a "use strict" directive is forbidden with a non-simple parameter list. Final: no true regressions (mode+path), +72 net.
 
-## Cycle 5 — US5 Arrow functions
-- [ ] M3-T050 `=>` (expr + block body); lexical `this` (capture enclosing `this_val`)
+## Cycle 5 — US5 Arrow functions (DONE — conformance 25.7% → 25.9%, +30 net)
+- [x] M3-T050 `=>` (expr + block body); lexical `this` (capture enclosing `this_val`). Lexer
+  `fat_arrow` token (`=>`, distinct from `=`/`>=`) + per-token `newline_before` flag (§12.3, for the
+  ASI-restricted production). AST `Function.is_arrow`; expression bodies normalized to a single
+  `return expr` so `body` is uniform. Cover-grammar: single-ident `x =>` detected by a 2-token peek
+  in `parseAssignment`; parenthesized `( … ) =>` by bounded lookahead (`parenIsArrowHead` scans to the
+  matching `)` tracking nesting) then reusing `parseParams`/`parsePattern` — no expression→pattern
+  reinterpretation. `FunctionData` gains `is_arrow` + `captured_this` (set to the interpreter's
+  `this_val` at creation); `[[Call]]` uses the captured `this` for arrows (bypassing call-site
+  rebinding); arrows get no `.prototype` and `new (()=>{})` → TypeError (§15.3). Early Errors
+  (§15.3.1): duplicate BoundNames (every mode) and the `[no LineTerminator here] =>` ASI restriction.
+  - **Regression hunt (net was −65 before fixes; gate measured WITHOUT `--harness-dir`, so positive
+    arrow tests that call `assert.*` can't pass that way — the win shows as +86 *with* the prelude, but
+    the bare gate only moves on negatives):** newly-parseable arrow source exposed three real gaps.
+    (1) §15.3.1 duplicate-param + ASI-`=>` early errors (recovered ~30). (2) **`class` was lexed as an
+    identifier** — `var C = class {…}` parsed as `C = «class»` + a stray block, so class *parse*-negative
+    tests (e.g. `arguments`/`super` in an arrow class field) only "passed" at HEAD because the arrow
+    inside failed to parse; with arrows working they reached runtime and failed. Fix: reserve `class`
+    (`kw_class`) and parse-reject it like `import` (§15.7 unsupported) — spec-correct and recovers the
+    28 `class/elements` negatives. Final: +42 recoveries / −12 regressions = **+30 net**.
+  - **Known gap:** 12 `arrow-function/syntax/early-errors/*` strict-mode binding restrictions remain
+    (`eval`/`arguments`/`yield`/future-reserved-words as a param name → SyntaxError only under
+    `[onlyStrict]`). The parser has no strict-mode context propagation yet; deferred (needs a
+    strict-aware BindingIdentifier check, not arrow-specific).
 
 ## Cycle 6 — US6 Object-literal extensions + access operators
 - [ ] M3-T060 Getters/setters, shorthand `{x}`, computed `{[k]:v}`, method shorthand; `?.` and `??`

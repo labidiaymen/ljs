@@ -32,6 +32,7 @@ pub const TokenKind = enum {
     kw_case,
     kw_default,
     kw_import, // import (modules / dynamic ImportCall — unsupported, parse-rejected)
+    kw_class, // class (ClassDeclaration / ClassExpression — unsupported, parse-rejected)
     pipe_pipe, // ||
     amp_amp, // &&
     star_star, // **
@@ -44,6 +45,7 @@ pub const TokenKind = enum {
     shr_un, // >>>
     template, // `...${}...` (raw inner stored in string_value)
     ellipsis, // ...
+    fat_arrow, // => (ArrowFunction, §15.3)
     kw_in, // in
     plus_plus, // ++
     minus_minus, // --
@@ -88,6 +90,9 @@ pub const Token = struct {
     lexeme: []const u8,
     /// Decoded string contents (string tokens only), allocated in the arena.
     string_value: []const u8 = "",
+    /// §12.3: a LineTerminator appeared in the trivia immediately before this token. Needed for
+    /// the restricted productions (ASI, and the `[no LineTerminator here]` arrow `=>`, §15.3.1).
+    newline_before: bool = false,
 };
 
 pub const LexError = error{ UnexpectedCharacter, UnterminatedString, OutOfMemory };
@@ -109,11 +114,14 @@ pub const Lexer = struct {
         return if (self.pos + 1 < self.src.len) self.src[self.pos + 1] else 0;
     }
 
-    // §12.2 White Space / §12.3 Line Terminators / §12.4 Comments.
-    fn skipTrivia(self: *Lexer) void {
+    // §12.2 White Space / §12.3 Line Terminators / §12.4 Comments. Returns true iff a
+    // LineTerminator was skipped (so `next` can flag the following token for restricted productions).
+    fn skipTrivia(self: *Lexer) bool {
+        var saw_newline = false;
         while (self.pos < self.src.len) {
             const c = self.src[self.pos];
             if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+                if (c == '\n' or c == '\r') saw_newline = true;
                 self.pos += 1;
                 continue;
             }
@@ -127,17 +135,29 @@ pub const Lexer = struct {
                 if (c2 == '*') { // block comment
                     self.pos += 2;
                     while (self.pos + 1 < self.src.len and
-                        !(self.src[self.pos] == '*' and self.src[self.pos + 1] == '/')) self.pos += 1;
+                        !(self.src[self.pos] == '*' and self.src[self.pos + 1] == '/')) : (self.pos += 1)
+                    {
+                        // §12.3: a multi-line comment containing a LineTerminator counts as one.
+                        if (self.src[self.pos] == '\n' or self.src[self.pos] == '\r') saw_newline = true;
+                    }
                     self.pos = @min(self.pos + 2, self.src.len);
                     continue;
                 }
             }
             break;
         }
+        return saw_newline;
     }
 
+    /// §12.1 — produce the next token, flagging it if a LineTerminator preceded it (§12.3).
     pub fn next(self: *Lexer) LexError!Token {
-        self.skipTrivia();
+        const nl = self.skipTrivia();
+        var t = try self.scanToken();
+        t.newline_before = nl;
+        return t;
+    }
+
+    fn scanToken(self: *Lexer) LexError!Token {
         if (self.pos >= self.src.len) return .{ .kind = .eof, .lexeme = "" };
 
         const c = self.src[self.pos];
@@ -184,6 +204,7 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, word, "case")) return .{ .kind = .kw_case, .lexeme = word };
             if (std.mem.eql(u8, word, "default")) return .{ .kind = .kw_default, .lexeme = word };
             if (std.mem.eql(u8, word, "import")) return .{ .kind = .kw_import, .lexeme = word };
+            if (std.mem.eql(u8, word, "class")) return .{ .kind = .kw_class, .lexeme = word };
             return .{ .kind = .identifier, .lexeme = word };
         }
 
@@ -260,6 +281,10 @@ pub const Lexer = struct {
             },
             '=' => {
                 if (self.peek() == '=') return self.lexEqEq(start);
+                if (self.peek() == '>') { // §15.3 ArrowFunction `=>`
+                    self.pos += 1;
+                    return tok(.fat_arrow, self.src[start..self.pos]);
+                }
                 return tok(.assign, self.src[start..self.pos]);
             },
             '|' => {

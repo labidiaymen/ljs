@@ -25,11 +25,15 @@ pub const NativeId = enum {
 };
 
 /// The closure captured by a function object: parameter patterns, body, and defining scope.
+/// §15.3 arrows additionally capture the enclosing `this` at creation (lexical `this`) and are
+/// flagged so [[Call]] bypasses `this` rebinding and [[Construct]] is rejected.
 pub const FunctionData = struct {
     params: []const ast.Param,
     rest: ?*const ast.Pattern = null,
     body: []const ast.Stmt,
     closure: *Environment,
+    is_arrow: bool = false,
+    captured_this: Value = .undefined, // §15.3: the enclosing `this` (arrows only)
 };
 
 pub const Object = struct {
@@ -53,8 +57,11 @@ pub const Object = struct {
         obj.kind = .function;
         obj.call = data;
         // §10.2.4: every ordinary function gets a `.prototype` object (used by `new`/`instanceof`).
-        const proto = try create(arena, null);
-        try obj.set("prototype", .{ .object = proto });
+        // §15.3: arrow functions are not constructors and have no own `.prototype`.
+        if (!data.is_arrow) {
+            const proto = try create(arena, null);
+            try obj.set("prototype", .{ .object = proto });
+        }
         return obj;
     }
 

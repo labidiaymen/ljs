@@ -382,6 +382,10 @@ pub const Interpreter = struct {
             return self.throwError("TypeError", "value is not a constructor");
         }
         const ctor = cc.normal.object;
+        // §15.3: arrow functions have no [[Construct]] — `new (() => {})` is a TypeError.
+        if (ctor.call) |fd| {
+            if (fd.is_arrow) return self.throwError("TypeError", "value is not a constructor");
+        }
         var proto: ?*Object = null;
         if (ctor.get("prototype")) |pv| {
             if (pv == .object) proto = pv.object;
@@ -399,7 +403,16 @@ pub const Interpreter = struct {
     }
 
     fn evalFunctionExpr(self: *Interpreter, f: *const ast.Function, env: *Environment) EvalError!Completion {
-        const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env });
+        // §15.3: an arrow captures the enclosing `this` at creation time (lexical `this`); an
+        // ordinary function gets `this` bound per-call instead.
+        const obj = try Object.createFunction(self.arena, .{
+            .params = f.params,
+            .rest = f.rest,
+            .body = f.body,
+            .closure = env,
+            .is_arrow = f.is_arrow,
+            .captured_this = if (f.is_arrow) self.this_val else .undefined,
+        });
         return .{ .normal = .{ .object = obj } };
     }
 
@@ -510,8 +523,10 @@ pub const Interpreter = struct {
                 if (bc.isAbrupt()) return bc;
             }
         }
+        // §15.3: an arrow has no own `this` binding — it uses the `this` captured at creation,
+        // ignoring however it was called. Ordinary functions take the call-site `this`.
         const saved_this = self.this_val;
-        self.this_val = this_val;
+        self.this_val = if (fd.is_arrow) fd.captured_this else this_val;
         defer self.this_val = saved_this;
 
         for (fd.body) |stmt| {

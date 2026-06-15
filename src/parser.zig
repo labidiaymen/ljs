@@ -481,8 +481,75 @@ pub const Parser = struct {
 
     // ── expressions ─────────────────────────────────────────────────────────
 
+    /// §15.3 ArrowFunction. Builds a `function` node flagged `is_arrow`. An expression body is
+    /// normalized to a single `return expr` statement; a `{ … }` body is a normal block.
+    /// `params`/`rest` come from the already-parsed (or about-to-parse) formal list.
+    fn finishArrow(self: *Parser, pl: ParamList) ParseError!*const ast.Node {
+        // §15.3.1 Early Error: `ArrowParameters [no LineTerminator here] =>` — a line terminator
+        // between the parameters and `=>` is a SyntaxError (ASI must not insert a semicolon here).
+        if (self.peek().newline_before) return ParseError.UnexpectedToken;
+        // §15.3.1 Early Error: an ArrowFunction's BoundNames must contain no duplicates (unlike a
+        // non-strict ordinary function, this holds in every mode).
+        if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
+        _ = try self.expect(.fat_arrow);
+        const body: []const ast.Stmt = if (self.peek().kind == .lbrace)
+            // ConciseBody : { FunctionBody }
+            try self.parseBlock()
+        else blk: {
+            // ConciseBody : ExpressionBody  →  implicit `return ExpressionBody`.
+            const expr = try self.parseAssignment();
+            const stmts = try self.arena.alloc(ast.Stmt, 1);
+            stmts[0] = .{ .ret = expr };
+            break :blk stmts;
+        };
+        // §15.1.1 Early Error: a "use strict" directive is forbidden with a non-simple param list.
+        if (!isSimpleParameterList(pl) and bodyHasUseStrict(body)) return ParseError.UnexpectedToken;
+        const f = try self.arena.create(ast.Function);
+        f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_arrow = true };
+        return self.alloc(.{ .function = f });
+    }
+
+    /// Bounded lookahead: with `self.idx` on a `(`, scan to its matching `)` (tracking nested
+    /// `()`/`[]`/`{}`) and report whether the token after it is `=>`. Used to disambiguate the
+    /// arrow cover-grammar `( … ) =>` from a parenthesized expression without backtracking the
+    /// real parse. Does not mutate parser state.
+    fn parenIsArrowHead(self: *Parser) bool {
+        var i = self.idx; // on the '('
+        var depth: usize = 0;
+        while (i < self.tokens.len) : (i += 1) {
+            switch (self.tokens[i].kind) {
+                .lparen, .lbracket, .lbrace => depth += 1,
+                .rparen, .rbracket, .rbrace => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        const next = if (i + 1 < self.tokens.len) self.tokens[i + 1].kind else .eof;
+                        return next == .fat_arrow;
+                    }
+                },
+                .eof => return false,
+                else => {},
+            }
+        }
+        return false;
+    }
+
     /// §13.15 Assignment (right-associative). Only identifier targets in M1 Cycle A.
     fn parseAssignment(self: *Parser) ParseError!*const ast.Node {
+        // §15.3 ArrowFunction (cover grammar, checked before the precedence climb):
+        //   • `Identifier =>` — a single un-parenthesized parameter.
+        //   • `( … ) =>` — a parenthesized formal list (lookahead to the matching `)`).
+        if (self.peek().kind == .identifier and self.idx + 1 < self.tokens.len and
+            self.tokens[self.idx + 1].kind == .fat_arrow)
+        {
+            const pat = try self.allocPattern(.{ .identifier = self.advance().lexeme });
+            const params = try self.arena.alloc(ast.Param, 1);
+            params[0] = .{ .pattern = pat, .default = null };
+            return self.finishArrow(.{ .params = params, .rest = null });
+        }
+        if (self.peek().kind == .lparen and self.parenIsArrowHead()) {
+            const pl = try self.parseParams();
+            return self.finishArrow(pl);
+        }
         const left = try self.parseConditional();
         const op = self.peek().kind;
         if (op == .assign or compoundBinOp(op) != null) {
@@ -687,6 +754,11 @@ pub const Parser = struct {
             // also keeps spread support honest: ImportCall forbids `...` (a Forbidden Extension), so
             // `import(...x)` must not parse as an ordinary spread call.
             .kw_import => return ParseError.UnexpectedToken,
+            // §15.7 Class definitions are unsupported — `class` is a reserved word, so any
+            // ClassExpression / ClassDeclaration is a parse-phase SyntaxError. (Rejecting at parse
+            // is spec-correct for an engine without classes and keeps negative parse tests honest:
+            // e.g. `class { x = () => arguments }` must fail to *parse*, not at runtime.)
+            .kw_class => return ParseError.UnexpectedToken,
             .lparen => {
                 _ = self.advance();
                 const inner = try self.parseAssignment();
@@ -708,6 +780,58 @@ fn isSimpleParameterList(pl: Parser.ParamList) bool {
         if (p.pattern.* != .identifier) return false;
     }
     return true;
+}
+
+/// §15.3.1 Early Error: an ArrowFunction's BoundNames must contain no duplicate entries.
+/// Walks every parameter pattern (including nested array/object patterns and the rest element),
+/// collecting bound identifiers; returns true on the first repeat. Bounded by the formal list
+/// size, so it runs only on the arrow-creation path (never the hot call path).
+fn hasDuplicateBoundNames(pl: Parser.ParamList) bool {
+    var names: std.ArrayList([]const u8) = .empty;
+    var buf: [64][]const u8 = undefined; // formal lists are tiny; a small fixed buffer suffices
+    var fba = std.heap.FixedBufferAllocator.init(std.mem.sliceAsBytes(buf[0..]));
+    const a = fba.allocator();
+    for (pl.params) |p| {
+        if (collectBoundNames(p.pattern, &names, a)) return true;
+    }
+    if (pl.rest) |r| {
+        if (collectBoundNames(r, &names, a)) return true;
+    }
+    return false;
+}
+
+/// Append `pattern`'s bound identifiers to `names`, returning true if any was already present.
+/// On allocator exhaustion (a pathologically large pattern) it conservatively returns false —
+/// the binding still succeeds at runtime; we just skip the duplicate diagnostic.
+fn collectBoundNames(pattern: *const ast.Pattern, names: *std.ArrayList([]const u8), a: std.mem.Allocator) bool {
+    switch (pattern.*) {
+        .identifier => |n| {
+            for (names.items) |existing| {
+                if (std.mem.eql(u8, existing, n)) return true;
+            }
+            names.append(a, n) catch return false;
+            return false;
+        },
+        .array => |ap| {
+            for (ap.elements) |el| {
+                if (el.target) |t| if (collectBoundNames(t, names, a)) return true;
+            }
+            if (ap.rest) |r| return collectBoundNames(r, names, a);
+            return false;
+        },
+        .object => |op| {
+            for (op.properties) |prop| {
+                if (collectBoundNames(prop.target, names, a)) return true;
+            }
+            if (op.rest) |r| {
+                for (names.items) |existing| {
+                    if (std.mem.eql(u8, existing, r)) return true;
+                }
+                names.append(a, r) catch return false;
+            }
+            return false;
+        },
+    }
 }
 
 /// Does the function body's directive prologue (§11.2.1) contain a "use strict" directive? The
