@@ -37,15 +37,24 @@ pub fn run(io: std.Io, arena: Allocator, opts: Options, report: *rep.Report) Run
     var walker = dir.walk(arena) catch return RunError.OutOfMemory;
     defer walker.deinit();
 
+    // Per-test scratch arena: each test's source, parse tree, and engine objects live here and are
+    // freed (reset) after the test. Without this, the suite's ~34k executions accumulate in one
+    // never-freed arena and exhaust memory. The engine is arena-per-realm so nothing leaks across
+    // tests; only the report's `path` must outlive a test, so it is duped on the outer arena.
+    var scratch_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch_state.deinit();
+
     while (walker.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".js")) continue;
         if (std.mem.endsWith(u8, entry.basename, "_FIXTURE.js")) continue;
         if (std.mem.indexOf(u8, entry.path, "harness/") != null) continue; // suite's own helpers
 
-        const source = dir.readFileAlloc(io, entry.path, arena, .limited(8 << 20)) catch continue;
-        const path_owned = try arena.dupe(u8, entry.path); // entry.path is invalidated on next()
-        try runOne(io, arena, opts, prelude, source, path_owned, report);
+        const path_owned = try arena.dupe(u8, entry.path); // persists in the report; entry.path invalidated on next()
+        _ = scratch_state.reset(.{ .retain_with_limit = 8 << 20 }); // free the previous test's allocations; release pathological spikes (keep up to 8 MiB) so a single huge test doesn't hold memory for the whole run
+        const scratch = scratch_state.allocator();
+        const source = dir.readFileAlloc(io, entry.path, scratch, .limited(8 << 20)) catch continue;
+        try runOne(io, scratch, opts, prelude, source, path_owned, report);
     }
 }
 
