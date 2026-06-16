@@ -72,6 +72,20 @@ pub const Parser = struct {
     /// value (`({x = 1});`, `f({a = 1})`) — a §13.2.5.1 SyntaxError. Snapshotted/checked in `parseStmt`.
     cover_init: usize = 0,
 
+    /// §14.13.1 / §14.8.1 / §14.9.1 label & control-flow scope tracking (parse-phase Early Errors).
+    /// `labels` is the set of LabelIdentifier names currently in scope (the enclosing
+    /// LabelledStatements); a `break label` is a SyntaxError unless `label` ∈ `labels`. A subset,
+    /// `iteration_labels`, holds only those labels that (transitively, through a chain of labels)
+    /// label an *iteration* statement; a `continue label` is a SyntaxError unless `label` ∈
+    /// `iteration_labels` (continuing to a non-loop label is illegal). `iteration_depth` / `switch_depth`
+    /// count enclosing iteration / switch statements for unlabeled `break`/`continue` validity. All four
+    /// are reset to empty/zero on entry to a function/arrow/method body (labels and the iteration nest
+    /// do NOT cross a function boundary) and restored on exit.
+    labels: std.ArrayListUnmanaged([]const u8) = .empty,
+    iteration_labels: std.ArrayListUnmanaged([]const u8) = .empty,
+    iteration_depth: usize = 0,
+    switch_depth: usize = 0,
+
     /// `mode == .strict` starts the whole Script in strict context (the Test262 runner runs each
     /// test in both modes, expecting the engine to honor `RunMode`). An explicit `"use strict"`
     /// directive prologue is detected independently in `parseProgram`.
@@ -328,11 +342,11 @@ pub const Parser = struct {
         _ = try self.expect(.lparen);
         const cond = try self.parseAssignment();
         _ = try self.expect(.rparen);
-        const then = try self.allocStmt(try self.parseSubStmt());
+        const then = try self.allocStmt(try self.parseSubStmt(false));
         var otherwise: ?*const ast.Stmt = null;
         if (self.peek().kind == .kw_else) {
             _ = self.advance();
-            otherwise = try self.allocStmt(try self.parseSubStmt());
+            otherwise = try self.allocStmt(try self.parseSubStmt(false));
         }
         return .{ .if_stmt = .{ .cond = cond, .then = then, .otherwise = otherwise } };
     }
@@ -342,8 +356,28 @@ pub const Parser = struct {
         _ = try self.expect(.lparen);
         const cond = try self.parseAssignment();
         _ = try self.expect(.rparen);
-        const body = try self.allocStmt(try self.parseSubStmt());
+        self.iteration_depth += 1;
+        defer self.iteration_depth -= 1;
+        const body = try self.allocStmt(try self.parseSubStmt(true));
         return .{ .while_stmt = .{ .cond = cond, .body = body } };
+    }
+
+    /// §14.7.2 `do Statement while ( Expression ) ;`. The trailing `;` is ASI-optional via the
+    /// special rule in §14.7.2 (the `;` is auto-inserted regardless of a line terminator), so we
+    /// consume an explicit `;` if present but never require it.
+    fn parseDoWhile(self: *Parser) ParseError!ast.Stmt {
+        _ = self.advance(); // do
+        const body = blk: {
+            self.iteration_depth += 1;
+            defer self.iteration_depth -= 1;
+            break :blk try self.allocStmt(try self.parseSubStmt(true));
+        };
+        _ = try self.expect(.kw_while);
+        _ = try self.expect(.lparen);
+        const cond = try self.parseAssignment();
+        _ = try self.expect(.rparen);
+        if (self.peek().kind == .semicolon) _ = self.advance();
+        return .{ .do_while_stmt = .{ .cond = cond, .body = body } };
     }
 
     /// §14.7.5 contextual `of`: lexed as an identifier with lexeme `"of"`. Recognized only in a
@@ -438,7 +472,9 @@ pub const Parser = struct {
         var update: ?*const ast.Node = null;
         if (self.peek().kind != .rparen) update = try self.parseExpression();
         _ = try self.expect(.rparen);
-        const body = try self.allocStmt(try self.parseSubStmt());
+        self.iteration_depth += 1;
+        defer self.iteration_depth -= 1;
+        const body = try self.allocStmt(try self.parseSubStmt(true));
         return .{ .for_stmt = .{ .init = init_stmt, .cond = cond, .update = update, .body = body } };
     }
 
@@ -449,7 +485,9 @@ pub const Parser = struct {
     fn finishForInOf(self: *Parser, head: ast.ForHead, is_of: bool) ParseError!ast.Stmt {
         const right = if (is_of) try self.parseAssignment() else try self.parseExpression();
         _ = try self.expect(.rparen);
-        const body = try self.allocStmt(try self.parseSubStmt());
+        self.iteration_depth += 1;
+        defer self.iteration_depth -= 1;
+        const body = try self.allocStmt(try self.parseSubStmt(true));
         if (is_of) return .{ .for_of_stmt = .{ .head = head, .right = right, .body = body } };
         return .{ .for_in_stmt = .{ .head = head, .right = right, .body = body } };
     }
@@ -460,6 +498,8 @@ pub const Parser = struct {
         const disc = try self.parseAssignment();
         _ = try self.expect(.rparen);
         _ = try self.expect(.lbrace);
+        self.switch_depth += 1;
+        defer self.switch_depth -= 1;
         var cases: std.ArrayList(ast.Case) = .empty;
         while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
             var test_expr: ?*const ast.Node = null;
@@ -537,13 +577,15 @@ pub const Parser = struct {
         return stmt;
     }
 
-    /// §14.5: a single-statement body (the body of `if`/`else`, `while`, `for`, `for-in`/`for-of`)
+    /// §14.5: a single-statement body (the body of `if`/`else`, `while`, `do`, `for`, `for-in`/`for-of`)
     /// is a `Statement`, NOT a `Declaration`. So a lexical declaration (`let`/`const`), a
     /// `ClassDeclaration`, or a `GeneratorDeclaration` (`function*`) in body position is a
     /// SyntaxError (`if (x) class C {}`, `while (x) let y;`, `for (;;) function* g(){}`). A plain
-    /// `FunctionDeclaration` is rejected only in strict mode; in sloppy mode Annex B B.3.4 permits it
-    /// as the body of an `if`/`else` (kept legal here — those Annex B positives live under `annexB/`).
-    fn parseSubStmt(self: *Parser) ParseError!ast.Stmt {
+    /// `FunctionDeclaration` is rejected in strict mode always; in sloppy mode Annex B B.3.4 permits it
+    /// only as the body of an `if`/`else` — `loop_body` (the body of an iteration statement) forbids it
+    /// there too (`do function f(){} while(0)` / `while(0) function f(){}` are SyntaxErrors). The
+    /// Annex B B.3.4 `if` positives live under `annexB/`.
+    fn parseSubStmt(self: *Parser, loop_body: bool) ParseError!ast.Stmt {
         switch (self.peek().kind) {
             .kw_const, .kw_class => return ParseError.UnexpectedToken,
             .kw_let => {
@@ -559,9 +601,18 @@ pub const Parser = struct {
             },
             .kw_function => {
                 // `function*` (generator declaration) is never a valid substatement; a plain
-                // `function` is invalid only in strict mode.
+                // `function` is invalid in strict mode, and (Annex B B.3.4) as an iteration body.
                 const next_is_star = self.idx + 1 < self.tokens.len and self.tokens[self.idx + 1].kind == .star;
-                if (self.strict or next_is_star) return ParseError.UnexpectedToken;
+                if (self.strict or next_is_star or loop_body) return ParseError.UnexpectedToken;
+            },
+            // §14.13 + Annex B B.3.2: a LabelledStatement is itself a valid sub-statement, but a
+            // *labelled FunctionDeclaration* is NOT permitted in any sub-statement position
+            // (`if (x) lbl: function f(){}`, `for(;;) lbl: function f(){}` are SyntaxErrors). The
+            // label-chain is parsed with `sub_position` set so it rejects a function labelled-item.
+            .identifier => {
+                if (self.idx + 1 < self.tokens.len and self.tokens[self.idx + 1].kind == .colon) {
+                    return self.parseLabeled(true);
+                }
             },
             else => {},
         }
@@ -596,6 +647,7 @@ pub const Parser = struct {
             },
             .kw_if => return self.parseIf(),
             .kw_while => return self.parseWhile(),
+            .kw_do => return self.parseDoWhile(),
             .kw_for => return self.parseFor(),
             .kw_switch => return self.parseSwitch(),
             .kw_try => return self.parseTry(),
@@ -607,15 +659,47 @@ pub const Parser = struct {
             },
             .kw_break => {
                 _ = self.advance();
+                // §14.9 BreakStatement `break [no LineTerminator here] LabelIdentifier? ;`. An
+                // identifier on the SAME line is the optional target label; a LineTerminator before it
+                // triggers ASI (the `break` is label-less). §14.9.1 Early Error: the label must be in
+                // scope, and a label-less `break` requires an enclosing iteration or switch.
+                var label: ?[]const u8 = null;
+                const t = self.peek();
+                if (t.kind == .identifier and !t.newline_before) {
+                    label = t.lexeme;
+                    _ = self.advance();
+                    if (!self.hasLabel(self.labels.items, label.?)) return ParseError.UnexpectedToken;
+                } else if (self.iteration_depth == 0 and self.switch_depth == 0) {
+                    return ParseError.UnexpectedToken;
+                }
                 if (self.peek().kind == .semicolon) _ = self.advance();
-                return .break_stmt;
+                return .{ .break_stmt = label };
             },
             .kw_continue => {
                 _ = self.advance();
+                // §14.8 ContinueStatement `continue [no LineTerminator here] LabelIdentifier? ;`.
+                // §14.8.1 Early Error: a `continue` must be inside an iteration; a labelled `continue`
+                // targets a label that (transitively) labels an iteration statement.
+                var label: ?[]const u8 = null;
+                const t = self.peek();
+                if (t.kind == .identifier and !t.newline_before) {
+                    label = t.lexeme;
+                    _ = self.advance();
+                    if (!self.hasLabel(self.iteration_labels.items, label.?)) return ParseError.UnexpectedToken;
+                } else if (self.iteration_depth == 0) {
+                    return ParseError.UnexpectedToken;
+                }
                 if (self.peek().kind == .semicolon) _ = self.advance();
-                return .continue_stmt;
+                return .{ .continue_stmt = label };
             },
             else => {
+                // §14.13 LabelledStatement `LabelIdentifier : Statement` — an Identifier immediately
+                // followed by `:` at statement start is a label prefix (disambiguated here from an
+                // ExpressionStatement / object literal: those never begin `identifier :` in statement
+                // position). Anything else is an ExpressionStatement.
+                if (self.peek().kind == .identifier and self.idx + 1 < self.tokens.len and self.tokens[self.idx + 1].kind == .colon) {
+                    return self.parseLabeled(false); // statement-list position: a sloppy labelled fn is OK (B.3.2)
+                }
                 // §14.5 ExpressionStatement : Expression `;` — a full Expression, so the comma /
                 // sequence operator is permitted here.
                 const e = try self.parseExpression();
@@ -623,6 +707,107 @@ pub const Parser = struct {
                 return .{ .expr = e };
             },
         }
+    }
+
+    fn hasLabel(self: *Parser, list: []const []const u8, name: []const u8) bool {
+        _ = self;
+        for (list) |l| if (std.mem.eql(u8, l, name)) return true;
+        return false;
+    }
+
+    /// Saved label / iteration-nest state for a function-body boundary (§14.13: labels and the
+    /// iteration/switch nest do not cross into a nested function body).
+    const ControlScope = struct {
+        labels: std.ArrayListUnmanaged([]const u8),
+        iteration_labels: std.ArrayListUnmanaged([]const u8),
+        iteration_depth: usize,
+        switch_depth: usize,
+    };
+
+    fn enterControlScope(self: *Parser) ControlScope {
+        const saved = ControlScope{
+            .labels = self.labels,
+            .iteration_labels = self.iteration_labels,
+            .iteration_depth = self.iteration_depth,
+            .switch_depth = self.switch_depth,
+        };
+        self.labels = .empty;
+        self.iteration_labels = .empty;
+        self.iteration_depth = 0;
+        self.switch_depth = 0;
+        return saved;
+    }
+
+    fn exitControlScope(self: *Parser, saved: ControlScope) void {
+        self.labels = saved.labels;
+        self.iteration_labels = saved.iteration_labels;
+        self.iteration_depth = saved.iteration_depth;
+        self.switch_depth = saved.switch_depth;
+    }
+
+    /// Does `kind` begin an IterationStatement (§14.7)? A label that (transitively) prefixes one of
+    /// these is a valid `continue` target; a label prefixing anything else is `break`-only.
+    fn tokenStartsIterationStmt(kind: lex.TokenKind) bool {
+        return switch (kind) {
+            .kw_while, .kw_do, .kw_for => true,
+            else => false,
+        };
+    }
+
+    /// §14.13 LabelledStatement `LabelIdentifier : LabelledItem`. The leading `identifier :` was
+    /// confirmed by the caller. Collects the full label chain (`a: b: stmt`), enforces §14.13.1
+    /// (a label may not be re-declared within its own LabelledStatement — duplicate-label SyntaxError),
+    /// records which labels prefix an iteration statement (for `continue label` validity), then parses
+    /// the LabelledItem as a substatement and wraps it in nested `labeled_stmt` nodes (outermost first).
+    fn parseLabeled(self: *Parser, sub_position: bool) ParseError!ast.Stmt {
+        const labels_before = self.labels.items.len;
+        const iter_labels_before = self.iteration_labels.items.len;
+        defer self.labels.shrinkRetainingCapacity(labels_before);
+        defer self.iteration_labels.shrinkRetainingCapacity(iter_labels_before);
+
+        // Collect the chain of label identifiers (`a: b: c: …`).
+        var chain: std.ArrayListUnmanaged([]const u8) = .empty;
+        while (self.peek().kind == .identifier and self.idx + 1 < self.tokens.len and self.tokens[self.idx + 1].kind == .colon) {
+            const name = self.advance().lexeme; // identifier
+            _ = self.advance(); // `:`
+            // §13.1.1 LabelIdentifier Early Errors: `yield` is not a valid label in a generator body
+            // or in strict mode; any other strict-reserved word (`let`/`static`/…) is invalid in strict
+            // mode. (`eval`/`arguments` ARE valid labels — a label is not a binding.) `await` inside a
+            // static block is reserved too.
+            if (std.mem.eql(u8, name, "yield")) {
+                if (self.in_generator or self.strict) return ParseError.UnexpectedToken;
+            } else if (self.in_static_block and std.mem.eql(u8, name, "await")) {
+                return ParseError.UnexpectedToken;
+            } else if (self.strict and !isEvalOrArguments(name) and isStrictReservedBindingName(name)) {
+                return ParseError.UnexpectedToken;
+            }
+            // §14.13.1: a duplicate label nested within the same labelled statement is a SyntaxError.
+            if (self.hasLabel(self.labels.items, name)) return ParseError.UnexpectedToken;
+            try self.labels.append(self.arena, name);
+            try chain.append(self.arena, name);
+        }
+        // If the labelled item is an iteration statement, every label in this chain can be a
+        // `continue` target.
+        if (tokenStartsIterationStmt(self.peek().kind)) {
+            for (chain.items) |name| try self.iteration_labels.append(self.arena, name);
+        }
+        // §14.13 LabelledItem : Statement | FunctionDeclaration. A plain `function` labelled-item is a
+        // §B.3.2 LabelledFunctionDeclaration — legal only in sloppy mode AND only in a statement-list
+        // position (NOT inside an `if`/`else`/loop body, where `sub_position` is set). A `function*`
+        // generator is never allowed. Other Declarations (`let`/`const`/`class`) are not `Statement`s.
+        const body = if (self.peek().kind == .kw_function) blk: {
+            const next_is_star = self.idx + 1 < self.tokens.len and self.tokens[self.idx + 1].kind == .star;
+            if (self.strict or next_is_star or sub_position) return ParseError.UnexpectedToken;
+            break :blk try self.parseStmt();
+        } else try self.parseSubStmt(false);
+        // Wrap innermost → outermost so `a: b: stmt` becomes labeled{a, labeled{b, stmt}}.
+        var wrapped = try self.allocStmt(body);
+        var i = chain.items.len;
+        while (i > 0) {
+            i -= 1;
+            wrapped = try self.allocStmt(.{ .labeled_stmt = .{ .label = chain.items[i], .body = wrapped } });
+        }
+        return wrapped.*;
     }
 
     /// §15.2 / §15.5: `function [*] [name] (params) { body }` — shared by declarations and expressions.
@@ -682,6 +867,11 @@ pub const Parser = struct {
         }
         self.strict = body_strict;
         self.in_generator = is_generator; // §15.5: the GeneratorBody parses with `[+Yield]`
+        // §14.13/§14.8/§14.9: labels and the iteration/switch nest do NOT cross a function boundary —
+        // the body starts with a fresh, empty label scope (`break`/`continue` can't target an outer
+        // loop). Saved/restored around the body parse.
+        const ctrl = self.enterControlScope();
+        defer self.exitControlScope(ctrl);
         const body = try self.parseBlock();
         // §15.1.1 Early Error: a "use strict" directive is forbidden when the parameter list is
         // non-simple (has defaults, patterns, or a rest element).
@@ -988,6 +1178,8 @@ pub const Parser = struct {
         self.in_method = true;
         self.in_derived_ctor = false;
         self.in_static_block = true; // §15.7.11: `await` is reserved inside the block
+        const ctrl = self.enterControlScope(); // §14.13: a static block starts a fresh label scope
+        defer self.exitControlScope(ctrl);
         const body = try self.parseBlock();
         return .{ .kind = .static_block, .is_static = true, .value = .{ .block = body } };
     }
@@ -1197,6 +1389,8 @@ pub const Parser = struct {
         // or a future-reserved word.
         if (body_strict and paramsHaveStrictReserved(pl)) return ParseError.UnexpectedToken;
         self.strict = body_strict;
+        const ctrl = self.enterControlScope(); // §14.13: an arrow body starts a fresh label scope
+        defer self.exitControlScope(ctrl);
         const body: []const ast.Stmt = if (self.peek().kind == .lbrace)
             // ConciseBody : { FunctionBody }
             try self.parseBlock()
@@ -1733,6 +1927,8 @@ pub const Parser = struct {
             (self.peek().kind == .lbrace and directivePrologueIsStrict(self.tokens[self.idx + 1 ..]));
         if (body_strict and paramsHaveStrictReserved(pl)) return ParseError.UnexpectedToken;
         self.strict = body_strict;
+        const ctrl = self.enterControlScope(); // §14.13: a method body starts a fresh label scope
+        defer self.exitControlScope(ctrl);
         const body = try self.parseBlock();
         if (!isSimpleParameterList(pl) and bodyHasUseStrict(body)) return ParseError.UnexpectedToken;
         return body;
@@ -2433,6 +2629,8 @@ fn stmtContainsArguments(stmt: ast.Stmt) bool {
             return false;
         },
         .while_stmt => |s| return containsArguments(s.cond) or stmtContainsArguments(s.body.*),
+        .do_while_stmt => |s| return containsArguments(s.cond) or stmtContainsArguments(s.body.*),
+        .labeled_stmt => |s| return stmtContainsArguments(s.body.*),
         .for_stmt => |s| {
             if (s.init) |i| if (stmtContainsArguments(i.*)) return true;
             if (s.cond) |c| if (containsArguments(c)) return true;
@@ -2526,7 +2724,7 @@ fn startsAccessorName(kind: lex.TokenKind) bool {
 /// ReservedWord is a valid IdentifierName key.
 fn isKeywordName(kind: lex.TokenKind) bool {
     return switch (kind) {
-        .kw_true, .kw_false, .kw_null, .kw_var, .kw_let, .kw_const, .kw_function, .kw_return, .kw_this, .kw_if, .kw_else, .kw_while, .kw_for, .kw_throw, .kw_try, .kw_catch, .kw_finally, .kw_break, .kw_continue, .kw_typeof, .kw_void, .kw_delete, .kw_new, .kw_instanceof, .kw_switch, .kw_case, .kw_default, .kw_import, .kw_class, .kw_extends, .kw_super, .kw_in => true,
+        .kw_true, .kw_false, .kw_null, .kw_var, .kw_let, .kw_const, .kw_function, .kw_return, .kw_this, .kw_if, .kw_else, .kw_while, .kw_do, .kw_for, .kw_throw, .kw_try, .kw_catch, .kw_finally, .kw_break, .kw_continue, .kw_typeof, .kw_void, .kw_delete, .kw_new, .kw_instanceof, .kw_switch, .kw_case, .kw_default, .kw_import, .kw_class, .kw_extends, .kw_super, .kw_in => true,
         else => false,
     };
 }

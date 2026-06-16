@@ -253,6 +253,9 @@ pub const Stmt = union(enum) {
     ret: ?*const Node, // §14.10 return statement
     if_stmt: struct { cond: *const Node, then: *const Stmt, otherwise: ?*const Stmt }, // §14.6
     while_stmt: struct { cond: *const Node, body: *const Stmt }, // §14.7.3
+    /// §14.7.2 `do Statement while ( Expression ) ;` — the body runs first, then the condition is
+    /// tested and the loop repeats while it is truthy. The body always executes at least once.
+    do_while_stmt: struct { cond: *const Node, body: *const Stmt },
     for_stmt: struct { init: ?*const Stmt, cond: ?*const Node, update: ?*const Node, body: *const Stmt }, // §14.7.4
     /// §14.7.5 `for (HEAD in EXPR) BODY` — enumerate the enumerable string-keyed property names of EXPR
     /// and its prototype chain (each once), binding each to HEAD. A null/undefined EXPR runs the body 0×.
@@ -267,9 +270,18 @@ pub const Stmt = union(enum) {
         catch_block: ?[]const Stmt,
         finally_block: ?[]const Stmt,
     },
-    break_stmt, // §14.9
-    continue_stmt, // §14.8
+    /// §14.9 BreakStatement `break [LabelIdentifier] ;` — `label` is null for an unlabeled break
+    /// (targets the innermost iteration/switch), or the target label name otherwise.
+    break_stmt: ?[]const u8,
+    /// §14.8 ContinueStatement `continue [LabelIdentifier] ;` — `label` is null for an unlabeled
+    /// continue (targets the innermost iteration), or the target loop's label name otherwise.
+    continue_stmt: ?[]const u8,
     switch_stmt: struct { discriminant: *const Node, cases: []const Case }, // §14.12
+    /// §14.13 LabelledStatement `LabelIdentifier : Statement`. `label` is the label name; `body` is
+    /// the labelled statement. A labelled iteration statement is the target of `break label` /
+    /// `continue label`; any other labelled statement is the target of `break label` only. Multiple
+    /// labels (`a: b: stmt`) nest as `labeled_stmt{ a, labeled_stmt{ b, stmt } }`.
+    labeled_stmt: struct { label: []const u8, body: *const Stmt },
 };
 
 /// A `switch` case; `test_expr == null` for `default`.

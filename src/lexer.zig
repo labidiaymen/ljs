@@ -18,6 +18,7 @@ pub const TokenKind = enum {
     kw_if,
     kw_else,
     kw_while,
+    kw_do, // do (DoWhileStatement, §14.7.2)
     kw_for,
     kw_throw,
     kw_try,
@@ -206,6 +207,7 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, word, "if")) return .{ .kind = .kw_if, .lexeme = word };
             if (std.mem.eql(u8, word, "else")) return .{ .kind = .kw_else, .lexeme = word };
             if (std.mem.eql(u8, word, "while")) return .{ .kind = .kw_while, .lexeme = word };
+            if (std.mem.eql(u8, word, "do")) return .{ .kind = .kw_do, .lexeme = word };
             if (std.mem.eql(u8, word, "for")) return .{ .kind = .kw_for, .lexeme = word };
             if (std.mem.eql(u8, word, "throw")) return .{ .kind = .kw_throw, .lexeme = word };
             if (std.mem.eql(u8, word, "try")) return .{ .kind = .kw_try, .lexeme = word };

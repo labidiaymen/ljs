@@ -744,6 +744,62 @@ test "M10 classes: declaration in statement position is block-scoped (§15.7 / �
     try expectNumber("function* g() { yield 5; } g().next().value", 5);
 }
 
+test "M10 do-while (§14.7.2): body runs, condition re-tests, at least once" {
+    // accumulate while i<3
+    try expectNumber("var i=0,s=0; do { s+=i; i++ } while (i<3); s", 3);
+    // body runs at least once even when the condition is false up front
+    try expectNumber("var n=0; do n++; while(false); n", 1);
+    // unlabeled break exits the do-while
+    try expectNumber("var i=0; do { if (i==2) break; i++ } while (i<10); i", 2);
+    // unlabeled continue re-tests the condition (does NOT skip the increment here)
+    try expectNumber("var i=0,s=0; do { i++; if (i==2) continue; s+=i } while (i<4); s", 8); // 1+3+4
+    // trailing `;` is ASI-optional: `do x; while(c)` with no explicit `;` still parses
+    try expectNumber("var i=0; do i++; while(i<3) i", 3);
+}
+
+test "M10 labeled break/continue (§14.13/§14.9/§14.8)" {
+    // labeled break exits BOTH loops; the outer i stops at 0 (break fires when j==1, i still 0)
+    try expectNumber("var i,j,last=-1; outer: for(i=0;i<3;i++){ for(j=0;j<3;j++){ if(j==1) break outer; last=i*10+j } } last", 0);
+    // labeled continue restarts the OUTER loop: inner never increments s (continue before s++)
+    try expectNumber("var s=0; outer: for(var i=0;i<3;i++){ for(var j=0;j<3;j++){ if(j==0) continue outer; s++ } } s", 0);
+    // labeled continue that does some work first: inner runs once per outer (j==1 continues outer)
+    try expectNumber("var s=0; outer: for(var i=0;i<3;i++){ for(var j=0;j<3;j++){ s++; if(j==0) continue outer } } s", 3);
+    // labeled break on a do-while loop
+    try expectNumber("var n=0; L: do { n++; if (n==2) break L; } while (n<10); n", 2);
+    // a labeled block: `break label` exits the block, skipping the rest
+    try expectNumber("var x=1; blk: { x=2; break blk; x=99; } x", 2);
+    // label on a while loop, continue label
+    try expectNumber("var i=0,s=0; L: while(i<5){ i++; if(i%2==0) continue L; s+=i } s", 9); // 1+3+5
+    // unlabeled break/continue still work inside a single loop
+    try expectNumber("var s=0; for(var i=0;i<5;i++){ if(i==3) break; s+=i } s", 3); // 0+1+2
+    try expectNumber("var s=0; for(var i=0;i<5;i++){ if(i%2==0) continue; s+=i } s", 4); // 1+3
+    // a label on a BLOCK only labels the block, NOT a loop nested inside it: an unlabeled break
+    // inside that loop exits only the inner loop, and `break L` exits the block.
+    try expectNumber("var s=0; L: { for(var i=0;i<5;i++){ if(i==2) break; s+=i } s+=100; } s", 101); // 0+1 then +100
+    try expectNumber("var s=0; L: { for(var i=0;i<5;i++){ s+=i; if(i==1) break L; } s+=100; } s", 1); // 0+1, break L skips +100
+    // a chain of labels on one loop: either label is a valid break target
+    try expectNumber("var c=0; a: b: for(var i=0;i<3;i++){ for(var j=0;j<3;j++){ c++; if(c==2) break a; } } c", 2);
+    // labeled break out of a switch wrapped in a label
+    try expectNumber("var x=0; sw: switch(1){ case 1: x=5; break sw; case 2: x=9; } x", 5);
+}
+
+test "M10 labeled statements: parse-phase Early Errors (§14.13.1/§14.8.1/§14.9.1)" {
+    // break/continue to an undefined label → SyntaxError
+    try expectSyntaxError("for(;;){ break nope; }");
+    try expectSyntaxError("for(;;){ continue nope; }");
+    // continue targeting a non-iteration label is a SyntaxError
+    try expectSyntaxError("blk: { continue blk; }");
+    // duplicate nested label is a SyntaxError
+    try expectSyntaxError("a: a: ;");
+    // a label does not cross a function boundary
+    try expectSyntaxError("L: for(;;){ function f(){ break L; } }");
+    // unlabeled break/continue outside any loop/switch is a SyntaxError
+    try expectSyntaxError("break;");
+    try expectSyntaxError("continue;");
+    // `continue` is illegal inside a switch (no enclosing iteration)
+    try expectSyntaxError("switch(0){ case 0: continue; }");
+}
+
 test "M4 classes: body is strict (Cycle 1, §15.7)" {
     // §15.7: a class body is always strict, so a method binding `eval`/`arguments` as a param is a
     // SyntaxError even with no directive and in sloppy RunMode.

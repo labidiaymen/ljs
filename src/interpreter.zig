@@ -62,6 +62,33 @@ pub const Interpreter = struct {
     /// for the generator ping-pong handoff. `global_single_threaded` spins up no thread pool (futex ops
     /// are pool-independent), so this is free for ordinary (non-generator) execution.
     io: std.Io = std.Io.Threaded.global_single_threaded.io(),
+    /// §14.13 the label name(s) that apply to the statement about to be evaluated — populated by
+    /// `labeled_stmt` (a chain `a: b: stmt` leaves `["a","b"]` here), consumed by an iteration
+    /// statement which snapshots them as its own labels and clears this back to empty before running
+    /// its body. Empty for every unlabeled statement (the hot-loop fast path: a label-less `break`/
+    /// `continue` against an empty label set needs no comparison).
+    pending_labels: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    /// §14.9/§14.8: is an abrupt `.brk`/`.cont` completion (carrying `comp_label`) targeted at a loop
+    /// whose applicable labels are `my_labels`? An unlabeled completion (`comp_label == null`) targets
+    /// the innermost loop (always a match); a labelled one matches only if its label is among `my_labels`.
+    inline fn loopHandles(comp_label: ?[]const u8, my_labels: []const []const u8) bool {
+        const lbl = comp_label orelse return true; // unlabeled → innermost loop catches it
+        for (my_labels) |m| if (std.mem.eql(u8, m, lbl)) return true;
+        return false;
+    }
+
+    /// Snapshot the labels applying to the iteration/switch statement now being evaluated and clear
+    /// `pending_labels` (so the statement's own body inherits no labels). Hot-loop fast path: an
+    /// unlabeled loop sees an empty set and returns an empty slice with no allocation. A labelled loop
+    /// dupes the names into the arena (the live buffer may be mutated by nested labelled statements).
+    fn takeLabels(self: *Interpreter) []const []const u8 {
+        const n = self.pending_labels.items.len;
+        if (n == 0) return &.{};
+        const out = self.arena.dupe([]const u8, self.pending_labels.items) catch &.{};
+        self.pending_labels.clearRetainingCapacity();
+        return out;
+    }
 
     pub fn run(self: *Interpreter, program: ast.Program, env: *Environment) EvalError!Completion {
         var last: Completion = .{ .normal = .undefined };
@@ -81,6 +108,11 @@ pub const Interpreter = struct {
 
     fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError!Completion {
         try self.tick();
+        // §14.13: the label(s) applying to THIS statement (set by an enclosing `labeled_stmt`) belong
+        // to this statement alone — capture them and clear `pending_labels` so they don't leak into any
+        // nested statement (e.g. `L: { for(;;)… }` — `L` labels the block, NOT the inner loop). Only an
+        // iteration/switch statement uses `my_labels`; the hot path (no label) takes an empty slice.
+        const my_labels = self.takeLabels();
         switch (stmt) {
             .expr => |e| return self.evalExpr(e, env),
             .declaration => |d| {
@@ -156,10 +188,27 @@ pub const Interpreter = struct {
                     if (!toBoolean(cc.normal)) break;
                     const bc = try self.evalStmt(s.body.*, env);
                     switch (bc) {
-                        .normal, .cont => {},
-                        .brk => break,
+                        .normal => {},
+                        .cont => |l| if (!loopHandles(l, my_labels)) return bc, // labelled `continue` for an outer loop
+                        .brk => |l| if (loopHandles(l, my_labels)) break else return bc,
                         .ret, .throw => return bc,
                     }
+                }
+                return .{ .normal = .undefined };
+            },
+            .do_while_stmt => |s| {
+                // §14.7.2 DoWhileStatement — body runs first, then the condition gates repetition.
+                while (true) {
+                    const bc = try self.evalStmt(s.body.*, env);
+                    switch (bc) {
+                        .normal => {},
+                        .cont => |l| if (!loopHandles(l, my_labels)) return bc,
+                        .brk => |l| if (loopHandles(l, my_labels)) break else return bc,
+                        .ret, .throw => return bc,
+                    }
+                    const cc = try self.evalExpr(s.cond, env);
+                    if (cc.isAbrupt()) return cc;
+                    if (!toBoolean(cc.normal)) break;
                 }
                 return .{ .normal = .undefined };
             },
@@ -178,8 +227,9 @@ pub const Interpreter = struct {
                     }
                     const bc = try self.evalStmt(s.body.*, loop_env);
                     switch (bc) {
-                        .normal, .cont => {}, // continue falls through to the update
-                        .brk => break,
+                        .normal => {}, // fall through to the update
+                        .cont => |l| if (!loopHandles(l, my_labels)) return bc, // for our loop: fall through to update
+                        .brk => |l| if (loopHandles(l, my_labels)) break else return bc,
                         .ret, .throw => return bc,
                     }
                     if (s.update) |u| {
@@ -189,8 +239,8 @@ pub const Interpreter = struct {
                 }
                 return .{ .normal = .undefined };
             },
-            .for_in_stmt => |s| return self.evalForIn(s, env),
-            .for_of_stmt => |s| return self.evalForOf(s, env),
+            .for_in_stmt => |s| return self.evalForIn(s, env, my_labels),
+            .for_of_stmt => |s| return self.evalForOf(s, env, my_labels),
             .throw_stmt => |e| {
                 // §14.14 ThrowStatement.
                 const c = try self.evalExpr(e, env);
@@ -211,10 +261,28 @@ pub const Interpreter = struct {
                 }
                 return result;
             },
-            .break_stmt => return .brk,
-            .continue_stmt => return .cont,
+            .break_stmt => |label| return .{ .brk = label },
+            .continue_stmt => |label| return .{ .cont = label },
+            .labeled_stmt => |s| {
+                // §14.13 LabelledStatement. The labels applying to THIS statement (`my_labels`, captured
+                // and cleared at the top) plus this label are republished as `pending_labels` for the
+                // immediately-nested statement: an iteration/switch statement snapshots the whole set (so
+                // `continue label`/`break label` and a chain `a: b: for…` target it); a non-iteration
+                // labelled statement (e.g. a block) absorbs a matching `break label` here.
+                self.pending_labels.clearRetainingCapacity();
+                for (my_labels) |l| try self.pending_labels.append(self.arena, l);
+                try self.pending_labels.append(self.arena, s.label);
+                const bc = try self.evalStmt(s.body.*, env);
+                self.pending_labels.clearRetainingCapacity(); // consumed (or unused by a non-loop body)
+                switch (bc) {
+                    .brk => |l| if (l != null and std.mem.eql(u8, l.?, s.label)) return .{ .normal = .undefined },
+                    else => {},
+                }
+                return bc;
+            },
             .switch_stmt => |s| {
-                // §14.12 SwitchStatement — match by ===, fall through, `break` exits.
+                // §14.12 SwitchStatement — match by ===, fall through, `break` exits. A switch is a
+                // `break` target (label-less, or labelled when wrapped in `L:`), never a `continue` one.
                 const dc = try self.evalExpr(s.discriminant, env);
                 if (dc.isAbrupt()) return dc;
                 const sw_env = try Environment.create(self.arena, env);
@@ -238,7 +306,7 @@ pub const Interpreter = struct {
                         const bc = try self.runBlock(case.body, sw_env);
                         switch (bc) {
                             .normal => {},
-                            .brk => return .{ .normal = .undefined },
+                            .brk => |l| if (loopHandles(l, my_labels)) return .{ .normal = .undefined } else return bc,
                             .ret, .throw, .cont => return bc,
                         }
                     }
@@ -259,7 +327,7 @@ pub const Interpreter = struct {
     }
 
     /// §14.7.5 `for (HEAD in EXPR)` — ForIn/OfHeadEvaluation (enumerate) + ForIn/OfBodyEvaluation.
-    fn evalForIn(self: *Interpreter, s: anytype, env: *Environment) EvalError!Completion {
+    fn evalForIn(self: *Interpreter, s: anytype, env: *Environment, my_labels: []const []const u8) EvalError!Completion {
         // §14.7.5.6 step 7.a: a null/undefined operand → the body never runs (no throw).
         const rc = try self.evalExpr(s.right, env);
         if (rc.isAbrupt()) return rc;
@@ -273,8 +341,9 @@ pub const Interpreter = struct {
             if (hb.completion.isAbrupt()) return hb.completion;
             const bc = try self.evalStmt(s.body.*, hb.env);
             switch (bc) {
-                .normal, .cont => {},
-                .brk => break,
+                .normal => {},
+                .cont => |l| if (!loopHandles(l, my_labels)) return bc,
+                .brk => |l| if (loopHandles(l, my_labels)) break else return bc,
                 .ret, .throw => return bc,
             }
         }
@@ -286,7 +355,7 @@ pub const Interpreter = struct {
     /// `IteratorValue` → bind to HEAD → run body, and `IteratorClose` (call `return()`) on an early exit
     /// (`break`/`return`/`throw`). Any object with a `[Symbol.iterator]` works; Arrays/Strings use a fast
     /// native iterator. A non-iterable operand → TypeError.
-    fn evalForOf(self: *Interpreter, s: anytype, env: *Environment) EvalError!Completion {
+    fn evalForOf(self: *Interpreter, s: anytype, env: *Environment, my_labels: []const []const u8) EvalError!Completion {
         const rc = try self.evalExpr(s.right, env);
         if (rc.isAbrupt()) return rc;
         const git = try self.getIterator(rc.normal);
@@ -308,10 +377,18 @@ pub const Interpreter = struct {
             }
             const bc = try self.evalStmt(s.body.*, hb.env);
             switch (bc) {
-                .normal, .cont => {},
-                .brk => {
+                .normal => {},
+                .cont => |l| {
+                    // A `continue` for our loop steps to the next value; a labelled one for an outer
+                    // loop is an abrupt exit of THIS loop — close the iterator and propagate (§7.4.11).
+                    if (!loopHandles(l, my_labels)) {
+                        try self.iteratorClose(iterator);
+                        return bc;
+                    }
+                },
+                .brk => |l| {
                     try self.iteratorClose(iterator); // §14.7.5.7 step 11.b.iii: break closes the iterator
-                    break;
+                    if (loopHandles(l, my_labels)) break else return bc; // outer-targeted break still propagates
                 },
                 .ret, .throw => {
                     try self.iteratorClose(iterator);
@@ -1604,6 +1681,11 @@ pub const Interpreter = struct {
         const saved_home = self.home_object;
         if (!fd.is_arrow) self.home_object = fd.home_object;
         defer self.home_object = saved_home;
+        // §14.13: labels do not cross a function boundary — the body starts with no pending label
+        // (e.g. a call inside a labelled statement must not leak that label into the callee's loops).
+        const saved_labels = self.pending_labels;
+        self.pending_labels = .empty;
+        defer self.pending_labels = saved_labels;
 
         for (fd.body) |stmt| {
             const c = try self.evalStmt(stmt, call_env);
@@ -1611,7 +1693,7 @@ pub const Interpreter = struct {
                 .normal => {},
                 .ret => |v| return .{ .normal = v },
                 .throw => return c,
-                .brk, .cont => {}, // not produced inside a function body in M1
+                .brk, .cont => {}, // not produced inside a function body (loops/labels consume them)
             }
         }
         return .{ .normal = .undefined }; // implicit return
