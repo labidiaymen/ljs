@@ -1253,3 +1253,59 @@ test "M6 enumerable-awareness: for-in & spread skip non-enumerable / proto metho
     try expectBool("var spread={...{a:1,b:2}}; spread.hasOwnProperty('a') && spread.hasOwnProperty('b')", true);
     try expectStr("var o={}; Object.defineProperty(o,'h',{value:1,enumerable:false}); o.v=2; var s=''; for(var k in {...o}) s+=k; s", "v");
 }
+
+test "M6 Function.prototype.call (Cycle 2, §20.2.3.3)" {
+    // `this` = thisArg, remaining args forwarded.
+    try expectNumber("function f(a){return this.x+a} f.call({x:1}, 2)", 3);
+    try expectNumber("function f(a,b){return this.x+a+b} f.call({x:1}, 2, 3)", 6);
+    // No thisArg / no args.
+    try expectNumber("function f(){return 42} f.call()", 42);
+    // `.call` resolves on every function (inherited from %Function.prototype%).
+    try expectBool("typeof Function.prototype.call === 'function'", true);
+    // A built-in method works via .call ([].push.call(obj,...) style — array method on an array-like is
+    // M-subset, but the resolution + invocation path is what we assert here).
+    try expectNumber("function id(x){return x} id.call(null, 7)", 7);
+    // Calling .call on a non-function throws.
+    try expectThrows("Function.prototype.call.call(5)");
+}
+
+test "M6 Function.prototype.apply (Cycle 2, §20.2.3.1)" {
+    try expectNumber("function f(a){return this.x+a} f.apply({x:10}, [5])", 15);
+    try expectNumber("function f(a,b){return a+b} f.apply(null, [2,3])", 5);
+    // null/undefined argArray → no args.
+    try expectNumber("function f(){return 99} f.apply(null)", 99);
+    try expectNumber("function f(){return 99} f.apply(null, null)", 99);
+    try expectNumber("function f(){return 99} f.apply(null, undefined)", 99);
+    // array-like (has length + indices) is accepted.
+    try expectNumber("function f(a,b){return a+b} f.apply(null, {0:4, 1:6, length:2})", 10);
+    // a non-object, non-nullish argArray → TypeError.
+    try expectThrows("function f(){} f.apply(null, 5)");
+}
+
+test "M6 Function.prototype.bind (Cycle 2, §20.2.3.2)" {
+    // Fixes `this`.
+    try expectNumber("function f(a){return this.x+a} var g=f.bind({x:100}); g(1)", 101);
+    // Partial application: bound args prepend, then call args.
+    try expectNumber("function f(a){return this.x+a} f.bind({x:1},2)()", 3);
+    try expectNumber("function f(a,b){return a+b} var g=f.bind(null, 10); g(5)", 15);
+    try expectNumber("function f(a,b,c){return a+b+c} var g=f.bind(null,1,2); g(3)", 6);
+    // The bound function is itself callable and is `typeof "function"`.
+    try expectBool("typeof (function(){}).bind(null) === 'function'", true);
+    // Re-binding a bound function chains the bound args (1 then 2,3 then call 4).
+    try expectNumber("function f(a,b,c,d){return a+b+c+d} var g=f.bind(null,1).bind(null,2,3); g(4)", 10);
+    // A method used as a callback via bind keeps its receiver.
+    try expectNumber("var o={x:5, get:function(){return this.x}}; var cb=o.get.bind(o); cb()", 5);
+}
+
+test "M6 bind + new constructs the target, ignoring bound this (Cycle 2, §10.4.1.2)" {
+    // `new` on a bound function constructs the target; bound-this is ignored, bound args prepend.
+    try expectNumber("function C(a,b){this.s=a+b} var B=C.bind(null, 10); var o=new B(5); o.s", 15);
+    try expectNumber("function C(a){this.v=a} var B=C.bind({ignored:1}, 7); (new B()).v", 7);
+}
+
+test "M6 propertyHelper-style call.bind idiom (Cycle 2, §20.2.3)" {
+    // The exact propertyHelper.js line-31 pattern: Function.prototype.call.bind(hasOwnProperty)
+    // yields a free function `hasOwn(obj, key)`.
+    try expectBool("var hasOwn=Function.prototype.call.bind(Object.prototype.hasOwnProperty); hasOwn({a:1},'a')", true);
+    try expectBool("var hasOwn=Function.prototype.call.bind(Object.prototype.hasOwnProperty); hasOwn({a:1},'b')", false);
+}

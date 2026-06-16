@@ -82,14 +82,33 @@ net regression on the continuity gate.
   enforcement; strict `[[Set]]` non-writable rejection; the full §10.1.6.3 invariant matrix; Symbol /
   integer-key ordering.
 
-## Cycle 2 — `Function.prototype.call` / `apply` / `bind` (§20.2.3) — completes the propertyHelper.js unblock
-- [ ] M6-T110 A real `Function.prototype` object (global `Function` ctor), carrying non-enumerable
-  `call` (§20.2.3.3), `apply` (§20.2.3.1), `bind` (§20.2.3.2). `call`/`apply` re-dispatch to
-  `callFunction` with the given receiver + args; `bind` returns a bound-function exotic (prepends bound
-  args, fixes `this`). Function objects proto-link to `Function.prototype` so `f.call`/`f.bind` resolve.
-  Expected: propertyHelper.js fully LOADS and `verifyProperty` becomes callable → the `class/*`
-  `verifyProperty` positives in `language/expressions` recover (the main M6 conformance lever). Bench +
-  regression hunt gated as always.
+## Cycle 2 — `Function.prototype.call` / `apply` / `bind` (§20.2.3) — completes the propertyHelper.js unblock 🎯 (DONE — continuity gate (`language/expressions`, harness): passed 6139 → **6387** (+248), **0 true regressions / 248 recoveries** by `mode+path`; conformance 36.2% → **37.6%**. propertyHelper.js now FULLY LOADS and `verifyProperty` is callable + correct (verified by a direct prelude eval: sta.js + assert.js + propertyHelper.js + `verifyProperty({a:1},'a',{...}); "PH_OK"` → `"PH_OK"`). Recoveries by category: **116 `class`** (the `verifyProperty`-using `class/elements/*` field/method tests — the main lever), 21 `object`, 20 `call`, 16 `new`, 14 each `arrow-function`/`super`/`array`, 12 `function`, 4 `exponentiation`, 3 `delete`, 2 each of the comparison/inc-dec/modulus operator tests (Math.pow + verifyProperty on operator-semantics tests). Bench green: `perf: ok (no ljs-vs-self regression)`, ljs 0.2–0.6× Node (loop_mix −5.9% / loop_sum +3.4% / str_build −10.8% vs base, all `ok` — the ordinary-call hot path holds: bound check is a cheap optional branch, `arguments` binding is one arena alloc + small map per non-arrow call). Committed baseline bumped 6139 → 6387.)
+- [x] M6-T110 A real %Function.prototype% object (global `Function` ctor's `.prototype`), carrying
+  non-enumerable `call` (§20.2.3.3), `apply` (§20.2.3.1), `bind` (§20.2.3.2). `call`/`apply` re-dispatch
+  to `callFunction` with the given receiver + args (`apply` via §7.3.18 CreateListFromArrayLike:
+  Array → elements, null/undefined → none, array-like via `.length`, else TypeError); `bind` returns a
+  §10.4.1 Bound Function Exotic Object (`Object.bound = {target, bound_this, bound_args}`) that prepends
+  bound args + fixes `this`. `callFunction` detects `.bound` as a cheap early branch and forwards;
+  `evalNew` unwraps a bound chain and `[[Construct]]`s the underlying target (ignoring bound-this,
+  §10.4.1.2) via the extracted `construct(ctor, args)` helper. %Function.prototype% is itself a callable
+  → undefined (`function_proto_noop`). EVERY function object proto-links to %Function.prototype%:
+  ordinary AST closures / func decls / class ctors / object+class methods (via `evalFunctionExpr`),
+  arrows, native built-ins (`defineMethod` + each native ctor), and bound functions — so
+  `f.call`/`.apply`/`.bind` resolve universally.
+- [x] M6-T120 **Unblock follow-through (beyond call/apply/bind):** propertyHelper.js's module top also
+  needs `Math.pow` (line 35, §21.3.2.26) and `verifyProperty` needs the `arguments` object
+  (`arguments.length`, line 47). Added: a minimal §21.3 `Math` namespace (`pow`/`floor`/`ceil`/`abs`/
+  `round`/`trunc`/`sign`/`sqrt`/`max`/`min`, non-enumerable, ToNumber-coercing) and a §10.4.4
+  `arguments` exotic binding for ordinary (non-arrow) functions — an ordinary array-like object
+  (indexed data props + non-enumerable `length`, NOT an Array exotic so `Array.isArray(arguments)` is
+  false), skipped when a parameter shadows the name. Without these the file loaded but `verifyProperty`
+  threw at the first invocation; with them the FULL unblock lands (the 116-`class` recovery).
+- [x] **Tests (`src/engine.zig`, all green):** `f.call({x:1},2)` → 3; `f.apply({x:10},[5])` → 15; apply
+  with null/undefined/array-like argArray + non-object TypeError; `g=f.bind({x:100}); g(1)` → 101;
+  partial application `f.bind({x:1},2)()` → 3 and `f.bind(null,1,2)(3)` → 6; re-bind chaining; a method
+  as a callback via bind keeps its receiver; `new (C.bind(null,10))(5)` constructs C ignoring bound-this;
+  the exact propertyHelper line-31 idiom `Function.prototype.call.bind(Object.prototype.hasOwnProperty)`
+  yields a working `hasOwn(obj,key)` predicate.
 
 ## Cycle 3 — `Object.keys`/`values`/`entries`/`create`/`assign`/`freeze`/`getPrototypeOf`/`setPrototypeOf` + close
 - [ ] M6-T210 `Object.keys`/`values`/`entries` (§20.1.2.16/.21/.5 — own enumerable string keys/values/

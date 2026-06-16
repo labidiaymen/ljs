@@ -105,6 +105,7 @@ pub const Interpreter = struct {
             .func_decl => |f| {
                 // §15.2 — bind a function object to its name in the current scope.
                 const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env });
+                obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
                 if (f.name) |name| try env.declare(name, .{ .object = obj }, true, true);
                 return .{ .normal = .undefined };
             },
@@ -768,7 +769,33 @@ pub const Interpreter = struct {
         if (cc.normal != .object or cc.normal.object.kind != .function) {
             return self.throwError("TypeError", "value is not a constructor");
         }
-        const ctor = cc.normal.object;
+        // §10.4.1.2 [[Construct]] of a Bound Function Exotic Object: ignore [[BoundThis]], construct the
+        // (possibly nested) target with [[BoundArguments]] ++ callArgs. Collect the prepended bound args
+        // by unwrapping any chain of bound functions, then `new` the underlying target.
+        if (cc.normal.object.bound != null) {
+            var bound_prefix: []const Value = &.{};
+            var inner: *Object = cc.normal.object;
+            while (inner.bound) |b| {
+                bound_prefix = try self.concatArgs(b.bound_args, bound_prefix);
+                inner = b.target;
+            }
+            var call_args: std.ArrayListUnmanaged(Value) = .empty;
+            const alc = try self.evalSpreadList(n.args, env, &call_args);
+            if (alc.isAbrupt()) return alc;
+            const merged = try self.concatArgs(bound_prefix, call_args.items);
+            return self.construct(inner, merged);
+        }
+        var args: std.ArrayListUnmanaged(Value) = .empty;
+        const alc = try self.evalSpreadList(n.args, env, &args);
+        if (alc.isAbrupt()) return alc;
+        return self.construct(cc.normal.object, args.items);
+    }
+
+    /// §10.2.2 [[Construct]] — instantiate `ctor` with already-evaluated `args`. Creates the new object
+    /// (proto = `ctor.prototype`), runs base/derived class field + `super` ordering, invokes the
+    /// constructor body with `this` = the new object, and returns an explicit object return if any.
+    /// Shared by `new C()` and a bound function's [[Construct]] (§10.4.1.2).
+    fn construct(self: *Interpreter, ctor: *Object, args: []const Value) EvalError!Completion {
         // §15.3: arrow functions have no [[Construct]] — `new (() => {})` is a TypeError.
         if (ctor.call) |fd| {
             if (fd.is_arrow) return self.throwError("TypeError", "value is not a constructor");
@@ -778,10 +805,6 @@ pub const Interpreter = struct {
             if (pv == .object) proto = pv.object;
         }
         const new_obj = try Object.create(self.arena, proto);
-
-        var args: std.ArrayListUnmanaged(Value) = .empty;
-        const alc = try self.evalSpreadList(n.args, env, &args);
-        if (alc.isAbrupt()) return alc;
 
         const is_derived = if (ctor.call) |fd| fd.is_derived_ctor else false;
 
@@ -803,7 +826,7 @@ pub const Interpreter = struct {
             if (fd.body.len == 0) {
                 if (fd.super_ctor) |sup| {
                     // Run the parent constructor (base or derived) on the new instance.
-                    const pc = try self.runParentCtor(sup, args.items, new_obj);
+                    const pc = try self.runParentCtor(sup, args, new_obj);
                     if (pc.isAbrupt()) return pc;
                 }
                 // Then this class's own fields.
@@ -813,7 +836,7 @@ pub const Interpreter = struct {
             }
         }
 
-        const result = try self.callFunction(ctor, args.items, .{ .object = new_obj });
+        const result = try self.callFunction(ctor, args, .{ .object = new_obj });
         if (result.isAbrupt()) return result;
         if (result.normal == .object) return .{ .normal = result.normal }; // explicit object return wins
         return .{ .normal = .{ .object = new_obj } };
@@ -1127,6 +1150,7 @@ pub const Interpreter = struct {
             .is_derived_ctor = is_derived,
             .super_ctor = super_ctor,
         });
+        ctor.prototype = self.functionProto(); // §20.2.3 default; a derived class overrides to Super below
         // The constructor's `.prototype` object holds the instance methods.
         const proto: *Object = blk: {
             const pv = ctor.get("prototype") orelse break :blk try Object.create(self.arena, null);
@@ -1313,6 +1337,7 @@ pub const Interpreter = struct {
             .is_arrow = f.is_arrow,
             .captured_this = if (f.is_arrow) self.this_val else .undefined,
         });
+        obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
         return .{ .normal = .{ .object = obj } };
     }
 
@@ -1413,6 +1438,13 @@ pub const Interpreter = struct {
 
     /// §10.2.1 [[Call]] — native built-in, else an ordinary AST-closure function.
     pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
+        // §10.4.1.1 [[Call]] of a Bound Function Exotic Object: run the target with `this` =
+        // [[BoundThis]] and args = [[BoundArguments]] ++ callArgs. Cheap early branch (the common
+        // case is `.bound == null`, a single optional test off the hot path).
+        if (func.bound) |b| {
+            const merged = try self.concatArgs(b.bound_args, args);
+            return self.callFunction(b.target, merged, b.bound_this);
+        }
         if (func.native != .none) return self.callNative(func, args, this_val);
         // Each call stacks several heavy native frames — count call depth too so the guard
         // fires before the native stack overflows (these frames are bigger than expr frames).
@@ -1452,6 +1484,21 @@ pub const Interpreter = struct {
                 if (bc.isAbrupt()) return bc;
             }
         }
+        // §10.4.4 / §15.1: an ordinary (non-arrow) function gets an `arguments` exotic binding holding
+        // the call-site args (indexed data properties + a non-enumerable `length`). M-subset: an
+        // ordinary object (NOT an Array exotic, so `Array.isArray(arguments)` is false) supporting
+        // `arguments.length` / `arguments[i]` — what propertyHelper.js's `verifyProperty` reads. Skipped
+        // when a parameter (or the rest binding) already binds the name `arguments` (it shadows). Arrows
+        // inherit the enclosing `arguments` lexically, so they get none of their own.
+        if (!fd.is_arrow and call_env.lookupLocal("arguments") == null) {
+            const ao = try Object.create(self.arena, self.objectProto());
+            for (args, 0..) |a, i| {
+                const key = try numberToString(self.arena, @floatFromInt(i));
+                try ao.set(key, a);
+            }
+            try ao.defineData("length", .{ .number = @floatFromInt(args.len) }, true, false, true);
+            try call_env.declare("arguments", .{ .object = ao }, true, true);
+        }
         // §15.3: an arrow has no own `this` binding — it uses the `this` captured at creation,
         // ignoring however it was called. Ordinary functions take the call-site `this`.
         const saved_this = self.this_val;
@@ -1474,6 +1521,17 @@ pub const Interpreter = struct {
             }
         }
         return .{ .normal = .undefined }; // implicit return
+    }
+
+    /// Concatenate two argument slices into a freshly-allocated slice (`a ++ b`). Used by the bound
+    /// function [[Call]]/[[Construct]] (§10.4.1) to prepend [[BoundArguments]] before the call args.
+    fn concatArgs(self: *Interpreter, a: []const Value, b: []const Value) EvalError![]const Value {
+        if (a.len == 0) return b;
+        if (b.len == 0) return a;
+        const out = try self.arena.alloc(Value, a.len + b.len);
+        @memcpy(out[0..a.len], a);
+        @memcpy(out[a.len..], b);
+        return out;
     }
 
     /// §8.6.2 BindingInitialization / §13.15.5.2 — destructure `value` into the bindings of
@@ -1840,6 +1898,19 @@ pub const Interpreter = struct {
         return self.globalProto("Array");
     }
 
+    /// §20.2.3 %Function.prototype% — the [[Prototype]] stamped on every function object (ordinary AST
+    /// closures, classes, arrows, bound) so `fn.call`/`.apply`/`.bind` resolve. Null only in a direct
+    /// unit-test eval with no realm globals (those tests don't call .call/.bind).
+    pub fn functionProto(self: *Interpreter) ?*Object {
+        return self.globalProto("Function");
+    }
+
+    /// §20.1.3 %Object.prototype% — the default [[Prototype]] for ordinary objects (e.g. the implicit
+    /// `arguments` exotic). Null only in a realm-less unit-test eval.
+    pub fn objectProto(self: *Interpreter) ?*Object {
+        return self.globalProto("Object");
+    }
+
     // ── §20.1.2 / §20.1.3 Object reflection ─────────────────────────────────
 
     /// §6.2.6 ToPropertyDescriptor — read a descriptor object's own `value`/`writable`/`get`/`set`/
@@ -2088,6 +2159,119 @@ pub const Interpreter = struct {
         return .{ .normal = .{ .boolean = false } };
     }
 
+    // ── §21.3 Math ──────────────────────────────────────────────────────────
+
+    /// §21.3.2 Math.<name>( ...args ) — the minimal numeric subset (the harness needs `pow`; the rest
+    /// are cheap companions). Each coerces its operands with ToNumber and returns a Number.
+    fn mathMethod(self: *Interpreter, name: []const u8, args: []const Value) EvalError!Completion {
+        _ = self;
+        const x = if (args.len > 0) toNumber(args[0]) else std.math.nan(f64);
+        const y = if (args.len > 1) toNumber(args[1]) else std.math.nan(f64);
+        const r: f64 = blk: {
+            if (std.mem.eql(u8, name, "pow")) break :blk std.math.pow(f64, x, y); // §21.3.2.26
+            if (std.mem.eql(u8, name, "floor")) break :blk @floor(x); // §21.3.2.16
+            if (std.mem.eql(u8, name, "ceil")) break :blk @ceil(x); // §21.3.2.10
+            if (std.mem.eql(u8, name, "round")) break :blk @floor(x + 0.5); // §21.3.2.28 (M-subset)
+            if (std.mem.eql(u8, name, "trunc")) break :blk @trunc(x); // §21.3.2.38
+            if (std.mem.eql(u8, name, "abs")) break :blk @abs(x); // §21.3.2.1
+            if (std.mem.eql(u8, name, "sqrt")) break :blk @sqrt(x); // §21.3.2.32
+            if (std.mem.eql(u8, name, "sign")) break :blk std.math.sign(x); // §21.3.2.30
+            if (std.mem.eql(u8, name, "max")) { // §21.3.2.24
+                var m: f64 = -std.math.inf(f64);
+                for (args) |a| {
+                    const v = toNumber(a);
+                    if (std.math.isNan(v)) break :blk std.math.nan(f64);
+                    if (v > m) m = v;
+                }
+                break :blk m;
+            }
+            if (std.mem.eql(u8, name, "min")) { // §21.3.2.25
+                var m: f64 = std.math.inf(f64);
+                for (args) |a| {
+                    const v = toNumber(a);
+                    if (std.math.isNan(v)) break :blk std.math.nan(f64);
+                    if (v < m) m = v;
+                }
+                break :blk m;
+            }
+            break :blk std.math.nan(f64);
+        };
+        return .{ .normal = .{ .number = r } };
+    }
+
+    // ── §20.2.3 Function.prototype methods ──────────────────────────────────
+
+    /// §20.2.3.1/.2/.3 — `Function.prototype.call`/`apply`/`bind`. `this_val` is the target function
+    /// (the receiver of the method call, e.g. `f` in `f.call(...)`); step 1 of each requires it to be
+    /// callable (TypeError otherwise). `name` selects the method.
+    fn functionPrototypeMethod(self: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
+        // §20.2.3.{1,2,3} step 1: the receiver must be callable.
+        if (this_val != .object or this_val.object.kind != .function) {
+            return self.throwError("TypeError", "Function.prototype method called on non-callable");
+        }
+        const target = this_val.object;
+
+        if (std.mem.eql(u8, name, "call")) {
+            // §20.2.3.3 Function.prototype.call ( thisArg, ...args )
+            const this_arg = if (args.len > 0) args[0] else .undefined;
+            const rest = if (args.len > 1) args[1..] else &.{};
+            return self.callFunction(target, rest, this_arg);
+        }
+
+        if (std.mem.eql(u8, name, "apply")) {
+            // §20.2.3.1 Function.prototype.apply ( thisArg, argArray )
+            const this_arg = if (args.len > 0) args[0] else .undefined;
+            const arg_array = if (args.len > 1) args[1] else .undefined;
+            const call_args = try self.createListFromArrayLike(arg_array);
+            switch (call_args) {
+                .abrupt => |c| return c,
+                .list => |list| return self.callFunction(target, list, this_arg),
+            }
+        }
+
+        if (std.mem.eql(u8, name, "bind")) {
+            // §20.2.3.2 Function.prototype.bind ( thisArg, ...args ) → §10.4.1.3 BoundFunctionCreate.
+            const this_arg = if (args.len > 0) args[0] else .undefined;
+            const bound_args_src = if (args.len > 1) args[1..] else &.{};
+            // Copy the bound args into the realm arena (the caller's `args` slice is transient).
+            const bound_args = try self.arena.dupe(Value, bound_args_src);
+            const bf = try Object.createBound(self.arena, self.functionProto(), .{
+                .target = target,
+                .bound_this = this_arg,
+                .bound_args = bound_args,
+            });
+            return .{ .normal = .{ .object = bf } };
+        }
+
+        return self.throwError("TypeError", "unknown Function.prototype method");
+    }
+
+    /// §7.3.18 CreateListFromArrayLike (§20.2.3.1 step 2): null/undefined → empty list; an Array →
+    /// its elements; any other object → its `0..length-1` indexed values (M-subset: array-likes via
+    /// `.length`); a non-object non-nullish argArray → TypeError.
+    fn createListFromArrayLike(self: *Interpreter, v: Value) EvalError!union(enum) { list: []const Value, abrupt: Completion } {
+        switch (v) {
+            .undefined, .null => return .{ .list = &.{} },
+            .object => |o| {
+                if (o.kind == .array) return .{ .list = o.elements.items };
+                // Generic array-like: read `length` then index 0..length-1.
+                const lc = try self.getProperty(v, "length");
+                if (lc.isAbrupt()) return .{ .abrupt = lc };
+                const n = toNumber(lc.normal);
+                const len: usize = if (n > 0 and n < 1e9) @intFromFloat(n) else 0;
+                const list = try self.arena.alloc(Value, len);
+                for (0..len) |i| {
+                    const key = try numberToString(self.arena, @floatFromInt(i));
+                    const ec = try self.getProperty(v, key);
+                    if (ec.isAbrupt()) return .{ .abrupt = ec };
+                    list[i] = ec.normal;
+                }
+                return .{ .list = list };
+            },
+            else => return .{ .abrupt = (try self.throwError("TypeError", "CreateListFromArrayLike called on non-object")) },
+        }
+    }
+
     /// Dispatch a built-in function (§19/§20). Behavior keyed by `func.native`.
     fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
         switch (func.native) {
@@ -2098,6 +2282,7 @@ pub const Interpreter = struct {
             },
             .array_method => return builtin_array.call(self, func.native_name, this_val, args),
             .string_method => return builtin_string.call(self, func.native_name, this_val, args),
+            .math_method => return self.mathMethod(func.native_name, args),
             else => {},
         }
         switch (func.native) {
@@ -2125,6 +2310,7 @@ pub const Interpreter = struct {
             },
             .object_to_string => return .{ .normal = .{ .string = "[object Object]" } },
             .function_ctor => return self.throwError("TypeError", "Function constructor is not supported"),
+            .function_proto_noop => return .{ .normal = .undefined }, // §20.2.3 %Function.prototype%() → undefined
             .object_define_property => return self.objectDefineProperty(args),
             .object_define_properties => return self.objectDefineProperties(args),
             .object_get_own_property_descriptor => return self.objectGetOwnPropertyDescriptor(args),
@@ -2132,8 +2318,8 @@ pub const Interpreter = struct {
             .object_has_own_property => return self.objectHasOwnProperty(this_val, args),
             .object_property_is_enumerable => return self.objectPropertyIsEnumerable(this_val, args),
             .object_is_prototype_of => return self.objectIsPrototypeOf(this_val, args),
-            .function_method => return self.throwError("TypeError", "Function.prototype method is not supported"),
-            .array_ctor, .array_method, .string_method => unreachable, // handled in the first switch
+            .function_method => return self.functionPrototypeMethod(func.native_name, this_val, args),
+            .array_ctor, .array_method, .string_method, .math_method => unreachable, // handled in the first switch
             .none => unreachable,
         }
     }

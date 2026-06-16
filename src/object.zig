@@ -34,6 +34,19 @@ pub const NativeId = enum {
     object_is_prototype_of, // Object.prototype.isPrototypeOf
     // §20.2.3 Function.prototype methods (Cycle 2)
     function_method, // Function.prototype.<native_name> (call/apply/bind)
+    function_proto_noop, // %Function.prototype% itself — a callable that returns undefined (§20.2.3)
+    // §21.3 Math — `native_name` is the method (`pow`/`floor`/…). The Math namespace object holds these.
+    math_method, // Math.<native_name>
+};
+
+/// §10.4.1 A Bound Function Exotic Object's internal slots: the wrapped target, the bound `this`, and
+/// the prepended bound arguments. When called, the target runs with `this` = [[BoundThis]] and args =
+/// [[BoundArguments]] ++ callArgs; when constructed (`new`), [[BoundThis]] is ignored and the target is
+/// the [[Construct]] callee. Present iff the object is a bound function (`Object.bound != null`).
+pub const BoundData = struct {
+    target: *Object,
+    bound_this: Value,
+    bound_args: []const Value,
 };
 
 /// The closure captured by a function object: parameter patterns, body, and defining scope.
@@ -148,6 +161,10 @@ pub const Object = struct {
     call: ?FunctionData = null, // present iff kind == .function (and native == .none)
     native: NativeId = .none,
     native_name: []const u8 = "",
+    /// §10.4.1 set iff this is a Bound Function Exotic Object (made by `Function.prototype.bind`).
+    /// `kind` stays `.function` so `typeof` / callability checks pass; [[Call]]/[[Construct]] detect
+    /// this slot and forward to `target` with the bound `this`/args prepended.
+    bound: ?BoundData = null,
     elements: std.ArrayListUnmanaged(Value) = .empty, // backing store iff kind == .array
     /// §15.7 PrivateName slots — a per-object map keyed by the `#name` (the `#` is part of the key,
     /// so private names never collide with string-keyed properties). Distinct from `properties` so a
@@ -180,6 +197,17 @@ pub const Object = struct {
     pub fn createArray(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try create(arena, prototype);
         obj.kind = .array;
+        return obj;
+    }
+
+    /// §10.4.1.3 BoundFunctionCreate — a Bound Function Exotic Object wrapping `target` with a fixed
+    /// `this` and prepended args. `kind = .function` (so it is callable / `typeof "function"`), but it
+    /// carries no `call`/`native`; [[Call]]/[[Construct]] detect `.bound` and forward to the target.
+    /// The caller proto-links it to %Function.prototype%.
+    pub fn createBound(arena: std.mem.Allocator, prototype: ?*Object, data: BoundData) std.mem.Allocator.Error!*Object {
+        const obj = try create(arena, prototype);
+        obj.kind = .function;
+        obj.bound = data;
         return obj;
     }
 
