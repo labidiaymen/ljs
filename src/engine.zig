@@ -660,6 +660,84 @@ test "M8 iteration protocol: custom iterable (§7.4)" {
     try expectNumber(dstr_src, 1); // 0 + 1
 }
 
+test "M17 iterator-correct array destructuring: step once + IteratorClose (§8.5.2 / §13.15.5.3)" {
+    // §13.15.5.3: a fixed pattern `[x]` over an INFINITE iterator steps EXACTLY ONCE, binds, then calls
+    // IteratorClose (the iterator's `return()`) because the iterator is not done. (This is the case that
+    // used to drain forever and hang.) `return()` is called exactly once.
+    const close_once =
+        \\var doneCallCount = 0;
+        \\var iter = { [Symbol.iterator]() { return {
+        \\  next() { return { value: 42, done: false }; },
+        \\  return() { doneCallCount += 1; return {}; }
+        \\}; } };
+        \\function f([x]) { if (x !== 42) throw 'bad x'; }
+        \\f(iter); doneCallCount
+    ;
+    try expectNumber(close_once, 1); // return() called once; x bound to the single step's value
+    // §13.15.5.3 (assignment form): `[a, b]` over a 5-element counting iterator steps EXACTLY twice and
+    // then closes (return() once). Assert both the step count and the close count.
+    const exact_steps =
+        \\var stepCount = 0, closeCount = 0;
+        \\var iter = { [Symbol.iterator]() { var n = 0; return {
+        \\  next() { stepCount++; return { value: n++, done: n > 5 }; },
+        \\  return() { closeCount++; return {}; }
+        \\}; } };
+        \\var a, b; [a, b] = iter;
+        \\if (a !== 0 || b !== 1) throw 'bad values';
+        \\stepCount * 10 + closeCount
+    ;
+    try expectNumber(exact_steps, 21); // 2 steps, 1 close → 2*10 + 1
+    // §13.15.5.3 BindingRestElement: `[first, ...rest]` drains the REMAINDER of a finite iterable.
+    try expectNumber("var [first, ...rest] = [10, 20, 30, 40]; first + rest.length * 100", 310); // 10 + 3*100
+    try expectStr("var [, ...rest] = ['a', 'b', 'c']; rest.join(',')", "b,c"); // elision steps once, rest drains
+    // A pattern that EXHAUSTS the iterator does NOT call return() (it is already done, §13.15.5.3). With
+    // a 3-slot pattern over a 2-value iterator, the 3rd step returns done → c is undefined, no close.
+    const exhaust_no_close =
+        \\var closeCount = 0;
+        \\var iter = { [Symbol.iterator]() { var n = 0; return {
+        \\  next() { return n < 2 ? { value: n++, done: false } : { value: undefined, done: true }; },
+        \\  return() { closeCount++; return {}; }
+        \\}; } };
+        \\var a, b, c; [a, b, c] = iter;
+        \\if (a !== 0 || b !== 1 || c !== undefined) throw 'bad values';
+        \\closeCount
+    ;
+    try expectNumber(exhaust_no_close, 0); // iterator naturally done on the 3rd step → no IteratorClose
+}
+
+test "M17 reliability: infinite iterator-consuming loops terminate via the step watchdog" {
+    // §reliability: even with correct stepping, the rest-drain / for-of over a GENUINELY infinite
+    // iterable must FAIL (StepLimitExceeded) rather than hang the process. Use a low step limit so the
+    // watchdog fires quickly; assert the run TERMINATES with `.step_limit` (never hangs).
+    const inf_iter = // a `next()` that is never done
+        \\var iter = { [Symbol.iterator]() { return { next() { return { value: 1, done: false }; } }; } };
+    ;
+    // for-of over an infinite iterable.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const src = inf_iter ++ "\nfor (var x of iter) {}";
+        const r = try evaluateWithLimit(arena_state.allocator(), src, .sloppy, 100_000);
+        try testing.expect(r == .step_limit);
+    }
+    // rest-element destructuring `[...r] = iter` over an infinite iterable.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const src = inf_iter ++ "\nvar r; [...r] = iter;";
+        const r = try evaluateWithLimit(arena_state.allocator(), src, .sloppy, 100_000);
+        try testing.expect(r == .step_limit);
+    }
+    // spread over an infinite iterable.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const src = inf_iter ++ "\nvar a = [...iter];";
+        const r = try evaluateWithLimit(arena_state.allocator(), src, .sloppy, 100_000);
+        try testing.expect(r == .step_limit);
+    }
+}
+
 test "M8 iteration protocol: Array/String native iterators (§22.1.5 / §23.1.5)" {
     // Array.prototype[Symbol.iterator] resolves and yields the elements.
     try expectBool("typeof [][Symbol.iterator] === 'function'", true);

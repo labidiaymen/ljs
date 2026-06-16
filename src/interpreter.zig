@@ -396,6 +396,7 @@ pub const Interpreter = struct {
             .iterator => |it| it,
         };
         while (true) {
+            try self.tick(); // §reliability: an infinite iterable terminates via the step watchdog, never hangs
             const step = try self.iteratorStep(iterator);
             const v = switch (step) {
                 .abrupt => |c| return c, // a throwing next() — already an abrupt completion
@@ -446,6 +447,7 @@ pub const Interpreter = struct {
             .iterator => |it| it,
         };
         while (true) {
+            try self.tick(); // §reliability: an infinite async iterable terminates via the step watchdog, never hangs
             // §14.7.5.6 step 3.b: result ← Await( IteratorNext(iterator) ). An async iterator's `next`
             // returns a promise of the IteratorResult; await it, then decode `{value, done}`.
             const raw = try self.iteratorCallRaw(iterator, "next", .undefined, false);
@@ -1997,33 +1999,56 @@ pub const Interpreter = struct {
                 return .{ .normal = .undefined };
             },
             .array => |ap| {
-                // §13.15.5.3 ArrayBindingPattern: pull values positionally from an iterable, materialized
-                // via the §7.4 iterator protocol (Arrays/Strings fast-pathed; any `[Symbol.iterator]` works).
-                var list: std.ArrayListUnmanaged(Value) = .empty;
-                const ic = try self.iterateToList(value, &list);
-                if (ic.isAbrupt()) return ic;
-                const slice = list.items;
-                for (ap.elements, 0..) |el, i| {
-                    if (el.target == null) continue; // elision / hole — skip this position
-                    var v: Value = if (i < slice.len) slice[i] else .undefined;
+                // §8.5.2 IteratorBindingInitialization — GetIterator(value) ONCE, then step the iterator
+                // exactly once per element (Arrays/Strings fast-pathed). When the pattern is satisfied
+                // without a rest element and the iterator is not done, IteratorClose it (§7.4.11). An
+                // abrupt completion mid-destructuring also closes a not-done iterator before propagating.
+                const opened = try self.destrOpen(value);
+                var rec: ArrayDestr = switch (opened) {
+                    .abrupt => |c| return c,
+                    .driver => |d| d,
+                };
+                for (ap.elements) |el| {
+                    // §8.5.2: each element (incl. an elision) advances the iterator exactly once.
+                    const sc = try self.destrStep(&rec);
+                    if (sc.isAbrupt()) return sc; // IteratorStep threw → already done, no close needed
+                    if (el.target == null) continue; // elision / hole — value consumed, bound nowhere
+                    var v: Value = sc.normal;
                     if (v == .undefined) {
                         if (el.default) |dn| { // §8.6.2 apply the `= default` when undefined
-                            const dc = try self.evalExpr(dn, env);
-                            if (dc.isAbrupt()) return dc;
+                            const dc = self.evalExpr(dn, env) catch |e| {
+                                try self.destrClose(rec); // engine error mid-pattern → close, then propagate
+                                return e;
+                            };
+                            if (dc.isAbrupt()) {
+                                try self.destrClose(rec); // §8.5.2: abrupt default closes a not-done iterator
+                                return dc;
+                            }
                             v = dc.normal;
                         }
                     }
-                    const bc = try self.bindPattern(el.target.?, v, env, mutable);
-                    if (bc.isAbrupt()) return bc;
+                    const bc = self.bindPattern(el.target.?, v, env, mutable) catch |e| {
+                        try self.destrClose(rec);
+                        return e;
+                    };
+                    if (bc.isAbrupt()) {
+                        try self.destrClose(rec); // §8.5.2: a throwing sub-pattern closes the iterator
+                        return bc;
+                    }
                 }
                 if (ap.rest) |rest_pat| {
-                    // §13.15.5.3 BindingRestElement — leftover items become a fresh Array.
-                    const rest_arr = try Object.createArray(self.arena, self.arrayProto());
-                    if (slice.len > ap.elements.len) {
-                        for (slice[ap.elements.len..]) |a| try rest_arr.elements.append(self.arena, a);
-                    }
+                    // §13.15.5.3 BindingRestElement — drain the REMAINDER into a fresh Array (consumes to
+                    // completion; step-bounded so an infinite iterable fails via the watchdog).
+                    const rest = try self.destrRest(&rec);
+                    const rest_arr = switch (rest) {
+                        .abrupt => |c| return c, // a throwing next() during the drain (iterator now done)
+                        .array => |a| a,
+                    };
                     const bc = try self.bindPattern(rest_pat, .{ .object = rest_arr }, env, mutable);
                     if (bc.isAbrupt()) return bc;
+                } else {
+                    // §13.15.5.3: pattern satisfied with no rest → close the iterator if not done.
+                    try self.destrClose(rec);
                 }
                 return .{ .normal = .undefined };
             },
@@ -2083,27 +2108,43 @@ pub const Interpreter = struct {
     fn assignPattern(self: *Interpreter, target: *const ast.Node, value: Value, env: *Environment) EvalError!Completion {
         switch (target.*) {
             .array_literal => |elems| {
-                // §13.15.5.3 ArrayAssignmentPattern — pull positionally from the iterable, materialized
-                // via the §7.4 iterator protocol (Arrays/Strings fast-pathed; any `[Symbol.iterator]` works).
-                var list: std.ArrayListUnmanaged(Value) = .empty;
-                const ic = try self.iterateToList(value, &list);
-                if (ic.isAbrupt()) return ic;
-                const slice = list.items;
-                for (elems, 0..) |el, i| {
-                    if (el.* == .elision) continue; // hole — skip this position
+                // §13.15.5.3 IteratorDestructuringAssignmentEvaluation — GetIterator(value) ONCE, step
+                // once per element (Arrays/Strings fast-pathed). A rest element `...t` drains the
+                // remainder; otherwise, when the pattern is satisfied and the iterator is not done, close
+                // it (§7.4.11). An abrupt completion mid-pattern closes a not-done iterator first.
+                const opened = try self.destrOpen(value);
+                var rec: ArrayDestr = switch (opened) {
+                    .abrupt => |c| return c,
+                    .driver => |d| d,
+                };
+                for (elems) |el| {
                     if (el.* == .spread) {
-                        // §13.15.5.3 AssignmentRestElement — leftover items become a fresh Array, then
-                        // assigned to the rest target (an identifier / member / index reference).
-                        const rest_arr = try Object.createArray(self.arena, self.arrayProto());
-                        if (slice.len > i) for (slice[i..]) |a| try rest_arr.elements.append(self.arena, a);
+                        // §13.15.5.3 AssignmentRestElement — drain the remainder, then assign it (the rest
+                        // target — identifier / member / index / nested pattern). No close (iterator drained).
+                        const rest = try self.destrRest(&rec);
+                        const rest_arr = switch (rest) {
+                            .abrupt => |c| return c,
+                            .array => |a| a,
+                        };
                         const rc = try self.assignTargetNode(el.spread, .{ .object = rest_arr }, env);
                         if (rc.isAbrupt()) return rc;
-                        break;
+                        return .{ .normal = .undefined }; // rest is always last — done
                     }
-                    const v = if (i < slice.len) slice[i] else .undefined;
-                    const tc = try self.assignElement(el, v, env);
-                    if (tc.isAbrupt()) return tc;
+                    // §13.15.5.3: every element (incl. an elision) advances the iterator exactly once.
+                    const sc = try self.destrStep(&rec);
+                    if (sc.isAbrupt()) return sc; // IteratorStep threw → already done, no close needed
+                    if (el.* == .elision) continue; // hole — value consumed, assigned nowhere
+                    const tc = self.assignElement(el, sc.normal, env) catch |e| {
+                        try self.destrClose(rec);
+                        return e;
+                    };
+                    if (tc.isAbrupt()) {
+                        try self.destrClose(rec); // §13.15.5.3: a throwing target/default closes the iterator
+                        return tc;
+                    }
                 }
+                // §13.15.5.3: pattern satisfied with no rest → close the iterator if not done.
+                try self.destrClose(rec);
                 return .{ .normal = .undefined };
             },
             .object_literal => |props| {
@@ -2520,6 +2561,7 @@ pub const Interpreter = struct {
             .abrupt => |c| return c,
             .iterator => |iterator| {
                 while (true) {
+                    try self.tick(); // §reliability: a genuinely infinite iterable fails via the watchdog, never hangs
                     const step = try self.iteratorStep(iterator);
                     switch (step) {
                         .abrupt => |c| return c,
@@ -2530,6 +2572,119 @@ pub const Interpreter = struct {
                 return .{ .normal = .undefined };
             },
         }
+    }
+
+    /// §8.5.2 IteratorBindingInitialization / §13.15.5.3 IteratorDestructuringAssignmentEvaluation —
+    /// an iterator record driven ONE STEP AT A TIME by array-pattern destructuring (binding & assignment).
+    /// Unlike `iterateToList` it does NOT drain: each pattern element advances the iterator exactly once
+    /// (so an infinite iterator destructured by a fixed pattern is fine), and when the pattern is
+    /// satisfied without a rest element the iterator is closed via IteratorClose (§7.4.11) if not done.
+    ///
+    /// A plain Array (default iterator) is fast-pathed over `.elements` with no observable iterator
+    /// calls — the difference (no `next`/`return` invocation) is unobservable for the built-in iterator,
+    /// so we never construct one. Any other iterable goes through the real §7.4 protocol.
+    const ArrayDestr = union(enum) {
+        /// Plain Array fast path: a cursor over the backing `elements` (no iterator object exists).
+        fast: struct { items: []const Value, idx: usize = 0 },
+        /// General iterable: a §7.4 iterator record. `done` mirrors IteratorRecord.[[Done]].
+        iter: struct { iterator: *Object, done: bool = false },
+
+        fn isDone(self: ArrayDestr) bool {
+            return switch (self) {
+                .fast => |f| f.idx >= f.items.len,
+                .iter => |it| it.done,
+            };
+        }
+    };
+
+    /// §8.5.2 step: advance the array-destructuring iterator exactly once. Returns the produced value
+    /// (or `undefined` once the iterator is done — IteratorStep returned done, per §13.15.5.3 step 4),
+    /// or an abrupt completion if `next()` throws. After a done step the record is marked done so later
+    /// elements short-circuit to `undefined` without further `next()` calls (§8.5.2 4.a).
+    fn destrStep(self: *Interpreter, rec: *ArrayDestr) EvalError!Completion {
+        switch (rec.*) {
+            .fast => |*f| {
+                if (f.idx >= f.items.len) return .{ .normal = .undefined };
+                const v = f.items[f.idx];
+                f.idx += 1;
+                return .{ .normal = v };
+            },
+            .iter => |*it| {
+                if (it.done) return .{ .normal = .undefined };
+                try self.tick(); // §reliability: a bounded watchdog even though a fixed pattern steps finitely
+                const step = try self.iteratorStep(it.iterator);
+                switch (step) {
+                    .abrupt => |c| {
+                        // §7.4.4: an abrupt IteratorStep sets [[Done]] = true (the iterator self-closed).
+                        it.done = true;
+                        return c;
+                    },
+                    .done => {
+                        it.done = true;
+                        return .{ .normal = .undefined };
+                    },
+                    .value => |v| return .{ .normal = v },
+                }
+            },
+        }
+    }
+
+    /// §13.15.5.3 BindingRestElement / AssignmentRestElement — drain the REMAINDER of the iterator into a
+    /// fresh Array. This is the ONLY destructuring path that consumes to completion; the rest-drain loop
+    /// is step-bounded so an infinite iterable fails via the watchdog rather than hanging.
+    fn destrRest(self: *Interpreter, rec: *ArrayDestr) EvalError!union(enum) { array: *Object, abrupt: Completion } {
+        const arr = try Object.createArray(self.arena, self.arrayProto());
+        switch (rec.*) {
+            .fast => |*f| {
+                while (f.idx < f.items.len) : (f.idx += 1) try arr.elements.append(self.arena, f.items[f.idx]);
+            },
+            .iter => |*it| {
+                while (!it.done) {
+                    try self.tick(); // §reliability: a rest over an infinite iterable terminates via the watchdog
+                    const step = try self.iteratorStep(it.iterator);
+                    switch (step) {
+                        .abrupt => |c| {
+                            it.done = true;
+                            return .{ .abrupt = c };
+                        },
+                        .done => it.done = true,
+                        .value => |v| try arr.elements.append(self.arena, v),
+                    }
+                }
+            },
+        }
+        return .{ .array = arr };
+    }
+
+    /// §7.4.11 IteratorClose after a destructuring pattern WITHOUT a rest element: if the record is a
+    /// real iterator that is not yet done, call its `return()`. The plain-Array fast path has no iterator
+    /// object, so closing is a no-op. On an abrupt `completion` the original throw is preserved (a
+    /// throwing `return()` is swallowed; an engine error still propagates).
+    fn destrClose(self: *Interpreter, rec: ArrayDestr) EvalError!void {
+        switch (rec) {
+            .fast => {},
+            .iter => |it| if (!it.done) try self.iteratorClose(it.iterator),
+        }
+    }
+
+    /// GetIterator(value) once for array destructuring, choosing the unobservable fast path for a plain
+    /// Array (default iterator) and the §7.4 protocol otherwise. A non-iterable → abrupt TypeError.
+    fn destrOpen(self: *Interpreter, value: Value) EvalError!union(enum) { driver: ArrayDestr, abrupt: Completion } {
+        if (value == .object and value.object.kind == .array) {
+            return .{ .driver = .{ .fast = .{ .items = value.object.elements.items } } };
+        }
+        if (value == .string) {
+            // A String iterates code units; materialize once (finite) and drive the fast path over them.
+            const s = value.string;
+            var units: std.ArrayListUnmanaged(Value) = .empty;
+            for (0..s.len) |i| try units.append(self.arena, .{ .string = s[i .. i + 1] });
+            return .{ .driver = .{ .fast = .{ .items = units.items } } };
+        }
+        const git = try self.getIterator(value);
+        return switch (git) {
+            .abrupt => |c| .{ .abrupt = c },
+            .iterator => |iterator| .{ .driver = .{ .iter = .{ .iterator = iterator } } },
+        };
     }
 
     // ── §27.5 Generators (thread-per-generator, strict ping-pong handoff) ────────
