@@ -27,7 +27,22 @@ pub const NativeId = enum {
     object_define_property, // Object.defineProperty
     object_define_properties, // Object.defineProperties
     object_get_own_property_descriptor, // Object.getOwnPropertyDescriptor
+    object_get_own_property_descriptors, // Object.getOwnPropertyDescriptors (§20.1.2.9)
     object_get_own_property_names, // Object.getOwnPropertyNames
+    object_keys, // Object.keys (§20.1.2.19)
+    object_values, // Object.values (§20.1.2.23)
+    object_entries, // Object.entries (§20.1.2.6)
+    object_create, // Object.create (§20.1.2.2)
+    object_assign, // Object.assign (§20.1.2.1)
+    object_get_prototype_of, // Object.getPrototypeOf (§20.1.2.12)
+    object_set_prototype_of, // Object.setPrototypeOf (§20.1.2.22)
+    object_is, // Object.is (§20.1.2.14)
+    object_freeze, // Object.freeze (§20.1.2.7)
+    object_is_frozen, // Object.isFrozen (§20.1.2.16)
+    object_seal, // Object.seal (§20.1.2.21)
+    object_is_sealed, // Object.isSealed (§20.1.2.17)
+    object_prevent_extensions, // Object.preventExtensions (§20.1.2.20)
+    object_is_extensible, // Object.isExtensible (§20.1.2.15)
     // §20.1.3 Object.prototype reflection
     object_has_own_property, // Object.prototype.hasOwnProperty
     object_property_is_enumerable, // Object.prototype.propertyIsEnumerable
@@ -155,7 +170,11 @@ pub const Descriptor = struct {
 
 pub const Object = struct {
     arena: std.mem.Allocator,
-    properties: std.StringHashMapUnmanaged(PropertyValue),
+    /// §10.1.11.1 OrdinaryOwnPropertyKeys requires own string keys in *insertion order* (integer keys
+    /// ascending is handled by the Array exotic's `elements`). An ArrayHashMap preserves insertion
+    /// order with the same get/put/iterator API as a StringHashMap; `for-in`/`Object.keys`/spread thus
+    /// observe creation order, matching the spec and the many Test262 tests that assert it.
+    properties: std.StringArrayHashMapUnmanaged(PropertyValue),
     prototype: ?*Object,
     kind: Kind = .ordinary,
     call: ?FunctionData = null, // present iff kind == .function (and native == .none)
@@ -165,6 +184,11 @@ pub const Object = struct {
     /// `kind` stays `.function` so `typeof` / callability checks pass; [[Call]]/[[Construct]] detect
     /// this slot and forward to `target` with the bound `this`/args prepended.
     bound: ?BoundData = null,
+    /// §10.1 [[Extensible]] — whether new own properties may be added (§20.1.2 preventExtensions /
+    /// seal / freeze clear it). Ordinary objects start extensible. The hot `set` data path checks it
+    /// only when CREATING a new property (existing-property writes skip the branch), so updates to
+    /// already-present data properties pay nothing.
+    extensible: bool = true,
     elements: std.ArrayListUnmanaged(Value) = .empty, // backing store iff kind == .array
     /// §15.7 PrivateName slots — a per-object map keyed by the `#name` (the `#` is part of the key,
     /// so private names never collide with string-keyed properties). Distinct from `properties` so a
@@ -259,14 +283,21 @@ pub const Object = struct {
     /// property keeps its attributes (only `value` changes); an existing accessor is replaced by a
     /// fresh all-true data property (the simple definition path — callers route accessor writes
     /// through `getProp`/the setter, so reaching here means a plain data write).
+    ///
+    /// Enforcement (§10.1.9.2 OrdinarySetWithOwnDescriptor): an existing non-writable data property is
+    /// not overwritten, and a new property is not added to a non-extensible object — both silent
+    /// no-ops in the M-subset (strict-mode TypeError is deferred; `Object.isFrozen`/`isSealed` still
+    /// report correctly). The hot path (writing an existing writable data prop) takes the single
+    /// `writable` branch and skips the `[[Extensible]]` check entirely.
     pub fn set(self: *Object, key: []const u8, value: Value) std.mem.Allocator.Error!void {
         if (self.properties.getPtr(key)) |pv| switch (pv.payload) {
             .data => {
+                if (!pv.writable) return; // §10.1.9.2: a non-writable data property rejects the write
                 pv.payload = .{ .data = value };
                 return;
             },
             .accessor => {}, // fall through: replace with an all-true data property
-        };
+        } else if (!self.extensible) return; // §10.1.5/§10.1.9: no new props on a non-extensible object
         try self.properties.put(self.arena, key, PropertyValue.dataDefault(value));
     }
 
@@ -313,6 +344,8 @@ pub const Object = struct {
     /// is M-subset-deferred). Data↔accessor and value/flag changes are allowed when configurable.
     pub fn defineProperty(self: *Object, key: []const u8, d: Descriptor) std.mem.Allocator.Error!bool {
         const existing = self.properties.getPtr(key);
+        // §10.1.6.3 step 2.a: a property absent from a non-extensible object cannot be added.
+        if (existing == null and !self.extensible) return false;
         if (existing) |cur| {
             // §10.1.6.3 step 2–4: a non-configurable current property restricts the redefinition.
             if (!cur.configurable) {
@@ -362,6 +395,48 @@ pub const Object = struct {
             .enumerable = enumerable,
             .configurable = configurable,
         });
+        return true;
+    }
+
+    // ── §20.1.2 Integrity levels (preventExtensions / seal / freeze) ────────────
+
+    /// §7.3.16 SetIntegrityLevel("sealed") — clear [[Extensible]] and make every own property
+    /// non-configurable. (Array exotic `length`/indices are M-subset: the flag is cleared so new
+    /// properties are rejected, but per-index attribute mutation is not separately tracked.)
+    pub fn sealObject(self: *Object) void {
+        self.extensible = false;
+        var it = self.properties.iterator();
+        while (it.next()) |entry| entry.value_ptr.configurable = false;
+    }
+
+    /// §7.3.16 SetIntegrityLevel("frozen") — clear [[Extensible]], make every own property
+    /// non-configurable, and every own DATA property non-writable (accessors keep their get/set).
+    pub fn freezeObject(self: *Object) void {
+        self.extensible = false;
+        var it = self.properties.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.configurable = false;
+            if (entry.value_ptr.payload == .data) entry.value_ptr.writable = false;
+        }
+    }
+
+    /// §7.3.17 TestIntegrityLevel — `frozen`: non-extensible AND every own property non-configurable
+    /// AND every data property non-writable. A non-extensible object with no own properties is frozen.
+    pub fn isFrozenObject(self: *Object) bool {
+        if (self.extensible) return false;
+        var it = self.properties.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.configurable) return false;
+            if (entry.value_ptr.payload == .data and entry.value_ptr.writable) return false;
+        }
+        return true;
+    }
+
+    /// §7.3.17 TestIntegrityLevel — `sealed`: non-extensible AND every own property non-configurable.
+    pub fn isSealedObject(self: *Object) bool {
+        if (self.extensible) return false;
+        var it = self.properties.iterator();
+        while (it.next()) |entry| if (entry.value_ptr.configurable) return false;
         return true;
     }
 

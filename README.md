@@ -7,12 +7,16 @@ performance story from day one.
 > **Status: M4 (classes) closed.** A tree-walking interpreter runs variables,
 > functions/closures, objects, control flow, exceptions, the full modern-syntax surface
 > (operators, template literals, spread/rest, destructuring, arrow functions, object-literal sugar,
-> `?.`/`??`, the complete assignment-operator set, and strict-mode Early Errors), and now the full
+> `?.`/`??`, the complete assignment-operator set, and strict-mode Early Errors), the full
 > **class** surface (declarations/expressions, constructor, methods, fields, statics, `extends`/`super`,
-> accessors, computed names, private `#x`, and `static {}` blocks) — enough to load the Test262 harness
-> and pass **35.8%** of `language/expressions` (6,077 tests, harness metric). Generators and async are
-> later milestones. The bytecode/JIT tiers are future work. A learning-grade, in-progress engine, not a
-> drop-in Node replacement.
+> accessors, computed names, private `#x`, and `static {}` blocks), `for-in`/`for-of` enumeration, and
+> the **property-descriptor / reflection** API (`Object.defineProperty`/`getOwnPropertyDescriptor(s)`/
+> `getOwnPropertyNames`/`keys`/`values`/`entries`/`create`/`assign`/`is`/`getPrototypeOf`/`setPrototypeOf`/
+> `freeze`/`seal`/`preventExtensions`, `Object.prototype.hasOwnProperty`/`propertyIsEnumerable`/
+> `isPrototypeOf`, and `Function.prototype.call`/`apply`/`bind`) — enough to load the Test262 harness
+> (both `propertyHelper.js` and `compareArray.js` now fully load) and pass **38.4%** of
+> `language/expressions` (6,509 tests, harness metric). Generators and async are later milestones. The
+> bytecode/JIT tiers are future work. A learning-grade, in-progress engine, not a drop-in Node replacement.
 
 ## Why another engine?
 
@@ -102,8 +106,22 @@ class files at M3 close) drained across five cycles: C1 core (decl/expr, ctor, m
 statics, `new`), C2 `extends`/`super` (+42), C3 accessors + computed names (+240), C4 private `#x` +
 `static {}` (+311), C5 §15.7.1 Early-Errors audit + close (+0; all already enforced). M4 total:
 **32.3% → 35.8%** (passed 5,484 → 6,077, **+593**), 0 true regressions per cycle by `mode+path`,
-bench-green throughout (ljs 0.2–0.5× Node). Generators/async next. The harness also validates
+bench-green throughout (ljs 0.2–0.5× Node). The harness also validates
 classification, fault isolation, determinism, and regression detection.
+
+**M6 result (reflection / property-descriptor built-ins, harness metric):** `test/language/expressions`
+→ **6,509 passed = 38.4%**. The §6.1.7.1 property-attribute model (writable/enumerable/configurable per
+own property) + `[[Extensible]]` + the §20.1.2/§20.1.3/§20.2.3 reflection API unblock the two harness
+files behind a large fraction of positive tests: **propertyHelper.js** (`verifyProperty`) and
+**compareArray.js** (`assert.compareArray`) now both fully load. Three cycles: C1 descriptor model +
+`Object`/`Object.prototype` reflection + enumerable-aware for-in/spread (+62), C2
+`Function.prototype.call`/`apply`/`bind` → propertyHelper.js loads (+248), C3
+`Object.keys`/`values`/`entries`/`create`/`assign`/`is`/`getPrototypeOf`/`setPrototypeOf` +
+`freeze`/`seal`/`preventExtensions` (with integrity enforcement) + insertion-ordered own-property keys
+(§10.1.11.1) (+122). M6 total: **35.8% → 38.4%** (passed 6,077 → 6,509, **+432**), 0 true regressions per
+cycle by `mode+path`, bench-green throughout (ljs 0.2–0.5× Node). Deferred: `Reflect.*`, `Proxy`, the full
+§10.1.6.3 invariant matrix, strict-mode write/delete TypeErrors, and Symbol-keyed properties. Generators/
+async next.
 
 ## Roadmap
 
@@ -114,7 +132,9 @@ classification, fault isolation, determinism, and regression detection.
 | **M2** | core built-in library — arrays, strings | ✅ done |
 | **M3** | parser / syntax coverage — 9 cycles, drain the `parse_error` bottleneck | ✅ done (23.3% → 27.2% of expressions; bench green throughout, ljs 0.2–0.5× Node) |
 | **M4** | **classes** — decl/expr, constructor, methods, fields, statics, `extends`/`super`, accessors, computed names, private `#x`, `static {}` blocks | ✅ done (32.3% → 35.8% of expressions, harness metric, +593; bench green, ljs 0.2–0.5× Node) |
-| M5+ | generators / async — climbing Test262 % | next |
+| **M5** | **`for-in` / `for-of`** — enumeration parse + iteration scaffold | ✅ done (held 35.8%; the enumeration prerequisite for M6's enumerable-awareness) |
+| **M6** | **reflection / property descriptors** — §6.1.7.1 attributes + `[[Extensible]]`, `Object.defineProperty`/`getOwnPropertyDescriptor(s)`/`getOwnPropertyNames`/`keys`/`values`/`entries`/`create`/`assign`/`is`/`getPrototypeOf`/`setPrototypeOf`/`freeze`/`seal`/`preventExtensions`, `Object.prototype.hasOwnProperty`/`propertyIsEnumerable`/`isPrototypeOf`, `Function.prototype.call`/`apply`/`bind`; unblocks `propertyHelper.js` + `compareArray.js` | ✅ done (35.8% → 38.4% of expressions, harness metric, +432; bench green, ljs 0.2–0.5× Node) |
+| M7+ | generators / async — climbing Test262 % | next |
 | Later | bytecode VM, then optimizing tiers — graduated when the benchmarks justify it | future |
 
 M3's nine cycles: operators (`**`, bitwise, shifts, `in`) · template literals · spread/rest ·

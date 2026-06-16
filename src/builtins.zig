@@ -82,7 +82,23 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try defineMethod(arena, object_fn, "defineProperty", .object_define_property, "defineProperty");
     try defineMethod(arena, object_fn, "defineProperties", .object_define_properties, "defineProperties");
     try defineMethod(arena, object_fn, "getOwnPropertyDescriptor", .object_get_own_property_descriptor, "getOwnPropertyDescriptor");
+    try defineMethod(arena, object_fn, "getOwnPropertyDescriptors", .object_get_own_property_descriptors, "getOwnPropertyDescriptors");
     try defineMethod(arena, object_fn, "getOwnPropertyNames", .object_get_own_property_names, "getOwnPropertyNames");
+    // §20.1.2 enumeration / creation / extensibility statics (M6 Cycle 3).
+    try defineMethod(arena, object_fn, "keys", .object_keys, "keys");
+    try defineMethod(arena, object_fn, "values", .object_values, "values");
+    try defineMethod(arena, object_fn, "entries", .object_entries, "entries");
+    try defineMethod(arena, object_fn, "create", .object_create, "create");
+    try defineMethod(arena, object_fn, "assign", .object_assign, "assign");
+    try defineMethod(arena, object_fn, "getPrototypeOf", .object_get_prototype_of, "getPrototypeOf");
+    try defineMethod(arena, object_fn, "setPrototypeOf", .object_set_prototype_of, "setPrototypeOf");
+    try defineMethod(arena, object_fn, "is", .object_is, "is");
+    try defineMethod(arena, object_fn, "freeze", .object_freeze, "freeze");
+    try defineMethod(arena, object_fn, "isFrozen", .object_is_frozen, "isFrozen");
+    try defineMethod(arena, object_fn, "seal", .object_seal, "seal");
+    try defineMethod(arena, object_fn, "isSealed", .object_is_sealed, "isSealed");
+    try defineMethod(arena, object_fn, "preventExtensions", .object_prevent_extensions, "preventExtensions");
+    try defineMethod(arena, object_fn, "isExtensible", .object_is_extensible, "isExtensible");
     try env.declare("Object", .{ .object = object_fn }, true, true);
 
     // §20.5 The Error family — each a native constructor; `name` is the error name.

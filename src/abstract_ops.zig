@@ -126,6 +126,19 @@ pub fn strictEquals(l: Value, r: Value) bool {
     };
 }
 
+/// §7.2.11 SameValue ( x, y ) — like `===` except NaN equals NaN and +0 is distinct from -0
+/// (the equality used by `Object.is`, §20.1.2.14, and the §10.1.6.3 redefinition invariant).
+pub fn sameValue(x: Value, y: Value) bool {
+    if (x == .number and y == .number) {
+        const a = x.number;
+        const b = y.number;
+        if (std.math.isNan(a) and std.math.isNan(b)) return true; // §6.1.6.1.14: NaN is SameValue NaN
+        if (a == 0 and b == 0) return std.math.signbit(a) == std.math.signbit(b); // +0 ≠ -0
+        return a == b;
+    }
+    return strictEquals(x, y);
+}
+
 /// §7.2.15 IsLooselyEqual (==) — primitive subset.
 pub fn looseEquals(l: Value, r: Value) bool {
     if (@as(std.meta.Tag(Value), l) == @as(std.meta.Tag(Value), r)) return strictEquals(l, r);

@@ -1309,3 +1309,94 @@ test "M6 propertyHelper-style call.bind idiom (Cycle 2, §20.2.3)" {
     try expectBool("var hasOwn=Function.prototype.call.bind(Object.prototype.hasOwnProperty); hasOwn({a:1},'a')", true);
     try expectBool("var hasOwn=Function.prototype.call.bind(Object.prototype.hasOwnProperty); hasOwn({a:1},'b')", false);
 }
+
+test "M6 Object.keys/values/entries (Cycle 3, §20.1.2.19/.23/.6)" {
+    // keys → own enumerable string keys (insertion order); values → the values; entries → [k,v] pairs.
+    try expectStr("Object.keys({a:1,b:2}).join()", "a,b");
+    try expectStr("Object.values({a:1,b:2}).join()", "1,2");
+    try expectStr("Object.entries({a:1,b:2}).map(function(e){return e[0]+':'+e[1]}).join()", "a:1,b:2");
+    // Non-enumerable own props are skipped.
+    try expectStr("var o={a:1}; Object.defineProperty(o,'h',{value:9,enumerable:false}); Object.keys(o).join()", "a");
+    try expectNumber("Object.keys({a:1,b:2,c:3}).length", 3);
+    // Inherited enumerable keys are NOT included (own-only).
+    try expectStr("var p={x:1}; var o=Object.create(p); o.y=2; Object.keys(o).join()", "y");
+    // Array: own enumerable index keys.
+    try expectStr("Object.keys(['a','b']).join()", "0,1");
+}
+
+test "M6 Object.create (Cycle 3, §20.1.2.2)" {
+    // Inherited property via the prototype.
+    try expectNumber("var o=Object.create({x:1}); o.x", 1);
+    // null prototype → no inherited Object.prototype methods.
+    try expectBool("var o=Object.create(null); o.hasOwnProperty===undefined", true);
+    // getPrototypeOf round-trips the supplied proto.
+    try expectBool("var p={}; var o=Object.create(p); Object.getPrototypeOf(o)===p", true);
+    // Second arg defines own properties from a descriptor map.
+    try expectNumber("var o=Object.create(null,{v:{value:7,enumerable:true}}); o.v", 7);
+    try expectStr("var o=Object.create({},{a:{value:1,enumerable:true},b:{value:2,enumerable:true}}); Object.keys(o).join()", "a,b");
+    // A non-object, non-null proto throws.
+    try expectThrows("Object.create(5)");
+}
+
+test "M6 Object.assign (Cycle 3, §20.1.2.1)" {
+    try expectStr("Object.keys(Object.assign({},{a:1},{b:2})).join()", "a,b");
+    try expectNumber("Object.assign({a:1},{a:9,b:2}).a", 9); // later source overwrites
+    try expectNumber("var t={}; Object.assign(t,{a:1}); t.a", 1);
+    try expectBool("var t={}; Object.assign(t,{a:1})===t", true); // returns target
+    try expectNumber("Object.assign({x:1},null,undefined,{y:2}).y", 2); // nullish sources skipped
+    // Only own enumerable props are copied (inherited / non-enumerable skipped).
+    try expectStr("var s=Object.create({inh:1}); s.own=2; Object.keys(Object.assign({},s)).join()", "own");
+    try expectThrows("Object.assign(null,{})"); // nullish target throws
+}
+
+test "M6 Object.getPrototypeOf / setPrototypeOf (Cycle 3, §20.1.2.12/.22)" {
+    try expectBool("var p={}; var o=Object.create(p); Object.getPrototypeOf(o)===p", true);
+    try expectBool("Object.getPrototypeOf(Object.create(null))===null", true);
+    try expectNumber("var o={}; Object.setPrototypeOf(o,{z:5}); o.z", 5);
+    try expectBool("var o={}; Object.setPrototypeOf(o,null); Object.getPrototypeOf(o)===null", true);
+    try expectBool("var o={}; Object.setPrototypeOf(o,{})===o", true); // returns O
+    try expectThrows("Object.setPrototypeOf(null,{})");
+    try expectThrows("Object.setPrototypeOf({},5)");
+}
+
+test "M6 Object.is (Cycle 3, §20.1.2.14 SameValue)" {
+    try expectBool("Object.is(NaN,NaN)", true);
+    try expectBool("Object.is(0,-0)", false);
+    try expectBool("Object.is(-0,-0)", true);
+    try expectBool("Object.is(1,1)", true);
+    try expectBool("Object.is('a','a')", true);
+    try expectBool("Object.is({},{})", false); // distinct objects
+    try expectBool("var o={}; Object.is(o,o)", true);
+    try expectBool("Object.is(null,undefined)", false);
+}
+
+test "M6 Object.freeze/isFrozen/seal/isSealed/preventExtensions/isExtensible (Cycle 3, §20.1.2)" {
+    // freeze: isFrozen true; new props rejected; existing data prop write rejected.
+    try expectBool("var o={a:1}; Object.freeze(o); Object.isFrozen(o)", true);
+    try expectBool("var o={a:1}; Object.freeze(o)===o", true); // returns O
+    try expectNumber("var o={a:1}; Object.freeze(o); o.a=99; o.a", 1); // write silently rejected
+    try expectBool("var o={a:1}; Object.freeze(o); o.b=2; o.b===undefined", true); // new prop rejected
+    try expectBool("var o={}; Object.isFrozen(o)", false); // an ordinary extensible object is not frozen
+    // seal: isSealed true; not frozen (writes still allowed); new props rejected.
+    try expectBool("var o={a:1}; Object.seal(o); Object.isSealed(o)", true);
+    try expectBool("var o={a:1}; Object.seal(o); Object.isFrozen(o)", false); // writable → sealed but not frozen
+    try expectNumber("var o={a:1}; Object.seal(o); o.a=5; o.a", 5); // write allowed
+    try expectBool("var o={a:1}; Object.seal(o); o.b=2; o.b===undefined", true); // new prop rejected
+    // preventExtensions / isExtensible.
+    try expectBool("Object.isExtensible({})", true);
+    try expectBool("var o={}; Object.preventExtensions(o); Object.isExtensible(o)", false);
+    try expectBool("var o={}; Object.preventExtensions(o); o.x=1; o.x===undefined", true);
+    try expectBool("var o={}; Object.preventExtensions(o); Object.isFrozen(o)", true); // no props + non-ext → frozen
+    // freeze makes the props non-configurable (delete returns false / leaves the prop).
+    try expectBool("var o={a:1}; Object.freeze(o); delete o.a", false);
+    try expectNumber("var o={a:1}; Object.freeze(o); delete o.a; o.a", 1);
+    // a frozen prop's descriptor is non-writable + non-configurable.
+    try expectBool("var o={a:1}; Object.freeze(o); Object.getOwnPropertyDescriptor(o,'a').writable", false);
+    try expectBool("var o={a:1}; Object.freeze(o); Object.getOwnPropertyDescriptor(o,'a').configurable", false);
+}
+
+test "M6 Object.getOwnPropertyDescriptors (Cycle 3, §20.1.2.9)" {
+    try expectNumber("var o={a:1,b:2}; Object.getOwnPropertyDescriptors(o).a.value", 1);
+    try expectBool("var o={a:1}; Object.getOwnPropertyDescriptors(o).a.enumerable", true);
+    try expectNumber("var o={a:1}; Object.defineProperty(o,'h',{value:9,enumerable:false}); Object.keys(Object.getOwnPropertyDescriptors(o)).length", 2);
+}

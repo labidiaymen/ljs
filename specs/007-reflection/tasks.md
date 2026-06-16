@@ -110,13 +110,56 @@ net regression on the continuity gate.
   the exact propertyHelper line-31 idiom `Function.prototype.call.bind(Object.prototype.hasOwnProperty)`
   yields a working `hasOwn(obj,key)` predicate.
 
-## Cycle 3 — `Object.keys`/`values`/`entries`/`create`/`assign`/`freeze`/`getPrototypeOf`/`setPrototypeOf` + close
-- [ ] M6-T210 `Object.keys`/`values`/`entries` (§20.1.2.16/.21/.5 — own enumerable string keys/values/
-  pairs), `Object.create` (§20.1.2.2 — new object with the given proto + optional property descriptors),
-  `Object.assign` (§20.1.2.1 — copy own enumerable into target), `Object.getPrototypeOf`/`setPrototypeOf`
-  (§20.1.2.12/.23), `Object.freeze`/`isFrozen` + `preventExtensions`/`isExtensible` (§20.1.2.6/.11) with
-  the extensibility + non-writable enforcement the freeze tests need. Close the milestone with the final
-  conformance delta + regression hunt.
+## Cycle 3 — `Object.keys`/`values`/`entries`/`create`/`assign`/`freeze`/`getPrototypeOf`/`setPrototypeOf` + close 🎯 (DONE — continuity gate (`language/expressions`, harness): passed 6387 → **6509** (+122), **0 true regressions / 122 recoveries** by `mode+path`; conformance 37.6% → **38.4%**. Recoveries by path: 26 each `new`/`super`/`array`/`call`, 6 `object`, 4 each `arrow-function`/`class`, 2 `optional-chaining`, 1 each `delete`/`logical-assignment` — the lever was making own-property iteration **insertion-ordered** (`StringHashMapUnmanaged` → `StringArrayHashMapUnmanaged`, §10.1.11.1), which fixed every test that constructs an array/object then asserts element/key *order* (incl. spread/destructuring/`compareArray`-style checks), plus the new `Object.keys`/`assign`/`create`/`freeze` surface. Bench green: `perf: ok (no ljs-vs-self regression)`, ljs 0.2–0.5× Node (loop_mix −5.8% / loop_sum −1.8% / str_build −13.6%, all `ok`) — the `set` hot path adds only a `writable` branch on existing-prop writes and an `extensible` branch on NEW-prop creation (skipped on updates); the ArrayHashMap is order-preserving at no measurable cost for the small property maps in the bench. `harness/compareArray.js` now FULLY LOADS (it is a deprecation stub forwarding to `assert.compareArray` in assert.js; verified end-to-end: `assert.compareArray([1,2,3],[1,2,3])` passes and a mismatch throws — 2/2 both modes). Committed baseline bumped 6387 → 6509.)
+- [x] M6-T210 `Object.keys`/`values`/`entries` (§20.1.2.19/.23/.6 — own enumerable string keys/values/
+  pairs via a new own-enumerable-keys collector, no proto walk), `Object.create` (§20.1.2.2 — new object
+  with the given proto [object or null] + optional §20.1.2.5 property-descriptor map),
+  `Object.assign` (§20.1.2.1 — copy own enumerable into target, nullish sources skipped, returns target),
+  `Object.getPrototypeOf`/`setPrototypeOf` (§20.1.2.12/.22 — set rejects on a non-extensible object with a
+  different proto), `Object.is` (§20.1.2.14 → new §7.2.11 `sameValue` in abstract_ops: NaN≡NaN, +0≠−0),
+  `Object.getOwnPropertyDescriptors` (§20.1.2.9). Extensibility: an `[[Extensible]]` bool on `Object`
+  (default true), cleared by `Object.preventExtensions`/`seal`/`freeze`; `Object.freeze`/`isFrozen`,
+  `seal`/`isSealed`, `preventExtensions`/`isExtensible` (§20.1.2.7/.16/.21/.17/.20/.15) via
+  `freezeObject`/`sealObject`/`isFrozenObject`/`isSealedObject` on `Object`. **Enforcement landed (not
+  just flags):** `set` rejects a write to a non-writable data prop and a NEW prop on a non-extensible
+  object (silent in sloppy — M-subset; strict TypeError deferred); `defineProperty` rejects a new prop on a
+  non-extensible object (§10.1.6.3 step 2); `[[Delete]]` returns false for a non-configurable prop
+  (§10.1.10.1) so `delete` on a sealed/frozen prop reports correctly. Tests in `src/engine.zig` (all green):
+  `Object.keys/values/entries`, `assign` merge + nullish skip + returns-target, `create` inherited + null
+  proto + descriptor map, `getPrototypeOf`/`setPrototypeOf`, `Object.is(NaN,NaN)`/`is(0,-0)`,
+  `freeze`+`isFrozen`+write/new-prop rejection+`delete`→false, `seal`/`isSealed`,
+  `preventExtensions`/`isExtensible`, `getOwnPropertyDescriptors`.
+- [x] **Conformance + regression hunt (harness, ReleaseFast, `git stash` HEAD vs working-tree `comm`):**
+  continuity gate `language/expressions` `passed 6387 → 6509` (+122), 37.6% → **38.4%** — **0 true
+  regressions / 122 recoveries** by `mode+path`. The committed baseline was verified to equal the true HEAD
+  pass-set before diffing. The insertion-order switch was the dominant lever (it is spec-mandated,
+  §10.1.11.1, and widely asserted in Test262). Committed baseline bumped 6387 → 6509.
+
+## Milestone M6 — CLOSE ✅ (DONE)
+**Final harness metric (`language/expressions`): 35.8% (M5 close, 6077) → 38.4% (6509), +432 tests over 3
+cycles.** Per-cycle: C1 6077→6139 (+62, descriptor model + `Object`/`Object.prototype` reflection +
+enumerable-awareness); C2 6139→6387 (+248, `Function.prototype.call`/`apply`/`bind` → propertyHelper.js
+fully loads); C3 6387→6509 (+122, `Object.keys`/`values`/`entries`/`create`/`assign`/`is`/`getPrototypeOf`/
+`setPrototypeOf`/`freeze`/`seal`/`preventExtensions` + integrity enforcement + insertion-ordered own keys).
+The two harness files behind a large fraction of positive Test262 tests now both fully load: **propertyHelper.js**
+(C1+C2) and **compareArray.js** (a stub forwarding to `assert.compareArray`, working end-to-end as of C3).
+0 true regressions across all three cycles. Bench green every cycle (ljs ≤ Node, no data-prop fast-path
+regression).
+
+**Remaining gaps (out of M6 scope — future milestones):**
+- **`Reflect.*`** (§28.1) — `Reflect.get/set/has/ownKeys/defineProperty/…` not implemented.
+- **`Proxy`** (§28.2) / exotic `[[Get]]`/`[[Set]]`/`[[OwnPropertyKeys]]` traps — not implemented.
+- **Full §10.1.6.3 ValidateAndApplyPropertyDescriptor invariant matrix** — only the common
+  non-configurable guards are enforced (idempotent redefine, can't-make-configurable/writable/enumerable,
+  data↔accessor flip on a non-configurable prop). The complete invariant lattice is M-subset-simplified.
+- **Strict-mode `[[Set]]`/`[[Delete]]` TypeError** — a rejected write/add/delete (non-writable,
+  non-extensible, non-configurable) is a silent no-op in our sloppy M-subset; strict-mode should throw.
+  `Object.isFrozen`/`isSealed`/`isExtensible` and the `delete`→false return are correct regardless.
+- **Symbol-keyed properties / `getOwnPropertySymbols`** — no Symbol type yet; `ToPropertyKey` is ToString.
+- **`Object.fromEntries` / `Object.defineProperty` accessor invariant corner cases** — not in this slice.
+- **Array exotic per-index integrity** — `seal`/`freeze` of an Array clears `[[Extensible]]` (rejects new
+  props) but does not separately track per-index `[[Writable]]`/`[[Configurable]]` (the Array indices live
+  in `elements`, not the descriptor map); `Object.isFrozen([...])` of a non-empty array may over-report.
 
 ## Dependencies / order
 Ordered by impact-to-effort and spec layering: the descriptor model + `Object` reflection + enumerable-
