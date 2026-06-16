@@ -2164,7 +2164,10 @@ pub const Parser = struct {
         if (in_chain and self.peek().kind == .template) return ParseError.UnexpectedToken;
         // §13.4.2/3 postfix ++ / -- . §13.3.9.1 Early Error: the operand of an UpdateExpression may
         // not be an OptionalChain (`a?.b++` is a SyntaxError) — the chain result isn't a Reference.
-        if (self.peek().kind == .plus_plus or self.peek().kind == .minus_minus) {
+        // §13.4 restricted production: `LeftHandSideExpression [no LineTerminator here] ++ / --`. A
+        // LineTerminator before the operator (incl. the Unicode U+2028/U+2029) means it is NOT a
+        // postfix update — ASI ends the statement here and the `++`/`--` begins the next one.
+        if ((self.peek().kind == .plus_plus or self.peek().kind == .minus_minus) and !self.peek().newline_before) {
             if (in_chain) return ParseError.UnexpectedToken;
             // §13.4.1.1 Early Error: in strict, a postfix-update operand may not be the reference
             // `eval`/`arguments`.

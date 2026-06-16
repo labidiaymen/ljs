@@ -2413,6 +2413,41 @@ test "M23 ID_Start / ID_Continue validation of escaped code points (§12.7)" {
     try expectNoSyntaxErrorStrict("var \\u{10840};"); // astral IMPERIAL ARAMAIC ALEPH
 }
 
+test "M25 raw non-ASCII Unicode identifiers — binding + use (§12.7)" {
+    // Raw `é` (U+00E9) as an IdentifierPart.
+    try expectNumber("var café = 1; café", 1);
+    // Raw é and `\u{e9}` escape decode to the same StringValue → same binding.
+    try expectNumber("var café = 5; caf\\u{e9}", 5);
+    try expectNumber("var caf\\u{e9} = 7; café", 7);
+    // A raw-Unicode identifier whose ASCII look-alike is not declared is `undefined` (distinct name).
+    try expectBool("var café = 1; typeof cafe === 'undefined'", true);
+    // Raw ID_Start letters: Greek Ω (U+03A9), SCRIPT CAPITAL P ℘ (U+2118, Other_ID_Start).
+    try expectNumber("var Ω = 3; Ω", 3);
+    try expectNumber("var ℘ = 4; ℘", 4);
+    // ZWNJ (U+200C) / ZWJ (U+200D) are valid raw ID_Continue (must NOT be eaten as whitespace).
+    try expectNumber("var a\u{200c}b = 8; a\u{200c}b", 8);
+}
+
+test "M25 raw Unicode private names + property names (§15.7 / §12.7)" {
+    // Raw ℘ (U+2118) as a private name.
+    try expectNumber("class C{ #℘ = 5; get(){ return this.#℘; } } new C().get()", 5);
+    // Raw é private name round-trips with the `\u` spelling of the same code point.
+    try expectNumber("class C{ #café = 9; g(){ return this.#caf\\u{e9}; } } new C().g()", 9);
+    // Raw member access `o.℘` resolves the same property as the computed `o[\"℘\"]`.
+    try expectNumber("var o = {}; o[\"℘\"] = 6; o.℘", 6);
+    try expectNumber("var o = {}; o.℘ = 7; o[\"℘\"]", 7);
+}
+
+test "M25 Unicode WhiteSpace + LineTerminators in skipTrivia (§12.2 / §12.3)" {
+    // Raw NBSP (U+00A0) between tokens is WhiteSpace — skipped like a space (`var<NBSP>x=1; x`).
+    try expectNumber("var\u{00a0}x = 1; x", 1);
+    // U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are LineTerminators: each separates two
+    // statements via ASI (no explicit `;`), so all three bindings are in scope for `a + b + c`.
+    try expectNumber("var a = 1\u{2028}var b = 2\u{2029}var c = 3\na + b + c", 6);
+    // IDEOGRAPHIC SPACE (U+3000) and BOM/ZWNBSP (U+FEFF) are also WhiteSpace.
+    try expectNumber("var\u{3000}y\u{feff}= 2; y", 2);
+}
+
 test "M23 escaped contextual keywords are not the keyword (§12.7.1)" {
     // A contextual keyword spelled with an escape is the plain identifier — these grammar positions
     // then become SyntaxErrors (the keyword form is required verbatim).

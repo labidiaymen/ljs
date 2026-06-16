@@ -158,6 +158,25 @@ pub const Lexer = struct {
                 self.pos += 1;
                 continue;
             }
+            // §12.2 Unicode WhiteSpace / §12.3 Unicode LineTerminators encoded as raw multibyte
+            // UTF-8. Decode the sequence at `self.pos`; if it is one of the non-ASCII white-space or
+            // line-terminator code points, skip it. NOTE: U+200C/U+200D (ZWNJ/ZWJ) are ID_Continue,
+            // NOT white space — they must NOT be skipped here (else raw identifiers regress).
+            if (c >= 0x80) {
+                const len = std.unicode.utf8ByteSequenceLength(c) catch break;
+                if (self.pos + len > self.src.len) break;
+                const cp = std.unicode.utf8Decode(self.src[self.pos .. self.pos + len]) catch break;
+                if (isUnicodeWhiteSpace(cp)) {
+                    self.pos += len;
+                    continue;
+                }
+                if (cp == 0x2028 or cp == 0x2029) { // §12.3 LS / PS
+                    saw_newline = true;
+                    self.pos += len;
+                    continue;
+                }
+                break; // a non-trivia multibyte char (e.g. an identifier start) — stop skipping
+            }
             if (c == '/' and self.pos + 1 < self.src.len) {
                 const c2 = self.src[self.pos + 1];
                 if (c2 == '/') { // single-line comment
@@ -231,7 +250,7 @@ pub const Lexer = struct {
         // (`$ _ A-Za-z`) or a `\uHHHH` / `\u{H…}` escape whose code point is a valid ID_Start
         // (§12.7.1). The escaped form is scanned by `scanIdentifier`, which decodes + validates and
         // returns whether any escape was present.
-        if (isIdentStart(c) or c == '\\') {
+        if (isIdentStart(c) or c == '\\' or self.rawIdLen(self.pos, true) != 0) {
             const id = try self.scanIdentifier(start, false);
             const word = id.value;
             // §12.7.1: a keyword spelled with an escape is NOT a keyword token; it is an identifier
@@ -284,7 +303,9 @@ pub const Lexer = struct {
         // private identifiers to class-body member contexts, §15.7).
         if (c == '#') {
             const after = self.peek2();
-            if (!isIdentStart(after) and after != '\\') return LexError.UnexpectedCharacter;
+            // §15.7 PrivateName `#name` — `#` followed by an IdentifierStart: ASCII, a `\u` escape,
+            // or (M25) a raw Unicode ID_Start at `self.pos + 1`.
+            if (!isIdentStart(after) and after != '\\' and self.rawIdLen(self.pos + 1, true) == 0) return LexError.UnexpectedCharacter;
             self.pos += 1; // '#'
             const id = try self.scanIdentifier(self.pos, false);
             // §15.7 PrivateName lexeme INCLUDES the leading `#` (so `#x` and `x` never collide). The
@@ -670,6 +691,20 @@ pub const Lexer = struct {
         }
     }
 
+    /// §12.7 — decode the UTF-8 sequence starting at byte `at` (which must be `>= 0x80`) and, if it
+    /// is a valid raw Unicode IdentifierStart (resp. IdentifierPart when `start == false`), return its
+    /// byte length; otherwise return 0 (invalid UTF-8, truncated, or a code point not allowed in that
+    /// position — the char simply isn't part of the identifier). ASCII is handled by the byte-path
+    /// callers, so this is only consulted for `>= 0x80` bytes.
+    fn rawIdLen(self: *Lexer, at: usize, start: bool) usize {
+        if (at >= self.src.len or self.src[at] < 0x80) return 0;
+        const len = std.unicode.utf8ByteSequenceLength(self.src[at]) catch return 0;
+        if (at + len > self.src.len) return 0;
+        const cp = std.unicode.utf8Decode(self.src[at .. at + len]) catch return 0;
+        const ok = if (start) unicode_id.isIdStart(cp) else unicode_id.isIdContinue(cp);
+        return if (ok) len else 0;
+    }
+
     const ScannedIdent = struct { value: []const u8, had_escape: bool };
 
     /// §12.7 / §12.7.1 — scan an IdentifierName beginning at `from`, supporting `\uHHHH` / `\u{H…}`
@@ -682,20 +717,23 @@ pub const Lexer = struct {
     fn scanIdentifier(self: *Lexer, from: usize, is_private: bool) LexError!ScannedIdent {
         _ = is_private;
         self.pos = from;
-        // Fast path: a plain ASCII identifier with no escape. Scan greedily; if we hit a `\` the
-        // identifier contained an escape and we restart on the buffered path.
+        // Fast path: a plain ASCII identifier with no escape AND no raw non-ASCII char. Scan greedily;
+        // if we hit a `\` (escape) or a `>= 0x80` byte (raw Unicode) we restart on the buffered path.
         if (self.pos < self.src.len and isIdentStart(self.src[self.pos])) {
             var p = self.pos + 1;
             while (p < self.src.len and isIdentPart(self.src[p])) p += 1;
-            if (p >= self.src.len or self.src[p] != '\\') {
+            if (p >= self.src.len or (self.src[p] != '\\' and self.src[p] < 0x80)) {
                 const slice = self.src[from..p];
                 self.pos = p;
                 return .{ .value = slice, .had_escape = false };
             }
         }
-        // Buffered path: at least one `\u` escape somewhere in the identifier.
+        // Buffered path: at least one `\u` escape OR a raw non-ASCII (`>= 0x80`) char in the identifier.
+        // `had_escape` is reported true iff a `\u` escape was actually present (a raw-only Unicode
+        // identifier is NOT an escaped identifier — keyword matching / reserved-word handling differ).
         var buf: std.ArrayList(u8) = .empty;
         var first = true;
+        var had_escape = false;
         while (self.pos < self.src.len) {
             const ch = self.src[self.pos];
             if (ch == '\\') {
@@ -709,6 +747,7 @@ pub const Lexer = struct {
                     if (!unicode_id.isIdContinue(cp)) return LexError.UnexpectedCharacter;
                 }
                 try self.encodeCodePoint(&buf, cp);
+                had_escape = true;
                 first = false;
                 continue;
             }
@@ -719,10 +758,21 @@ pub const Lexer = struct {
                 first = false;
                 continue;
             }
+            if (ch >= 0x80) {
+                // §12.7 raw Unicode IdentifierStart / IdentifierPart. Decode + validate the code point;
+                // an invalid UTF-8 sequence or a code point not allowed in this position ENDS the
+                // identifier (it isn't part of it — not an error here). Append the raw UTF-8 bytes.
+                const len = self.rawIdLen(self.pos, first);
+                if (len == 0) break;
+                try buf.appendSlice(self.arena, self.src[self.pos .. self.pos + len]);
+                self.pos += len;
+                first = false;
+                continue;
+            }
             break;
         }
         if (first) return LexError.UnexpectedCharacter; // empty (e.g. a bare `\` that was not `\u`)
-        return .{ .value = buf.items, .had_escape = true };
+        return .{ .value = buf.items, .had_escape = had_escape };
     }
 
     /// §12.9.4.1 — parse a UnicodeEscapeSequence body (after the `\u`): `HHHH` (4 hex) or `{H…}`
@@ -814,6 +864,23 @@ fn isIdentStart(c: u8) bool {
 }
 fn isIdentPart(c: u8) bool {
     return isIdentStart(c) or isDigit(c);
+}
+
+/// §12.2 WhiteSpace — the non-ASCII (`>= 0x80`) white-space code points. (ASCII SP/TAB and the
+/// other format-control white space are handled by the caller's byte path.) Excludes U+2028/U+2029
+/// (those are §12.3 LineTerminators, handled separately) and U+200C/U+200D (ID_Continue, not WS).
+fn isUnicodeWhiteSpace(cp: u21) bool {
+    return switch (cp) {
+        0x00A0, // NO-BREAK SPACE
+        0x1680, // OGHAM SPACE MARK
+        0x2000...0x200A, // EN QUAD .. HAIR SPACE
+        0x202F, // NARROW NO-BREAK SPACE
+        0x205F, // MEDIUM MATHEMATICAL SPACE
+        0x3000, // IDEOGRAPHIC SPACE
+        0xFEFF, // ZERO WIDTH NO-BREAK SPACE (BOM / ZWNBSP)
+        => true,
+        else => false,
+    };
 }
 
 /// §12.7.2 ReservedWord — the keywords that may not be the StringValue of an IdentifierName that
