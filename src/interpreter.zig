@@ -3479,12 +3479,14 @@ fn shouldAssign(op: ast.LogicalOp, cur: Value) bool {
     };
 }
 
-/// A block needs its own declarative scope only if it lexically declares (let/const/function);
+/// A block needs its own declarative scope only if it lexically declares (let/const/function/class);
 /// `var` is function-scoped and declaration-free blocks can reuse the parent env (hot-loop win).
+/// §15.7: a ClassDeclaration creates a block-scoped lexical binding (like `let`), so a block whose
+/// only declaration is a class still needs its own scope or the class name leaks to the parent.
 fn blockNeedsScope(stmts: []const ast.Stmt) bool {
     for (stmts) |s| switch (s) {
         .declaration => |d| if (d.kind != .var_decl) return true,
-        .func_decl => return true,
+        .func_decl, .class_decl => return true,
         else => {},
     };
     return false;

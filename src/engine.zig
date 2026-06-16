@@ -707,6 +707,43 @@ test "M4 classes: class expression (Cycle 1, §15.7)" {
     try expectNumber("new (class { constructor() { this.v = 42; } })().v", 42);
 }
 
+test "M10 EmptyStatement (§14.4): bare/doubled `;` and trailing `;` after declarations" {
+    // a bare `;` is a no-op statement (not a SyntaxError)
+    try expectNumber("; 1", 1);
+    // doubled empty statements
+    try expectNumber(";; 2", 2);
+    // §14.4: a `;` (EmptyStatement) after a class declaration — the common Test262 `class C {};` form
+    try expectNumber("class C { m() { return 9; } }; new C().m()", 9);
+    // a `;` after a function declaration
+    try expectNumber("function f() { return 5; }; f()", 5);
+    // an empty loop body (`for (...);`) runs the header but no body statement
+    try expectNumber("var i = 0; for (; i < 3; i++); i", 3);
+    // an empty `if`/`else` body
+    try expectNumber("if (true) ; else ; 7", 7);
+    try expectNumber("while (false) ; 8", 8);
+}
+
+test "M10 classes: declaration in statement position is block-scoped (§15.7 / §14.3)" {
+    // statement-form class declaration: the binding name resolves and methods work
+    try expectNumber("class C { m() { return 7; } } new C().m()", 7);
+    // a derived class declared as a statement; instance is `instanceof` the base
+    try expectBool("class A {} class B extends A {} (new B()) instanceof A", true);
+    // §15.7: a ClassDeclaration creates a block-scoped lexical binding (like `let`), NOT a
+    // function-style binding that leaks to the enclosing scope — a class declared in a block
+    // is not visible after the block.
+    try expectStr("{ class Q {} } typeof Q", "undefined");
+    try expectThrows("{ class Q {} } new Q()");
+    // used before its declaration in the same scope → ReferenceError (no function-style hoisting
+    // of the initialized binding — matches §14.3 lexical-binding ordering observably).
+    try expectThrows("new D(); class D {}");
+    // anonymous `class {}` is not a ClassDeclaration (statement position requires a name).
+    try expectSyntaxError("class {}");
+    // `class` must still work where it is an expression (parenthesized / assignment RHS).
+    try expectNumber("var x = (class { m() { return 3; } }); new x().m()", 3);
+    // a function* declaration in statement position parses and produces a generator.
+    try expectNumber("function* g() { yield 5; } g().next().value", 5);
+}
+
 test "M4 classes: body is strict (Cycle 1, §15.7)" {
     // §15.7: a class body is always strict, so a method binding `eval`/`arguments` as a param is a
     // SyntaxError even with no directive and in sloppy RunMode.

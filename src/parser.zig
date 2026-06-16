@@ -328,11 +328,11 @@ pub const Parser = struct {
         _ = try self.expect(.lparen);
         const cond = try self.parseAssignment();
         _ = try self.expect(.rparen);
-        const then = try self.allocStmt(try self.parseStmt());
+        const then = try self.allocStmt(try self.parseSubStmt());
         var otherwise: ?*const ast.Stmt = null;
         if (self.peek().kind == .kw_else) {
             _ = self.advance();
-            otherwise = try self.allocStmt(try self.parseStmt());
+            otherwise = try self.allocStmt(try self.parseSubStmt());
         }
         return .{ .if_stmt = .{ .cond = cond, .then = then, .otherwise = otherwise } };
     }
@@ -342,7 +342,7 @@ pub const Parser = struct {
         _ = try self.expect(.lparen);
         const cond = try self.parseAssignment();
         _ = try self.expect(.rparen);
-        const body = try self.allocStmt(try self.parseStmt());
+        const body = try self.allocStmt(try self.parseSubStmt());
         return .{ .while_stmt = .{ .cond = cond, .body = body } };
     }
 
@@ -438,7 +438,7 @@ pub const Parser = struct {
         var update: ?*const ast.Node = null;
         if (self.peek().kind != .rparen) update = try self.parseExpression();
         _ = try self.expect(.rparen);
-        const body = try self.allocStmt(try self.parseStmt());
+        const body = try self.allocStmt(try self.parseSubStmt());
         return .{ .for_stmt = .{ .init = init_stmt, .cond = cond, .update = update, .body = body } };
     }
 
@@ -449,7 +449,7 @@ pub const Parser = struct {
     fn finishForInOf(self: *Parser, head: ast.ForHead, is_of: bool) ParseError!ast.Stmt {
         const right = if (is_of) try self.parseAssignment() else try self.parseExpression();
         _ = try self.expect(.rparen);
-        const body = try self.allocStmt(try self.parseStmt());
+        const body = try self.allocStmt(try self.parseSubStmt());
         if (is_of) return .{ .for_of_stmt = .{ .head = head, .right = right, .body = body } };
         return .{ .for_in_stmt = .{ .head = head, .right = right, .body = body } };
     }
@@ -537,8 +537,47 @@ pub const Parser = struct {
         return stmt;
     }
 
+    /// §14.5: a single-statement body (the body of `if`/`else`, `while`, `for`, `for-in`/`for-of`)
+    /// is a `Statement`, NOT a `Declaration`. So a lexical declaration (`let`/`const`), a
+    /// `ClassDeclaration`, or a `GeneratorDeclaration` (`function*`) in body position is a
+    /// SyntaxError (`if (x) class C {}`, `while (x) let y;`, `for (;;) function* g(){}`). A plain
+    /// `FunctionDeclaration` is rejected only in strict mode; in sloppy mode Annex B B.3.4 permits it
+    /// as the body of an `if`/`else` (kept legal here — those Annex B positives live under `annexB/`).
+    fn parseSubStmt(self: *Parser) ParseError!ast.Stmt {
+        switch (self.peek().kind) {
+            .kw_const, .kw_class => return ParseError.UnexpectedToken,
+            .kw_let => {
+                // §14.5 + the ExpressionStatement lookahead `[lookahead ∉ { let [ }]`: `let` begins a
+                // (forbidden) LexicalDeclaration here only when it is followed by `[` (always — that
+                // lookahead has no [no LineTerminator here]), or by a BindingIdentifier / `{` on the
+                // SAME line. When a LineTerminator follows `let` and the next token is an identifier
+                // (`while (0) let \n x = 1`), ASI ends the statement at `let` — `let` is then an
+                // IdentifierReference ExpressionStatement, which IS a valid Statement body.
+                const next = if (self.idx + 1 < self.tokens.len) self.tokens[self.idx + 1] else return ParseError.UnexpectedToken;
+                if (next.kind == .lbracket) return ParseError.UnexpectedToken;
+                if (!next.newline_before and (next.kind == .identifier or next.kind == .lbrace)) return ParseError.UnexpectedToken;
+            },
+            .kw_function => {
+                // `function*` (generator declaration) is never a valid substatement; a plain
+                // `function` is invalid only in strict mode.
+                const next_is_star = self.idx + 1 < self.tokens.len and self.tokens[self.idx + 1].kind == .star;
+                if (self.strict or next_is_star) return ParseError.UnexpectedToken;
+            },
+            else => {},
+        }
+        return self.parseStmt();
+    }
+
     fn parseStmtInner(self: *Parser) ParseError!ast.Stmt {
         switch (self.peek().kind) {
+            // §14.4 EmptyStatement : `;` — a no-op. Represented as an empty Block (zero statements),
+            // which the interpreter runs as a no-op without allocating a scope (`blockNeedsScope`
+            // is false for an empty slice). A bare `;`, doubled `;;`, and a `;` trailing a class or
+            // function declaration (e.g. `class C {};`) all reach here.
+            .semicolon => {
+                _ = self.advance();
+                return .{ .block = &.{} };
+            },
             .lbrace => return .{ .block = try self.parseBlock() },
             .kw_var, .kw_let, .kw_const => return self.parseDecl(),
             .kw_function => {
