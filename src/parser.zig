@@ -57,6 +57,15 @@ pub const Parser = struct {
     /// body (`parseFunction`/`finishArrow`); an ordinary function/arrow un-sets it (yield does NOT cross
     /// into a nested non-generator), a `function*` sets it.
     in_generator: bool = false,
+    /// §15.8 `[+Await]` grammar parameter: true while parsing an async function / async arrow / async
+    /// method body. Inside one, `await` is the §15.8 AwaitExpression operator (not an
+    /// IdentifierReference) and `await` as a BindingIdentifier is a §15.8.1 SyntaxError; outside one,
+    /// `await` is an ordinary identifier (sloppy) and an `await` operator is a SyntaxError. Saved/
+    /// restored around every function body (`parseFunction`/`finishArrow`/method parsing); an ordinary
+    /// (non-async) function/arrow un-sets it (await does NOT cross into a nested non-async function),
+    /// an `async function`/`async (…) =>`/`async m(){}` sets it. May coexist with `in_generator` for
+    /// async generators (`async function* g(){}`), where both operators are live in the body.
+    in_async: bool = false,
     /// §14.7.5 `[~In]` grammar: while parsing the FIRST clause of a `for (…)` header, the relational
     /// `in` operator is suppressed so `for (a in b)` is recognized as a for-in head (not the binary
     /// expression `a in b`). Honored in `parseExprFrom` (skips `kw_in` at the relational level). Reset
@@ -165,6 +174,10 @@ pub const Parser = struct {
             .identifier => {
                 // §15.7.11: `await` is reserved as a BindingIdentifier inside a static block.
                 if (self.in_static_block and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
+                // §15.8.1: inside an async body `await` may not be a BindingIdentifier (`var await`,
+                // `let [await]`, a destructuring target `[await]`). (Params parse `~Await`, so a param
+                // `await` is rejected separately via `paramsHaveAwait`; this catches body declarations.)
+                if (self.in_async and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
                 // §15.5.1: inside a generator body `yield` may not be a BindingIdentifier
                 // (`var yield`, `function* g(){ var yield }`, a destructuring target `[yield]`).
                 if (self.in_generator and std.mem.eql(u8, self.peek().lexeme, "yield")) return ParseError.UnexpectedToken;
@@ -610,6 +623,10 @@ pub const Parser = struct {
             // (`if (x) lbl: function f(){}`, `for(;;) lbl: function f(){}` are SyntaxErrors). The
             // label-chain is parsed with `sub_position` set so it rejects a function labelled-item.
             .identifier => {
+                // §15.8: an AsyncFunctionDeclaration (`async function …` / `async function* …`) is a
+                // Declaration, never a valid sub-statement (like `function*`/`class`) — reject it in
+                // `if`/`else`/loop body position (`if (x) async function f(){}`).
+                if (self.atAsyncFunctionStart()) return ParseError.UnexpectedToken;
                 if (self.idx + 1 < self.tokens.len and self.tokens[self.idx + 1].kind == .colon) {
                     return self.parseLabeled(true);
                 }
@@ -633,7 +650,7 @@ pub const Parser = struct {
             .kw_var, .kw_let, .kw_const => return self.parseDecl(),
             .kw_function => {
                 _ = self.advance();
-                return .{ .func_decl = try self.parseFunction() };
+                return .{ .func_decl = try self.parseFunction(false) };
             },
             // §15.7 ClassDeclaration (statement position). Requires a binding name.
             .kw_class => return .{ .class_decl = try self.parseClass(true) },
@@ -693,6 +710,17 @@ pub const Parser = struct {
                 return .{ .continue_stmt = label };
             },
             else => {
+                // §15.8 AsyncFunctionDeclaration `async [no LineTerminator here] function …` in
+                // statement position — a Declaration (hoisted), parsed before the label / expression
+                // fallthrough. `async` is the contextual modifier ONLY when `function` follows on the
+                // SAME line (a LineTerminator triggers ASI: `async \n function f(){}` is the expression
+                // statement `async` then a separate `function` declaration). An async generator decl
+                // (`async function* g(){}`) also lands here.
+                if (self.atAsyncFunctionStart()) {
+                    _ = self.advance(); // `async`
+                    _ = self.advance(); // `function`
+                    return .{ .func_decl = try self.parseFunction(true) };
+                }
                 // §14.13 LabelledStatement `LabelIdentifier : Statement` — an Identifier immediately
                 // followed by `:` at statement start is a label prefix (disambiguated here from an
                 // ExpressionStatement / object literal: those never begin `identifier :` in statement
@@ -776,8 +804,11 @@ pub const Parser = struct {
             // static block is reserved too.
             if (std.mem.eql(u8, name, "yield")) {
                 if (self.in_generator or self.strict) return ParseError.UnexpectedToken;
-            } else if (self.in_static_block and std.mem.eql(u8, name, "await")) {
-                return ParseError.UnexpectedToken;
+            } else if (std.mem.eql(u8, name, "await")) {
+                // §13.1.1 LabelIdentifier `await`: invalid inside an async body (`await` is reserved
+                // there) and inside a static block (§15.7.11). Outside async (sloppy script/function)
+                // `await` is a valid label.
+                if (self.in_async or self.in_static_block) return ParseError.UnexpectedToken;
             } else if (self.strict and !isEvalOrArguments(name) and isStrictReservedBindingName(name)) {
                 return ParseError.UnexpectedToken;
             }
@@ -810,11 +841,11 @@ pub const Parser = struct {
         return wrapped.*;
     }
 
-    /// §15.2 / §15.5: `function [*] [name] (params) { body }` — shared by declarations and expressions.
-    /// The current token is the one AFTER `function` (the caller consumed `function`); a leading `*`
-    /// (§15.5 GeneratorDeclaration / GeneratorExpression) is consumed here and flips the generator
-    /// context for the body.
-    fn parseFunction(self: *Parser) ParseError!*const ast.Function {
+    /// §15.2 / §15.5 / §15.8: `[async] function [*] [name] (params) { body }` — shared by declarations
+    /// and expressions. The current token is the one AFTER `function` (the caller consumed any `async`
+    /// and the `function` keyword); a leading `*` (§15.5 Generator / §15.6 AsyncGenerator) is consumed
+    /// here and flips the generator context for the body. `is_async` (§15.8) flips the await context.
+    fn parseFunction(self: *Parser, is_async: bool) ParseError!*const ast.Function {
         const enclosing_strict = self.strict;
         defer self.strict = enclosing_strict; // §11.2.2: never un-strict an inner scope on the way out
         // §13.3.5/§13.3.7: an ordinary FunctionDeclaration/Expression has its OWN [[HomeObject]] (none)
@@ -824,10 +855,12 @@ pub const Parser = struct {
         const saved_in_derived = self.in_derived_ctor;
         const saved_in_static = self.in_static_block;
         const saved_in_generator = self.in_generator;
+        const saved_in_async = self.in_async;
         defer self.in_method = saved_in_method;
         defer self.in_derived_ctor = saved_in_derived;
         defer self.in_static_block = saved_in_static;
         defer self.in_generator = saved_in_generator;
+        defer self.in_async = saved_in_async;
         self.in_method = false;
         self.in_derived_ctor = false;
         self.in_static_block = false; // §15.7.11: a nested ordinary function un-reserves `await`
@@ -835,11 +868,13 @@ pub const Parser = struct {
         // an ordinary nested function un-sets `in_generator` (yield does not cross into it).
         const is_generator = self.peek().kind == .star;
         if (is_generator) _ = self.advance();
-        // §15.5: the BODY parses with `[+Yield]`, but the FormalParameters are restricted — a `yield`
-        // operator in a default is a §15.5.1 SyntaxError. We keep `in_generator` false across the name +
-        // params (so `yield` as an operator there does not parse), set it true only for the body, and
-        // explicitly reject `yield` as the generator's name / a param BindingIdentifier below.
+        // §15.5/§15.8: the BODY parses with `[+Yield]`/`[+Await]`, but the FormalParameters are
+        // restricted — a `yield`/`await` operator in a default is a §15.5.1/§15.8.1 SyntaxError. We keep
+        // `in_generator`/`in_async` false across the name + params (so `yield`/`await` as an operator
+        // there does not parse), set them for the body only, and explicitly reject `yield`/`await` as
+        // the function's name / a param BindingIdentifier below.
         self.in_generator = false;
+        self.in_async = false;
         var name: ?[]const u8 = null;
         if (self.peek().kind == .identifier) name = self.advance().lexeme;
         // §13.1.1: a strict function's name (BindingIdentifier) may not be `eval`/`arguments`/a
@@ -849,11 +884,24 @@ pub const Parser = struct {
         // §15.5.1: a generator's BindingIdentifier may not be `yield`, and (in a generator) `yield` may
         // not be a parameter BindingIdentifier (`function* g(yield){}` / `function* yield(){}`).
         if (is_generator) if (name) |nm| if (std.mem.eql(u8, nm, "yield")) return ParseError.UnexpectedToken;
+        // §15.8.1: an async function's BindingIdentifier may not be `await`, and `await` may not be an
+        // async function's parameter BindingIdentifier (`async function await(){}` / `async function
+        // f(await){}`). The name is bound in the enclosing scope; the `[+Await]` of the surrounding
+        // context (an async fn nested in another) also forbids it — but the function's own asyncness
+        // is sufficient to reject its name/params.
+        if (is_async) if (name) |nm| if (std.mem.eql(u8, nm, "await")) return ParseError.UnexpectedToken;
         const pl = try self.parseParams();
         if (is_generator and paramsHaveYield(pl)) return ParseError.UnexpectedToken;
+        // §15.8.1: an async function's FormalParameters may not bind `await` (`async function f(await){}`)
+        // nor contain an AwaitExpression (the params parse `~Await`, so `await x` there is the identifier
+        // `await` applied to `x` — a syntax error on its own — but `await` as a binding name is the case
+        // we must reject explicitly).
+        if (is_async and paramsHaveAwait(pl)) return ParseError.UnexpectedToken;
         // §15.5.1: a GeneratorDeclaration/Expression has UniqueFormalParameters — no duplicate bound
         // names, in EVERY mode (not only strict), so `function*(x = 0, x){}` is a SyntaxError sloppy too.
         if (is_generator and hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
+        // §15.8.1 / §15.6.1: an AsyncFunction/AsyncGenerator also has UniqueFormalParameters.
+        if (is_async and hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
         // §11.2.2 lexical inheritance: the body is strict if the enclosing scope is, OR it carries
         // its own "use strict" prologue. Prescan the body tokens (current token is `{`) so the
         // param/body Early Errors below see the function's own strictness.
@@ -867,6 +915,7 @@ pub const Parser = struct {
         }
         self.strict = body_strict;
         self.in_generator = is_generator; // §15.5: the GeneratorBody parses with `[+Yield]`
+        self.in_async = is_async; // §15.8: the AsyncFunctionBody parses with `[+Await]`
         // §14.13/§14.8/§14.9: labels and the iteration/switch nest do NOT cross a function boundary —
         // the body starts with a fresh, empty label scope (`break`/`continue` can't target an outer
         // loop). Saved/restored around the body parse.
@@ -876,8 +925,13 @@ pub const Parser = struct {
         // §15.1.1 Early Error: a "use strict" directive is forbidden when the parameter list is
         // non-simple (has defaults, patterns, or a rest element).
         if (!isSimpleParameterList(pl) and bodyHasUseStrict(body)) return ParseError.UnexpectedToken;
+        // §15.8.1 / §15.6.1 Early Error: for an AsyncFunction / AsyncGenerator, a BoundName of the
+        // FormalParameters may not also occur in the LexicallyDeclaredNames of the body
+        // (`async function f(bar){ let bar; }`). (Ordinary/generator functions have the same rule but
+        // are tracked separately as pre-existing cuts; methods already enforce it.)
+        if (is_async and paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
         const f = try self.arena.create(ast.Function);
-        f.* = .{ .name = name, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = is_generator };
+        f.* = .{ .name = name, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = is_generator, .is_async = is_async };
         return f;
     }
 
@@ -1033,13 +1087,25 @@ pub const Parser = struct {
             }
         }
 
-        // §15.7 GeneratorMethod `* m(){…}` / `static * m(){…}` / `* [expr](){…}` — a leading `*`
-        // marks a generator method (§15.5). `async m` / `async * m` (async generators) stay
-        // parse-rejected (a separate future milestone). Accessors `get`/`set` (handled just below),
-        // computed names `[expr]`, and PrivateName members `#x` (handled below) land too. `get`/`set`/
-        // `async` are only a modifier when followed by something that begins a property name (else they
-        // are an ordinary element key, e.g. `get(){}` / `get = 1` / `get;`).
+        // §15.7 GeneratorMethod `* m(){…}` / §15.8 AsyncMethod `async m(){…}` / §15.6 AsyncGeneratorMethod
+        // `async * m(){…}` — a leading `*` marks a generator method (§15.5); a leading `async` (no
+        // LineTerminator before the name) marks an async method, optionally followed by `*` for an
+        // async generator. Accessors `get`/`set` (handled just below), computed names `[expr]`, and
+        // PrivateName members `#x` (handled below) land too. `get`/`set`/`async` are only a modifier
+        // when followed by something that begins a property name (else they are an ordinary element
+        // key, e.g. `get(){}` / `get = 1` / `get;` / `async(){}` / `async;`).
         var is_generator_method = false;
+        var is_async_method = false;
+        // §15.8: `async` is the modifier only when (no LineTerminator before the next token AND) the
+        // next token begins a property name or is `*`. `async \n m(){}` is the field `async` then a
+        // method `m` (ASI), so a LineTerminator un-sets the modifier.
+        if (self.peek().kind == .identifier and std.mem.eql(u8, self.peek().lexeme, "async") and
+            !self.tokens[self.idx + 1].newline_before and
+            (startsAccessorName(self.tokens[self.idx + 1].kind) or self.tokens[self.idx + 1].kind == .star))
+        {
+            is_async_method = true;
+            _ = self.advance(); // consume `async`
+        }
         switch (self.peek().kind) {
             .star => {
                 is_generator_method = true;
@@ -1047,14 +1113,10 @@ pub const Parser = struct {
             },
             .identifier => {
                 const w = self.peek().lexeme;
-                if (std.mem.eql(u8, w, "async") and
-                    (startsAccessorName(self.tokens[self.idx + 1].kind) or self.tokens[self.idx + 1].kind == .star))
-                {
-                    return ParseError.UnexpectedToken; // async method / async generator (deferred)
-                }
                 // §15.7 `get x(){…}` / `set x(v){…}` accessor (instance or static). A `get`/`set`
-                // followed by a PrivateIdentifier is a PRIVATE accessor `get #x(){…}`.
-                if ((std.mem.eql(u8, w, "get") or std.mem.eql(u8, w, "set")) and
+                // followed by a PrivateIdentifier is a PRIVATE accessor `get #x(){…}`. (Not reachable
+                // when `is_async_method` — `async get(){}` is an async method named `get`.)
+                if (!is_async_method and (std.mem.eql(u8, w, "get") or std.mem.eql(u8, w, "set")) and
                     startsAccessorName(self.tokens[self.idx + 1].kind))
                 {
                     return self.parseClassAccessor(is_static, std.mem.eql(u8, w, "get"));
@@ -1080,36 +1142,41 @@ pub const Parser = struct {
             // SyntaxError (handled in parsePrivateName) and a private name is never the class ctor.
             if (is_static and is_literal and !is_private and std.mem.eql(u8, pn.key, "prototype")) return ParseError.UnexpectedToken;
             // §15.7: a non-static, non-private method named `constructor` is the class constructor —
-            // but a GENERATOR method named `constructor` is a §15.7.1 SyntaxError (a constructor is
-            // never a generator), and a `static *prototype` was already rejected above.
-            const is_ctor = !is_generator_method and !is_static and is_literal and !is_private and std.mem.eql(u8, pn.key, "constructor");
-            if (is_generator_method and is_literal and !is_private and !is_static and std.mem.eql(u8, pn.key, "constructor")) return ParseError.UnexpectedToken;
+            // but a GENERATOR or ASYNC method named `constructor` is a §15.7.1 SyntaxError (a
+            // constructor is never a generator/async), and a `static *prototype` was already rejected.
+            const is_ctor = !is_generator_method and !is_async_method and !is_static and is_literal and !is_private and std.mem.eql(u8, pn.key, "constructor");
+            if ((is_generator_method or is_async_method) and is_literal and !is_private and !is_static and std.mem.eql(u8, pn.key, "constructor")) return ParseError.UnexpectedToken;
             // §13.3.5/§13.3.7: every MethodDefinition body has a [[HomeObject]] (`super.x` allowed);
             // `super(...)` is allowed only in a DERIVED class's `constructor`. Saved/restored so the
             // flags don't leak to the next element (or, via the defers, to anything after the body).
             const saved_in_method = self.in_method;
             const saved_in_derived = self.in_derived_ctor;
             const saved_in_generator = self.in_generator;
+            const saved_in_async = self.in_async;
             defer self.in_method = saved_in_method;
             defer self.in_derived_ctor = saved_in_derived;
             defer self.in_generator = saved_in_generator;
+            defer self.in_async = saved_in_async;
             self.in_method = true;
             self.in_derived_ctor = is_ctor and is_derived;
-            // §15.5: a generator method's BODY parses with `[+Yield]`; its FormalParameters do NOT
-            // (a `yield` operator in a default is a §15.5.1 SyntaxError, and `yield` may not be a
-            // param BindingIdentifier). An ordinary method un-sets `in_generator` (yield is not the
-            // operator there even when the method sits inside an enclosing generator).
+            // §15.5/§15.8: a generator/async method's BODY parses with `[+Yield]`/`[+Await]`; its
+            // FormalParameters do NOT (a `yield`/`await` operator in a default is a §15.5.1/§15.8.1
+            // SyntaxError, and `yield`/`await` may not be a param BindingIdentifier). An ordinary method
+            // un-sets both (they are not operators there even inside an enclosing generator/async fn).
             self.in_generator = false;
+            self.in_async = false;
             const pl = try self.parseParams();
             if (is_generator_method and paramsHaveYield(pl)) return ParseError.UnexpectedToken;
+            if (is_async_method and paramsHaveAwait(pl)) return ParseError.UnexpectedToken;
             self.in_generator = is_generator_method;
+            self.in_async = is_async_method;
             const body = try self.parseMethodBody(pl);
             // §15.7 / §13.2.5.1 UniqueFormalParameters — a method's parameters have no duplicates.
             if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
             // §14.3.1 / §15.5.1: a method's params may not collide with its body's LexicallyDeclaredNames.
             if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
             const f = try self.arena.create(ast.Function);
-            f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = is_generator_method };
+            f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = is_generator_method, .is_async = is_async_method };
             return .{
                 .kind = if (is_ctor) .constructor else .method,
                 .is_static = is_static,
@@ -1119,9 +1186,9 @@ pub const Parser = struct {
                 .value = .{ .func = f },
             };
         }
-        // A leading `*` with no following method body (`* x;` / `* x = 1`) is a SyntaxError — a
-        // generator element must be a method.
-        if (is_generator_method) return ParseError.UnexpectedToken;
+        // A leading `*` or `async` with no following method body (`* x;` / `async x = 1`) is a
+        // SyntaxError — a generator / async element must be a method (have a `(params)` body).
+        if (is_generator_method or is_async_method) return ParseError.UnexpectedToken;
 
         // §15.7 FieldDefinition `x = Initializer ;` or bare `x ;` (ASI). An optional `= expr`.
         // §15.7.1 Early Errors on the field's PropName: it may not be `constructor`; a `static` field
@@ -1172,11 +1239,21 @@ pub const Parser = struct {
         const saved_in_method = self.in_method;
         const saved_in_derived = self.in_derived_ctor;
         const saved_in_static = self.in_static_block;
+        const saved_in_async = self.in_async;
+        const saved_in_generator = self.in_generator;
         defer self.in_method = saved_in_method;
         defer self.in_derived_ctor = saved_in_derived;
         defer self.in_static_block = saved_in_static;
+        defer self.in_async = saved_in_async;
+        defer self.in_generator = saved_in_generator;
         self.in_method = true;
         self.in_derived_ctor = false;
+        // §15.7.11: a ClassStaticBlock is NOT an async/generator context — `await`/`yield` are not
+        // operators here. `await` is RESERVED (a binding/reference is a SyntaxError, via `in_static_block`)
+        // and `ContainsAwait` of the block is a Syntax Error, so an `await`-led form must not parse as
+        // the operator even when the block is nested in an async function. Reset both context flags.
+        self.in_async = false;
+        self.in_generator = false;
         self.in_static_block = true; // §15.7.11: `await` is reserved inside the block
         const ctrl = self.enterControlScope(); // §14.13: a static block starts a fresh label scope
         defer self.exitControlScope(ctrl);
@@ -1367,8 +1444,16 @@ pub const Parser = struct {
     /// normalized to a single `return expr` statement; a `{ … }` body is a normal block.
     /// `params`/`rest` come from the already-parsed (or about-to-parse) formal list.
     fn finishArrow(self: *Parser, pl: ParamList) ParseError!*const ast.Node {
+        return self.finishArrowAsync(pl, false);
+    }
+
+    /// §15.3 / §15.8 ArrowFunction / AsyncArrowFunction. `is_async` flags an async arrow (`async x =>`,
+    /// `async (a) =>`), whose body parses with `[+Await]` (and whose `=>` was preceded by `async`).
+    fn finishArrowAsync(self: *Parser, pl: ParamList, is_async: bool) ParseError!*const ast.Node {
         const enclosing_strict = self.strict;
+        const saved_in_async = self.in_async;
         defer self.strict = enclosing_strict; // §11.2.2: never un-strict on the way out
+        defer self.in_async = saved_in_async;
         // §15.3.1 Early Error: `ArrowParameters [no LineTerminator here] =>` — a line terminator
         // between the parameters and `=>` is a SyntaxError (ASI must not insert a semicolon here).
         if (self.peek().newline_before) return ParseError.UnexpectedToken;
@@ -1389,6 +1474,12 @@ pub const Parser = struct {
         // or a future-reserved word.
         if (body_strict and paramsHaveStrictReserved(pl)) return ParseError.UnexpectedToken;
         self.strict = body_strict;
+        // §15.3 ArrowFunction[?Yield, ?Await]: an ordinary arrow's body inherits the enclosing
+        // `[?Yield, ?Await]` (an arrow inside a generator/async fn sees `yield`/`await` as operators in
+        // its body). An ASYNC arrow forces `[+Await]` for its body regardless. `in_generator` is left
+        // untouched (inherited). (The caller set `in_async` true across an `async (…)` param parse; here
+        // we keep it true for the async-arrow body too.)
+        if (is_async) self.in_async = true;
         const ctrl = self.enterControlScope(); // §14.13: an arrow body starts a fresh label scope
         defer self.exitControlScope(ctrl);
         const body: []const ast.Stmt = if (self.peek().kind == .lbrace)
@@ -1403,8 +1494,11 @@ pub const Parser = struct {
         };
         // §15.1.1 Early Error: a "use strict" directive is forbidden with a non-simple param list.
         if (!isSimpleParameterList(pl) and bodyHasUseStrict(body)) return ParseError.UnexpectedToken;
+        // §15.8.1 Early Error: an async arrow's FormalParameters BoundNames may not also occur in the
+        // body's LexicallyDeclaredNames (`async (bar) => { let bar; }`).
+        if (is_async and paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
         const f = try self.arena.create(ast.Function);
-        f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_arrow = true };
+        f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_arrow = true, .is_async = is_async };
         return self.alloc(.{ .function = f });
     }
 
@@ -1413,7 +1507,13 @@ pub const Parser = struct {
     /// arrow cover-grammar `( … ) =>` from a parenthesized expression without backtracking the
     /// real parse. Does not mutate parser state.
     fn parenIsArrowHead(self: *Parser) bool {
-        var i = self.idx; // on the '('
+        return self.parenIsArrowHeadAt(self.idx);
+    }
+
+    /// As `parenIsArrowHead`, but the `(` is at the given token index (used for `async ( … ) =>`,
+    /// where the `(` sits one past `async`). Returns true iff the token after the matching `)` is `=>`.
+    fn parenIsArrowHeadAt(self: *Parser, start: usize) bool {
+        var i = start; // on the '('
         var depth: usize = 0;
         while (i < self.tokens.len) : (i += 1) {
             switch (self.tokens[i].kind) {
@@ -1430,6 +1530,45 @@ pub const Parser = struct {
             }
         }
         return false;
+    }
+
+    /// §15.8: is the current token an `async` contextual keyword starting an AsyncFunctionDeclaration
+    /// `async [no LineTerminator here] function …`? `async` is the modifier only when `function`
+    /// follows on the SAME line (no intervening LineTerminator — else ASI splits it). The `function`
+    /// keyword must immediately follow `async`.
+    fn atAsyncFunctionStart(self: *Parser) bool {
+        if (self.peek().kind != .identifier or !std.mem.eql(u8, self.peek().lexeme, "async")) return false;
+        if (self.idx + 1 >= self.tokens.len) return false;
+        const nxt = self.tokens[self.idx + 1];
+        return nxt.kind == .kw_function and !nxt.newline_before;
+    }
+
+    /// §15.8: classify an `async`-led head in expression (AssignmentExpression) position. Returns the
+    /// kind of async construct starting here, or null if `async` is not a modifier (it is then an
+    /// ordinary IdentifierReference — `async`, `async()` call, `async + 1`, `async\nx => …`, etc.).
+    /// `async` is the modifier ONLY with NO LineTerminator before the following token (§15.8 restricted
+    /// production) AND the following form is an arrow head or `function`. A trailing `=>` after the
+    /// matching `)` distinguishes `async (a, b) => …` from a call `async(a, b)`.
+    const AsyncHead = enum { arrow_ident, arrow_paren, function_expr };
+    fn atAsyncArrowOrFunction(self: *Parser) ?AsyncHead {
+        if (self.peek().kind != .identifier or !std.mem.eql(u8, self.peek().lexeme, "async")) return null;
+        if (self.idx + 1 >= self.tokens.len) return null;
+        const nxt = self.tokens[self.idx + 1];
+        // §15.8 restricted production `async [no LineTerminator here] …` — a LineTerminator after
+        // `async` makes it a plain IdentifierReference (ASI), never the modifier.
+        if (nxt.newline_before) return null;
+        // `async function …` / `async function* …` — an AsyncFunctionExpression / AsyncGeneratorExpression.
+        if (nxt.kind == .kw_function) return .function_expr;
+        // `async Identifier =>` — a single-parameter async arrow. The identifier must be on the same
+        // line as `async`, and `=>` must immediately follow (also same line — checked in finishArrow).
+        if (nxt.kind == .identifier and self.idx + 2 < self.tokens.len and
+            self.tokens[self.idx + 2].kind == .fat_arrow)
+        {
+            return .arrow_ident;
+        }
+        // `async ( … ) =>` — a parenthesized async arrow (vs the call `async(...)`, which has no `=>`).
+        if (nxt.kind == .lparen and self.parenIsArrowHeadAt(self.idx + 1)) return .arrow_paren;
+        return null;
     }
 
     /// §13.16 Expression — the comma / sequence operator layer that wraps AssignmentExpression.
@@ -1459,6 +1598,47 @@ pub const Parser = struct {
         if (self.in_generator and self.peek().kind == .identifier and std.mem.eql(u8, self.peek().lexeme, "yield")) {
             return self.parseYield();
         }
+        // §15.8 AwaitExpression `await UnaryExpression` — inside an async context `await` is the
+        // operator. Parsed via `parseUnary` (UnaryExpression precedence); routed there so it composes
+        // with the rest of the precedence climb (`await a + b` ≡ `(await a) + b`). Handled at the
+        // assignment level only as a quick gate for the async-arrow / ordinary fallthrough — the actual
+        // node is built in `parseUnary`, so we just fall through to the precedence path below.
+        // §15.8 async arrow / async function expression (cover grammar, before the ordinary arrow):
+        //   • `async [no LT] Identifier =>` — a single-parameter async arrow.
+        //   • `async [no LT] ( … ) =>` — a parenthesized async arrow.
+        //   • `async [no LT] function …` — an async function expression.
+        // `async` is the modifier ONLY with no LineTerminator before the following token (else ASI /
+        // `async` is an identifier). Distinguished from a CALL `async(x)` by the trailing `=>`.
+        if (self.atAsyncArrowOrFunction()) |kind| switch (kind) {
+            .arrow_ident => {
+                _ = self.advance(); // `async`
+                // §15.8.1: `async await => …` — `await` may not be an async arrow's param BindingIdentifier.
+                if (std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
+                const pat = try self.allocPattern(.{ .identifier = self.advance().lexeme });
+                const params = try self.arena.alloc(ast.Param, 1);
+                params[0] = .{ .pattern = pat, .default = null };
+                return self.finishArrowAsync(.{ .params = params, .rest = null }, true);
+            },
+            .arrow_paren => {
+                _ = self.advance(); // `async`
+                const saved_in_async = self.in_async;
+                defer self.in_async = saved_in_async;
+                // §15.8: an AsyncArrowFunction's CoverCallExpressionAndAsyncArrowHead parses its
+                // formals with `[+Await]` — so `await` is reserved as a BindingIdentifier inside them
+                // (including in a nested arrow's params, `async(a = (await) => {}) => {}`), and an
+                // `await` operator there becomes an `await_expr`. §15.8.1 then rejects any params that
+                // bind/contain `await` (`paramsHaveAwait`, which catches both the identifier and the node).
+                self.in_async = true;
+                const pl = try self.parseParams();
+                if (paramsHaveAwait(pl)) return ParseError.UnexpectedToken;
+                return self.finishArrowAsync(pl, true);
+            },
+            .function_expr => {
+                _ = self.advance(); // `async`
+                _ = self.advance(); // `function`
+                return self.alloc(.{ .function = try self.parseFunction(true) });
+            },
+        };
         // §15.3 ArrowFunction (cover grammar, checked before the precedence climb):
         //   • `Identifier =>` — a single un-parenthesized parameter.
         //   • `( … ) =>` — a parenthesized formal list (lookahead to the matching `)`).
@@ -1467,6 +1647,8 @@ pub const Parser = struct {
         {
             // §15.7.11: `await` is reserved as a BindingIdentifier inside a static block (`await => …`).
             if (self.in_static_block and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
+            // §15.8.1: inside an async context `await` may not be an arrow's param BindingIdentifier.
+            if (self.in_async and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
             const pat = try self.allocPattern(.{ .identifier = self.advance().lexeme });
             const params = try self.arena.alloc(ast.Param, 1);
             params[0] = .{ .pattern = pat, .default = null };
@@ -1735,6 +1917,14 @@ pub const Parser = struct {
 
     fn parseUnary(self: *Parser) ParseError!*const ast.Node {
         self.last_was_paren = false; // reset; set by a parenthesized primary (§13.13.1 mix check)
+        // §15.8 AwaitExpression : `await` UnaryExpression — inside an async context `await` is the
+        // operator (at UnaryExpression precedence, so `await a.b()` awaits the call result and `await
+        // -x` awaits `-x`). Outside async, `await` is an ordinary identifier (handled in parsePrimary).
+        if (self.in_async and self.peek().kind == .identifier and std.mem.eql(u8, self.peek().lexeme, "await")) {
+            _ = self.advance(); // await
+            const operand = try self.parseUnary();
+            return self.alloc(.{ .await_expr = operand });
+        }
         // §13.4.4/5 prefix ++ / --
         if (self.peek().kind == .plus_plus or self.peek().kind == .minus_minus) {
             const op: ast.UpdateOp = if (self.peek().kind == .plus_plus) .inc else .dec;
@@ -1743,8 +1933,9 @@ pub const Parser = struct {
             // §13.3.9.1 Early Error: `++a?.b` — a prefix-update operand may not be an OptionalChain.
             if (target.* == .optional) return ParseError.UnexpectedToken;
             // §13.4.1.1 Early Error: an UpdateExpression operand must be a simple assignment target; a
-            // (parenthesized) YieldExpression is not (`++(yield)` in a generator is a SyntaxError).
-            if (target.* == .yield_expr) return ParseError.UnexpectedToken;
+            // (parenthesized) YieldExpression / AwaitExpression is not (`++(yield)` in a generator,
+            // `++(await x)` in an async function are SyntaxErrors).
+            if (target.* == .yield_expr or target.* == .await_expr) return ParseError.UnexpectedToken;
             // §13.4.1.1 Early Error: in strict, the operand of a prefix update may not be the
             // reference `eval`/`arguments`.
             if (self.strict) switch (target.*) {
@@ -1906,9 +2097,10 @@ pub const Parser = struct {
                 .identifier => |n| if (isEvalOrArguments(n)) return ParseError.UnexpectedToken,
                 else => {},
             };
-            // §13.4.1.1 Early Error: a (parenthesized) YieldExpression is not a simple assignment
-            // target — `(yield)++` in a generator is a SyntaxError.
-            if (expr.* == .yield_expr) return ParseError.UnexpectedToken;
+            // §13.4.1.1 Early Error: a (parenthesized) YieldExpression / AwaitExpression is not a
+            // simple assignment target — `(yield)++` in a generator, `(await x)++` in an async
+            // function are SyntaxErrors.
+            if (expr.* == .yield_expr or expr.* == .await_expr) return ParseError.UnexpectedToken;
             const op: ast.UpdateOp = if (self.peek().kind == .plus_plus) .inc else .dec;
             _ = self.advance();
             expr = try self.alloc(.{ .update = .{ .op = op, .prefix = false, .target = expr } });
@@ -1953,43 +2145,61 @@ pub const Parser = struct {
                 break;
             }
 
-            // §13.2.5 GeneratorMethod `* m(){…}` / `* [expr](){…}` in an object literal — a leading
-            // `*` marks a generator method (§15.5). `async m` / `async * m` (async generators) stay
-            // parse-rejected (a separate future milestone).
-            if (self.peek().kind == .star) {
-                _ = self.advance(); // consume `*`
-                const name = try self.parsePropertyName();
-                if (self.peek().kind != .lparen) return ParseError.UnexpectedToken; // a `*` element must be a method
-                const saved_in_generator = self.in_generator;
-                defer self.in_generator = saved_in_generator;
-                // §15.5: the params parse `~Yield` (a `yield` there is a §15.5.1 SyntaxError), the body `+Yield`.
-                self.in_generator = false;
-                const pl = try self.parseParams();
-                if (paramsHaveYield(pl)) return ParseError.UnexpectedToken;
-                self.in_generator = true;
-                const body = try self.parseMethodBody(pl);
-                if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
-                // §14.3.1 / §15.5.1: params may not collide with the body's LexicallyDeclaredNames.
-                if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
-                const f = try self.arena.create(ast.Function);
-                f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = true };
-                const fnode = try self.alloc(.{ .function = f });
-                try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = fnode });
-                if (self.peek().kind == .comma) {
-                    _ = self.advance();
-                    continue;
+            // §13.2.5 GeneratorMethod `* m(){…}` / §15.8 AsyncMethod `async m(){…}` / §15.6
+            // AsyncGeneratorMethod `async * m(){…}` in an object literal — a leading `*` marks a
+            // generator method; a leading `async` (no LineTerminator before the name/`*`) marks an
+            // async method, optionally `*` for an async generator. `async` is the modifier only when
+            // followed by something that begins a property name or `*` (else `{async: 1}` / `{async}` /
+            // `{async(){}}` use the identifier `async`).
+            {
+                var om_is_async = false;
+                if (self.peek().kind == .identifier and std.mem.eql(u8, self.peek().lexeme, "async") and
+                    !self.tokens[self.idx + 1].newline_before and
+                    (startsAccessorName(self.tokens[self.idx + 1].kind) or self.tokens[self.idx + 1].kind == .star))
+                {
+                    om_is_async = true;
+                    _ = self.advance(); // consume `async`
                 }
-                break;
+                var om_is_gen = false;
+                if (self.peek().kind == .star) {
+                    om_is_gen = true;
+                    _ = self.advance(); // consume `*`
+                }
+                if (om_is_async or om_is_gen) {
+                    const name = try self.parsePropertyName();
+                    if (self.peek().kind != .lparen) return ParseError.UnexpectedToken; // a `*`/`async` element must be a method
+                    const saved_in_generator = self.in_generator;
+                    const saved_in_async = self.in_async;
+                    defer self.in_generator = saved_in_generator;
+                    defer self.in_async = saved_in_async;
+                    // §15.5/§15.8: the params parse `~Yield`/`~Await` (a `yield`/`await` operator there
+                    // is a §15.5.1/§15.8.1 SyntaxError), the body `+Yield`/`+Await`.
+                    self.in_generator = false;
+                    self.in_async = false;
+                    const pl = try self.parseParams();
+                    if (om_is_gen and paramsHaveYield(pl)) return ParseError.UnexpectedToken;
+                    if (om_is_async and paramsHaveAwait(pl)) return ParseError.UnexpectedToken;
+                    self.in_generator = om_is_gen;
+                    self.in_async = om_is_async;
+                    const body = try self.parseMethodBody(pl);
+                    if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
+                    // §14.3.1 / §15.5.1: params may not collide with the body's LexicallyDeclaredNames.
+                    if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
+                    const f = try self.arena.create(ast.Function);
+                    f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = om_is_gen, .is_async = om_is_async };
+                    const fnode = try self.alloc(.{ .function = f });
+                    try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = fnode });
+                    if (self.peek().kind == .comma) {
+                        _ = self.advance();
+                        continue;
+                    }
+                    break;
+                }
             }
 
             // §13.2.5.6 `get`/`set` accessor — only when the next token starts a property name (so
             // `{get: 1}` and `{get(){}}` and `{get}` stay ordinary uses of the identifier `get`).
             const w = self.peek();
-            if (w.kind == .identifier and std.mem.eql(u8, w.lexeme, "async") and
-                (startsAccessorName(self.tokens[self.idx + 1].kind) or self.tokens[self.idx + 1].kind == .star))
-            {
-                return ParseError.UnexpectedToken; // async method / async generator method (deferred)
-            }
             if (w.kind == .identifier and (std.mem.eql(u8, w.lexeme, "get") or std.mem.eql(u8, w.lexeme, "set")) and
                 startsAccessorName(self.tokens[self.idx + 1].kind))
             {
@@ -2159,6 +2369,11 @@ pub const Parser = struct {
                 // reaching the primary position (`void yield`, `yield + x`, `(yield)`, the second
                 // `yield` in `yield 3 + yield 4`) is a SyntaxError.
                 if (self.in_generator and std.mem.eql(u8, t.lexeme, "yield")) return ParseError.UnexpectedToken;
+                // §15.8 / §15.8.1: inside an async context `await` is ALWAYS the AwaitExpression
+                // operator (parsed at the unary level by `parseUnary`), never an IdentifierReference —
+                // a bare `await` reaching primary position is a SyntaxError. Outside async (sloppy
+                // scripts/functions) `await` is an ordinary identifier and falls through below.
+                if (self.in_async and std.mem.eql(u8, t.lexeme, "await")) return ParseError.UnexpectedToken;
                 // §15.7.11: `await` is reserved as an IdentifierReference inside a static block body.
                 if (self.in_static_block and std.mem.eql(u8, t.lexeme, "await")) return ParseError.UnexpectedToken;
                 _ = self.advance();
@@ -2202,7 +2417,7 @@ pub const Parser = struct {
             },
             .kw_function => {
                 _ = self.advance();
-                return self.alloc(.{ .function = try self.parseFunction() });
+                return self.alloc(.{ .function = try self.parseFunction(false) });
             },
             .kw_this => {
                 _ = self.advance();
@@ -2368,6 +2583,59 @@ fn nodeReferencesYield(node: *const ast.Node) bool {
         .assign => |a| nodeReferencesYield(a.value),
         .comma => |c| nodeReferencesYield(c.left) or nodeReferencesYield(c.right),
         .call => |c| nodeReferencesYield(c.callee),
+        else => false,
+    };
+}
+
+/// §15.8.1 / §15.6.1 Early Error: an AsyncFunction/AsyncArrow/AsyncGenerator's FormalParameters may
+/// neither bind `await` (`async function f(await){}`) nor — since params parse `~Await` — contain an
+/// AwaitExpression. A param BindingIdentifier `await`, or a default that references `await` as the
+/// identifier (`async (a = await) => {}`, parsed as the identifier `await` since params are `~Await`),
+/// is invalid. Mirrors `paramsHaveYield`.
+fn paramsHaveAwait(pl: Parser.ParamList) bool {
+    for (pl.params) |p| {
+        if (patternBindsAwait(p.pattern)) return true;
+        if (p.default) |d| if (nodeReferencesAwait(d)) return true;
+    }
+    if (pl.rest) |r| return patternBindsAwait(r);
+    return false;
+}
+
+fn patternBindsAwait(pattern: *const ast.Pattern) bool {
+    switch (pattern.*) {
+        .identifier => |n| return std.mem.eql(u8, n, "await"),
+        .array => |ap| {
+            for (ap.elements) |el| {
+                if (el.target) |t| if (patternBindsAwait(t)) return true;
+                if (el.default) |d| if (nodeReferencesAwait(d)) return true;
+            }
+            if (ap.rest) |r| return patternBindsAwait(r);
+            return false;
+        },
+        .object => |op| {
+            for (op.properties) |prop| {
+                if (patternBindsAwait(prop.target)) return true;
+                if (prop.default) |d| if (nodeReferencesAwait(d)) return true;
+            }
+            if (op.rest) |r| return std.mem.eql(u8, r, "await");
+            return false;
+        },
+    }
+}
+
+/// Shallow scan for an `await` IdentifierReference or an `await_expr` node in `node` — enough to
+/// reject `await` in an async function's FormalParameters (§15.8.1). Mirrors `nodeReferencesYield`.
+fn nodeReferencesAwait(node: *const ast.Node) bool {
+    return switch (node.*) {
+        .identifier => |n| std.mem.eql(u8, n, "await"),
+        .await_expr => true,
+        .unary => |u| nodeReferencesAwait(u.operand),
+        .binary => |b| nodeReferencesAwait(b.left) or nodeReferencesAwait(b.right),
+        .logical => |l| nodeReferencesAwait(l.left) or nodeReferencesAwait(l.right),
+        .conditional => |c| nodeReferencesAwait(c.cond) or nodeReferencesAwait(c.then) or nodeReferencesAwait(c.otherwise),
+        .assign => |a| nodeReferencesAwait(a.value),
+        .comma => |c| nodeReferencesAwait(c.left) or nodeReferencesAwait(c.right),
+        .call => |c| nodeReferencesAwait(c.callee),
         else => false,
     };
 }
@@ -2604,6 +2872,7 @@ fn containsArguments(node: *const ast.Node) bool {
         .function => |f| return f.is_arrow and bodyContainsArguments(f.body),
         .class_expr => return false,
         .yield_expr => |y| return if (y.argument) |a| containsArguments(a) else false,
+        .await_expr => |operand| return containsArguments(operand),
     }
 }
 

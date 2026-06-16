@@ -103,6 +103,12 @@ pub const Node = union(enum) {
     /// (§15.5.5 — parsed in Cycle 1, full delegation semantics deferred to Cycle 2). `yield` has very
     /// low precedence (just above the comma/sequence operator, below assignment).
     yield_expr: struct { argument: ?*const Node, delegate: bool },
+    /// §15.8 AwaitExpression — `await UnaryExpression`. Legal only inside an async function / async
+    /// arrow / async method body (a parse-phase SyntaxError otherwise, §15.8.1). Parses at the
+    /// UnaryExpression precedence level (like a prefix unary operator). The async *runtime* (Promise
+    /// resolution + the microtask/Job queue) is deferred to M11 Cycle 2; evaluating this node before
+    /// then raises a "not yet supported" error (parse/early-error tests never reach runtime).
+    await_expr: *const Node,
 };
 
 /// One link of an optional chain: the access applied to the (non-nullish) base. `call` carries the
@@ -190,6 +196,12 @@ pub const Function = struct {
     /// §14.4 yield operator inside the body. Mutually exclusive with `is_arrow` (arrows can't be
     /// generators in the grammar).
     is_generator: bool = false,
+    /// §15.8 AsyncFunctionDeclaration / AsyncFunctionExpression / async arrow / async method
+    /// (`async function f(){}`, `async () => …`, `async m(){}`). When set, `await` is the §15.8
+    /// operator inside the body. May combine with `is_generator` (§15.6 AsyncGeneratorDeclaration
+    /// `async function* g(){}`, where both `await` and `yield` are operators) and with `is_arrow`
+    /// (async arrows). The async *runtime* (returning a Promise) is deferred to M11 Cycle 2.
+    is_async: bool = false,
 };
 
 /// §15.7 Class Definitions. A `Class` is the shared shape of a ClassDeclaration (statement) and a

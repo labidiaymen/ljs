@@ -150,7 +150,7 @@ pub const Interpreter = struct {
             },
             .func_decl => |f| {
                 // §15.2 — bind a function object to its name in the current scope.
-                const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env, .is_generator = f.is_generator });
+                const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env, .is_generator = f.is_generator, .is_async = f.is_async });
                 obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
                 if (f.name) |name| try env.declare(name, .{ .object = obj }, true, true);
                 return .{ .normal = .undefined };
@@ -635,6 +635,15 @@ pub const Interpreter = struct {
                 // a single handoff.
                 if (y.delegate) return self.doYieldDelegate(arg);
                 return self.doYield(arg);
+            },
+            .await_expr => |operand| {
+                // §15.8 AwaitExpression — evaluate the operand (so side effects / errors surface),
+                // then raise the deferred-runtime error. The real Promise-resolution + microtask
+                // suspension is M11 Cycle 2; parse / early-error tests never reach here, and executable
+                // async tests are `[async]`-flagged and skipped by the runner.
+                const oc = try self.evalExpr(operand, env);
+                if (oc.isAbrupt()) return oc;
+                return self.throwError("Error", "await is not yet supported at runtime (M11 Cycle 2)");
             },
             .call => |c| return self.evalCall(c, env),
             .new_expr => |n| return self.evalNew(n, env),
@@ -1503,6 +1512,7 @@ pub const Interpreter = struct {
             .closure = env,
             .is_arrow = f.is_arrow,
             .is_generator = f.is_generator,
+            .is_async = f.is_async,
             .captured_this = if (f.is_arrow) self.this_val else .undefined,
         });
         obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
@@ -1615,7 +1625,11 @@ pub const Interpreter = struct {
         // Generator object in `suspended_start` (the body runs on its own thread later, on `.next`).
         // Checked before the depth bump so it pays no recursion budget; ordinary functions skip it.
         if (func.call) |fd0| {
-            if (fd0.is_generator) return self.createGenerator(func, args, this_val);
+            if (fd0.is_generator and !fd0.is_async) return self.createGenerator(func, args, this_val);
+            // §15.8: an async function's [[Call]] returns a Promise and runs the body as a Job —
+            // deferred to M11 Cycle 2 (Promise + microtask queue). Parse / early-error tests never
+            // reach here; the executable async tests are `[async]`-flagged and skipped by the runner.
+            if (fd0.is_async) return self.throwError("Error", "async functions are not yet supported at runtime (M11 Cycle 2)");
         }
         // Each call stacks several heavy native frames — count call depth too so the guard
         // fires before the native stack overflows (these frames are bigger than expr frames).

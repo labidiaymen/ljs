@@ -592,11 +592,51 @@ test "M9 generators: generator-method early errors stay rejected (§15.5.1, Cycl
     try expectSyntaxError("var o = {*g(yield){}};");
     // §15.7.1: a generator method named `constructor` is forbidden.
     try expectSyntaxError("class C{ *constructor(){} }");
-    // async generator methods stay parse-rejected (separate async milestone).
-    try expectSyntaxError("class C{ async *g(){} }");
-    try expectSyntaxError("var o = {async *g(){}};");
+    // async generator methods now PARSE (M11 Cycle 1) — covered by the M11 async tests.
+    try expectNoSyntaxErrorStrict("class C{ async *g(){} }");
+    try expectNoSyntaxErrorStrict("var o = {async *g(){}};");
     // a `*` element with no method body is a SyntaxError.
     try expectSyntaxError("class C{ *x = 1; }");
+}
+
+test "M11 async: function/arrow/method parse; typeof; runtime stub (§15.8, Cycle 1)" {
+    // §15.8 AsyncFunctionExpression — an async function object is still a function.
+    try expectStr("typeof (async function(){})", "function");
+    // §15.8 AsyncFunctionDeclaration parses as a statement and binds its name.
+    try expectStr("async function f(){} typeof f", "function");
+    // §15.6 AsyncGeneratorExpression / Declaration parse.
+    try expectStr("typeof (async function*(){})", "function");
+    try expectStr("async function* g(){} typeof g", "function");
+    // §15.8 AsyncArrowFunction (single param, parenthesized params, zero params) parse.
+    try expectNoSyntaxErrorStrict("var f = async x => x;");
+    try expectNoSyntaxErrorStrict("var f = async (a, b) => a + b;");
+    try expectNoSyntaxErrorStrict("var f = async () => 1;");
+    // §15.8 async methods in object & class bodies, incl. `static async` and computed, parse.
+    try expectNoSyntaxErrorStrict("var o = { async m(){} };");
+    try expectNoSyntaxErrorStrict("var o = { async *m(){} };");
+    try expectNoSyntaxErrorStrict("class C { async m(){} }");
+    try expectNoSyntaxErrorStrict("class C { static async m(){} }");
+    try expectNoSyntaxErrorStrict("class C { async ['x'](){} }");
+    // Runtime deferred to Cycle 2: calling an async function throws the not-yet-supported stub.
+    try expectThrows("async function f(){ return 1; } f()");
+}
+
+test "M11 async: `await` as identifier outside async; operator only inside async (§15.8)" {
+    // §15.8: outside an async function (a sloppy script/function) `await` is an ordinary identifier.
+    try expectNumber("function f(){var await = 1; return await;} f()", 1);
+    try expectNumber("var await = 41; await + 1", 42);
+    // §15.8.1: inside an async function `await` is the operator — a bare `await` as a binding name is
+    // a SyntaxError, and `await` reaching IdentifierReference position is a SyntaxError.
+    try expectSyntaxError("async function f(){ var await = 1; }");
+    try expectSyntaxError("async function f(await){}");
+    try expectSyntaxError("async function await(){}");
+    // §15.8.1: an async arrow's param may not be named `await`.
+    try expectSyntaxError("var f = async await => 1;");
+    // §15.8: `await` IS the operator inside an async body (parses; runtime stub at evaluation).
+    try expectNoSyntaxErrorStrict("async function f(x){ return await x; }");
+    try expectNoSyntaxErrorStrict("async function f(x){ await x; }");
+    // an async method body also has `[+Await]`.
+    try expectNoSyntaxErrorStrict("var o = { async m(x){ return await x; } };");
 }
 
 test "M3 arrow functions: bodies & param forms (US5, §15.3)" {
@@ -810,10 +850,10 @@ test "M4 classes: body is strict (Cycle 1, §15.7)" {
 }
 
 test "M4 classes: unsupported element syntax still parse-rejects (Cycle 1 scope)" {
-    // generator methods landed in M9 Cycle 2 (covered by the M9 generator-method tests); `async` /
-    // async generators are a separate future milestone — they must still parse-reject.
-    try expectSyntaxError("class C { async m() {} }"); // async method (deferred)
-    try expectSyntaxError("class C { async *m() {} }"); // async generator (deferred)
+    // generator methods landed in M9 Cycle 2; async methods / async generator methods landed in M11
+    // Cycle 1 (§15.8/§15.6 parsing) — they now PARSE (covered by the M11 async tests below).
+    try expectNoSyntaxErrorStrict("class C { async m() {} }"); // async method (M11)
+    try expectNoSyntaxErrorStrict("class C { async *m() {} }"); // async generator method (M11)
     // a ClassDeclaration requires a name
     try expectSyntaxError("class {}");
 }

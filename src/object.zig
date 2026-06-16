@@ -179,6 +179,11 @@ pub const FunctionData = struct {
     /// object (it does NOT run the body); `yield` inside the body is the §14.4 yield operator. Ordinary
     /// functions and arrows leave this false (the hot call path is unchanged — no thread, no overhead).
     is_generator: bool = false,
+    /// §15.8: this function is async (`async function f(){}`, `async () => …`, `async m(){}`). The
+    /// async *runtime* (returning a Promise, the §15.8 await microtask machinery) is deferred to M11
+    /// Cycle 2; for now calling an async function raises a "not yet supported" runtime error (parse /
+    /// early-error tests never reach runtime, and the executable async tests are skipped by the runner).
+    is_async: bool = false,
     /// §9.2.5 / §15.7.14 [[HomeObject]]: for a class/object method the object the method is defined
     /// on — its `.prototype` (instance method) or the constructor (static method). `super.x` inside
     /// the method resolves against `home_object.[[Prototype]]`. Null for ordinary functions/arrows.
