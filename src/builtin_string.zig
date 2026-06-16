@@ -10,8 +10,23 @@ const Completion = @import("completion.zig").Completion;
 const ops = @import("abstract_ops.zig");
 
 pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
-    const s = if (this_val == .string) this_val.string else try it.toString(this_val);
+    // §22.1.3 the receiver is a primitive String, or a `new String(x)` wrapper (unwrap via [[StringData]]),
+    // or any other value coerced via ToString.
+    const s = if (this_val == .string)
+        this_val.string
+    else if (this_val == .object and this_val.object.primitive != null and this_val.object.primitive.? == .string)
+        this_val.object.primitive.?.string
+    else
+        try it.toString(this_val);
     const eql = std.mem.eql;
+
+    if (eql(u8, name, "toString") or eql(u8, name, "valueOf")) {
+        // §22.1.3.28/.32 thisStringValue: only a primitive String or a String wrapper object is valid.
+        if (this_val != .string and !(this_val == .object and this_val.object.primitive != null and this_val.object.primitive.? == .string)) {
+            return it.throwError("TypeError", "String.prototype method called on incompatible receiver");
+        }
+        return str(s);
+    }
 
     if (eql(u8, name, "charAt")) {
         const i = idxArg(args, 0);

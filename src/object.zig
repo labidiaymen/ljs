@@ -233,6 +233,7 @@ pub const NativeId = enum {
     string_ctor, // String(x)
     object_ctor, // Object()
     object_to_string, // Object.prototype.toString
+    object_value_of, // §20.1.3.7 Object.prototype.valueOf (returns ToObject(this) — the receiver)
     array_ctor, // Array(...)
     array_method, // Array.prototype.<native_name> / Array.isArray
     string_method, // String.prototype.<native_name>
@@ -525,6 +526,11 @@ pub const Object = struct {
     /// §27.1.4.4 the captured `done` flag for an `async_from_sync_wrap` continuation closure (it wraps
     /// the awaited value into `{ value, done: afs_done }`). Meaningful only on that native.
     afs_done: bool = false,
+    /// §21.1.4.1/§22.1.4.1/§20.3.4.1 [[NumberData]]/[[StringData]]/[[BooleanData]] — the wrapped
+    /// primitive of a `new Number(x)` / `new String(x)` / `new Boolean(x)` exotic object. Null for every
+    /// ordinary object. `Number.prototype.valueOf` etc. (and thus ToPrimitive's valueOf) read it, so a
+    /// wrapper object coerces back to its primitive in operator/coercion contexts.
+    primitive: ?Value = null,
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);

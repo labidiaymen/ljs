@@ -42,8 +42,10 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
         }
         return .{ .normal = .{ .boolean = false } };
     }
-    if (eql(u8, name, "join")) {
-        const sep = if (args.len > 0 and args[0] != .undefined) try it.toString(args[0]) else ",";
+    if (eql(u8, name, "join") or eql(u8, name, "toString")) {
+        // §23.1.3.36 Array.prototype.toString delegates to join with the default `,` separator
+        // (M-subset: join is the array's own join, not an arbitrary overridden one).
+        const sep = if (eql(u8, name, "join") and args.len > 0 and args[0] != .undefined) try it.toString(args[0]) else ",";
         var buf: std.ArrayList(u8) = .empty;
         for (arr.elements.items, 0..) |el, i| {
             if (i > 0) try buf.appendSlice(it.arena, sep);

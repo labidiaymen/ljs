@@ -26,6 +26,8 @@ const looseEquals = ops.looseEquals;
 const instanceOf = ops.instanceOf;
 const parseIndex = ops.parseIndex;
 const numberToString = ops.numberToString;
+const numToInt32 = ops.numberToInt32;
+const numToUint32 = ops.numberToUint32;
 
 pub const EvalError = error{ StepLimitExceeded, OutOfMemory };
 
@@ -859,7 +861,9 @@ pub const Interpreter = struct {
                 switch (u.target.*) {
                     .identifier => |name| {
                         const b = env.lookup(name) orelse return self.throwError("ReferenceError", name);
-                        const old = toNumber(b.value);
+                        const oldc = try self.toNumberV(b.value);
+                        if (oldc.isAbrupt()) return oldc;
+                        const old = oldc.normal.number;
                         b.value = .{ .number = old + delta };
                         return .{ .normal = .{ .number = if (u.prefix) old + delta else old } };
                     },
@@ -868,7 +872,9 @@ pub const Interpreter = struct {
                         if (oc.isAbrupt()) return oc;
                         const cur = try self.getProperty(oc.normal, m.name);
                         if (cur.isAbrupt()) return cur;
-                        const old = toNumber(cur.normal);
+                        const oldc = try self.toNumberV(cur.normal);
+                        if (oldc.isAbrupt()) return oldc;
+                        const old = oldc.normal.number;
                         const sc = try self.setProperty(oc.normal, m.name, .{ .number = old + delta });
                         if (sc.isAbrupt()) return sc;
                         return .{ .normal = .{ .number = if (u.prefix) old + delta else old } };
@@ -880,7 +886,9 @@ pub const Interpreter = struct {
                         if (kc.isAbrupt()) return kc;
                         const cur = try self.getPropertyV(oc.normal, kc.normal);
                         if (cur.isAbrupt()) return cur;
-                        const old = toNumber(cur.normal);
+                        const oldc = try self.toNumberV(cur.normal);
+                        if (oldc.isAbrupt()) return oldc;
+                        const old = oldc.normal.number;
                         const sc = try self.setPropertyV(oc.normal, kc.normal, .{ .number = old + delta });
                         if (sc.isAbrupt()) return sc;
                         return .{ .normal = .{ .number = if (u.prefix) old + delta else old } };
@@ -891,7 +899,9 @@ pub const Interpreter = struct {
                         if (oc.isAbrupt()) return oc;
                         const cur = try self.getPrivate(oc.normal, pm.name);
                         if (cur.isAbrupt()) return cur;
-                        const old = toNumber(cur.normal);
+                        const oldc = try self.toNumberV(cur.normal);
+                        if (oldc.isAbrupt()) return oldc;
+                        const old = oldc.normal.number;
                         const sc = try self.setPrivate(oc.normal, pm.name, .{ .number = old + delta });
                         if (sc.isAbrupt()) return sc;
                         return .{ .normal = .{ .number = if (u.prefix) old + delta else old } };
@@ -907,7 +917,7 @@ pub const Interpreter = struct {
                     if (idx < t.exprs.len) {
                         const c = try self.evalExpr(t.exprs[idx], env);
                         if (c.isAbrupt()) return c;
-                        const s = try self.toStringCoerce(c.normal); // §13.2.8.5: ToString throws on a Symbol
+                        const s = try self.toStringCoerceV(c.normal); // §13.2.8.5: ToPrimitive(string)+ToString; throws on a Symbol
                         switch (s) {
                             .abrupt => |a| return a,
                             .string => |str| try buf.appendSlice(self.arena, str),
@@ -1190,6 +1200,13 @@ pub const Interpreter = struct {
         const result = try self.callFunction(ctor, args, .{ .object = new_obj });
         if (result.isAbrupt()) return result;
         if (result.normal == .object) return .{ .normal = result.normal }; // explicit object return wins
+        // §21.1.4.1/§22.1.4.1/§20.3.4.1: `new Number/String/Boolean(x)` is a primitive wrapper exotic —
+        // the constructor native returns the coerced PRIMITIVE; box it on the new object's internal slot
+        // so `Number.prototype.valueOf` etc. (and ToPrimitive) recover it. Other ctors return undefined.
+        switch (ctor.native) {
+            .number_ctor, .string_ctor, .boolean_ctor => new_obj.primitive = result.normal,
+            else => {},
+        }
         return .{ .normal = .{ .object = new_obj } };
     }
 
@@ -2539,6 +2556,117 @@ pub const Interpreter = struct {
             .undefined, .null => return self.throwError("TypeError", "Cannot set properties of null or undefined"),
             else => return .{ .normal = value },
         }
+    }
+
+    // ── §7.1.1 ToPrimitive ───────────────────────────────────────────────────
+
+    /// §7.1.1 the conversion hint for ToPrimitive — `default`/`number`/`string` (the spec strings
+    /// passed to a `@@toPrimitive` method, and the method-name order for OrdinaryToPrimitive).
+    pub const PrimHint = enum {
+        default,
+        number,
+        string,
+        fn str(self: PrimHint) []const u8 {
+            return switch (self) {
+                .default => "default",
+                .number => "number",
+                .string => "string",
+            };
+        }
+    };
+
+    /// The realm's well-known `Symbol.toPrimitive` identity (held on the `Symbol` constructor).
+    /// Null only in a realm-less unit-test eval (no `Symbol`), in which case OrdinaryToPrimitive
+    /// (valueOf/toString) is still used.
+    fn wellKnownToPrimitive(self: *Interpreter) ?*Symbol {
+        const g = self.globals orelse return null;
+        const b = g.lookup("Symbol") orelse return null;
+        if (b.value != .object) return null;
+        const pv = b.value.object.get("toPrimitive") orelse return null;
+        return if (pv == .symbol) pv.symbol else null;
+    }
+
+    /// §7.1.1 ToPrimitive ( input, hint ) — convert a value to a primitive. Primitives pass through
+    /// unchanged (the hot path: no allocation, no method calls). For an Object: if it has an
+    /// `@@toPrimitive` method, call it with the hint string and require a primitive result; otherwise
+    /// run §7.1.1.1 OrdinaryToPrimitive with the effective hint (a `default` hint behaves as `number`).
+    /// Returns the primitive Value, or an abrupt `.throw` completion on a TypeError / a thrown method.
+    pub fn toPrimitive(self: *Interpreter, v: Value, hint: PrimHint) EvalError!Completion {
+        if (v != .object) return .{ .normal = v };
+        const o = v.object;
+        // §7.1.1 step 2.a: exoticToPrim = GetMethod(input, @@toPrimitive).
+        if (self.wellKnownToPrimitive()) |sym| {
+            const mc = try self.getSymbolProperty(v, sym);
+            if (mc.isAbrupt()) return mc;
+            const m = mc.normal;
+            if (m != .undefined and m != .null) {
+                if (m != .object or !isCallable(m.object)) {
+                    return self.throwError("TypeError", "Symbol.toPrimitive is not a function");
+                }
+                const rc = try self.callFunction(m.object, &.{.{ .string = hint.str() }}, v);
+                if (rc.isAbrupt()) return rc;
+                // §7.1.1 step 2.c.iii: the result must be a primitive.
+                if (rc.normal == .object) {
+                    return self.throwError("TypeError", "Cannot convert object to primitive value");
+                }
+                return .{ .normal = rc.normal };
+            }
+        }
+        // §7.1.1 step 3: no @@toPrimitive → OrdinaryToPrimitive; a `default` hint means `number`.
+        const eff: PrimHint = if (hint == .string) .string else .number;
+        return self.ordinaryToPrimitive(o, eff);
+    }
+
+    /// §7.1.1.1 OrdinaryToPrimitive ( O, hint ) — try `valueOf` then `toString` (or the reverse for a
+    /// `string` hint); the first callable method whose result is a primitive wins. A TypeError if
+    /// neither yields a primitive.
+    fn ordinaryToPrimitive(self: *Interpreter, o: *Object, hint: PrimHint) EvalError!Completion {
+        const names: [2][]const u8 = if (hint == .string)
+            .{ "toString", "valueOf" }
+        else
+            .{ "valueOf", "toString" };
+        for (names) |name| {
+            const mc = try self.getProperty(.{ .object = o }, name);
+            if (mc.isAbrupt()) return mc;
+            const m = mc.normal;
+            if (m == .object and isCallable(m.object)) {
+                const rc = try self.callFunction(m.object, &.{}, .{ .object = o });
+                if (rc.isAbrupt()) return rc;
+                if (rc.normal != .object) return .{ .normal = rc.normal }; // primitive → done
+            }
+        }
+        return self.throwError("TypeError", "Cannot convert object to primitive value");
+    }
+
+    /// §7.1.4 ToNumber in a coercion context: ToPrimitive (number hint) an object, then the pure
+    /// numeric conversion. Primitives skip straight to the pure `toNumber` (hot path). A Symbol is a
+    /// TypeError per §7.1.4 (surfaced here, not the pure helper's NaN).
+    fn toNumberV(self: *Interpreter, v: Value) EvalError!Completion {
+        const prim = switch (v) {
+            .object => blk: {
+                const pc = try self.toPrimitive(v, .number);
+                if (pc.isAbrupt()) return pc;
+                break :blk pc.normal;
+            },
+            else => v,
+        };
+        if (prim == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a number");
+        return .{ .normal = .{ .number = toNumber(prim) } };
+    }
+
+    /// §7.1.17 ToString in a coercion context: ToPrimitive (string hint) an object, then ToString.
+    /// A Symbol is a TypeError (§7.1.17 step 3). Used by string `+` and template substitution.
+    fn toStringCoerceV(self: *Interpreter, v: Value) EvalError!CoerceResult {
+        const prim = switch (v) {
+            .object => blk: {
+                const pc = try self.toPrimitive(v, .string);
+                if (pc.isAbrupt()) return .{ .abrupt = pc };
+                break :blk pc.normal;
+            },
+            else => v,
+        };
+        if (prim == .symbol) return .{ .abrupt = try self.throwError("TypeError", "Cannot convert a Symbol value to a string") };
+        return .{ .string = try self.toString(prim) };
     }
 
     // ── §7.4 Iteration protocol (Symbol.iterator) ───────────────────────────────
@@ -4262,13 +4390,22 @@ pub const Interpreter = struct {
         const c = try self.evalExpr(operand, env);
         if (c.isAbrupt()) return c;
         const v = c.normal;
-        return switch (op) {
-            .plus => .{ .normal = .{ .number = toNumber(v) } }, // §13.5.4
-            .minus => .{ .normal = .{ .number = -toNumber(v) } }, // §13.5.5
-            .not => .{ .normal = .{ .boolean = !toBoolean(v) } }, // §13.5.7
-            .void_ => .{ .normal = .undefined }, // §13.5.2: evaluate operand (done), yield undefined
-            .bit_not => .{ .normal = .{ .number = @floatFromInt(~ops.toInt32(v)) } }, // §13.5.6
+        // §13.5.7 `!` and §13.5.2 `void` need no numeric coercion (so no ToPrimitive side effect).
+        switch (op) {
+            .not => return .{ .normal = .{ .boolean = !toBoolean(v) } }, // §13.5.7
+            .void_ => return .{ .normal = .undefined }, // §13.5.2: evaluate operand (done), yield undefined
             .typeof_, .delete_ => unreachable,
+            else => {},
+        }
+        // §13.5.4/.5/.6: unary `+`/`-`/`~` ToNumber the operand (ToPrimitive number-hint for an object).
+        const nc = try self.toNumberV(v);
+        if (nc.isAbrupt()) return nc;
+        const n = nc.normal.number;
+        return switch (op) {
+            .plus => .{ .normal = .{ .number = n } }, // §13.5.4
+            .minus => .{ .normal = .{ .number = -n } }, // §13.5.5
+            .bit_not => .{ .normal = .{ .number = @floatFromInt(~numToInt32(n)) } }, // §13.5.6
+            else => unreachable,
         };
     }
 
@@ -4338,38 +4475,38 @@ pub const Interpreter = struct {
         const r = rc.normal;
 
         switch (op) {
-            .add => { // §13.8.1 Addition / §13.15.3 ApplyStringOrNumericBinaryOperator: concat if either is String, else numeric.
-                // §13.8.1: a Symbol operand makes ToString (string case) or ToNumber (numeric case)
-                // throw a TypeError — `sym + ""` / `"" + sym` / `sym + 1` are all errors.
-                if (l == .symbol or r == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a string");
-                if (l == .string or r == .string) {
-                    const ls = try self.toString(l);
-                    const rs = try self.toString(r);
+            .add => { // §13.15.3 ApplyStringOrNumericBinaryOperator: ToPrimitive(default) both operands FIRST (left then
+                // right), then concat if either prim is a String, else numeric. An object's @@toPrimitive/valueOf/
+                // toString runs here; primitives pass through ToPrimitive untouched.
+                const lpc = try self.toPrimitive(l, .default);
+                if (lpc.isAbrupt()) return lpc;
+                const rpc = try self.toPrimitive(r, .default);
+                if (rpc.isAbrupt()) return rpc;
+                const lp = lpc.normal;
+                const rp = rpc.normal;
+                if (lp == .string or rp == .string) {
+                    // §13.8.1: a Symbol operand makes ToString throw a TypeError.
+                    if (lp == .symbol or rp == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a string");
+                    const ls = try self.toString(lp);
+                    const rs = try self.toString(rp);
                     return .{ .normal = .{ .string = try std.mem.concat(self.arena, u8, &.{ ls, rs }) } };
                 }
-                return .{ .normal = .{ .number = toNumber(l) + toNumber(r) } };
+                // numeric: §13.8.1 a Symbol operand throws on ToNumber.
+                if (lp == .symbol or rp == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a number");
+                return .{ .normal = .{ .number = toNumber(lp) + toNumber(rp) } };
             },
-            .sub => return .{ .normal = .{ .number = toNumber(l) - toNumber(r) } },
-            .mul => return .{ .normal = .{ .number = toNumber(l) * toNumber(r) } },
-            .div => return .{ .normal = .{ .number = toNumber(l) / toNumber(r) } },
-            .mod => return .{ .normal = .{ .number = @rem(toNumber(l), toNumber(r)) } },
-            .exp => return .{ .normal = .{ .number = std.math.pow(f64, toNumber(l), toNumber(r)) } }, // §13.6
-            .bit_and => return .{ .normal = .{ .number = @floatFromInt(ops.toInt32(l) & ops.toInt32(r)) } }, // §13.12
-            .bit_or => return .{ .normal = .{ .number = @floatFromInt(ops.toInt32(l) | ops.toInt32(r)) } },
-            .bit_xor => return .{ .normal = .{ .number = @floatFromInt(ops.toInt32(l) ^ ops.toInt32(r)) } },
-            .shl => { // §13.9 — wrap via u32, result is int32
-                const sh: u5 = @intCast(ops.toUint32(r) & 31);
-                const res: i32 = @bitCast(ops.toUint32(l) << sh);
-                return .{ .normal = .{ .number = @floatFromInt(res) } };
-            },
-            .shr => { // arithmetic (sign-propagating)
-                const sh: u5 = @intCast(ops.toUint32(r) & 31);
-                return .{ .normal = .{ .number = @floatFromInt(ops.toInt32(l) >> sh) } };
-            },
-            .shr_un => { // logical (zero-fill), result is uint32
-                const sh: u5 = @intCast(ops.toUint32(r) & 31);
-                return .{ .normal = .{ .number = @floatFromInt(ops.toUint32(l) >> sh) } };
-            },
+            // §13.7/§13.6/§13.12/§13.9 numeric binary operators: ToNumber (via ToPrimitive number-hint) both operands.
+            .sub => return self.numericBinary(l, r, .sub),
+            .mul => return self.numericBinary(l, r, .mul),
+            .div => return self.numericBinary(l, r, .div),
+            .mod => return self.numericBinary(l, r, .mod),
+            .exp => return self.numericBinary(l, r, .exp),
+            .bit_and => return self.numericBinary(l, r, .bit_and),
+            .bit_or => return self.numericBinary(l, r, .bit_or),
+            .bit_xor => return self.numericBinary(l, r, .bit_xor),
+            .shl => return self.numericBinary(l, r, .shl),
+            .shr => return self.numericBinary(l, r, .shr),
+            .shr_un => return self.numericBinary(l, r, .shr_un),
             .in_op => { // §13.10.2 `key in obj`
                 if (r != .object) return self.throwError("TypeError", "Cannot use 'in' operator to search in a non-object");
                 const key = try self.toString(l);
@@ -4383,16 +4520,103 @@ pub const Interpreter = struct {
                 };
                 return .{ .normal = .{ .boolean = has } };
             },
-            .lt => return .{ .normal = .{ .boolean = relational(l, r, .lt) } },
-            .gt => return .{ .normal = .{ .boolean = relational(l, r, .gt) } },
-            .le => return .{ .normal = .{ .boolean = relational(l, r, .le) } },
-            .ge => return .{ .normal = .{ .boolean = relational(l, r, .ge) } },
+            .lt => return self.relationalV(l, r, .lt),
+            .gt => return self.relationalV(l, r, .gt),
+            .le => return self.relationalV(l, r, .le),
+            .ge => return self.relationalV(l, r, .ge),
             .instanceof_ => return .{ .normal = .{ .boolean = instanceOf(l, r) } },
-            .eq => return .{ .normal = .{ .boolean = looseEquals(l, r) } },
-            .ne => return .{ .normal = .{ .boolean = !looseEquals(l, r) } },
+            .eq => {
+                const c = try self.looseEqualsV(l, r);
+                if (c.isAbrupt()) return c;
+                return .{ .normal = .{ .boolean = c.normal.boolean } };
+            },
+            .ne => {
+                const c = try self.looseEqualsV(l, r);
+                if (c.isAbrupt()) return c;
+                return .{ .normal = .{ .boolean = !c.normal.boolean } };
+            },
             .seq => return .{ .normal = .{ .boolean = strictEquals(l, r) } },
             .sne => return .{ .normal = .{ .boolean = !strictEquals(l, r) } },
         }
+    }
+
+    /// §13.15.3 ApplyStringOrNumericBinaryOperator for the purely numeric operators (everything but
+    /// `+`): ToNumber (via ToPrimitive number-hint) both operands left-to-right, then the IEEE-754 /
+    /// Int32 / UInt32 operation. A Symbol operand → TypeError (raised by `toNumberV`).
+    fn numericBinary(self: *Interpreter, l: Value, r: Value, op: ast.BinaryOp) EvalError!Completion {
+        const lc = try self.toNumberV(l);
+        if (lc.isAbrupt()) return lc;
+        const rc = try self.toNumberV(r);
+        if (rc.isAbrupt()) return rc;
+        const a = lc.normal.number;
+        const b = rc.normal.number;
+        return switch (op) {
+            .sub => .{ .normal = .{ .number = a - b } },
+            .mul => .{ .normal = .{ .number = a * b } },
+            .div => .{ .normal = .{ .number = a / b } },
+            .mod => .{ .normal = .{ .number = @rem(a, b) } },
+            .exp => .{ .normal = .{ .number = std.math.pow(f64, a, b) } }, // §13.6
+            .bit_and => .{ .normal = .{ .number = @floatFromInt(numToInt32(a) & numToInt32(b)) } }, // §13.12
+            .bit_or => .{ .normal = .{ .number = @floatFromInt(numToInt32(a) | numToInt32(b)) } },
+            .bit_xor => .{ .normal = .{ .number = @floatFromInt(numToInt32(a) ^ numToInt32(b)) } },
+            .shl => blk: { // §13.9 — wrap via u32, result is int32
+                const sh: u5 = @intCast(numToUint32(b) & 31);
+                const res: i32 = @bitCast(numToUint32(a) << sh);
+                break :blk .{ .normal = .{ .number = @floatFromInt(res) } };
+            },
+            .shr => blk: { // arithmetic (sign-propagating)
+                const sh: u5 = @intCast(numToUint32(b) & 31);
+                break :blk .{ .normal = .{ .number = @floatFromInt(numToInt32(a) >> sh) } };
+            },
+            .shr_un => blk: { // logical (zero-fill), result is uint32
+                const sh: u5 = @intCast(numToUint32(b) & 31);
+                break :blk .{ .normal = .{ .number = @floatFromInt(numToUint32(a) >> sh) } };
+            },
+            else => unreachable,
+        };
+    }
+
+    /// §7.2.13 IsLessThan / §13.10 relational comparison with object coercion: ToPrimitive(number) each
+    /// operand (left first), then the pure comparison (string-vs-string is lexical, else numeric).
+    fn relationalV(self: *Interpreter, l: Value, r: Value, op: ops.RelOp) EvalError!Completion {
+        // §13.10.1: in `a < b` LeftFirst, ToPrimitive(a) THEN ToPrimitive(b). (`numToPrimNumber`
+        // is a no-op on primitives, so the common number/string case keeps its fast path.)
+        const lpc = try self.toPrimitive(l, .number);
+        if (lpc.isAbrupt()) return lpc;
+        const rpc = try self.toPrimitive(r, .number);
+        if (rpc.isAbrupt()) return rpc;
+        const lp = lpc.normal;
+        const rp = rpc.normal;
+        // §7.2.13: a Symbol primitive operand → ToNumber throws (unless both are strings, handled in `relational`).
+        if (!(lp == .string and rp == .string)) {
+            if (lp == .symbol or rp == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a number");
+        }
+        return .{ .normal = .{ .boolean = relational(lp, rp, op) } };
+    }
+
+    /// §7.2.15 IsLooselyEqual (`==`) with object coercion: when one side is an Object and the other a
+    /// Number/String/Symbol primitive, ToPrimitive(object, default) and retry; otherwise the pure
+    /// primitive comparison. (object == object is reference equality, handled by the pure helper.)
+    fn looseEqualsV(self: *Interpreter, l: Value, r: Value) EvalError!Completion {
+        // §7.2.15 step 10/11: Object vs primitive (number/string/symbol/bigint) → coerce the object.
+        const l_obj = l == .object;
+        const r_obj = r == .object;
+        if (l_obj != r_obj) { // exactly one is an object
+            const other = if (l_obj) r else l;
+            if (other == .undefined or other == .null) {
+                return .{ .normal = .{ .boolean = false } }; // §7.2.15: Object == null/undefined is false
+            }
+            if (l_obj) {
+                const pc = try self.toPrimitive(l, .default);
+                if (pc.isAbrupt()) return pc;
+                return self.looseEqualsV(pc.normal, r);
+            } else {
+                const pc = try self.toPrimitive(r, .default);
+                if (pc.isAbrupt()) return pc;
+                return self.looseEqualsV(l, pc.normal);
+            }
+        }
+        return .{ .normal = .{ .boolean = looseEquals(l, r) } };
     }
 
     /// §20.5: throw a real Error object carrying `name`/`message`, proto-linked to the realm's
@@ -5148,12 +5372,24 @@ pub const Interpreter = struct {
             .string_ctor => {
                 // §22.1.1.1 String ( value ) — `String(sym)` is the ALLOWED Symbol→string conversion
                 // (SymbolDescriptiveString), so it routes through the infallible ToString, not the
-                // throwing coercion. Other values stringify normally.
+                // throwing coercion. An object operand is ToPrimitive(string)'d first (so a wrapper /
+                // `valueOf`/`toString` object stringifies via its own method).
                 const v: Value = if (args.len > 0) args[0] else .undefined;
+                if (v == .object) {
+                    const pc = try self.toPrimitive(v, .string);
+                    if (pc.isAbrupt()) return pc;
+                    return .{ .normal = .{ .string = try self.toString(pc.normal) } };
+                }
                 return .{ .normal = .{ .string = try self.toString(v) } };
             },
-            .number_ctor => return .{ .normal = .{ .number = if (args.len > 0) toNumber(args[0]) else 0 } }, // §21.1.1.1
-            .boolean_ctor => return .{ .normal = .{ .boolean = args.len > 0 and toBoolean(args[0]) } }, // §20.3.1.1
+            .number_ctor => { // §21.1.1.1 Number ( value ) — ToNumber (ToPrimitive(number) an object first).
+                const v: Value = if (args.len > 0) args[0] else .undefined;
+                if (args.len == 0) return .{ .normal = .{ .number = 0 } };
+                const nc = try self.toNumberV(v);
+                if (nc.isAbrupt()) return nc;
+                return .{ .normal = nc.normal };
+            },
+            .boolean_ctor => return .{ .normal = .{ .boolean = args.len > 0 and toBoolean(args[0]) } }, // §20.3.1.1 (ToBoolean — no ToPrimitive)
             .number_static => { // §21.1.2.2–.5 isNaN/isFinite/isInteger/isSafeInteger — no coercion
                 const x: Value = if (args.len > 0) args[0] else .undefined;
                 const isnum = x == .number;
@@ -5169,27 +5405,41 @@ pub const Interpreter = struct {
                     isnum and std.math.isFinite(v) and @floor(v) == v and @abs(v) <= 9007199254740991;
                 return .{ .normal = .{ .boolean = res } };
             },
-            .number_method => { // §21.1.3 Number.prototype.toString/valueOf (M-subset: primitive `this`)
+            .number_method => { // §21.1.3 Number.prototype.toString/valueOf — primitive `this` or a Number wrapper object
                 const n: f64 = switch (this_val) {
                     .number => |x| x,
+                    // §21.1.3.3/.7 thisNumberValue: a `new Number(x)` wrapper unwraps via [[NumberData]].
+                    .object => |o| if (o.primitive != null and o.primitive.? == .number) o.primitive.?.number else return self.throwError("TypeError", "Number.prototype method called on incompatible receiver"),
                     else => return self.throwError("TypeError", "Number.prototype method called on incompatible receiver"),
                 };
                 if (std.mem.eql(u8, func.native_name, "valueOf")) return .{ .normal = .{ .number = n } };
                 return .{ .normal = .{ .string = try self.toString(.{ .number = n }) } };
             },
-            .boolean_method => { // §20.3.3 Boolean.prototype.toString/valueOf (M-subset: primitive `this`)
+            .boolean_method => { // §20.3.3 Boolean.prototype.toString/valueOf — primitive `this` or a Boolean wrapper object
                 const b: bool = switch (this_val) {
                     .boolean => |x| x,
+                    // §20.3.3.2/.3 thisBooleanValue: a `new Boolean(x)` wrapper unwraps via [[BooleanData]].
+                    .object => |o| if (o.primitive != null and o.primitive.? == .boolean) o.primitive.?.boolean else return self.throwError("TypeError", "Boolean.prototype method called on incompatible receiver"),
                     else => return self.throwError("TypeError", "Boolean.prototype method called on incompatible receiver"),
                 };
                 if (std.mem.eql(u8, func.native_name, "valueOf")) return .{ .normal = .{ .boolean = b } };
                 return .{ .normal = .{ .string = if (b) "true" else "false" } };
             },
             .object_ctor => {
+                // §20.1.1.1 Object ( [ value ] ): an object argument is returned as-is; otherwise a fresh
+                // ordinary object is created proto-linked to %Object.prototype% (so its inherited
+                // `toString`/`hasOwnProperty`/etc. — and thus ToPrimitive — resolve).
                 if (args.len > 0 and args[0] == .object) return .{ .normal = args[0] };
-                return .{ .normal = .{ .object = try Object.create(self.arena, null) } };
+                return .{ .normal = .{ .object = try Object.create(self.arena, self.objectProto()) } };
             },
             .object_to_string => return .{ .normal = .{ .string = "[object Object]" } },
+            // §20.1.3.7 Object.prototype.valueOf returns ToObject(this). For an object receiver that is
+            // the receiver itself (so OrdinaryToPrimitive's valueOf step yields a non-primitive and falls
+            // through to toString — the default object→"[object Object]" behavior). undefined/null throw.
+            .object_value_of => return switch (this_val) {
+                .undefined, .null => self.throwError("TypeError", "Object.prototype.valueOf called on null or undefined"),
+                else => .{ .normal = this_val },
+            },
             .function_ctor => return self.throwError("TypeError", "Function constructor is not supported"),
             .function_proto_noop => return .{ .normal = .undefined }, // §20.2.3 %Function.prototype%() → undefined
             .object_define_property => return self.objectDefineProperty(args),

@@ -2601,3 +2601,38 @@ test "M28 for-of over a custom iterable closes on break/throw (§7.4.11 Iterator
     // §7.4.2: for-of over a String iterates its elements, binding each to the loop variable.
     try expectStr("var out = ''; for (var c of 'abc') out = c + out; out", "cba");
 }
+
+test "M29 ToPrimitive — valueOf/toString invoked in operator coercion (§7.1.1 / §7.1.1.1)" {
+    // §13.15.3 `+` numeric: a `valueOf`-bearing object coerces to its number.
+    try expectNumber("({valueOf: function(){ return 5; }}) + 1", 6);
+    // §13.15.3 `+` string: a `toString`-bearing object concatenates as its string.
+    try expectStr("({toString: function(){ return \"x\"; }}) + \"y\"", "xy");
+    // §7.1.1.1: number hint tries valueOf first (so this is 2, not "01").
+    try expectNumber("({valueOf: function(){return 1;}, toString: function(){return 0;}}) + 1", 2);
+    // §23.1.3.36: an Array's ToPrimitive(string via toString) joins its elements.
+    try expectStr("[1,2] + \"\"", "1,2");
+    // §7.2.15: abstract equality coerces the object operand (toString → "x").
+    try expectBool("({toString: function(){ return \"x\"; }}) == \"x\"", true);
+    // §7.2.13: relational comparison ToPrimitive(number)s the object.
+    try expectBool("({valueOf: function(){ return 3; }}) < 5", true);
+    // §13.5.5 unary minus + §13.4 update run ToNumber (valueOf).
+    try expectNumber("-({valueOf: function(){ return 4; }})", -4);
+    // §7.1.1 step 2: @@toPrimitive takes precedence and receives the hint string.
+    try expectNumber("({[Symbol.toPrimitive]: function(h){ return h === \"number\" ? 42 : 0; }}) - 0", 42);
+    // §7.1.1.1: neither valueOf nor toString yielding a primitive → TypeError.
+    try expectThrows("({valueOf: function(){return {};}, toString: function(){return {};}}) + 1");
+}
+
+test "M29 primitive wrapper objects unbox in coercion (§21.1.4.1 / §22.1.4.1 / §20.3.4.1)" {
+    // §21.1.3.3 thisNumberValue: a Number wrapper coerces back to its primitive.
+    try expectNumber("new Number(5) + 0", 5);
+    try expectNumber("Number(new Number(7))", 7);
+    // §22.1.3.32: a String wrapper coerces / unboxes via valueOf.
+    try expectStr("new String(\"ab\") + \"\"", "ab");
+    try expectStr("new String(\"hi\").valueOf()", "hi");
+    // §20.3.3.3: a Boolean wrapper unboxes (true → 1 in numeric `+`).
+    try expectNumber("new Boolean(true) + 0", 1);
+    try expectBool("new Boolean(false).valueOf()", false);
+    // §7.2.15: `new Number(5) == "5"` (number↔string after unboxing).
+    try expectBool("new Number(5) == \"5\"", true);
+}

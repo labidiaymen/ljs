@@ -100,6 +100,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     if (function_proto) |fp| fp.prototype = object_proto; // §20.2.3 %Function.prototype% → %Object.prototype%
     if (object_proto) |op| {
         try defineMethod(arena, op, "toString", .object_to_string, "toString");
+        try defineMethod(arena, op, "valueOf", .object_value_of, "valueOf"); // §20.1.3.7
         try defineMethod(arena, op, "hasOwnProperty", .object_has_own_property, "hasOwnProperty");
         try defineMethod(arena, op, "propertyIsEnumerable", .object_property_is_enumerable, "propertyIsEnumerable");
         try defineMethod(arena, op, "isPrototypeOf", .object_is_prototype_of, "isPrototypeOf");
@@ -151,6 +152,10 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
             const string_methods = [_][]const u8{
                 "charAt",    "charCodeAt",  "indexOf",     "includes", "slice",
                 "substring", "toUpperCase", "toLowerCase", "split",
+                // §22.1.3.28/.32: toString/valueOf return the [[StringData]] (so a `new String(x)` wrapper
+                // and ToPrimitive recover the string primitive).
+                   "toString",
+                "valueOf",
             };
             for (string_methods) |m| try defineMethod(arena, pv.object, m, .string_method, m);
         }
@@ -200,7 +205,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     // proto-link to this Array.prototype (interpreter.arrayProto looks it up here).
     const array_fn = try Object.createNative(arena, .array_ctor, "Array");
     array_fn.prototype = function_proto; // §20.2.3 the Array constructor → %Function.prototype%
-    const array_methods = [_][]const u8{ "push", "pop", "indexOf", "includes", "join", "slice", "forEach", "map" };
+    const array_methods = [_][]const u8{ "push", "pop", "indexOf", "includes", "join", "slice", "forEach", "map", "toString" };
     if (array_fn.get("prototype")) |pv| {
         if (pv == .object) {
             pv.object.prototype = object_proto; // §23.1.3 Array.prototype inherits %Object.prototype%
@@ -218,7 +223,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     const symbol_fn = try Object.createNative(arena, .symbol_ctor, "Symbol");
     symbol_fn.prototype = function_proto; // §20.2.3 the Symbol constructor → %Function.prototype%
     // §20.4.2 well-known symbols — installed non-writable/non-enumerable/non-configurable per spec.
-    const well_known = [_][]const u8{ "iterator", "asyncIterator", "toStringTag", "hasInstance" };
+    const well_known = [_][]const u8{ "iterator", "asyncIterator", "toStringTag", "hasInstance", "toPrimitive" };
     for (well_known) |name| {
         const desc = try std.fmt.allocPrint(arena, "Symbol.{s}", .{name});
         const sym = try newSymbol(arena, desc);
