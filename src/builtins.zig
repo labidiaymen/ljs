@@ -219,6 +219,42 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     }
     try env.declare("%GeneratorPrototype%", .{ .object = gen_proto }, false, true);
 
+    // §27.6.1 %AsyncGeneratorPrototype% — the [[Prototype]] of every AsyncGenerator object (made by
+    // calling an `async function*`). Carries `next`/`return`/`throw` (§27.6.1.2/.3/.4, each returns a
+    // PROMISE of {value,done}) and `[Symbol.asyncIterator]()` (returns `this`, §27.6.1.5), so an async
+    // generator is consumed through §14.7.5 `for await`. Stashed under a sentinel global name;
+    // `interpreter.asyncGeneratorProto` resolves it. [[Prototype]] is %Object.prototype% (the M-subset
+    // elides the intermediate %AsyncIteratorPrototype%).
+    const async_iter_pv = symbol_fn.get("asyncIterator") orelse unreachable; // installed in well_known above
+    const async_iter_sym: *Symbol = async_iter_pv.symbol;
+    const agen_proto = try Object.create(arena, object_proto);
+    try defineMethod(arena, agen_proto, "next", .async_generator_method, "next"); // §27.6.1.2
+    try defineMethod(arena, agen_proto, "return", .async_generator_method, "return"); // §27.6.1.3
+    try defineMethod(arena, agen_proto, "throw", .async_generator_method, "throw"); // §27.6.1.4
+    {
+        // §27.6.1.5 %AsyncGeneratorPrototype%[Symbol.asyncIterator]() returns `this` — keyed by the SAME
+        // Symbol.asyncIterator identity, so GetIterator(agen, async) finds it and `for await` consumes it.
+        const agiter_fn = try Object.createNative(arena, .async_generator_iterator, "[Symbol.asyncIterator]");
+        agiter_fn.prototype = function_proto;
+        try agen_proto.defineSymbolData(async_iter_sym, .{ .object = agiter_fn }, true, false, true);
+    }
+    try env.declare("%AsyncGeneratorPrototype%", .{ .object = agen_proto }, false, true);
+
+    // §27.1.4.2 %AsyncFromSyncIteratorPrototype% — the [[Prototype]] of an AsyncFromSyncIterator (built
+    // by GetIterator(obj, async) when `obj` is only SYNC-iterable). Its next/return/throw drive the
+    // wrapped sync iterator and promise-wrap + await each `{value,done}` result so a sync iterable is
+    // consumed as if async (§14.7.5 `for await` over a sync iterable, e.g. `[Promise.resolve(1), 2]`).
+    const afs_proto = try Object.create(arena, object_proto);
+    try defineMethod(arena, afs_proto, "next", .async_from_sync_method, "next"); // §27.1.4.2.1
+    try defineMethod(arena, afs_proto, "return", .async_from_sync_method, "return"); // §27.1.4.2.2
+    try defineMethod(arena, afs_proto, "throw", .async_from_sync_method, "throw"); // §27.1.4.2.3
+    {
+        const afsiter_fn = try Object.createNative(arena, .async_generator_iterator, "[Symbol.asyncIterator]");
+        afsiter_fn.prototype = function_proto;
+        try afs_proto.defineSymbolData(async_iter_sym, .{ .object = afsiter_fn }, true, false, true);
+    }
+    try env.declare("%AsyncFromSyncIteratorPrototype%", .{ .object = afs_proto }, false, true);
+
     // §27.2 Promise — the constructor + %PromisePrototype% (then/catch/finally) + the statics
     // (resolve/reject). `new Promise(executor)` / `Promise.resolve` / `.then` produce Promise objects
     // (proto = Promise.prototype); the async-function runtime + the microtask Job queue (interpreter)

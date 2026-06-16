@@ -922,6 +922,70 @@ test "M11 Cycle 3: thenable adoption settles the promise (§27.2.1.3.2 / §27.2.
     );
 }
 
+test "M13 async generators: yield produces values, consumed via for await (§27.6 / §14.7.5)" {
+    // An `async function*` returns an AsyncGenerator; consuming it with `for await` inside an async
+    // function collects the yielded values in order. `yield await p` exercises await inside the body.
+    try expectGlobalStringAfterDrain(
+        \\var out = '';
+        \\async function* g(){ yield 1; yield await Promise.resolve(2); yield 3; }
+        \\async function main(){ for await (const x of g()) { out = out + x; } }
+        \\main();
+    , "out", "123");
+    // The async generator's body return value lands on the terminal { done:true } (not iterated by for-await).
+    try expectGlobalStringAfterDrain(
+        \\var out = '';
+        \\async function* g(){ yield 'a'; return 'R'; yield 'b'; }
+        \\async function main(){ for await (const x of g()) { out = out + x; } out = out + '!'; }
+        \\main();
+    , "out", "a!");
+}
+
+test "M13 for await over a sync iterable of promises (AsyncFromSyncIterator §27.1.4)" {
+    // A SYNC iterable with no [Symbol.asyncIterator] is wrapped in an AsyncFromSyncIterator; each sync
+    // element (here a mix of a promise and a plain value) is awaited, so `[Promise.resolve(1), 2]`
+    // iterates as 1, 2.
+    try expectGlobalStringAfterDrain(
+        \\var out = '';
+        \\async function main(){ for await (const x of [Promise.resolve(1), 2, Promise.resolve(3)]) { out = out + x; } }
+        \\main();
+    , "out", "123");
+}
+
+test "M13 async generator method on a class (§15.6 / §27.6)" {
+    try expectGlobalStringAfterDrain(
+        \\var out = '';
+        \\class C { async *m(){ yield 10; yield 20; } }
+        \\async function main(){ for await (const x of new C().m()) { out = out + x + ','; } }
+        \\main();
+    , "out", "10,20,");
+}
+
+test "M13 async generator .next() returns a promise of {value,done} (§27.6.1.2)" {
+    try expectGlobalStringAfterDrain(
+        \\var out = '';
+        \\async function* g(){ yield 7; }
+        \\async function main(){ var it = g(); var r = await it.next(); out = r.value + ':' + r.done; }
+        \\main();
+    , "out", "7:false");
+}
+
+test "M13 yield* over an async iterable in an async generator (§27.6.3.8)" {
+    try expectGlobalStringAfterDrain(
+        \\var out = '';
+        \\async function* inner(){ yield 1; yield 2; }
+        \\async function* outer(){ yield* inner(); yield 3; }
+        \\async function main(){ for await (const x of outer()) { out = out + x; } }
+        \\main();
+    , "out", "123");
+}
+
+test "M13 for await is a SyntaxError outside an async context (§14.7.5)" {
+    try expectSyntaxError("function f(){ for await (const x of []) {} }");
+    try expectSyntaxError("for await (const x of []) {}");
+    // `for await` requires the `of` form (no for-in, no C-style).
+    try expectSyntaxError("async function f(){ for await (const x in []) {} }");
+}
+
 test "M11 async: `await` as identifier outside async; operator only inside async (§15.8)" {
     // §15.8: outside an async function (a sloppy script/function) `await` is an ordinary identifier.
     try expectNumber("function f(){var await = 1; return await;} f()", 1);

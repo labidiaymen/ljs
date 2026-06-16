@@ -402,10 +402,24 @@ pub const Parser = struct {
 
     fn parseFor(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // for
+        // §14.7.5 `for await (LHS of EXPR) BODY` — the optional `await` (contextual identifier, no
+        // LineTerminator restriction needed since `for` already consumed) marks an async for-of. It is
+        // legal ONLY inside an async function / async generator (`[+Await]`); a `for await` outside an
+        // async context is a SyntaxError.
+        var is_await = false;
+        if (self.peek().kind == .identifier and std.mem.eql(u8, self.peek().lexeme, "await")) {
+            if (!self.in_async) return ParseError.UnexpectedToken;
+            _ = self.advance(); // await
+            is_await = true;
+        }
         _ = try self.expect(.lparen);
         var init_stmt: ?*const ast.Stmt = null;
         switch (self.peek().kind) {
-            .semicolon => _ = self.advance(),
+            // §14.7.5: `for await (; …)` is a SyntaxError — `for await` has no C-style form.
+            .semicolon => {
+                if (is_await) return ParseError.UnexpectedToken;
+                _ = self.advance();
+            },
             .kw_var, .kw_let, .kw_const => {
                 // §14.7.5 ForBinding vs §14.7.4 ForStatement init: parse the declaration kind + the
                 // FIRST binding with the relational `in` suppressed (`[~In]`), then disambiguate.
@@ -422,9 +436,13 @@ pub const Parser = struct {
                 // `for (var/let/const ForBinding in/of …)` — a for-in / for-of head (no initializer).
                 if (self.peek().kind == .kw_in or self.peekIsOf()) {
                     const is_of = self.peekIsOf();
+                    // §14.7.5: `for await` requires the `of` form (`for await (… in …)` is a SyntaxError).
+                    if (is_await and !is_of) return ParseError.UnexpectedToken;
                     _ = self.advance(); // `in` / `of`
-                    return self.finishForInOf(.{ .decl = .{ .kind = kind, .target = target } }, is_of);
+                    return self.finishForInOf(.{ .decl = .{ .kind = kind, .target = target } }, is_of, is_await);
                 }
+                // §14.7.5: `for await` has no C-style form — the head must be a for-of.
+                if (is_await) return ParseError.UnexpectedToken;
                 // Otherwise a C-style `for (var x [= init] [, …]; …)` declaration. Finish the first
                 // declarator's optional initializer + any remaining comma-separated declarators.
                 var decls: std.ArrayList(ast.Declarator) = .empty;
@@ -465,9 +483,13 @@ pub const Parser = struct {
                     const is_of = self.peekIsOf();
                     // §13.15.1: the for-in/of LHS must be a simple AssignmentTarget.
                     if (!isSimpleAssignTarget(first)) return ParseError.UnexpectedToken;
+                    // §14.7.5: `for await` requires the `of` form.
+                    if (is_await and !is_of) return ParseError.UnexpectedToken;
                     _ = self.advance(); // `in` / `of`
-                    return self.finishForInOf(.{ .target = first }, is_of);
+                    return self.finishForInOf(.{ .target = first }, is_of, is_await);
                 }
+                // §14.7.5: `for await` has no C-style form — the head must be a for-of.
+                if (is_await) return ParseError.UnexpectedToken;
                 // §14.7.4 C-style init Expression — the comma / sequence operator is permitted.
                 var expr = first;
                 while (self.peek().kind == .comma) {
@@ -495,13 +517,13 @@ pub const Parser = struct {
     /// for-in / for-of statement. for-of's operand is an AssignmentExpression (§14.7.5: `of` takes an
     /// AssignmentExpression — `for (x of a, b)` is a SyntaxError); for-in's operand is a full
     /// Expression (`for (x in a, b)` is legal). The operand is `[+In]` (the suppression was only the head).
-    fn finishForInOf(self: *Parser, head: ast.ForHead, is_of: bool) ParseError!ast.Stmt {
+    fn finishForInOf(self: *Parser, head: ast.ForHead, is_of: bool, is_await: bool) ParseError!ast.Stmt {
         const right = if (is_of) try self.parseAssignment() else try self.parseExpression();
         _ = try self.expect(.rparen);
         self.iteration_depth += 1;
         defer self.iteration_depth -= 1;
         const body = try self.allocStmt(try self.parseSubStmt(true));
-        if (is_of) return .{ .for_of_stmt = .{ .head = head, .right = right, .body = body } };
+        if (is_of) return .{ .for_of_stmt = .{ .head = head, .right = right, .body = body, .is_await = is_await } };
         return .{ .for_in_stmt = .{ .head = head, .right = right, .body = body } };
     }
 

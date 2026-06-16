@@ -275,7 +275,10 @@ pub const Stmt = union(enum) {
     for_in_stmt: struct { head: ForHead, right: *const Node, body: *const Stmt },
     /// §14.7.5 `for (HEAD of EXPR) BODY` — iterate the values of the iterable EXPR (Array elements /
     /// String chars in this M-subset), binding each to HEAD. A non-iterable EXPR is a TypeError.
-    for_of_stmt: struct { head: ForHead, right: *const Node, body: *const Stmt },
+    /// `is_await` marks a `for await (HEAD of EXPR) BODY` (§14.7.5.6 ForIn/OfBodyEvaluation with the
+    /// `async` iteration hint): GetIterator(EXPR, async), and each step `await`s `iterator.next()` and
+    /// the value. Legal only in an async context (the parser rejects it otherwise).
+    for_of_stmt: struct { head: ForHead, right: *const Node, body: *const Stmt, is_await: bool = false },
     throw_stmt: *const Node, // §14.14
     try_stmt: struct { // §14.15
         block: []const Stmt,

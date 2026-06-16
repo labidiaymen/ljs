@@ -168,6 +168,54 @@ pub const Generator = struct {
     /// §27.7 the Promise returned by the async function call — resolved on normal return, rejected on
     /// an uncaught throw. Null for ordinary generators.
     promise: ?*Object = null,
+    /// §27.6 set iff this body drives an ASYNC GENERATOR (`async function*`). Both `is_async` and this
+    /// are set. The body may suspend at an `await` (carry the awaited value out, register reactions to
+    /// resume — like a plain async fn) OR at a `yield` (carry the yielded value out, settle the current
+    /// AsyncGeneratorRequest); `transfer_await` discriminates which a given `.yield` transfer is. The
+    /// terminal completion settles the current request (done:true / rejection) instead of `promise`.
+    is_async_gen: bool = false,
+    /// §27.6.3.8 discriminates an async-generator `.yield`-kind suspension: `true` ⇒ the body is
+    /// AWAITing `transfer_value` (the servicer registers fulfill/reject reactions that resume it);
+    /// `false` ⇒ the body YIELDed `transfer_value` (the servicer settles the current request with
+    /// `{value, done:false}`). Meaningless unless `is_async_gen` and `transfer_kind == .yield`.
+    transfer_await: bool = false,
+    /// §27.6 back-pointer to the owning AsyncGenerator (its request queue + state), so the body thread
+    /// and the servicer share it. Null for plain generators / async functions.
+    async_gen: ?*AsyncGenerator = null,
+};
+
+/// §27.6.1 [[AsyncGeneratorState]] — an async generator's lifecycle. `suspended_start` (body not yet
+/// run) / `suspended_yield` (parked at a `yield`) / `executing` (body running between suspensions) /
+/// `awaiting_return` (a `.return` is being awaited before completion, §27.6.3.10) / `completed`.
+pub const AsyncGeneratorState = enum { suspended_start, suspended_yield, executing, awaiting_return, completed };
+
+/// §27.6.3.1 AsyncGeneratorRequest — one queued `.next(v)` / `.return(v)` / `.throw(e)`. Each carries
+/// the completion (`kind` + `value`) to resume the body with and the Promise capability (`promise` +
+/// its resolve/reject functions) to settle when this request produces a result. Serviced FIFO, one at
+/// a time (§27.6.3.4 AsyncGeneratorDrainQueue).
+pub const AsyncGenRequest = struct {
+    kind: ResumeKind,
+    value: Value,
+    /// The promise returned to the caller by the `.next/.return/.throw` that enqueued this request.
+    promise: *Object,
+    /// The resolve / reject functions of `promise` (so the servicer can settle it with the IteratorResult
+    /// or reject it on a thrown completion), §27.2.1.3.
+    resolve: *Object,
+    reject: *Object,
+};
+
+/// §27.6.1 An AsyncGenerator object's state: the underlying suspendable `Generator` (thread + handoff),
+/// the [[AsyncGeneratorState]], and the [[AsyncGeneratorQueue]] of pending requests. Present iff an
+/// Object is an async generator (`Object.async_generator != null`). Arena-allocated.
+pub const AsyncGenerator = struct {
+    /// The thread substrate (reused from §27.5 generators) on which the body runs, suspending at each
+    /// `await` / `yield`. Its `is_async`+`is_async_gen` are set; its `async_gen` points back here.
+    gen: *Generator,
+    state: AsyncGeneratorState = .suspended_start,
+    /// §27.6.3.1 [[AsyncGeneratorQueue]] — pending requests serviced FIFO. `head` is the index of the
+    /// request currently being serviced (the front); entries before it are done.
+    queue: std.ArrayListUnmanaged(AsyncGenRequest) = .empty,
+    head: usize = 0,
 };
 
 /// Built-in (Zig-implemented) function identity. Dispatched by the interpreter's callNative;
@@ -222,6 +270,14 @@ pub const NativeId = enum {
     // §27.5 Generator — %GeneratorPrototype% methods + [Symbol.iterator].
     generator_method, // %GeneratorPrototype%.next / .return / .throw (native_name selects)
     generator_iterator, // %GeneratorPrototype%[Symbol.iterator] — returns `this`
+    // §27.6 AsyncGenerator — %AsyncGeneratorPrototype% methods (each returns a promise) + asyncIterator.
+    async_generator_method, // %AsyncGeneratorPrototype%.next / .return / .throw (native_name selects)
+    async_generator_iterator, // %AsyncGeneratorPrototype%[Symbol.asyncIterator] — returns `this`
+    // §27.1.4 AsyncFromSyncIterator — next/return/throw promise-wrapping the wrapped sync iterator.
+    async_from_sync_method, // %AsyncFromSyncIteratorPrototype%.next / .return / .throw (native_name selects)
+    /// §27.1.4.4 AsyncFromSyncIteratorContinuation onFulfilled — wraps an awaited value `v` into a fresh
+    /// IteratorResult `{ value: v, done }`. `afs_done` carries the captured `done` flag.
+    async_from_sync_wrap,
     // §27.2 Promise — the constructor, prototype methods, and statics.
     promise_ctor, // new Promise(executor)
     promise_then, // Promise.prototype.then
@@ -416,6 +472,14 @@ pub const Object = struct {
     /// Holds the suspendable-execution machinery (body thread + ping-pong semaphores). Null for every
     /// other object (zero cost). The %GeneratorPrototype% `next`/`return`/`throw` natives drive it.
     generator: ?*Generator = null,
+    /// §27.6 AsyncGenerator state — present iff this object is an async generator (made by calling an
+    /// `async function*`). Holds the underlying Generator (thread) + the request queue + state. Null for
+    /// every other object (zero cost). The %AsyncGeneratorPrototype% next/return/throw natives drive it.
+    async_generator: ?*AsyncGenerator = null,
+    /// §27.1.4 AsyncFromSyncIterator state — present iff this object wraps a SYNC iterator for async
+    /// consumption (built by GetIterator(obj, async) when `obj` has no `[Symbol.asyncIterator]`). Its
+    /// next/return/throw natives promise-wrap + await each sync step. Null for every other object.
+    async_from_sync: ?*Object = null,
     /// §27.2.6 Promise state — present iff this object is a Promise (`new Promise`, `Promise.resolve`,
     /// the result of `then`/`catch`/`finally`, or an async function's returned promise). Null for
     /// every other object (zero cost). The %PromisePrototype% / Promise statics + the Job queue read it.
@@ -437,6 +501,9 @@ pub const Object = struct {
     /// §27.2.4.1.2 [[AlreadyCalled]] — a combinator element closure runs at most once (a promise can
     /// settle once, but a malicious thenable could call its callbacks repeatedly). Guards double-count.
     already_called: bool = false,
+    /// §27.1.4.4 the captured `done` flag for an `async_from_sync_wrap` continuation closure (it wraps
+    /// the awaited value into `{ value, done: afs_done }`). Meaningful only on that native.
+    afs_done: bool = false,
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);

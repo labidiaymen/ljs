@@ -263,7 +263,7 @@ pub const Interpreter = struct {
                 return .{ .normal = .undefined };
             },
             .for_in_stmt => |s| return self.evalForIn(s, env, my_labels),
-            .for_of_stmt => |s| return self.evalForOf(s, env, my_labels),
+            .for_of_stmt => |s| return if (s.is_await) self.evalForAwaitOf(s, env, my_labels) else self.evalForOf(s, env, my_labels),
             .throw_stmt => |e| {
                 // §14.14 ThrowStatement.
                 const c = try self.evalExpr(e, env);
@@ -420,6 +420,74 @@ pub const Interpreter = struct {
             }
         }
         return .{ .normal = .undefined };
+    }
+
+    /// §14.7.5.6 ForIn/OfBodyEvaluation with the `async` iteration hint — `for await (HEAD of EXPR) BODY`.
+    /// GetIterator(EXPR, async): use `EXPR[Symbol.asyncIterator]()` if present, else wrap the sync
+    /// iterator in an AsyncFromSyncIterator (§27.1.4). Each iteration AWAITs `iterator.next()` (and the
+    /// async-from-sync wrapper also awaits each value), binds the value, runs the body; an abrupt
+    /// completion closes the iterator with an awaited `return` (§7.4.11 AsyncIteratorClose). Runs only on
+    /// an async body thread (`current_gen.is_async`), guaranteed by the parser's async-context check.
+    fn evalForAwaitOf(self: *Interpreter, s: anytype, env: *Environment, my_labels: []const []const u8) EvalError!Completion {
+        const rc = try self.evalExpr(s.right, env);
+        if (rc.isAbrupt()) return rc;
+        const ait = try self.getAsyncIterator(rc.normal);
+        const iterator: *Object = switch (ait) {
+            .abrupt => |c| return c,
+            .iterator => |it| it,
+        };
+        while (true) {
+            // §14.7.5.6 step 3.b: result ← Await( IteratorNext(iterator) ). An async iterator's `next`
+            // returns a promise of the IteratorResult; await it, then decode `{value, done}`.
+            const raw = try self.iteratorCallRaw(iterator, "next", .undefined, false);
+            if (raw.isAbrupt()) return raw;
+            const aw = try self.doAwait(raw.normal);
+            if (aw.isAbrupt()) return aw; // a rejected `next` promise throws into the body
+            const decoded = try self.iterResultFromValue(aw.normal);
+            const step: IterStep = switch (decoded) {
+                .abrupt => |c| return c,
+                .result => |r| r,
+            };
+            if (step.done) break; // §14.7.5.6: done → finish the loop
+            const v = step.value;
+            const hb = try self.bindForHead(s.head, v, env);
+            if (hb.completion.isAbrupt()) {
+                try self.asyncIteratorClose(iterator);
+                return hb.completion;
+            }
+            const bc = try self.evalStmt(s.body.*, hb.env);
+            switch (bc) {
+                .normal => {},
+                .cont => |l| {
+                    if (!loopHandles(l, my_labels)) {
+                        try self.asyncIteratorClose(iterator);
+                        return bc;
+                    }
+                },
+                .brk => |l| {
+                    try self.asyncIteratorClose(iterator);
+                    if (loopHandles(l, my_labels)) break else return bc;
+                },
+                .ret, .throw => {
+                    try self.asyncIteratorClose(iterator);
+                    return bc;
+                },
+            }
+        }
+        return .{ .normal = .undefined };
+    }
+
+    /// §7.4.11 AsyncIteratorClose — best-effort: call `iterator.return()`, AWAIT its (promise) result,
+    /// and ignore it (the original completion wins). A missing/non-callable `return` is a no-op. Runs on
+    /// the async body thread (so `await` is available).
+    fn asyncIteratorClose(self: *Interpreter, iterator: *Object) EvalError!void {
+        const rc = try self.getProperty(.{ .object = iterator }, "return");
+        if (rc.isAbrupt()) return; // swallow
+        if (rc.normal != .object or rc.normal.object.kind != .function) return;
+        const inner = self.callFunction(rc.normal.object, &.{}, .{ .object = iterator }) catch return;
+        if (inner.isAbrupt()) return; // swallow a throwing return
+        // Await the (possibly promise) result so a pending close settles before the loop unwinds.
+        _ = self.doAwait(inner.normal) catch return;
     }
 
     const HeadBinding = struct { env: *Environment, completion: Completion = .{ .normal = .undefined } };
@@ -653,6 +721,13 @@ pub const Interpreter = struct {
                     const ac = try self.evalExpr(an, env);
                     if (ac.isAbrupt()) return ac;
                     arg = ac.normal;
+                }
+                // §27.6.3.8 in an ASYNC generator, `yield` is AsyncGeneratorYield (await the operand,
+                // then suspend producing {value,done:false}); `yield*` delegates over an async iterator.
+                const cg = self.current_gen.?;
+                if (cg.is_async_gen) {
+                    if (y.delegate) return self.doAsyncYieldDelegate(arg);
+                    return self.doAsyncYield(arg);
                 }
                 // §15.5.5 `yield* expr` delegates to the iterator of `expr`; plain `yield expr` performs
                 // a single handoff.
@@ -1651,11 +1726,13 @@ pub const Interpreter = struct {
         // Generator object in `suspended_start` (the body runs on its own thread later, on `.next`).
         // Checked before the depth bump so it pays no recursion budget; ordinary functions skip it.
         if (func.call) |fd0| {
-            if (fd0.is_generator and !fd0.is_async) return self.createGenerator(func, args, this_val);
+            // §27.6.2 an async generator (`async function*`) [[Call]] returns an AsyncGenerator object
+            // (lazy — the body runs on its own thread when first driven). Checked before the plain
+            // generator / async branches (it is both is_async AND is_generator).
+            if (fd0.is_generator and fd0.is_async) return self.createAsyncGenerator(func, args, this_val);
+            if (fd0.is_generator) return self.createGenerator(func, args, this_val);
             // §27.7.5.1 an async function's [[Call]] returns a Promise immediately and runs the body on
-            // a generator-style thread, suspending at each `await`. (Async generators — both is_async
-            // and is_generator — are deferred; they currently fall through to this async path, running
-            // the body without a yield surface, which is acceptable until M11 Cycle 3.)
+            // a generator-style thread, suspending at each `await`.
             if (fd0.is_async) return self.callAsyncFunction(func, args, this_val);
         }
         // Each call stacks several heavy native frames — count call depth too so the guard
@@ -2186,6 +2263,47 @@ pub const Interpreter = struct {
         return .{ .iterator = rc.normal.object };
     }
 
+    /// The realm's well-known `Symbol.asyncIterator` identity (held on the `Symbol` constructor).
+    fn wellKnownAsyncIterator(self: *Interpreter) ?*Symbol {
+        const g = self.globals orelse return null;
+        const b = g.lookup("Symbol") orelse return null;
+        if (b.value != .object) return null;
+        const pv = b.value.object.get("asyncIterator") orelse return null;
+        return if (pv == .symbol) pv.symbol else null;
+    }
+
+    /// §7.4.3 GetIterator ( obj, async ) — read `obj[Symbol.asyncIterator]`; if present, call it (the
+    /// result is the async iterator). If ABSENT, fall back to the SYNC iterator (`obj[Symbol.iterator]`)
+    /// and wrap it in an AsyncFromSyncIterator (§27.1.4.1 CreateAsyncFromSyncIterator) so `for await`
+    /// can drive a sync iterable. A value with neither → TypeError.
+    fn getAsyncIterator(self: *Interpreter, obj: Value) EvalError!IterResult {
+        if (self.wellKnownAsyncIterator()) |async_sym| {
+            const mc = try self.getSymbolProperty(obj, async_sym);
+            if (mc.isAbrupt()) return .{ .abrupt = mc };
+            if (mc.normal == .object and mc.normal.object.kind == .function) {
+                const rc = try self.callFunction(mc.normal.object, &.{}, obj);
+                if (rc.isAbrupt()) return .{ .abrupt = rc };
+                if (rc.normal != .object) {
+                    return .{ .abrupt = try self.throwError("TypeError", "Result of Symbol.asyncIterator is not an object") };
+                }
+                return .{ .iterator = rc.normal.object };
+            }
+            // §7.4.3 step 1.b.i: an undefined/null [Symbol.asyncIterator] (or absent) → use the sync path.
+            if (mc.normal != .undefined and mc.normal != .null) {
+                return .{ .abrupt = try self.throwError("TypeError", "Symbol.asyncIterator is not callable") };
+            }
+        }
+        // §27.1.4.1 CreateAsyncFromSyncIterator: get the SYNC iterator, wrap it.
+        const sync = try self.getIterator(obj);
+        const sync_iter: *Object = switch (sync) {
+            .abrupt => |c| return .{ .abrupt = c },
+            .iterator => |it| it,
+        };
+        const wrapper = try Object.create(self.arena, self.asyncFromSyncProto());
+        wrapper.async_from_sync = sync_iter;
+        return .{ .iterator = wrapper };
+    }
+
     const StepResult = union(enum) { value: Value, done, abrupt: Completion };
 
     /// §7.4.4 IteratorStep + §7.4.5 IteratorValue — call `iterator.next()`, require an object result,
@@ -2606,6 +2724,19 @@ pub const Interpreter = struct {
         return self.iterResultFromValue(rc.normal);
     }
 
+    /// Call `iterator[method](arg)` and return its RAW result value (no IteratorResult decode). Used by
+    /// `for await` (the result is a promise to be awaited before decoding) and by async `yield*`. A
+    /// missing/non-callable method → TypeError. `pass_arg` false calls with no argument.
+    fn iteratorCallRaw(self: *Interpreter, iterator: *Object, method: []const u8, arg: Value, pass_arg: bool) EvalError!Completion {
+        const mc = try self.getProperty(.{ .object = iterator }, method);
+        if (mc.isAbrupt()) return mc;
+        if (mc.normal != .object or mc.normal.object.kind != .function) {
+            return self.throwError("TypeError", "iterator method is not a function");
+        }
+        const args: []const Value = if (pass_arg) &.{arg} else &.{};
+        return self.callFunction(mc.normal.object, args, .{ .object = iterator });
+    }
+
     /// Decode an IteratorResult object into `{ value, done }` (§7.4.4 / §7.4.5). A non-object → TypeError.
     fn iterResultFromValue(self: *Interpreter, result: Value) EvalError!CallStepResult {
         if (result != .object) {
@@ -2802,6 +2933,9 @@ pub const Interpreter = struct {
         // §27.7.5.3 await: a reaction with no capability/handler resumes the parked async body thread.
         if (reaction.await_gen) |gen| {
             const kind: object_mod.ResumeKind = if (reaction.kind == .fulfill) .next else .throw;
+            // §27.6.3.8: an async-GENERATOR body resumes through the request-queue servicer (settles
+            // requests as it advances); a plain async function resumes through `resumeAsync`.
+            if (gen.is_async_gen) return self.asyncGenResumeAfterAwait(gen, kind, argument);
             return self.resumeAsync(gen, kind, argument);
         }
         const cap = reaction.capability;
@@ -3026,6 +3160,9 @@ pub const Interpreter = struct {
     /// reaction Job resumes us with the settlement (`.next` value → await result; `.throw` reason →
     /// throw at the await point). Only runs on an async body thread (`current_gen.is_async`).
     fn doAwait(self: *Interpreter, value: Value) EvalError!Completion {
+        // §27.6.3.8: in an async generator the servicer must distinguish an await from a yield (both are
+        // `.yield`-kind handoffs); mark this transfer as an await so it registers resumption reactions.
+        self.current_gen.?.transfer_await = true;
         const r = self.doYieldRaw(value);
         if (r.abandon) return .{ .ret = .undefined }; // realm teardown woke us to unwind
         return switch (r.kind) {
@@ -3033,6 +3170,376 @@ pub const Interpreter = struct {
             .throw => .{ .throw = r.value }, // a rejected await throws the reason into the body
             .ret => .{ .ret = r.value }, // teardown injection (unwind, run finally blocks)
         };
+    }
+
+    // ── §27.6 Async Generators (thread substrate + Promise/Job runtime) ──────────
+    //
+    // An async generator body runs on the SAME std.Thread substrate as a sync generator / async
+    // function. It may suspend in two ways, BOTH via `doYieldRaw` (carry a value out, park):
+    //   • `await x`  → `transfer_await = true`; the servicer wraps x via PromiseResolve and registers
+    //                  fulfill/reject reactions that resume the body (identical to an async fn await).
+    //   • `yield x`  → AsyncGeneratorYield (§27.6.3.8): FIRST `await x` (above), THEN a second handoff
+    //                  with `transfer_await = false` carrying x out; the servicer resolves the CURRENT
+    //                  request's promise with {value:x, done:false}.
+    // Each `.next/.return/.throw` enqueues an AsyncGenRequest (returning a fresh promise) and kicks the
+    // servicing loop (`asyncGenDrainQueue`), which runs the body to its next yield/await/completion and
+    // settles requests, one at a time. The terminal completion settles the front request done:true /
+    // rejection. NO HANGS: every resume runs the body to exactly one suspension; the servicer registers
+    // a reaction (await) or settles + dequeues (yield/terminal) and returns to the Job drain.
+
+    /// §27.6.3.8 AsyncGeneratorYield — on the async-gen body thread: first AWAIT the operand (so a
+    /// thenable yield value is adopted), then hand it out as a YIELD (`transfer_await = false`) and park
+    /// until the next request resumes us. A `.next(v)` makes the yield evaluate to `v`; an injected
+    /// `.throw`/`.return` re-throws / returns at the yield point (running finally blocks).
+    fn doAsyncYield(self: *Interpreter, value: Value) EvalError!Completion {
+        // §27.6.3.8 step 5: Await the operand first.
+        const ac = try self.doAwait(value);
+        if (ac.isAbrupt()) return ac; // a rejected await of the yield operand throws into the body
+        const awaited = ac.normal;
+        // Now suspend producing the yielded value (a non-await handoff → the servicer settles the request).
+        self.current_gen.?.transfer_await = false;
+        const r = self.doYieldRaw(awaited);
+        if (r.abandon) return .{ .ret = .undefined };
+        return switch (r.kind) {
+            .next => .{ .normal = r.value }, // the value sent to the next .next(v)
+            .throw => .{ .throw = r.value }, // §27.6.3.8: an injected .throw re-throws at the yield
+            .ret => .{ .ret = r.value }, // an injected .return returns (runs finally blocks)
+        };
+    }
+
+    /// §27.6.3.8 `yield* expr` in an ASYNC generator — delegate over the ASYNC iterator of `expr`
+    /// (GetIterator async; a sync iterable is wrapped). Each round: await the inner `next/throw/return`
+    /// (its result is a promise), decode `{value, done}`; a done result finishes the `yield*` with that
+    /// value; otherwise re-yield the value to the outer consumer (an AsyncGeneratorYield) and forward the
+    /// next resumption to the inner iterator. Runs on the async-gen body thread.
+    fn doAsyncYieldDelegate(self: *Interpreter, source: Value) EvalError!Completion {
+        const ait = try self.getAsyncIterator(source);
+        const iterator: *Object = switch (ait) {
+            .abrupt => |c| return c,
+            .iterator => |it| it,
+        };
+        var received: Resumption = .{ .kind = .next, .value = .undefined, .abandon = false };
+        while (true) {
+            const method: []const u8 = switch (received.kind) {
+                .next => "next",
+                .throw => "throw",
+                .ret => "return",
+            };
+            // §27.6.3.8: a `.throw`/`.return` to a missing inner method is special-cased.
+            if (received.kind != .next) {
+                const mc = try self.getProperty(.{ .object = iterator }, method);
+                if (mc.isAbrupt()) return mc;
+                if (mc.normal != .object or mc.normal.object.kind != .function) {
+                    if (received.kind == .ret) return .{ .ret = received.value };
+                    try self.asyncIteratorClose(iterator);
+                    return self.throwError("TypeError", "The async iterator does not provide a throw method");
+                }
+            }
+            const raw = try self.iteratorCallRaw(iterator, method, received.value, true);
+            if (raw.isAbrupt()) return raw;
+            // Await the (promise) result, then decode.
+            const aw = try self.doAwait(raw.normal);
+            if (aw.isAbrupt()) return aw;
+            const decoded = try self.iterResultFromValue(aw.normal);
+            const step: IterStep = switch (decoded) {
+                .abrupt => |c| return c,
+                .result => |r| r,
+            };
+            if (step.done) {
+                // §27.6.3.8: a done `.return` result returns from the body; otherwise the yield* value.
+                if (received.kind == .ret) return .{ .ret = step.value };
+                return .{ .normal = step.value };
+            }
+            // Re-yield the inner value to the outer consumer (AsyncGeneratorYield), capturing the next
+            // resumption (which we forward to the inner iterator).
+            const yc = try self.doAsyncYield(step.value);
+            switch (yc) {
+                .normal => |v| received = .{ .kind = .next, .value = v, .abandon = false },
+                .throw => |e| received = .{ .kind = .throw, .value = e, .abandon = false },
+                .ret => |v| return .{ .ret = v }, // an injected .return unwinds the body
+                .brk, .cont => return .{ .ret = .undefined },
+            }
+        }
+    }
+
+    /// §27.6.2 calling an `async function*` — create an AsyncGenerator object in `suspended_start`
+    /// (lazy: the body thread spawns on the first request). Mirrors `createGenerator` but tags the
+    /// underlying Generator `is_async`+`is_async_gen` and links it to the AsyncGenerator state.
+    fn createAsyncGenerator(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
+        const gen = try self.arena.create(object_mod.Generator);
+        const args_copy = try self.arena.dupe(Value, args);
+        gen.* = .{
+            .func = func,
+            .args = args_copy,
+            .this_val = this_val,
+            .home_object = if (func.call) |fd| fd.home_object else null,
+            .is_async = true,
+            .is_async_gen = true,
+        };
+        const ag = try self.arena.create(object_mod.AsyncGenerator);
+        ag.* = .{ .gen = gen };
+        gen.async_gen = ag;
+        if (self.gen_registry) |reg| try reg.append(self.arena, gen);
+        const obj = try Object.create(self.arena, self.asyncGeneratorProto());
+        obj.async_generator = ag;
+        return .{ .normal = .{ .object = obj } };
+    }
+
+    /// %AsyncGeneratorPrototype% — stashed under the sentinel global name by `builtins.setup`.
+    fn asyncGeneratorProto(self: *Interpreter) ?*Object {
+        const g = self.globals orelse return null;
+        const b = g.lookup("%AsyncGeneratorPrototype%") orelse return null;
+        return if (b.value == .object) b.value.object else null;
+    }
+
+    /// %AsyncFromSyncIteratorPrototype% — the proto of an AsyncFromSyncIterator wrapper object.
+    fn asyncFromSyncProto(self: *Interpreter) ?*Object {
+        const g = self.globals orelse return null;
+        const b = g.lookup("%AsyncFromSyncIteratorPrototype%") orelse return null;
+        return if (b.value == .object) b.value.object else null;
+    }
+
+    /// §27.6.1.2/.3/.4 %AsyncGeneratorPrototype%.next/return/throw — enqueue an AsyncGeneratorRequest
+    /// (returning a fresh promise) and drive the queue. Each ALWAYS returns a promise (a sync error —
+    /// e.g. called on a non-async-generator — rejects that promise rather than throwing, §27.6.1.2).
+    fn asyncGeneratorResume(self: *Interpreter, this_val: Value, kind: object_mod.ResumeKind, value: Value) EvalError!Completion {
+        const promise = try self.newPromise();
+        const resolve_fn = try self.makeResolvingFunction(promise, .promise_resolve_fn);
+        const reject_fn = try self.makeResolvingFunction(promise, .promise_reject_fn);
+        // §27.6.1.2 step 3: a brand-check failure rejects the returned promise (does NOT throw).
+        if (this_val != .object or this_val.object.async_generator == null) {
+            const tc = try self.throwError("TypeError", "not an async generator");
+            try self.rejectPromiseRaw(promise, tc.throw);
+            return .{ .normal = .{ .object = promise } };
+        }
+        const ag = this_val.object.async_generator.?;
+        // §27.6.3.1 AsyncGeneratorEnqueue: append the request to the queue.
+        try ag.queue.append(self.arena, .{ .kind = kind, .value = value, .promise = promise, .resolve = resolve_fn, .reject = reject_fn });
+        // §27.6.3.4 AsyncGeneratorDrainQueue: if not already running and not awaiting-return, service it.
+        if (ag.state != .executing and ag.state != .awaiting_return) {
+            try self.asyncGenDrainQueue(ag);
+        }
+        return .{ .normal = .{ .object = promise } };
+    }
+
+    /// §27.6.3.4 AsyncGeneratorDrainQueue / §27.6.3.5 AsyncGeneratorResume — service the FRONT request:
+    /// resume the body to its next yield/await/completion (or, on a completed generator, settle the
+    /// request directly), then react to the transfer. Services requests until the body suspends on an
+    /// `await` (a reaction Job will re-enter via `asyncGenResumeAfterAwait`) or the queue drains. Runs on
+    /// the servicing interpreter (main or a Job).
+    fn asyncGenDrainQueue(self: *Interpreter, ag: *object_mod.AsyncGenerator) EvalError!void {
+        while (ag.head < ag.queue.items.len) {
+            const req = ag.queue.items[ag.head];
+            // §27.6.3.5 on a COMPLETED async generator: settle the request without running the body.
+            if (ag.state == .completed) {
+                switch (req.kind) {
+                    .next => try self.asyncGenSettleResult(req, .undefined, true),
+                    .ret => try self.asyncGenSettleResult(req, req.value, true),
+                    .throw => _ = try self.callFunction(req.reject, &.{req.value}, .undefined),
+                }
+                ag.head += 1;
+                continue;
+            }
+            const gen = ag.gen;
+            if (ag.state == .suspended_start) {
+                // §27.6.3.5: spawn the body thread; it runs to the first await/yield/completion.
+                // A `.return`/`.throw` on a suspended-start async generator completes it directly.
+                if (req.kind == .ret) {
+                    ag.state = .completed;
+                    try self.asyncGenSettleResult(req, req.value, true);
+                    ag.head += 1;
+                    continue;
+                }
+                if (req.kind == .throw) {
+                    ag.state = .completed;
+                    _ = try self.callFunction(req.reject, &.{req.value}, .undefined);
+                    ag.head += 1;
+                    continue;
+                }
+                ag.state = .executing;
+                gen.resume_kind = .next;
+                gen.sent_value = req.value;
+                gen.transfer_await = false;
+                const t = std.Thread.spawn(.{}, asyncBodyThread, .{ self, gen }) catch {
+                    ag.state = .completed;
+                    const tc = try self.throwError("RangeError", "Cannot spawn async generator thread");
+                    _ = try self.callFunction(req.reject, &.{tc.throw}, .undefined);
+                    ag.head += 1;
+                    continue;
+                };
+                gen.thread = t;
+                gen.to_caller.waitUncancelable(self.io);
+            } else {
+                // §27.6.3.5 SUSPENDED-YIELD: resume the parked yield with the request's completion.
+                ag.state = .executing;
+                gen.resume_kind = req.kind;
+                gen.sent_value = req.value;
+                gen.transfer_await = false;
+                gen.resume_gen.post(self.io);
+                gen.to_caller.waitUncancelable(self.io);
+            }
+            // React to where the body suspended / completed.
+            const more = try self.asyncGenHandleTransfer(ag);
+            if (!more) return; // suspended on an await — a reaction Job will resume the drain
+        }
+    }
+
+    /// After a body handoff: classify the transfer. An AWAIT suspension registers reactions that resume
+    /// the body (returns false — stop draining; the Job continues it). A YIELD settles the front request
+    /// with {value,done:false} and advances the queue (returns true — keep draining the next request). A
+    /// terminal return/throw settles the front request done:true / rejection (returns true).
+    fn asyncGenHandleTransfer(self: *Interpreter, ag: *object_mod.AsyncGenerator) EvalError!bool {
+        const gen = ag.gen;
+        switch (gen.transfer_kind) {
+            .yield => {
+                if (gen.transfer_await) {
+                    // §27.6.3.8 step 8 (await): the body is parked on an await — register reactions on
+                    // PromiseResolve(value) that resume THIS body (via `asyncGenResumeAfterAwait`). Keep
+                    // `ag.state = .executing` so a NEW request arriving in this window only ENQUEUES (the
+                    // resume-guard in `asyncGeneratorResume` skips draining while executing) and does NOT
+                    // post `resume_gen` — the body is waiting for the await reaction, not a request. The
+                    // sole resume path is the reaction Job. (`gen.state` is left for `cleanupGenerators`.)
+                    ag.state = .executing;
+                    gen.state = .suspended_yield; // mark the body thread parked (for realm teardown).
+                    const awaited = try self.promiseResolveValue(gen.transfer_value);
+                    const on_f: object_mod.PromiseReaction = .{ .kind = .fulfill, .handler = null, .capability = null, .await_gen = gen };
+                    const on_r: object_mod.PromiseReaction = .{ .kind = .reject, .handler = null, .capability = null, .await_gen = gen };
+                    const pd = awaited.promise.?;
+                    switch (pd.state) {
+                        .pending => {
+                            try pd.fulfill_reactions.append(self.arena, on_f);
+                            try pd.reject_reactions.append(self.arena, on_r);
+                        },
+                        .fulfilled => try self.enqueueJob(.{ .reaction = .{ .reaction = on_f, .argument = pd.result } }),
+                        .rejected => try self.enqueueJob(.{ .reaction = .{ .reaction = on_r, .argument = pd.result } }),
+                    }
+                    return false;
+                }
+                // §27.6.3.8 a real YIELD: settle the front request with {value, done:false}, advance.
+                ag.state = .suspended_yield;
+                gen.state = .suspended_yield; // the body thread is parked at the yield (for teardown).
+                const req = ag.queue.items[ag.head];
+                try self.asyncGenSettleResult(req, gen.transfer_value, false);
+                ag.head += 1;
+                return true;
+            },
+            .ret => {
+                // §27.6.3.5: body returned — settle the front request {value, done:true}, complete.
+                ag.state = .completed;
+                if (gen.thread) |t| {
+                    t.join();
+                    gen.thread = null;
+                }
+                const req = ag.queue.items[ag.head];
+                try self.asyncGenSettleResult(req, gen.transfer_value, true);
+                ag.head += 1;
+                return true;
+            },
+            .throw => {
+                // §27.6.3.5: an uncaught throw — reject the front request, complete the generator.
+                ag.state = .completed;
+                if (gen.thread) |t| {
+                    t.join();
+                    gen.thread = null;
+                }
+                const req = ag.queue.items[ag.head];
+                _ = try self.callFunction(req.reject, &.{gen.transfer_value}, .undefined);
+                ag.head += 1;
+                return true;
+            },
+        }
+    }
+
+    /// Resume an async-generator body parked on an `await` (called from a settled-await reaction Job),
+    /// run it to the next suspension/completion, react, and keep draining the queue. `.next` → the await
+    /// evaluates to `value`; `.throw` → the await throws `value`.
+    fn asyncGenResumeAfterAwait(self: *Interpreter, gen: *object_mod.Generator, kind: object_mod.ResumeKind, value: Value) EvalError!void {
+        const ag = gen.async_gen.?;
+        if (ag.state == .completed) return; // defensive
+        ag.state = .executing;
+        gen.resume_kind = kind;
+        gen.sent_value = value;
+        gen.transfer_await = false;
+        gen.resume_gen.post(self.io);
+        gen.to_caller.waitUncancelable(self.io);
+        const more = try self.asyncGenHandleTransfer(ag);
+        if (more) try self.asyncGenDrainQueue(ag);
+    }
+
+    /// Settle a request's promise with a CreateIterResultObject {value, done} (§7.4.1) via its resolve
+    /// function (so a thenable value is properly adopted, §27.6.3.9 step 9 uses the resolve abstraction).
+    fn asyncGenSettleResult(self: *Interpreter, req: object_mod.AsyncGenRequest, value: Value, done: bool) EvalError!void {
+        const result = try self.iterResultObject(value, done);
+        _ = try self.callFunction(req.resolve, &.{.{ .object = result }}, .undefined);
+    }
+
+    /// Build a plain IteratorResult `{ value, done }` object (proto %Object.prototype%). Like
+    /// `iterResult` but returns the bare Object (callers wrap into a Completion / pass to resolve).
+    fn iterResultObject(self: *Interpreter, value: Value, done: bool) EvalError!*Object {
+        const obj = try Object.create(self.arena, self.objectProto());
+        try obj.set("value", value);
+        try obj.set("done", .{ .boolean = done });
+        return obj;
+    }
+
+    // ── §27.1.4 AsyncFromSyncIterator ────────────────────────────────────────────
+
+    /// §27.1.4.2.1/.2/.3 %AsyncFromSyncIteratorPrototype%.next/return/throw — drive the wrapped SYNC
+    /// iterator's matching method and return a PROMISE of the IteratorResult whose `value` has been
+    /// awaited (§27.1.4.4 AsyncFromSyncIteratorContinuation). A sync throw rejects the returned promise.
+    /// `return`/`throw` on a sync iterator lacking that method resolve/reject per §27.1.4.2.2/.3 step 5.
+    fn asyncFromSyncMethod(self: *Interpreter, name: []const u8, this_val: Value, arg: Value, has_arg: bool) EvalError!Completion {
+        const promise = try self.newPromise();
+        if (this_val != .object or this_val.object.async_from_sync == null) {
+            const tc = try self.throwError("TypeError", "not an AsyncFromSyncIterator");
+            try self.rejectPromiseRaw(promise, tc.throw);
+            return .{ .normal = .{ .object = promise } };
+        }
+        const sync_iter = this_val.object.async_from_sync.?;
+        const is_next = std.mem.eql(u8, name, "next");
+        const is_return = std.mem.eql(u8, name, "return");
+        // §27.1.4.2.2/.3 step 3: look up `return`/`throw` on the sync iterator; absent → special-case.
+        if (!is_next) {
+            const mc = try self.getProperty(.{ .object = sync_iter }, name);
+            if (mc.isAbrupt()) {
+                try self.rejectPromiseRaw(promise, mc.throw);
+                return .{ .normal = .{ .object = promise } };
+            }
+            if (mc.normal != .object or mc.normal.object.kind != .function) {
+                // §27.1.4.2.2 step 5: absent `return` → resolve with { value: arg, done: true }.
+                // §27.1.4.2.3 step 5: absent `throw` → reject with `arg` (re-throw the exception).
+                if (is_return) {
+                    const ir = try self.iterResultObject(if (has_arg) arg else .undefined, true);
+                    try self.resolvePromise(promise, .{ .object = ir });
+                } else {
+                    try self.rejectPromiseRaw(promise, arg);
+                }
+                return .{ .normal = .{ .object = promise } };
+            }
+        }
+        // Call the sync iterator's method, decode the IteratorResult.
+        const raw = try self.iteratorCallRaw(sync_iter, name, arg, has_arg);
+        if (raw.isAbrupt()) {
+            try self.rejectPromiseRaw(promise, raw.throw);
+            return .{ .normal = .{ .object = promise } };
+        }
+        const decoded = try self.iterResultFromValue(raw.normal);
+        const step: IterStep = switch (decoded) {
+            .abrupt => |c| {
+                try self.rejectPromiseRaw(promise, c.throw);
+                return .{ .normal = .{ .object = promise } };
+            },
+            .result => |r| r,
+        };
+        // §27.1.4.4 AsyncFromSyncIteratorContinuation: valueWrapper = PromiseResolve(value); the result
+        // promise resolves, when valueWrapper settles, to CreateIterResultObject(awaitedValue, done).
+        const value_wrapper = try self.promiseResolveValue(step.value);
+        const wrap = try Object.createNative(self.arena, .async_from_sync_wrap, "");
+        wrap.prototype = self.functionProto();
+        wrap.afs_done = step.done;
+        // PerformPromiseThen(valueWrapper, wrap) with the result promise as the capability.
+        try self.performPromiseThen(value_wrapper, wrap, null, promise);
+        return .{ .normal = .{ .object = promise } };
     }
 
     /// §27.2.3.1 the Promise constructor — `new Promise(executor)`: create a pending promise, build its
@@ -4085,6 +4592,27 @@ pub const Interpreter = struct {
                 return self.generatorResume(this_val, kind, arg);
             },
             .generator_iterator => return .{ .normal = this_val }, // §27.5.1.1 returns `this`
+            .async_generator_method => { // §27.6.1.2/.3/.4 %AsyncGeneratorPrototype%.next/return/throw
+                const arg: Value = if (args.len > 0) args[0] else .undefined;
+                const kind: object_mod.ResumeKind = if (std.mem.eql(u8, func.native_name, "return"))
+                    .ret
+                else if (std.mem.eql(u8, func.native_name, "throw"))
+                    .throw
+                else
+                    .next;
+                return self.asyncGeneratorResume(this_val, kind, arg);
+            },
+            .async_generator_iterator => return .{ .normal = this_val }, // §27.6.1.5 / §27.1.4.2.4 returns `this`
+            .async_from_sync_method => { // §27.1.4.2 %AsyncFromSyncIteratorPrototype%.next/return/throw
+                const arg: Value = if (args.len > 0) args[0] else .undefined;
+                const has_arg = args.len > 0;
+                return self.asyncFromSyncMethod(func.native_name, this_val, arg, has_arg);
+            },
+            .async_from_sync_wrap => { // §27.1.4.4: wrap an awaited value into { value, done }
+                const v: Value = if (args.len > 0) args[0] else .undefined;
+                const ir = try self.iterResultObject(v, func.afs_done);
+                return .{ .normal = .{ .object = ir } };
+            },
             // §27.2 Promise — the prototype methods (need `this`) + the resolving/finally thunks.
             .promise_then => return self.promiseThen(this_val, args),
             .promise_catch => return self.promiseCatch(this_val, args),
@@ -4183,6 +4711,7 @@ pub const Interpreter = struct {
             .array_ctor, .array_method, .string_method, .math_method => unreachable, // handled in the first switch
             .array_values, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
             .generator_method, .generator_iterator => unreachable, // handled in the first switch
+            .async_generator_method, .async_generator_iterator, .async_from_sync_method, .async_from_sync_wrap => unreachable, // handled in the first switch
             .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch
             .promise_all, .promise_all_settled, .promise_any, .promise_race, .promise_combinator_element => unreachable, // handled in the first switch
             .promise_resolve_fn, .promise_reject_fn, .promise_finally_thunk, .test_done => unreachable, // handled in the first switch
