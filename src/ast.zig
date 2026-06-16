@@ -293,6 +293,7 @@ pub const Stmt = union(enum) {
     /// continue (targets the innermost iteration), or the target loop's label name otherwise.
     continue_stmt: ?[]const u8,
     switch_stmt: struct { discriminant: *const Node, cases: []const Case }, // §14.12
+    with_stmt: struct { object: *const Node, body: *const Stmt }, // §14.11 WithStatement (sloppy-only)
     /// §14.13 LabelledStatement `LabelIdentifier : Statement`. `label` is the label name; `body` is
     /// the labelled statement. A labelled iteration statement is the target of `break label` /
     /// `continue label`; any other labelled statement is the target of `break label` only. Multiple

@@ -762,6 +762,15 @@ test "M20 Array.prototype keys/entries + iterator self-iterability (§23.1.3.18/
     try expectNumber("[...[7].entries()][0].length", 2);
 }
 
+test "M21 with statement: object environment record (§14.11)" {
+    try expectNumber("var o = {x: 5}; var r; with (o) { r = x; } r", 5); // read from binding object
+    try expectNumber("var o = {x: 1}; with (o) { x = 9; } o.x", 9); // write through to the object
+    try expectNumber("var y = 7; var o = {x: 1}; var r; with (o) { r = y; } r", 7); // fall through to outer scope
+    try expectNumber("var x = 1; var o = {x: 42}; var r; with (o) { r = x; } r", 42); // object prop shadows outer var
+    try expectStr("var o = {x: 5}; with (o) {} typeof x", "undefined"); // with-binding does not leak out
+    try expectSyntaxError("\"use strict\"; with ({}) {}"); // §14.11.1 strict-mode SyntaxError
+}
+
 test "M9 generators: function* returns a generator; .next drives yield (§15.5 / §27.5, US1-US2)" {
     // §15.5.4: calling a generator returns a generator object (the body does NOT run yet).
     try expectStr("function* g(){} typeof g", "function");

@@ -364,6 +364,18 @@ pub const Parser = struct {
         return .{ .if_stmt = .{ .cond = cond, .then = then, .otherwise = otherwise } };
     }
 
+    /// §14.11 `with ( Expression ) Statement`. §14.11.1 Early Error: a WithStatement in strict
+    /// mode code is a SyntaxError.
+    fn parseWith(self: *Parser) ParseError!ast.Stmt {
+        _ = self.advance(); // with
+        if (self.strict) return ParseError.UnexpectedToken;
+        _ = try self.expect(.lparen);
+        const object = try self.parseExpression();
+        _ = try self.expect(.rparen);
+        const body = try self.allocStmt(try self.parseSubStmt(false));
+        return .{ .with_stmt = .{ .object = object, .body = body } };
+    }
+
     fn parseWhile(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // while
         _ = try self.expect(.lparen);
@@ -689,6 +701,7 @@ pub const Parser = struct {
             .kw_do => return self.parseDoWhile(),
             .kw_for => return self.parseFor(),
             .kw_switch => return self.parseSwitch(),
+            .kw_with => return self.parseWith(),
             .kw_try => return self.parseTry(),
             .kw_throw => {
                 _ = self.advance();
@@ -2953,6 +2966,7 @@ fn stmtContainsArguments(stmt: ast.Stmt) bool {
             }
             return false;
         },
+        .with_stmt => |s| return containsArguments(s.object) or stmtContainsArguments(s.body.*),
         .try_stmt => |s| {
             if (bodyContainsArguments(s.block)) return true;
             if (s.catch_block) |cb| if (bodyContainsArguments(cb)) return true;
@@ -3022,7 +3036,7 @@ fn startsAccessorName(kind: lex.TokenKind) bool {
 /// ReservedWord is a valid IdentifierName key.
 fn isKeywordName(kind: lex.TokenKind) bool {
     return switch (kind) {
-        .kw_true, .kw_false, .kw_null, .kw_var, .kw_let, .kw_const, .kw_function, .kw_return, .kw_this, .kw_if, .kw_else, .kw_while, .kw_do, .kw_for, .kw_throw, .kw_try, .kw_catch, .kw_finally, .kw_break, .kw_continue, .kw_typeof, .kw_void, .kw_delete, .kw_new, .kw_instanceof, .kw_switch, .kw_case, .kw_default, .kw_import, .kw_class, .kw_extends, .kw_super, .kw_in => true,
+        .kw_true, .kw_false, .kw_null, .kw_var, .kw_let, .kw_const, .kw_function, .kw_return, .kw_this, .kw_if, .kw_else, .kw_while, .kw_do, .kw_for, .kw_throw, .kw_try, .kw_catch, .kw_finally, .kw_break, .kw_continue, .kw_typeof, .kw_void, .kw_delete, .kw_new, .kw_instanceof, .kw_switch, .kw_case, .kw_default, .kw_import, .kw_class, .kw_extends, .kw_super, .kw_in, .kw_with => true,
         else => false,
     };
 }

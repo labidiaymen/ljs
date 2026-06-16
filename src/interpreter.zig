@@ -61,6 +61,10 @@ pub const Interpreter = struct {
     /// The realm's global environment — used to resolve the Error family for engine-thrown
     /// errors (so they carry the right prototype + name). Set by the engine after setup.
     globals: ?*Environment = null,
+    /// §14.11 count of `with` statements currently on the scope chain. When 0 (the overwhelming
+    /// common case) identifier resolution takes the fast declarative path unchanged; when >0,
+    /// resolution consults object Environment Records (the `with` binding objects) first.
+    with_depth: u32 = 0,
     /// §27.5 the generator whose body THIS interpreter is currently executing (set on the per-generator
     /// body interpreter spawned for a `function*`; null for the main interpreter and ordinary calls).
     /// A `yield` is legal only when this is non-null; evaluating `yield x` reaches the handoff via it.
@@ -346,7 +350,44 @@ pub const Interpreter = struct {
                 }
                 return .{ .normal = .undefined };
             },
+            .with_stmt => |s| {
+                // §14.11.7 — ToObject the operand, run the body in an object Environment Record whose
+                // binding object is it. null/undefined → TypeError (§7.1.18). `with_depth` gates
+                // identifier resolution onto the object while the `with` body executes.
+                const oc = try self.evalExpr(s.object, env);
+                if (oc.isAbrupt()) return oc;
+                const obj: *Object = switch (oc.normal) {
+                    .object => |o| o,
+                    .null, .undefined => return self.throwError("TypeError", "Cannot convert undefined or null to object"),
+                    else => try Object.create(self.arena, self.objectProto()), // M-subset: primitive ToObject boxing not modeled
+                };
+                const with_env = try Environment.create(self.arena, env);
+                with_env.with_object = obj;
+                self.with_depth += 1;
+                defer self.with_depth -= 1;
+                return self.evalStmt(s.body.*, with_env);
+            },
         }
+    }
+
+    /// §9.1.1.1 / §9.1.1.2 with-aware identifier resolution. Walks the scope chain consulting object
+    /// Environment Records (the `with` binding objects, via `HasProperty`) and declarative records.
+    /// ONLY used when `with_depth > 0`; the no-`with` path keeps the fast `env.lookup`. Returns the
+    /// holding object (for a with binding), the declarative binding, or `.unresolved`.
+    const IdRef = union(enum) { with_object: *Object, binding: *@import("environment.zig").Binding, unresolved };
+    fn resolveIdRef(self: *Interpreter, env: *Environment, name: []const u8) IdRef {
+        _ = self;
+        var e: ?*Environment = env;
+        while (e) |cur| {
+            if (cur.with_object) |opaque_obj| {
+                const obj: *Object = @ptrCast(@alignCast(opaque_obj));
+                if (obj.get(name) != null) return .{ .with_object = obj }; // §9.1.1.2.1 HasProperty (proto chain)
+            } else if (cur.vars.getPtr(name)) |b| {
+                return .{ .binding = b };
+            }
+            e = cur.parent;
+        }
+        return .unresolved;
     }
 
     fn runBlock(self: *Interpreter, stmts: []const ast.Stmt, env: *Environment) EvalError!Completion {
@@ -535,6 +576,15 @@ pub const Interpreter = struct {
     fn assignToTarget(self: *Interpreter, node: *const ast.Node, value: Value, env: *Environment) EvalError!Completion {
         switch (node.*) {
             .identifier => |name| {
+                if (self.with_depth > 0) switch (self.resolveIdRef(env, name)) {
+                    .with_object => |o| return self.setProperty(.{ .object = o }, name, value),
+                    .binding => |b| {
+                        if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
+                        b.value = value;
+                        return .{ .normal = value };
+                    },
+                    .unresolved => return self.throwError("ReferenceError", name),
+                };
                 const b = env.lookup(name) orelse return self.throwError("ReferenceError", name);
                 if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
                 b.value = value;
@@ -644,6 +694,14 @@ pub const Interpreter = struct {
             .null => return .{ .normal = .null },
             .identifier => |name| {
                 // §9.4.2 ResolveBinding + §6.2.5.5 GetValue + §9.1.1.1.6 GetBindingValue.
+                if (self.with_depth > 0) switch (self.resolveIdRef(env, name)) {
+                    .with_object => |o| return self.getProperty(.{ .object = o }, name),
+                    .binding => |b| {
+                        if (!b.initialized) return self.throwError("ReferenceError", name);
+                        return .{ .normal = b.value };
+                    },
+                    .unresolved => return self.throwError("ReferenceError", name),
+                };
                 const b = env.lookup(name) orelse return self.throwError("ReferenceError", name);
                 if (!b.initialized) return self.throwError("ReferenceError", name); // TDZ (staged; see declaration note)
                 return .{ .normal = b.value };
@@ -654,6 +712,15 @@ pub const Interpreter = struct {
                 if (c.isAbrupt()) return c;
                 // §13.15.2 / §8.4: `f = function(){}` (anonymous RHS, identifier LHS) → NamedEvaluation.
                 try self.maybeSetAnonName(a.value, c.normal, a.name);
+                if (self.with_depth > 0) switch (self.resolveIdRef(env, a.name)) {
+                    .with_object => |o| return self.setProperty(.{ .object = o }, a.name, c.normal),
+                    .binding => |b| {
+                        if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
+                        b.value = c.normal;
+                        return .{ .normal = c.normal };
+                    },
+                    .unresolved => return self.throwError("ReferenceError", a.name),
+                };
                 const b = env.lookup(a.name) orelse return self.throwError("ReferenceError", a.name);
                 if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
                 b.value = c.normal;

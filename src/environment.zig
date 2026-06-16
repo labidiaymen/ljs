@@ -14,6 +14,11 @@ pub const Environment = struct {
     arena: std.mem.Allocator,
     parent: ?*Environment,
     vars: std.StringHashMapUnmanaged(Binding),
+    /// §9.1.1.2 Object Environment Record — for a `with` scope, the binding object (as an opaque
+    /// `*Object`; stored opaque to avoid the Object↔Environment import cycle). null for ordinary
+    /// declarative scopes. The interpreter consults it (only when a `with` is active) during
+    /// identifier resolution, casting it back to `*Object`.
+    with_object: ?*anyopaque = null,
 
     pub fn create(arena: std.mem.Allocator, parent: ?*Environment) std.mem.Allocator.Error!*Environment {
         const env = try arena.create(Environment);
