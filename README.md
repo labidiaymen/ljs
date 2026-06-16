@@ -93,6 +93,29 @@ ljs run <file>        # evaluate a source file
   (deep recursion → `RangeError`, never a crash); inline ECMA-262 clause citations throughout
 - Runs the **Test262 harness** (`sta.js`/`assert.js`) and passes real conformance tests
 
+## Getting started (clone → build → test)
+
+```sh
+# Prerequisites: Zig 0.16.0 (pinned). Optional: ZLint (for `zig build lint`), Node (for the bench
+# ljs-vs-Node ratio — the bench still runs without it).
+
+zig build                 # compile the engine + CLI + harness
+zig build test            # run the engine unit tests (in src/engine.zig) — no Test262 needed
+
+# Test262 conformance corpus is gitignored (it's TC39's ~50k-file suite); fetch the pinned commit:
+zig build vendor          # sparse-checkout test/language at test262.pin → vendor/test262/
+
+# run conformance (with the regression gate against the committed baseline):
+zig build test262 -- --path vendor/test262/test/language --harness-dir vendor/test262/harness --baseline baseline/language.json
+zig build lint            # zig fmt --check + ZLint
+zig build bench           # ljs (ReleaseFast) vs Node, gated on no ljs-vs-self perf regression
+```
+
+The per-cycle gate (spec-driven dev): **build → test → lint → conformance (no regression) → bench
+(no regression)**, each cycle is one commit. The conformance corpus is reproducible from
+`test262.pin` (not committed); only the engine's own tests, the `baseline/*.json` passing-set
+snapshots, and the SDD docs in `specs/` are in git.
+
 ## Conformance (Test262)
 
 **Scope:** the conformance target is 100% **ECMAScript** — the JS language + standard built-in
@@ -112,11 +135,11 @@ zig build test262 -- --path <dir> --harness-dir vendor/test262/harness --update-
 zig build test262 -- --path <dir> --harness-dir vendor/test262/harness --baseline baseline/<name>.json   # exit 1 on regression
 ```
 
-**Current headline (HEAD, harness metric):** full `language/` → **14,039 passed / 39,913 total /
-5,594 skipped = 40.9%**; `language/expressions` → **7,922 / 19,215 = 46.7%**. Baselines:
-`baseline/language.json` (full tree, the milestone metric) and `baseline/language-expressions.json`
-(the expressions slice, kept for continuity). The remaining `language/statements` failures are
-dominated by `class` (≈4.8k fail-lines), then `for-of`, `function`, `for`, and `generators`.
+**Current headline (HEAD, harness metric):** full `language/` → **34,177 passed / 44,475 total /
+809 skipped = 78.3%**. Baselines: `baseline/language.json` (full tree, the milestone metric) and
+`baseline/language-expressions.json` (the expressions slice, kept for continuity). The remaining
+`language/` failures are now mostly runtime edge cases (`class` long tail, iterator/async details)
+plus the not-yet-implemented `dynamic-import` (host), regex literals, and `BigInt`.
 
 **Metric:** conformance is reported **WITH the Test262 harness prelude** (`--harness-dir
 vendor/test262/harness`, the standard Test262 way). The prior bare-gate numbers undercounted positive

@@ -54,6 +54,8 @@ pub fn main(init: std.process.Init) !void {
     runner.run(io, arena, opts, &report) catch |e| switch (e) {
         error.OpenFailed => {
             try err.print("setup error: cannot open path '{s}'\n", .{opts.path});
+            try err.print("hint: the Test262 corpus is gitignored — fetch it first with `zig build vendor`\n", .{});
+            try err.print("      (or `./scripts/vendor-test262.sh test/language`), then re-run.\n", .{});
             try err.flush();
             std.process.exit(2);
         },

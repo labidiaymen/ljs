@@ -197,6 +197,12 @@ pub fn build(b: *std.Build) void {
     const t262_step = b.step("test262", "Run the Test262 conformance harness");
     t262_step.dependOn(&run_t262.step);
 
+    // `zig build vendor` — fetch the pinned Test262 corpus (gitignored) into vendor/test262.
+    // Sparse checkout of test/language at the commit in test262.pin; run once after cloning.
+    const vendor = b.addSystemCommand(&.{ "scripts/vendor-test262.sh", "test/language" });
+    const vendor_step = b.step("vendor", "Fetch the pinned Test262 corpus (sparse: test/language)");
+    vendor_step.dependOn(&vendor.step);
+
     // Harness unit tests (metadata parsing, classification) run as part of `zig build test`.
     const t262_tests = b.addTest(.{ .root_module = t262_mod });
     const run_t262_tests = b.addRunArtifact(t262_tests);
