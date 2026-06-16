@@ -4920,7 +4920,9 @@ pub const Interpreter = struct {
             .array_method => return builtin_array.call(self, func.native_name, this_val, args),
             .string_method => return builtin_string.call(self, func.native_name, this_val, args),
             .math_method => return self.mathMethod(func.native_name, args),
-            .array_values => return self.makeArrayIterator(this_val), // §23.1.3.34 / Array.prototype[Symbol.iterator]
+            .array_values => return self.makeArrayIterator(this_val, .value), // §23.1.3.34 / Array.prototype[Symbol.iterator]
+            .array_keys => return self.makeArrayIterator(this_val, .key), // §23.1.3.18 Array.prototype.keys
+            .array_entries => return self.makeArrayIterator(this_val, .entry), // §23.1.3.7 Array.prototype.entries
             .string_iterator => return self.makeStringIterator(this_val), // §22.1.3.36 String.prototype[Symbol.iterator]
             .iterator_next => return self.iteratorNext(this_val), // §23.1.5.2.1 / §22.1.5.2.1 %…IteratorPrototype%.next
             .symbol_to_string => return self.symbolToString(this_val), // §20.4.3.3 / §20.4.3.4
@@ -5072,7 +5074,7 @@ pub const Interpreter = struct {
             .symbol_ctor => return self.symbolConstructor(args), // §20.4.1.1 Symbol([description])
             .promise_ctor => return self.promiseConstructor(args), // §27.2.3.1 Promise(executor) called w/o new
             .array_ctor, .array_method, .string_method, .math_method => unreachable, // handled in the first switch
-            .array_values, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
+            .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
             .generator_method, .generator_iterator => unreachable, // handled in the first switch
             .async_generator_method, .async_generator_iterator, .async_from_sync_method, .async_from_sync_wrap => unreachable, // handled in the first switch
             .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch
@@ -5107,10 +5109,10 @@ pub const Interpreter = struct {
 
     /// §23.1.5.1 CreateArrayIterator — a fresh Array Iterator object (proto = %Object.prototype% in the
     /// M-subset) carrying the array + cursor in its native `iter` slot, with a `next` method.
-    fn makeArrayIterator(self: *Interpreter, this_val: Value) EvalError!Completion {
+    fn makeArrayIterator(self: *Interpreter, this_val: Value, kind: @import("object.zig").IterKind) EvalError!Completion {
         if (this_val != .object) return self.throwError("TypeError", "Array.prototype.values requires an object");
         const iter = try Object.create(self.arena, self.objectProto());
-        iter.iter = .{ .array = this_val.object, .cursor = 0 };
+        iter.iter = .{ .array = this_val.object, .cursor = 0, .kind = kind };
         try self.installIteratorNext(iter);
         return .{ .normal = .{ .object = iter } };
     }
@@ -5134,6 +5136,14 @@ pub const Interpreter = struct {
         const next_fn = try Object.createNative(self.arena, .iterator_next, "next");
         next_fn.prototype = self.functionProto();
         try iter.defineData("next", .{ .object = next_fn }, true, false, true);
+        // §27.1.2.1 %IteratorPrototype%[Symbol.iterator]() returns `this` — so the iterator object is
+        // itself iterable (`for (x of arr.entries())`, `[...arr.keys()]`). Reuses the return-`this`
+        // native. Keyed by the realm's well-known Symbol.iterator (absent only in a realm-less eval).
+        if (self.wellKnownIterator()) |iter_sym| {
+            const self_fn = try Object.createNative(self.arena, .generator_iterator, "[Symbol.iterator]");
+            self_fn.prototype = self.functionProto();
+            try iter.defineSymbolData(iter_sym, .{ .object = self_fn }, true, false, true);
+        }
     }
 
     /// §23.1.5.2.1 / §22.1.5.2.1 %…IteratorPrototype%.next — advance the native iterator and return a
@@ -5148,7 +5158,17 @@ pub const Interpreter = struct {
         var done = true;
         if (st.array) |arr| {
             if (st.cursor < arr.elements.items.len) {
-                value = arr.elements.items[st.cursor];
+                const idx = st.cursor;
+                value = switch (st.kind) {
+                    .value => arr.elements.items[idx],
+                    .key => .{ .number = @floatFromInt(idx) },
+                    .entry => blk: { // [index, value] pair (§23.1.5.2.1)
+                        const pair = try Object.createArray(self.arena, self.arrayProto());
+                        try pair.elements.append(self.arena, .{ .number = @floatFromInt(idx) });
+                        try pair.elements.append(self.arena, arr.elements.items[idx]);
+                        break :blk .{ .object = pair };
+                    },
+                };
                 st.cursor += 1;
                 done = false;
             }

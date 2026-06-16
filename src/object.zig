@@ -18,7 +18,12 @@ pub const IterState = struct {
     string: ?[]const u8 = null,
     /// The current cursor: the next array index / byte offset to yield.
     cursor: usize = 0,
+    /// §23.1.5.1 array-iterator kind: `.value` (Array.prototype.values / [Symbol.iterator]),
+    /// `.key` (.keys → indices), `.entry` (.entries → `[index, value]` pairs).
+    kind: IterKind = .value,
 };
+
+pub const IterKind = enum { value, key, entry };
 
 /// §6.1.7.1 one symbol-keyed own property: the Symbol identity plus its value/attribute payload.
 /// Symbol-keyed properties live in a SEPARATE store from the string-keyed `properties` map so the
@@ -265,6 +270,8 @@ pub const NativeId = enum {
     symbol_ctor, // Symbol([description]) — callable, not a constructor
     symbol_to_string, // Symbol.prototype.toString / Symbol.prototype.valueOf (native_name selects)
     array_values, // Array.prototype[Symbol.iterator] / .values — returns an Array Iterator
+    array_keys, // Array.prototype.keys — Array Iterator over indices (§23.1.3.18)
+    array_entries, // Array.prototype.entries — Array Iterator over [index, value] (§23.1.3.7)
     string_iterator, // String.prototype[Symbol.iterator] — returns a String Iterator
     iterator_next, // %ArrayIteratorPrototype%.next / %StringIteratorPrototype%.next (native_name selects)
     // §27.5 Generator — %GeneratorPrototype% methods + [Symbol.iterator].

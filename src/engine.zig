@@ -752,6 +752,16 @@ test "M8 iteration protocol: Array/String native iterators (§22.1.5 / §23.1.5)
     try expectThrows("for (var x of {}) {}");
 }
 
+test "M20 Array.prototype keys/entries + iterator self-iterability (§23.1.3.18/.7 / §27.1.2.1)" {
+    // .keys() → indices; .values()/.entries() Array Iterators; each is itself iterable (for-of / spread).
+    try expectStr("[...[9, 8, 7].keys()].join(',')", "0,1,2");
+    try expectNumber("var s = 0; for (var v of [3, 4, 5].values()) s += v; s", 12);
+    try expectStr("var r = []; for (var e of ['a', 'b'].entries()) r.push(e[0] + '=' + e[1]); r.join(',')", "0=a,1=b");
+    try expectBool("typeof [].entries === 'function' && typeof [].keys === 'function'", true);
+    // the entry pair is a real 2-element Array.
+    try expectNumber("[...[7].entries()][0].length", 2);
+}
+
 test "M9 generators: function* returns a generator; .next drives yield (§15.5 / §27.5, US1-US2)" {
     // §15.5.4: calling a generator returns a generator object (the body does NOT run yet).
     try expectStr("function* g(){} typeof g", "function");

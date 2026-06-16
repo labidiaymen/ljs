@@ -209,6 +209,8 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
             values_fn.prototype = function_proto;
             try pv.object.defineSymbolData(iter_sym, .{ .object = values_fn }, true, false, true);
             try defineMethod(arena, pv.object, "values", .array_values, "values"); // §23.1.3.34
+            try defineMethod(arena, pv.object, "keys", .array_keys, "keys"); // §23.1.3.18
+            try defineMethod(arena, pv.object, "entries", .array_entries, "entries"); // §23.1.3.7
         }
     }
     if (string_fn.get("prototype")) |pv| {
