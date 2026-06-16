@@ -339,6 +339,13 @@ pub const Interpreter = struct {
                 if (kc.isAbrupt()) return kc;
                 return self.setProperty(oc.normal, try self.toString(kc.normal), value);
             },
+            // §13.3.2 `obj.#x` as a destructuring target — write the private slot (TypeError if `obj`
+            // lacks the brand). The `=` was not folded here (no default), so the node is `private_member`.
+            .private_member => |pm| {
+                const oc = try self.evalExpr(pm.object, env);
+                if (oc.isAbrupt()) return oc;
+                return self.setPrivate(oc.normal, pm.name, value);
+            },
             else => return self.throwError("ReferenceError", "invalid assignment target"),
         }
     }
@@ -449,11 +456,28 @@ pub const Interpreter = struct {
             .binary => |b| return self.evalBinary(b.op, b.left, b.right, env),
             .object_literal => |props| return self.evalObjectLiteral(props, env),
             .array_literal => |elems| {
-                // §13.2.4 ArrayLiteral — `...spread` elements flatten in place.
+                // §13.2.4 ArrayLiteral — `...spread` elements flatten in place; an `elision` hole
+                // contributes one `undefined` element (M-subset: no true sparse model). A trailing
+                // elision that the parser appended to mark `[...x,]` (a valid literal trailing comma
+                // after a spread) is dropped here so it adds no element.
+                var list = elems;
+                if (list.len >= 2 and list[list.len - 1].* == .elision and list[list.len - 2].* == .spread) {
+                    list = list[0 .. list.len - 1];
+                }
                 const arr = try Object.createArray(self.arena, self.arrayProto());
-                const lc = try self.evalSpreadList(elems, env, &arr.elements);
+                const lc = try self.evalSpreadList(list, env, &arr.elements);
                 if (lc.isAbrupt()) return lc;
                 return .{ .normal = .{ .object = arr } };
+            },
+            .elision => return .{ .normal = .undefined }, // §13.2.4 array hole → `undefined` value
+            .assign_pattern => |ap| {
+                // §13.15.5 DestructuringAssignment — evaluate the RHS once, destructure it into the
+                // refined literal pattern, and yield the RHS value.
+                const rc = try self.evalExpr(ap.value, env);
+                if (rc.isAbrupt()) return rc;
+                const pc = try self.assignPattern(ap.target, rc.normal, env);
+                if (pc.isAbrupt()) return pc;
+                return .{ .normal = rc.normal };
             },
             .member => |m| {
                 const oc = try self.evalExpr(m.object, env);
@@ -1619,6 +1643,152 @@ pub const Interpreter = struct {
                 }
                 return .{ .normal = .undefined };
             },
+        }
+    }
+
+    /// §13.15.5.2 DestructuringAssignmentEvaluation — the assignment analogue of `bindPattern`. The
+    /// `target` is a refined ArrayLiteral / ObjectLiteral (or, by recursion, a nested one). Each leaf
+    /// value is PUT into an EXISTING reference (identifier env assignment with const/TDZ checks via
+    /// `assignToTarget`; member `a.b` / index `a[k]`; or a further nested pattern). Defaults apply when
+    /// the matched value is `undefined`. Parallels `bindPattern` but assigns instead of declaring.
+    fn assignPattern(self: *Interpreter, target: *const ast.Node, value: Value, env: *Environment) EvalError!Completion {
+        switch (target.*) {
+            .array_literal => |elems| {
+                // §13.15.5.3 ArrayAssignmentPattern — pull positionally from the iterable (Arrays /
+                // Strings in the engine's iterable model).
+                const items = try self.iterableToSlice(value);
+                if (items == null) return self.throwError("TypeError", "value is not iterable");
+                const slice = items.?;
+                for (elems, 0..) |el, i| {
+                    if (el.* == .elision) continue; // hole — skip this position
+                    if (el.* == .spread) {
+                        // §13.15.5.3 AssignmentRestElement — leftover items become a fresh Array, then
+                        // assigned to the rest target (an identifier / member / index reference).
+                        const rest_arr = try Object.createArray(self.arena, self.arrayProto());
+                        if (slice.len > i) for (slice[i..]) |a| try rest_arr.elements.append(self.arena, a);
+                        const rc = try self.assignTargetNode(el.spread, .{ .object = rest_arr }, env);
+                        if (rc.isAbrupt()) return rc;
+                        break;
+                    }
+                    const v = if (i < slice.len) slice[i] else .undefined;
+                    const tc = try self.assignElement(el, v, env);
+                    if (tc.isAbrupt()) return tc;
+                }
+                return .{ .normal = .undefined };
+            },
+            .object_literal => |props| {
+                // §13.15.5.4: an ObjectAssignmentPattern requires a coercible value.
+                if (value == .undefined or value == .null) {
+                    return self.throwError("TypeError", "Cannot destructure null or undefined");
+                }
+                for (props) |p| {
+                    if (p.kind == .spread) {
+                        // §13.15.5.4 AssignmentRestProperty — remaining own enumerable props not named
+                        // by an earlier property, copied into a fresh object (CopyDataProperties).
+                        const rest_obj = try Object.create(self.arena, self.objectProto());
+                        if (value == .object) {
+                            var it = value.object.properties.iterator();
+                            while (it.next()) |entry| {
+                                if (!entry.value_ptr.enumerable) continue;
+                                const k = entry.key_ptr.*;
+                                var taken = false;
+                                for (props) |q| {
+                                    if (q.kind == .init and std.mem.eql(u8, q.key, k)) {
+                                        taken = true;
+                                        break;
+                                    }
+                                }
+                                if (taken) continue;
+                                const gc = try self.getProperty(value, k);
+                                if (gc.isAbrupt()) return gc;
+                                try rest_obj.set(k, gc.normal);
+                            }
+                        }
+                        const rc = try self.assignTargetNode(p.value, .{ .object = rest_obj }, env);
+                        if (rc.isAbrupt()) return rc;
+                        continue;
+                    }
+                    // §13.15.5.5 AssignmentProperty — `key: target = default` / shorthand `{x}` /
+                    // shorthand-with-default `{x = default}`.
+                    const key = try self.propKey(p, env);
+                    if (key.isAbrupt()) return key.completion;
+                    const gc = try self.getProperty(value, key.key);
+                    if (gc.isAbrupt()) return gc;
+                    var v = gc.normal;
+                    // §13.2.5.1 shorthand CoverInitializedName `{x = d}`: the default lives in `p.default`
+                    // (the value is the bare identifier). A `key: target = d` form folds the default into
+                    // `p.value` (an `assign*` node) — `assignElement` strips and applies that one.
+                    if (v == .undefined) {
+                        if (p.default) |dn| {
+                            const dc = try self.evalExpr(dn, env);
+                            if (dc.isAbrupt()) return dc;
+                            v = dc.normal;
+                        }
+                    }
+                    const tc = try self.assignElement(p.value, v, env);
+                    if (tc.isAbrupt()) return tc;
+                }
+                return .{ .normal = .undefined };
+            },
+            // A bare target reached as a pattern (shouldn't occur — callers route leaves through
+            // `assignElement`/`assignTargetNode`) — assign directly.
+            else => return self.assignTargetNode(target, value, env),
+        }
+    }
+
+    /// One array-pattern element carrying its own `= default` tail (`[a = d]`, `[a.b = d]`, `[a[k] = d]`,
+    /// `[this.#x = d]` — the literal parser folded the `=` into an `assign`/`assign_*`/`private_assign`
+    /// node) or a plain target. Applies the default when `value` is `undefined`, then PUTs the value into
+    /// the reference. The `assign*` shapes carry the reference inline (name / object+name / object+key),
+    /// so we assign directly without reconstructing a target node.
+    fn assignElement(self: *Interpreter, el: *const ast.Node, value: Value, env: *Environment) EvalError!Completion {
+        switch (el.*) {
+            // §13.15.5.5: `target = Initializer` — apply the default when the source value is undefined.
+            .assign => |a| {
+                const v = try self.applyDefault(value, a.value, env);
+                if (v.isAbrupt()) return v;
+                return self.assignToTarget(&.{ .identifier = a.name }, v.normal, env);
+            },
+            .assign_member => |m| {
+                const oc = try self.evalExpr(m.object, env);
+                if (oc.isAbrupt()) return oc;
+                const v = try self.applyDefault(value, m.value, env);
+                if (v.isAbrupt()) return v;
+                return self.setProperty(oc.normal, m.name, v.normal);
+            },
+            .assign_index => |ix| {
+                const oc = try self.evalExpr(ix.object, env);
+                if (oc.isAbrupt()) return oc;
+                const kc = try self.evalExpr(ix.key, env);
+                if (kc.isAbrupt()) return kc;
+                const v = try self.applyDefault(value, ix.value, env);
+                if (v.isAbrupt()) return v;
+                return self.setProperty(oc.normal, try self.toString(kc.normal), v.normal);
+            },
+            .private_assign => |pa| {
+                const oc = try self.evalExpr(pa.object, env);
+                if (oc.isAbrupt()) return oc;
+                const v = try self.applyDefault(value, pa.value, env);
+                if (v.isAbrupt()) return v;
+                return self.setPrivate(oc.normal, pa.name, v.normal);
+            },
+            else => return self.assignTargetNode(el, value, env), // plain / nested target, no default
+        }
+    }
+
+    /// §13.15.5.5: when the destructured source `value` is `undefined`, evaluate and use `default`;
+    /// otherwise keep `value`. Returns a Completion so a throwing default initializer propagates.
+    fn applyDefault(self: *Interpreter, value: Value, default: *const ast.Node, env: *Environment) EvalError!Completion {
+        if (value != .undefined) return .{ .normal = value };
+        return self.evalExpr(default, env);
+    }
+
+    /// Assign `value` to a destructuring TARGET node: a nested array/object pattern (recurse) or a
+    /// simple assignment reference (identifier / member / index — handled by `assignToTarget`).
+    fn assignTargetNode(self: *Interpreter, target: *const ast.Node, value: Value, env: *Environment) EvalError!Completion {
+        switch (target.*) {
+            .array_literal, .object_literal => return self.assignPattern(target, value, env),
+            else => return self.assignToTarget(target, value, env),
         }
     }
 

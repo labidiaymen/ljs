@@ -13,9 +13,10 @@ performance story from day one.
 > the **property-descriptor / reflection** API (`Object.defineProperty`/`getOwnPropertyDescriptor(s)`/
 > `getOwnPropertyNames`/`keys`/`values`/`entries`/`create`/`assign`/`is`/`getPrototypeOf`/`setPrototypeOf`/
 > `freeze`/`seal`/`preventExtensions`, `Object.prototype.hasOwnProperty`/`propertyIsEnumerable`/
-> `isPrototypeOf`, and `Function.prototype.call`/`apply`/`bind`) — enough to load the Test262 harness
-> (both `propertyHelper.js` and `compareArray.js` now fully load) and pass **38.4%** of
-> `language/expressions` (6,509 tests, harness metric). Generators and async are later milestones. The
+> `isPrototypeOf`, and `Function.prototype.call`/`apply`/`bind`), and **destructuring assignment**
+> (`[a, b] = arr`, `({x, y} = obj)`, holes / defaults / rest / nested / member-index targets, §13.15.5) —
+> enough to load the Test262 harness (both `propertyHelper.js` and `compareArray.js` now fully load) and
+> pass **39.6%** of `language/expressions` (6,718 tests, harness metric). Generators and async are later milestones. The
 > bytecode/JIT tiers are future work. A learning-grade, in-progress engine, not a drop-in Node replacement.
 
 ## Why another engine?
@@ -120,8 +121,20 @@ files behind a large fraction of positive tests: **propertyHelper.js** (`verifyP
 `freeze`/`seal`/`preventExtensions` (with integrity enforcement) + insertion-ordered own-property keys
 (§10.1.11.1) (+122). M6 total: **35.8% → 38.4%** (passed 6,077 → 6,509, **+432**), 0 true regressions per
 cycle by `mode+path`, bench-green throughout (ljs 0.2–0.5× Node). Deferred: `Reflect.*`, `Proxy`, the full
-§10.1.6.3 invariant matrix, strict-mode write/delete TypeErrors, and Symbol-keyed properties. Generators/
-async next.
+§10.1.6.3 invariant matrix, strict-mode write/delete TypeErrors, and Symbol-keyed properties.
+
+**M7 result (destructuring assignment, harness metric):** `test/language/expressions` → **6,718 passed =
+39.6%**. The §13.15.5 cover-grammar refinement in `parseAssignment` (an un-parenthesized ArrayLiteral/
+ObjectLiteral on the LHS of `=` is refined to an AssignmentPattern) + a parallel `assignPattern` evaluator
+(PUT each leaf into an existing reference — identifier / `a.b` / `a[k]` / nested pattern, with holes /
+defaults / array rest / object rest, single RHS eval) unblock the `assignment/dstr` subtree (it was ~all
+`parse_error`). Cycle 1: **38.4% → 39.6%** (passed 6,509 → 6,718, **+209**), 0 true regressions / 209
+recoveries by `mode+path` (167 `assignment/dstr`, 16 `class/dstr`, + `object`/`function`/`arrow-function`
+dstr and the array-literal-elision tests), bench-green (the refinement is parse-time; `assignPattern`
+never runs in the hot loop). The §13.2.5.1 CoverInitializedName + §13.15.5.1 rest-placement /
+non-assignable-leaf / parenthesized-literal parse-phase early errors keep the negatives green. Deferred:
+the full iterator protocol (`Symbol.iterator` / iterator-close / generators) for the `assignment/dstr` +
+`object/dstr` remainder. Generators/async next.
 
 ## Roadmap
 
@@ -134,7 +147,8 @@ async next.
 | **M4** | **classes** — decl/expr, constructor, methods, fields, statics, `extends`/`super`, accessors, computed names, private `#x`, `static {}` blocks | ✅ done (32.3% → 35.8% of expressions, harness metric, +593; bench green, ljs 0.2–0.5× Node) |
 | **M5** | **`for-in` / `for-of`** — enumeration parse + iteration scaffold | ✅ done (held 35.8%; the enumeration prerequisite for M6's enumerable-awareness) |
 | **M6** | **reflection / property descriptors** — §6.1.7.1 attributes + `[[Extensible]]`, `Object.defineProperty`/`getOwnPropertyDescriptor(s)`/`getOwnPropertyNames`/`keys`/`values`/`entries`/`create`/`assign`/`is`/`getPrototypeOf`/`setPrototypeOf`/`freeze`/`seal`/`preventExtensions`, `Object.prototype.hasOwnProperty`/`propertyIsEnumerable`/`isPrototypeOf`, `Function.prototype.call`/`apply`/`bind`; unblocks `propertyHelper.js` + `compareArray.js` | ✅ done (35.8% → 38.4% of expressions, harness metric, +432; bench green, ljs 0.2–0.5× Node) |
-| M7+ | generators / async — climbing Test262 % | next |
+| **M7** | **destructuring assignment** — §13.15.5 cover-grammar refinement (`[a,b]=arr`, `({x,y}=obj)`) + `assignPattern` (holes / defaults / array+object rest / nested / member-index-private targets, single RHS eval) + §13.2.5.1/§13.15.5.1 early errors | ✅ done (38.4% → 39.6% of expressions, harness metric, +209; bench green, ljs 0.2–0.5× Node) |
+| M8+ | generators / async — climbing Test262 % | next |
 | Later | bytecode VM, then optimizing tiers — graduated when the benchmarks justify it | future |
 
 M3's nine cycles: operators (`**`, bitwise, shifts, `in`) · template literals · spread/rest ·

@@ -57,6 +57,14 @@ pub const Parser = struct {
     /// keep `in` as a normal operator. Set only around `parseFor`'s first-clause parse.
     no_in: bool = false,
 
+    /// §13.2.5.1 CoverInitializedName obligation counter. An object/array literal `{x = d}` / `[a = d]`
+    /// records a `= default` that is ONLY legal once the literal is refined to an AssignmentPattern
+    /// (§13.15.5) or a BindingPattern. Each recorded default increments this; `validateAssignmentPattern`
+    /// discharges one per default it legitimizes. After a statement (or a directive-prologue expression)
+    /// is fully parsed, a non-zero residue means an un-refined CoverInitializedName escaped as a real
+    /// value (`({x = 1});`, `f({a = 1})`) — a §13.2.5.1 SyntaxError. Snapshotted/checked in `parseStmt`.
+    cover_init: usize = 0,
+
     /// `mode == .strict` starts the whole Script in strict context (the Test262 runner runs each
     /// test in both modes, expecting the engine to honor `RunMode`). An explicit `"use strict"`
     /// directive prologue is detected independently in `parseProgram`.
@@ -508,6 +516,18 @@ pub const Parser = struct {
     }
 
     fn parseStmt(self: *Parser) ParseError!ast.Stmt {
+        // §13.2.5.1: any CoverInitializedName created while parsing this statement must be discharged
+        // (refined to an AssignmentPattern) by the time the statement is fully parsed; an undischarged
+        // residue means it escaped as a real value (`({x = 1});`) — a SyntaxError. Snapshot the count
+        // and verify no net increase. (Nested statements re-check their own slice; refined ones already
+        // decremented, so the residue here reflects only THIS statement's leaked defaults.)
+        const cover_before = self.cover_init;
+        const stmt = try self.parseStmtInner();
+        if (self.cover_init > cover_before) return ParseError.UnexpectedToken;
+        return stmt;
+    }
+
+    fn parseStmtInner(self: *Parser) ParseError!ast.Stmt {
         switch (self.peek().kind) {
             .lbrace => return .{ .block = try self.parseBlock() },
             .kw_var, .kw_let, .kw_const => return self.parseDecl(),
@@ -1174,6 +1194,18 @@ pub const Parser = struct {
             const value = try self.parseAssignment();
             return self.alloc(.{ .logical_assign = .{ .op = lop, .target = left, .value = value } });
         }
+        // §13.15.5 DestructuringAssignment (cover grammar): an ArrayLiteral / ObjectLiteral followed by
+        // `=` is REFINED to an AssignmentPattern. Only the plain `=` form (not compound `+=` etc.) takes
+        // a pattern target (§13.15.1: a compound assignment requires a simple LeftHandSideExpression).
+        // §13.15.1: a PARENTHESIZED literal `({}) = 1` / `([a]) = 1` has AssignmentTargetType *invalid*
+        // (the parens make it a ParenthesizedExpression, not the AssignmentPattern cover grammar), so it
+        // is NOT refined — it falls through to the ordinary-assignment path, which rejects it.
+        if (op == .assign and !self.last_was_paren and (left.* == .array_literal or left.* == .object_literal)) {
+            try self.validateAssignmentPattern(left); // §13.15.1 AssignmentTargetType refinement
+            _ = self.advance();
+            const value = try self.parseAssignment();
+            return self.alloc(.{ .assign_pattern = .{ .target = left, .value = value } });
+        }
         if (op == .assign or compoundBinOp(op) != null) {
             // §13.15.1 Early Error: in strict, the assignment target may not be `eval`/`arguments`.
             if (self.strict) switch (left.*) {
@@ -1199,6 +1231,86 @@ pub const Parser = struct {
             }
         }
         return left;
+    }
+
+    /// §13.15.1 / §13.15.5.1 — refine an ArrayLiteral / ObjectLiteral (the cover grammar) into an
+    /// AssignmentPattern: validate that every leaf is a valid destructuring assignment target. A leaf
+    /// may be a plain assignment target (identifier / member `a.b` / index `a[k]` / `a.#x`), a nested
+    /// array/object literal pattern (recurse), or — carrying a `= default` — an `assign`/`assign_*`
+    /// node whose own target the same rules apply to. Holes (elision) and the trailing `...rest` are
+    /// allowed in array patterns; object-property *values* and rest are validated likewise. A
+    /// non-assignable leaf (`[1] = x`, `[a()] = x`, `({a: 1} = x)`) is a §13.15.1 SyntaxError.
+    fn validateAssignmentPattern(self: *Parser, node: *const ast.Node) ParseError!void {
+        switch (node.*) {
+            .array_literal => |elems| {
+                for (elems, 0..) |el, i| {
+                    if (el.* == .elision) continue; // hole — no target
+                    if (el.* == .spread) {
+                        // §13.15.5.1 AssignmentRestElement — it must be the LAST element (a following
+                        // element or a trailing comma `[...x,]`, which the parser marks with a trailing
+                        // elision, makes it non-last → SyntaxError) and may NOT carry a default
+                        // (`[...x = 1]` — the parser folds the `= 1` into an `assign*` node).
+                        if (i != elems.len - 1) return ParseError.UnexpectedToken;
+                        switch (el.spread.*) {
+                            .assign, .assign_member, .assign_index, .private_assign => return ParseError.UnexpectedToken,
+                            // §13.15.5.1: AssignmentRestElement is a DestructuringAssignmentTarget — a
+                            // nested array/object pattern is allowed (`[...[a, b]] = x`).
+                            else => try self.validateAssignmentTarget(el.spread),
+                        }
+                        continue;
+                    }
+                    try self.validateAssignmentTarget(el);
+                }
+            },
+            .object_literal => |props| {
+                for (props, 0..) |p, i| {
+                    // §13.2.5.1: this property's CoverInitializedName (if any) is now legitimized by
+                    // the refinement — discharge the obligation recorded at parse time.
+                    if (p.default != null and self.cover_init > 0) self.cover_init -= 1;
+                    switch (p.kind) {
+                        // §13.15.5.1: an object AssignmentPattern admits only `key: target`,
+                        // shorthand `{x}`, CoverInitializedName `{x = d}`, and `...rest`. Accessors /
+                        // methods are not valid pattern properties.
+                        .init => try self.validateAssignmentTarget(p.value),
+                        .spread => {
+                            // §13.15.5.1 AssignmentRestProperty — must be the LAST property
+                            // (`{...rest, b}` is a SyntaxError) and a simple DestructuringAssignmentTarget
+                            // (NOT a nested pattern / default — the rest target is an LHS reference).
+                            if (i != props.len - 1) return ParseError.UnexpectedToken;
+                            switch (p.value.*) {
+                                .identifier, .member, .index, .private_member => {},
+                                else => return ParseError.UnexpectedToken,
+                            }
+                        },
+                        .get, .set => return ParseError.UnexpectedToken,
+                    }
+                }
+            },
+            else => try self.validateAssignmentTarget(node),
+        }
+    }
+
+    /// Validate one destructuring assignment TARGET (§13.15.5.1 DestructuringAssignmentTarget): a
+    /// simple assignment reference (identifier / member / index / private member), a node carrying a
+    /// `= default` (`assign`/`assign_member`/`assign_index`/`private_assign`, produced by the literal
+    /// parser's right-recursive `=`), or a nested array/object literal pattern (recurse).
+    fn validateAssignmentTarget(self: *Parser, node: *const ast.Node) ParseError!void {
+        switch (node.*) {
+            .identifier => |n| {
+                // §13.15.1: in strict, an assignment target may not be `eval`/`arguments`.
+                if (self.strict and isEvalOrArguments(n)) return ParseError.UnexpectedToken;
+            },
+            .member, .index, .private_member => {},
+            // A `target = default` element/property (the literal parser folded the `=` into an
+            // assignment node). The DEFAULT side is an ordinary expression; only the TARGET recurses.
+            .assign => |a| {
+                if (self.strict and isEvalOrArguments(a.name)) return ParseError.UnexpectedToken;
+            },
+            .assign_member, .assign_index, .private_assign => {},
+            // Nested pattern `[{a}, [b]] = …` — the element is itself a literal to refine.
+            .array_literal, .object_literal => try self.validateAssignmentPattern(node),
+            else => return ParseError.UnexpectedToken, // §13.15.1 invalid assignment target
+        }
     }
 
     /// §13.14 Conditional `cond ? then : otherwise` (above assignment, right-associative branches).
@@ -1560,7 +1672,11 @@ pub const Parser = struct {
                 const fnode = try self.alloc(.{ .function = f });
                 try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = fnode });
             } else if (self.peek().kind == .colon) {
-                // PropertyDefinition : PropertyName `:` AssignmentExpression.
+                // PropertyDefinition : PropertyName `:` AssignmentExpression. A `key: target = init`
+                // tail is a legal AssignmentExpression value (`{a: b = 1}` ≡ `{a: (b = 1)}`), so
+                // `parseAssignment` already folds the `= init` into an `assign*` node — no separate
+                // default is needed here. When refined to an AssignmentPattern, `assignElement` strips
+                // that folded `= init` and applies it as the property's destructuring default.
                 _ = self.advance();
                 const value = try self.parseAssignmentInBrackets();
                 try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = value });
@@ -1569,15 +1685,21 @@ pub const Parser = struct {
                 // (non-computed, non-string-keyed) identifier name; a computed/string key with no
                 // `:`/`(` is a SyntaxError.
                 if (name.computed != null or !name.is_ident) return ParseError.UnexpectedToken;
-                // Shorthand with a default `{x = 1}` is only legal inside a destructuring *pattern*,
-                // not an object literal — reject it here (CoverInitializedName, §13.2.5.1).
-                if (self.peek().kind == .assign) return ParseError.UnexpectedToken;
                 // §13.1.1 / §15.7.11: a shorthand IdentifierReference may not be a reserved word —
                 // `yield` in strict, `await` inside a static block (`({ yield })` / `({ await })`).
                 if (self.strict and std.mem.eql(u8, name.key, "yield")) return ParseError.UnexpectedToken;
                 if (self.in_static_block and std.mem.eql(u8, name.key, "await")) return ParseError.UnexpectedToken;
+                // §13.2.5.1 CoverInitializedName `{x = default}`: legal ONLY as the cover grammar for an
+                // object AssignmentPattern. We parse it (recording the default) so `({x = 1} = o)` works;
+                // a literal that still carries it is a SyntaxError, enforced in `evalObjectLiteral`.
+                var default: ?*const ast.Node = null;
+                if (self.peek().kind == .assign) {
+                    _ = self.advance();
+                    default = try self.parseAssignmentInBrackets();
+                    self.cover_init += 1; // §13.2.5.1 CoverInitializedName — discharged only if refined
+                }
                 const ref = try self.alloc(.{ .identifier = name.key });
-                try props.append(self.arena, .{ .key = name.key, .value = ref });
+                try props.append(self.arena, .{ .key = name.key, .value = ref, .default = default });
             }
 
             if (self.peek().kind == .comma) {
@@ -1663,13 +1785,34 @@ pub const Parser = struct {
                 return self.alloc(.{ .identifier = t.lexeme });
             },
             .lbrace => return self.parseObjectLiteral(),
-            .lbracket => { // §13.2.4 array literal
+            .lbracket => { // §13.2.4 array literal (also the cover grammar for an ArrayAssignmentPattern)
                 _ = self.advance();
                 var elems: std.ArrayList(*const ast.Node) = .empty;
+                var last_was_spread = false;
                 while (self.peek().kind != .rbracket and self.peek().kind != .eof) {
-                    try elems.append(self.arena, try self.parseSpreadable());
+                    // §13.2.4 Elision — a hole `[a, , b]` / `[, x]` (a comma with no preceding element).
                     if (self.peek().kind == .comma) {
                         _ = self.advance();
+                        try elems.append(self.arena, try self.alloc(.elision));
+                        continue;
+                    }
+                    // An element may carry a `= AssignmentExpression` tail. In an array LITERAL this is
+                    // an ordinary assignment (`[a = 1]` ≡ `[(a = 1)]`); when the literal is refined to an
+                    // ArrayAssignmentPattern the `=` becomes the element's default. `parseSpreadable`'s
+                    // `parseAssignment` already consumes the `=` (assignment is right-recursive there), so
+                    // both readings share the same node shape (an `assign`/`assign_*` element or a spread).
+                    const el = try self.parseSpreadable();
+                    try elems.append(self.arena, el);
+                    last_was_spread = el.* == .spread;
+                    if (self.peek().kind == .comma) {
+                        _ = self.advance();
+                        // §13.15.5.1: a trailing comma AFTER a spread (`[...x,]`) is a valid array LITERAL
+                        // (no extra element) but makes the refined AssignmentRestElement non-last — record
+                        // a trailing `elision` so `validateAssignmentPattern` sees the spread is not last.
+                        // Literal evaluation drops a trailing elision that follows a spread.
+                        if (last_was_spread and self.peek().kind == .rbracket) {
+                            try elems.append(self.arena, try self.alloc(.elision));
+                        }
                         continue;
                     }
                     break;
@@ -1906,6 +2049,8 @@ fn containsArguments(node: *const ast.Node) bool {
         .logical => |l| return containsArguments(l.left) or containsArguments(l.right),
         .conditional => |c| return containsArguments(c.cond) or containsArguments(c.then) or containsArguments(c.otherwise),
         .assign => |a| return containsArguments(a.value),
+        .assign_pattern => |a| return containsArguments(a.target) or containsArguments(a.value),
+        .elision => return false,
         .assign_member => |a| return containsArguments(a.object) or containsArguments(a.value),
         .assign_index => |a| return containsArguments(a.object) or containsArguments(a.key) or containsArguments(a.value),
         .logical_assign => |a| return containsArguments(a.target) or containsArguments(a.value),
@@ -1930,6 +2075,7 @@ fn containsArguments(node: *const ast.Node) bool {
             for (props) |p| {
                 if (p.computed_key) |ck| if (containsArguments(ck)) return true;
                 if (containsArguments(p.value)) return true;
+                if (p.default) |d| if (containsArguments(d)) return true;
             }
             return false;
         },

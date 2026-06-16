@@ -43,8 +43,18 @@ pub const Node = union(enum) {
     comma: struct { left: *const Node, right: *const Node },
     binary: struct { op: BinaryOp, left: *const Node, right: *const Node },
     assign: struct { name: []const u8, value: *const Node }, // §13.15 Assignment (identifier target)
+    /// §13.15.5 DestructuringAssignment — `[ … ] = expr` / `({ … } = expr)`. Cover grammar: `target`
+    /// is the original `array_literal`/`object_literal` node, REFINED to an AssignmentPattern at parse
+    /// time (validated assignable, CoverInitializedName allowed). The interpreter's `assignPattern`
+    /// walks the literal node as a pattern, PUTting each value into an existing reference (identifier /
+    /// member / index / nested pattern). The whole expression yields the RHS value.
+    assign_pattern: struct { target: *const Node, value: *const Node },
     object_literal: []const Property, // §13.2.5  { k: v, ... }
     array_literal: []const *const Node, // §13.2.4  [ a, b, ... ]
+    /// §13.2.4 Elision — an array-literal hole (`[a, , b]` / `[, x]`). As a literal element it
+    /// evaluates to `undefined` (M-subset: no sparse model); as an AssignmentPattern element it is a
+    /// skipped position. Only ever appears inside `array_literal` element lists.
+    elision,
     member: struct { object: *const Node, name: []const u8 }, // §13.3.2  a.b
     index: struct { object: *const Node, key: *const Node }, // §13.3.3  a[expr]
     assign_member: struct { object: *const Node, name: []const u8, value: *const Node }, // a.b = v
@@ -113,6 +123,11 @@ pub const Property = struct {
     key: []const u8 = "",
     computed_key: ?*const Node = null, // §13.2.5 ComputedPropertyName `[expr]`
     value: *const Node,
+    /// §13.2.5.1 CoverInitializedName `{x = default}` / `{k: t = default}` — the `= AssignmentExpression`
+    /// is ONLY legal once the object literal is refined to an AssignmentPattern (§13.15.5). In a real
+    /// object literal it is a SyntaxError; the parser records it here and the evaluator rejects a
+    /// literal that still carries it. Applied (when the matched value is `undefined`) by `assignPattern`.
+    default: ?*const Node = null,
 };
 
 /// §13.3.3 BindingPattern (also reused for parameter binding, §15.1). A `Pattern` is the LHS of a

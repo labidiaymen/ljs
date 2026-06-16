@@ -370,6 +370,63 @@ test "M3 destructuring: function parameters (US4)" {
     try expectNumber("function f(...[a, b]) { return a + b; } f(4, 5)", 9);
 }
 
+test "M7 destructuring assignment: array targets (§13.15.5)" {
+    // basic + the whole expression yields the RHS value
+    try expectNumber("var a, b; [a, b] = [1, 2]; a + b", 3);
+    try expectNumber("var a, b; var r = ([a, b] = [7, 8]); r.length", 2); // assignment yields RHS
+    // swap (RHS evaluated once before any target is written)
+    try expectNumber("var a = 1, b = 2; [a, b] = [b, a]; a * 10 + b", 21);
+    // elision / hole
+    try expectNumber("var a; [, a] = [1, 2]; a", 2);
+    try expectNumber("var a, c; [a, , c] = [1, 2, 3]; a + c", 4);
+    // rest element collects the leftovers into a fresh Array
+    try expectNumber("var a, b; [a, ...b] = [1, 2, 3]; b.length", 2);
+    try expectNumber("var a, b; [a, ...b] = [1, 2, 3]; b[1]", 3);
+    // defaults (applied only when the source value is undefined)
+    try expectNumber("var a; [a = 5] = []; a", 5);
+    try expectNumber("var a, b; [a, b = 10] = [1]; a * 100 + b", 110);
+    try expectNumber("var a; [a = 5] = [9]; a", 9);
+    // a member / index target (PUT into an existing reference)
+    try expectNumber("var o = {}; var arr = [0]; [o.p, arr[0]] = [3, 4]; o.p * 10 + arr[0]", 34);
+    // a String is iterable
+    try expectStr("var a, b; [a, b] = \"hi\"; a + b", "hi");
+}
+
+test "M7 destructuring assignment: object targets (§13.15.5)" {
+    // shorthand + renaming `key: target`
+    try expectNumber("var x, y; ({x, y} = {x: 1, y: 2}); x + y", 3);
+    try expectNumber("var a, b; ({x: a, y: b} = {x: 3, y: 4}); a * 10 + b", 34);
+    // a member target as a property value: `{x: o.p}`
+    try expectNumber("var o = {}; ({x: o.p} = {x: 5}); o.p", 5);
+    // CoverInitializedName default `{x = d}` (applied when the property is undefined)
+    try expectNumber("var x; ({x = 9} = {}); x", 9);
+    try expectNumber("var x; ({x = 9} = {x: 7}); x", 7);
+    // rest property copies the remaining own enumerable props into a fresh object
+    try expectNumber("var a, r; ({a, ...r} = {a: 1, b: 2, c: 3}); r.b + r.c", 5);
+    // object pattern on null/undefined throws
+    try expectThrows("var x; ({x} = null);");
+    try expectThrows("var x; ({x} = undefined);");
+}
+
+test "M7 destructuring assignment: nested patterns (§13.15.5)" {
+    try expectNumber("var a, b; [[a], {b}] = [[1], {b: 2}]; a * 10 + b", 12);
+    try expectNumber("var a, b; ({p: [a, b]} = {p: [3, 4]}); a + b", 7);
+    try expectNumber("var y; ([{x: y = 9}] = [{}]); y", 9);
+}
+
+test "M7 destructuring assignment: cover-grammar early errors (§13.2.5.1 / §13.15.1)" {
+    // CoverInitializedName that is NOT refined to a pattern → SyntaxError (parse phase)
+    try expectSyntaxError("({x = 1});");
+    try expectSyntaxError("var o = {x = 1};");
+    try expectSyntaxError("f({a = 1});");
+    // non-assignable leaves → SyntaxError
+    try expectSyntaxError("[1] = x;");
+    try expectSyntaxError("({a: 1} = {});");
+    try expectSyntaxError("[a()] = [1];");
+    // array-literal holes still parse as ordinary literals (no regression)
+    try expectNumber("var x = [1, , 3]; x.length", 3);
+}
+
 test "M3 arrow functions: bodies & param forms (US5, §15.3)" {
     // expression body (implicit return), single un-parenthesized param
     try expectNumber("var f = x => x + 1; f(41)", 42);
