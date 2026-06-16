@@ -125,3 +125,54 @@ has no async-generator surface) + `for await`; AsyncFromSyncIterator; Promise su
 those ~127 tests fail rather than pass, but were skipped before so it's not a regression). The
 `finally` onFinally is called synchronously (its returned promise is not awaited) — a minor §27.2.5.3.1
 simplification.
+
+## Cycle 3 — globalThis + Promise combinators 🎯 (DONE)
+
+**Result (full `language/` tree, harness): passed 16,326 → 16,427 (+101), 37.4% → 37.6%.** Regression
+hunt by `path#mode` (`--update-baseline` BEFORE vs AFTER + `comm`): **101 recoveries / 0 TRUE
+regressions.** All recoveries are async/Promise/globalThis: `expressions/await` (16),
+`expressions/optional-chaining` of async (8), `statements`/`expressions/async-function` (13), async
+methods (object + class, static/computed/private) (~54), AggregateError subclassing (4),
+`await-using`/`expressions/in` (~6). Continuity `language/expressions`: 8,192 → 8,256 (+64). Bench:
+`perf: ok (no ljs-vs-self regression)`, ljs 0.2–0.6× Node — the reified global object does NOT change
+identifier resolution (still via the Environment chain; the hot lookup path is untouched), it only adds
+a one-time setup mirror of the standard globals.
+
+- [x] **globalThis (§19.3.1 / §9.3.4)** — a REIFIED global object whose own (writable/non-enumerable/
+  configurable) properties MIRROR the global bindings at `builtins.setup` (so `globalThis.Object ===
+  Object`, `globalThis.globalThis === globalThis`), proto = %Object.prototype%, stashed under the
+  sentinel `%GlobalThis%`. Engine identifier resolution is UNCHANGED (Environment chain) — the global
+  object exists so `globalThis` + property access through it work and so the runner can install `$DONE`
+  as an OWN property of it for `asyncHelpers.js`'s `asyncTest` (which gates on
+  `Object.prototype.hasOwnProperty.call(globalThis, "$DONE")`). DID NOT need to rewrite global variable
+  resolution — a mirrored reified object beside the Environment was sufficient and zero-risk to the bench.
+- [x] **Promise combinators (§27.2.4)** — `Promise.all` (§27.2.4.1: fulfills with the in-order values
+  array, rejects on first reject), `Promise.race` (§27.2.4.6: first settlement wins, forwards directly),
+  `Promise.allSettled` (§27.2.4.2: always fulfills with `{status, value|reason}` records), `Promise.any`
+  (§27.2.4.3: first fulfillment wins, else rejects with an AggregateError of the reasons). Built on the
+  existing §7.4 GetIterator+drain (`iterateToList`) and the Promise/Job machinery (`performPromiseThen`
+  + per-element resolve/reject closures sharing a `CombinatorState` with a [[Remaining]] counter started
+  at 1 and decremented once per settled element + once after the loop, so empty inputs settle correctly).
+- [x] **AggregateError (§20.5.7)** — a directly-constructible native global (`new AggregateError(errors,
+  message)` ToLists the `errors` iterable into the own `errors` data property), proto-linked like the
+  other Error ctors; used by `Promise.any`.
+- [x] **Thenable-adoption fix (§27.2.2.2, pre-existing bug found + fixed)** — `Promise.resolve(thenable)`
+  / `await thenable` for a PLAIN (non-Promise) thenable never settled: claiming the thenable set the
+  promise's [[AlreadyResolved]], which then blocked the PromiseResolveThenableJob's own resolve. Per
+  §27.2.2.2 step 1 the job creates resolving functions with a FRESH [[AlreadyResolved]] — `runThenableJob`
+  now clears the promise's flag before calling `thenable.then(resolve, reject)`. This unblocked the bulk
+  of the async-thenable tests (the +74 beyond globalThis/combinators).
+- [x] **Tests (`src/engine.zig`, all green)** — `typeof globalThis === "object"`; `globalThis.Object ===
+  Object` / self-reference / a global reachable through it; `Promise.all` (values array, ordering,
+  empty, first-reject), `Promise.race` (first-settled), `Promise.allSettled` (status records),
+  `Promise.any` (first-fulfill + AggregateError-on-all-reject) + `new AggregateError`; thenable adoption
+  (resolve/await/reject) regression.
+
+**Deferred (note, not attempted this cycle):** async generators (`async function*` — the body runs via
+the plain-async path but `yield` has no async-generator surface) + `for await` (parse_error / not yet
+wired); AsyncFromSyncIterator; `await using` declarations; Promise subclassing / `@@species` (combinators
+use %Promise% directly, no NewPromiseCapability(thisValue)); the `finally` onFinally is still called
+synchronously (§27.2.5.3.1 simplification). globalThis own-property MIRROR is a SNAPSHOT at setup — a
+later global `var`/assignment is not reflected back onto the global object (and vice-versa); adequate for
+the standard-globals the harness reads, full reflection (a live global object as the var environment's
+backing) is deferred.

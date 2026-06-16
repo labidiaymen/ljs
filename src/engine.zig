@@ -66,6 +66,12 @@ pub fn evaluateAsyncTest(arena: std.mem.Allocator, source: []const u8, mode: Run
         };
     }
     global.declare("$DONE", .{ .object = done_fn }, true, true) catch return error.OutOfMemory;
+    // §19.3 also install `$DONE` as an OWN property of the reified global object, so the harness's
+    // `asyncTest` — which gates on `Object.prototype.hasOwnProperty.call(globalThis, "$DONE")` — sees it
+    // (the async flag is signalled by `$DONE`'s presence on globalThis, per asyncHelpers.js).
+    if (global.lookup("%GlobalThis%")) |gb| if (gb.value == .object) {
+        gb.value.object.defineData("$DONE", .{ .object = done_fn }, true, false, true) catch return error.OutOfMemory;
+    };
     var gen_registry: std.ArrayListUnmanaged(*obj_mod.Generator) = .empty;
     var job_queue: std.ArrayListUnmanaged(obj_mod.Job) = .empty;
     var interp = Interpreter{ .arena = arena, .step_limit = step_limit, .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue, .async_done = done_sink };
@@ -787,6 +793,87 @@ test "M11 Promise: new Promise(executor) resolve/reject + executor throw (§27.2
     try expectGlobalStringAfterDrain("var r; new Promise(function(){ throw 'x'; }).then(function(){ r = 'F'; }, function(e){ r = 'R:' + e; });", "r", "R:x");
     // §27.2.3.1 step 2: a non-callable executor is a TypeError.
     try expectThrows("new Promise(42)");
+}
+
+test "M11 Cycle 3: globalThis reified global object (§19.3.1 / §9.3.4)" {
+    // §19.3.1 globalThis is an object …
+    try expectStr("typeof globalThis", "object");
+    // … carrying the standard globals as own properties (identity-equal to the bindings).
+    try expectBool("globalThis.Object === Object", true);
+    try expectBool("globalThis.Promise === Promise", true);
+    try expectBool("globalThis.Array === Array", true);
+    // §19.3.1 globalThis refers to the global object itself (self-referential).
+    try expectBool("globalThis.globalThis === globalThis", true);
+    // A user global is reachable through globalThis (the binding is mirrored at setup; reads observe it).
+    try expectNumber("globalThis.Math.pow(2, 5)", 32);
+}
+
+test "M11 Cycle 3: Promise.all fulfills with the values array; rejects on first reject (§27.2.4.1)" {
+    // §27.2.4.1 all inputs fulfill → the result fulfills with an array of their values, in order.
+    try expectGlobalNumberAfterDrain(
+        "var r; async function f(){ var xs = await Promise.all([Promise.resolve(1), Promise.resolve(2)]); return xs[0] + xs[1]; } f().then(function(v){ r = v; });",
+        "r",
+        3,
+    );
+    // non-promise members are wrapped (PromiseResolve), preserving order.
+    try expectGlobalStringAfterDrain("var r; Promise.all([1, Promise.resolve(2), 3]).then(function(xs){ r = xs.join(','); });", "r", "1,2,3");
+    // §27.2.4.1 the empty iterable fulfills synchronously-after-loop with an empty array (length 0).
+    try expectGlobalNumberAfterDrain("var r; Promise.all([]).then(function(xs){ r = xs.length; });", "r", 0);
+    // §27.2.4.1 a single rejection rejects the result with that reason.
+    try expectGlobalStringAfterDrain("var r; Promise.all([Promise.resolve(1), Promise.reject('bad')]).then(function(){ r = 'F'; }, function(e){ r = 'R:' + e; });", "r", "R:bad");
+}
+
+test "M11 Cycle 3: Promise.race settles with the first settlement (§27.2.4.6)" {
+    // §27.2.4.6 the first already-resolved member wins (both are settled, FIFO microtask order → 'a').
+    try expectGlobalStringAfterDrain("var r; Promise.race([Promise.resolve('a'), Promise.resolve('b')]).then(function(v){ r = v; });", "r", "a");
+    // a rejection that settles first rejects the race.
+    try expectGlobalStringAfterDrain("var r; Promise.race([Promise.reject('x'), Promise.resolve('y')]).then(function(){ r = 'F'; }, function(e){ r = 'R:' + e; });", "r", "R:x");
+}
+
+test "M11 Cycle 3: Promise.allSettled always fulfills with status records (§27.2.4.2)" {
+    // §27.2.4.2 a mix of fulfill/reject → an array of {status, value|reason} records, in order.
+    try expectGlobalStringAfterDrain(
+        "var r; Promise.allSettled([Promise.resolve(1), Promise.reject('e')]).then(function(xs){ r = xs[0].status + ':' + xs[0].value + '|' + xs[1].status + ':' + xs[1].reason; });",
+        "r",
+        "fulfilled:1|rejected:e",
+    );
+}
+
+test "M11 Cycle 3: Promise.any fulfills with first fulfillment; AggregateError if all reject (§27.2.4.3)" {
+    // §27.2.4.3 the first fulfillment wins even when an earlier member rejects.
+    try expectGlobalStringAfterDrain("var r; Promise.any([Promise.reject('x'), Promise.resolve('ok')]).then(function(v){ r = v; });", "r", "ok");
+    // §27.2.4.3 all members reject → reject with an AggregateError whose `.errors` lists the reasons.
+    try expectGlobalStringAfterDrain(
+        "var r; Promise.any([Promise.reject('a'), Promise.reject('b')]).then(function(){ r = 'F'; }, function(e){ r = e.name + ':' + e.errors.join(','); });",
+        "r",
+        "AggregateError:a,b",
+    );
+    // §20.5.7 AggregateError is also a directly-constructible global.
+    try expectStr("var e = new AggregateError([1, 2], 'oops'); e.name + '/' + e.message + '/' + e.errors.length", "AggregateError/oops/2");
+}
+
+test "M11 Cycle 3: thenable adoption settles the promise (§27.2.1.3.2 / §27.2.2.2)" {
+    // §27.2.2.2 PromiseResolveThenableJob: resolving a promise with a plain (non-Promise) thenable
+    // adopts its eventual state — the thenable's `resolve(v)` must settle the derived promise. Earlier
+    // the promise's [[AlreadyResolved]] (set when claiming the thenable) wrongly blocked the job's own
+    // resolve; the job now uses a fresh [[AlreadyResolved]], so adoption completes.
+    try expectGlobalStringAfterDrain(
+        "var out = 'X'; var thenable = { then: function(res){ res(42); } }; Promise.resolve(thenable).then(function(v){ out = 'got:' + v; });",
+        "out",
+        "got:42",
+    );
+    // The same adoption drives `await` of a plain thenable inside an async function.
+    try expectGlobalStringAfterDrain(
+        "var out = 'X'; var thenable = { then: function(res){ res(7); } }; async function f(){ out = 'got:' + (await thenable); } f();",
+        "out",
+        "got:7",
+    );
+    // A thenable that rejects propagates the rejection to the adopting promise.
+    try expectGlobalStringAfterDrain(
+        "var out = 'X'; var thenable = { then: function(res, rej){ rej('boom'); } }; Promise.resolve(thenable).then(function(){ out = 'F'; }, function(e){ out = 'R:' + e; });",
+        "out",
+        "R:boom",
+    );
 }
 
 test "M11 async: `await` as identifier outside async; operator only inside async (§15.8)" {

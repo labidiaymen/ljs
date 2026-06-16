@@ -246,4 +246,55 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     const math_methods = [_][]const u8{ "pow", "floor", "ceil", "abs", "round", "trunc", "sign", "sqrt", "max", "min" };
     for (math_methods) |m| try defineMethod(arena, math_obj, m, .math_method, m);
     try env.declare("Math", .{ .object = math_obj }, true, true);
+
+    // §27.2.4 Promise combinators — installed after the iterator protocol is wired (they consume an
+    // iterable via §7.4 GetIterator) and the Promise constructor exists. `Promise.all`/`race`/
+    // `allSettled`/`any` are static, non-enumerable methods on the Promise constructor.
+    if (env.lookup("Promise")) |b| if (b.value == .object) {
+        const pf = b.value.object;
+        try defineMethod(arena, pf, "all", .promise_all, "all"); // §27.2.4.1
+        try defineMethod(arena, pf, "allSettled", .promise_all_settled, "allSettled"); // §27.2.4.2
+        try defineMethod(arena, pf, "any", .promise_any, "any"); // §27.2.4.3
+        try defineMethod(arena, pf, "race", .promise_race, "race"); // §27.2.4.6
+    };
+
+    // §20.5.7 AggregateError — the error thrown by `Promise.any` when every input rejects. A native
+    // constructor carrying its rejection list in `errors`; proto-linked like the other Error ctors.
+    {
+        const ctor = try Object.createNative(arena, .aggregate_error_ctor, "AggregateError");
+        ctor.prototype = function_proto; // §20.2.3 the constructor function object → %Function.prototype%
+        if (ctor.get("prototype")) |pv| {
+            if (pv == .object) {
+                pv.object.prototype = object_proto; // §20.5.7.3 AggregateError.prototype inherits %Object.prototype%
+                try pv.object.set("name", .{ .string = "AggregateError" });
+            }
+        }
+        try env.declare("AggregateError", .{ .object = ctor }, true, true);
+    }
+
+    // §19.3 / §9.3.4 globalThis — a reified global object whose own properties MIRROR the global
+    // bindings (every standard global declared above), so `globalThis.Object === Object`, etc. The
+    // engine resolves ordinary identifiers through the Environment (unchanged — the hot path is
+    // untouched); the global object exists so `globalThis` and property access through it work and so
+    // the harness's `asyncTest` (which checks `Object.prototype.hasOwnProperty.call(globalThis,"$DONE")`)
+    // sees `$DONE` as an own property (the runner installs it on this object too). Its [[Prototype]] is
+    // %Object.prototype%. Built LAST so every standard binding is present to mirror.
+    const global_obj = try Object.create(arena, object_proto);
+    {
+        // Mirror every global binding as an own (writable/non-enumerable/configurable) property —
+        // EXCEPT the engine-internal sentinels (names that aren't valid identifiers, e.g.
+        // `%PromisePrototype%`), which user code must never reach. `globalThis` itself is added below.
+        var it = env.vars.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (name.len > 0 and name[0] == '%') continue; // skip %...% sentinels
+            try global_obj.defineData(name, entry.value_ptr.value, true, false, true);
+        }
+    }
+    // §19.3.1 globalThis is a writable, non-enumerable, configurable own property of the global object
+    // (and a global binding) that refers to the global object itself.
+    try global_obj.defineData("globalThis", .{ .object = global_obj }, true, false, true);
+    try env.declare("globalThis", .{ .object = global_obj }, true, true);
+    // Stash under a sentinel so the engine (and the async runner) can reach the global object.
+    try env.declare("%GlobalThis%", .{ .object = global_obj }, false, true);
 }

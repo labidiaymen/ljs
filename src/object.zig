@@ -69,6 +69,22 @@ pub const PromiseData = struct {
     reject_reactions: std.ArrayListUnmanaged(PromiseReaction) = .empty,
 };
 
+/// §27.2.4.1.2/.2.2/.3.2 the shared state of one Promise combinator (`all`/`allSettled`/`any`) call,
+/// captured by each per-element resolve/reject closure. The combinator seeds `values` (one slot per
+/// input promise), a `remaining` counter (the number of inputs not yet settled, started at 1 and
+/// decremented as each settles + once after the loop, §27.2.4.1.1), and the result `capability` to
+/// settle when `remaining` hits 0. `errors`/`values` double as the AggregateError list for `any`.
+/// Allocated in the realm arena; pointed at by each element closure (so they share one counter/array).
+pub const CombinatorState = struct {
+    /// The result promise to settle when all inputs have settled (the combinator's returned promise).
+    capability: *Object,
+    /// One slot per input: the fulfillment value (`all`), the `{status,...}` record (`allSettled`),
+    /// or the rejection reason (`any`). Grown as the iterable is consumed.
+    values: std.ArrayListUnmanaged(Value) = .empty,
+    /// §27.2.4.1.1 [[Remaining]] — inputs not yet settled. The combinator settles when this reaches 0.
+    remaining: usize = 1,
+};
+
 /// §9.5 a Job enqueued on the realm Job (microtask) queue. The engine drains the queue once the
 /// execution stack is empty. Two kinds (the two HostEnqueuePromiseJob callers in §27.2):
 ///   • `.reaction` — §27.2.2.1 NewPromiseReactionJob: run a settled promise's reaction (call its
@@ -213,6 +229,16 @@ pub const NativeId = enum {
     promise_finally, // Promise.prototype.finally
     promise_resolve, // Promise.resolve(x)
     promise_reject, // Promise.reject(x)
+    promise_all, // Promise.all(iterable) (§27.2.4.1)
+    promise_all_settled, // Promise.allSettled(iterable) (§27.2.4.2)
+    promise_any, // Promise.any(iterable) (§27.2.4.3)
+    promise_race, // Promise.race(iterable) (§27.2.4.6)
+    /// §27.2.4.1.2/.2.2/.3.2 a combinator per-element resolve/reject closure. `combinator` carries its
+    /// shared state (the result array, the remaining counter, the capability); `combinator_index` is
+    /// this element's slot. The same id backs `all`'s resolve, `allSettled`'s onFulfilled/onRejected,
+    /// and `any`'s reject — `native_name` selects the variant.
+    promise_combinator_element,
+    aggregate_error_ctor, // §20.5.7 AggregateError(errors, message) — thrown by Promise.any when all reject
     /// §27.2.1.3 the resolve / reject functions passed to an executor (and to a thenable's `then`).
     /// `promise_slot` (on the function object) is the promise they settle; `native_name` selects
     /// "resolve" vs "reject". These also back the finally-handler thunks (native_name "finally_*").
@@ -401,6 +427,16 @@ pub const Object = struct {
     /// §27.2.5.3.1 the captured `onFinally` callback for a `promise_finally_thunk` native (or the
     /// captured constant value to re-yield). Null elsewhere.
     finally_value: ?*Object = null,
+    /// §27.2.4.1.2 the shared combinator state a `promise_combinator_element` closure settles into
+    /// (its `values`/`remaining`/`capability`). Set on those function objects only; null elsewhere.
+    combinator: ?*CombinatorState = null,
+    /// §27.2.4.1.2 [[Index]] — which `combinator.values` slot this element closure writes. Meaningful
+    /// only when `combinator != null`. The combinator's [[AlreadyCalled]] guard rides on this closure
+    /// firing at most once: a second settle of the same input promise is a no-op (`already_called`).
+    combinator_index: usize = 0,
+    /// §27.2.4.1.2 [[AlreadyCalled]] — a combinator element closure runs at most once (a promise can
+    /// settle once, but a malicious thenable could call its callbacks repeatedly). Guards double-count.
+    already_called: bool = false,
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);

@@ -2827,6 +2827,11 @@ pub const Interpreter = struct {
     /// `thenable.then(resolveFn, rejectFn)` so the thenable drives `promise`'s eventual settlement. A
     /// throw from `then` rejects `promise`.
     fn runThenableJob(self: *Interpreter, promise: *Object, thenable: Value, then_fn: *Object) EvalError!void {
+        // §27.2.2.2 step 1: CreateResolvingFunctions(promise) — a FRESH [[AlreadyResolved]] record
+        // (the original resolve already fired into THIS job and set the promise's flag). Clear the
+        // promise's already_resolved so the thenable's resolve/reject can settle it; from here only
+        // these new functions act on the promise, so this is the single fresh resolution gate.
+        promise.promise.?.already_resolved = false;
         const resolve_fn = try self.makeResolvingFunction(promise, .promise_resolve_fn);
         const reject_fn = try self.makeResolvingFunction(promise, .promise_reject_fn);
         const rc = try self.callFunction(then_fn, &.{ .{ .object = resolve_fn }, .{ .object = reject_fn } }, thenable);
@@ -3066,6 +3071,152 @@ pub const Interpreter = struct {
         const p = try self.newPromise();
         try self.rejectPromiseRaw(p, r);
         return .{ .normal = .{ .object = p } };
+    }
+
+    // ── §27.2.4 Promise combinators (all / allSettled / any / race) ──────────────
+    //
+    // Each reads the iterable up front via §7.4 GetIterator+drain (`iterateToList`), wraps each element
+    // with PromiseResolve, and registers reactions through the existing Job machinery (`performPromiseThen`).
+    // `all`/`allSettled`/`any` share `CombinatorState` (a result array + a [[Remaining]] counter started
+    // at 1 and decremented once per settled element + once after the loop, §27.2.4.1.1, so the empty-input
+    // case settles synchronously after the loop). `race` needs no shared state — it forwards each element's
+    // settlement straight to the result promise (first-settled wins; later settlements are no-ops).
+
+    const CombinatorKind = enum { all, all_settled, any, race };
+
+    /// §27.2.4.1/.2/.3/.6 the shared driver. A non-iterable argument rejects the result promise (the
+    /// spec returns `IfAbruptRejectPromise` — a rejected promise, not a sync throw).
+    fn promiseCombinator(self: *Interpreter, args: []const Value, comptime kind: CombinatorKind) EvalError!Completion {
+        const result = try self.newPromise();
+        const arg: Value = if (args.len > 0) args[0] else .undefined;
+        // §7.4 GetIterator + drain the iterable to a value list; a non-iterable (or a throwing
+        // iterator) rejects the result promise rather than throwing synchronously.
+        var items: std.ArrayListUnmanaged(Value) = .empty;
+        const ic = try self.iterateToList(arg, &items);
+        if (ic.isAbrupt()) {
+            try self.rejectPromiseRaw(result, ic.throw);
+            return .{ .normal = .{ .object = result } };
+        }
+
+        if (kind == .race) {
+            // §27.2.4.6.1 PerformPromiseRace — forward each element's settlement to the result promise.
+            // The first to settle wins (`resolvePromise`/`rejectPromiseRaw` honor [[AlreadyResolved]]).
+            for (items.items) |item| {
+                const ep = try self.promiseResolveValue(item);
+                try self.performPromiseThen(ep, try self.makeResolvingFunction(result, .promise_resolve_fn), try self.makeResolvingFunction(result, .promise_reject_fn), null);
+            }
+            return .{ .normal = .{ .object = result } };
+        }
+
+        const state = try self.arena.create(object_mod.CombinatorState);
+        state.* = .{ .capability = result };
+        for (items.items, 0..) |item, index| {
+            // §27.2.4.1.1 step d.iii: a placeholder slot per element (filled by its resolve closure).
+            try state.values.append(self.arena, .undefined);
+            state.remaining += 1;
+            const ep = try self.promiseResolveValue(item);
+            const on_f = try self.makeCombinatorElement(state, index, switch (kind) {
+                .all => "all",
+                .all_settled => "settled_fulfill",
+                .any => "any_fulfill",
+                .race => unreachable,
+            });
+            const on_r: ?*Object = switch (kind) {
+                // §27.2.4.1: `all` reject → reject the result promise directly (the default reject closure).
+                .all => try self.makeResolvingFunction(result, .promise_reject_fn),
+                // §27.2.4.2/.3: `allSettled` reject and `any` reject record into the shared state.
+                .all_settled => try self.makeCombinatorElement(state, index, "settled_reject"),
+                .any => try self.makeCombinatorElement(state, index, "any_reject"),
+                .race => unreachable,
+            };
+            try self.performPromiseThen(ep, on_f, on_r, null);
+        }
+        // §27.2.4.1.1 step e: the implicit final decrement — if every element already settled (or there
+        // were none), settle the result now.
+        try self.combinatorSettleIfDone(state, kind);
+        return .{ .normal = .{ .object = result } };
+    }
+
+    /// Build one combinator per-element resolve/reject closure (id `promise_combinator_element`),
+    /// carrying the shared `state` and this element's `index`. `variant` selects the behavior.
+    fn makeCombinatorElement(self: *Interpreter, state: *object_mod.CombinatorState, index: usize, variant: []const u8) EvalError!*Object {
+        const f = try Object.createNative(self.arena, .promise_combinator_element, variant);
+        f.prototype = self.functionProto();
+        f.combinator = state;
+        f.combinator_index = index;
+        return f;
+    }
+
+    /// The body of a `promise_combinator_element` closure (§27.2.4.1.2 / .2.2 / .3.2). Records this
+    /// element's settlement into the shared state, then settles the result if it was the last one.
+    /// `[[AlreadyCalled]]` makes each closure fire at most once.
+    fn promiseCombinatorElement(self: *Interpreter, func: *Object, args: []const Value) EvalError!Completion {
+        const state = func.combinator orelse return .{ .normal = .undefined };
+        if (func.already_called) return .{ .normal = .undefined }; // §27.2.4.1.2 step 2–4 [[AlreadyCalled]]
+        func.already_called = true;
+        const arg: Value = if (args.len > 0) args[0] else .undefined;
+        const index = func.combinator_index;
+        // NOTE: `combinatorSettleIfDone` is the SOLE place that decrements [[Remaining]] (per call) — the
+        // element body only records its slot, then asks to settle. This avoids a double decrement.
+        if (std.mem.eql(u8, func.native_name, "all")) {
+            // §27.2.4.1.2: record the fulfillment value; reject is the result promise's reject closure.
+            state.values.items[index] = arg;
+            try self.combinatorSettleIfDone(state, .all);
+        } else if (std.mem.eql(u8, func.native_name, "any_reject")) {
+            // §27.2.4.3.2: record the rejection reason; if ALL reject, fail with an AggregateError.
+            state.values.items[index] = arg;
+            try self.combinatorSettleIfDone(state, .any);
+        } else if (std.mem.eql(u8, func.native_name, "any_fulfill")) {
+            // §27.2.4.3.1 step 8.j: the FIRST fulfillment resolves `any`'s result (later ones are no-ops).
+            try self.resolvePromise(state.capability, arg);
+        } else {
+            // §27.2.4.2.2/.3 allSettled — build the `{status, value|reason}` record either way.
+            const rec = try Object.create(self.arena, self.objectProto());
+            if (std.mem.eql(u8, func.native_name, "settled_fulfill")) {
+                try rec.set("status", .{ .string = "fulfilled" });
+                try rec.set("value", arg);
+            } else {
+                try rec.set("status", .{ .string = "rejected" });
+                try rec.set("reason", arg);
+            }
+            state.values.items[index] = .{ .object = rec };
+            try self.combinatorSettleIfDone(state, .all_settled);
+        }
+        return .{ .normal = .undefined };
+    }
+
+    /// §27.2.4.1.1 settle the combinator's result once [[Remaining]] reaches 0. `all`/`allSettled`
+    /// fulfill with the values array; `any` rejects with an AggregateError of the collected reasons.
+    fn combinatorSettleIfDone(self: *Interpreter, state: *object_mod.CombinatorState, comptime kind: CombinatorKind) EvalError!void {
+        state.remaining -= 1;
+        if (state.remaining != 0) return;
+        switch (kind) {
+            .all, .all_settled => {
+                const arr = try Object.createArray(self.arena, self.arrayProto());
+                try arr.elements.appendSlice(self.arena, state.values.items);
+                try self.resolvePromise(state.capability, .{ .object = arr });
+            },
+            .any => {
+                // §27.2.4.3.1 step 8.d.iii / .3.2: every input rejected → reject with an AggregateError
+                // whose `errors` is the array of reasons.
+                const errs = try Object.createArray(self.arena, self.arrayProto());
+                try errs.elements.appendSlice(self.arena, state.values.items);
+                const agg = try self.makeAggregateError(.{ .object = errs }, "All promises were rejected");
+                try self.rejectPromiseRaw(state.capability, agg);
+            },
+            .race => unreachable,
+        }
+    }
+
+    /// §20.5.7.1 build an AggregateError object with `errors` (an array) and `message`, proto-linked to
+    /// %AggregateError.prototype%. Used by `Promise.any` when every input rejects.
+    fn makeAggregateError(self: *Interpreter, errors: Value, message: []const u8) EvalError!Value {
+        const proto = self.globalProto("AggregateError") orelse self.errorProto("Error");
+        const err = try Object.create(self.arena, proto);
+        try err.set("name", .{ .string = "AggregateError" });
+        try err.set("message", .{ .string = message });
+        try err.defineData("errors", errors, true, false, true); // §20.5.7.4 own data property
+        return .{ .object = err };
     }
 
     /// §27.2.5.4 Promise.prototype.then(onFulfilled, onRejected) — `this` must be a promise; attach the
@@ -3940,6 +4091,11 @@ pub const Interpreter = struct {
             .promise_finally => return self.promiseFinally(this_val, args),
             .promise_resolve => return self.promiseStaticResolve(args),
             .promise_reject => return self.promiseStaticReject(args),
+            .promise_all => return self.promiseCombinator(args, .all),
+            .promise_all_settled => return self.promiseCombinator(args, .all_settled),
+            .promise_any => return self.promiseCombinator(args, .any),
+            .promise_race => return self.promiseCombinator(args, .race),
+            .promise_combinator_element => return self.promiseCombinatorElement(func, args),
             .promise_resolve_fn, .promise_reject_fn => return self.promiseResolvingFn(func, args),
             .promise_finally_thunk => return self.promiseFinallyThunk(func, args),
             .test_done => return self.testDone(args),
@@ -3958,6 +4114,31 @@ pub const Interpreter = struct {
                 else
                     .{ .string = "" };
                 try err.set("message", msg);
+                return .{ .normal = .{ .object = err } };
+            },
+            .aggregate_error_ctor => {
+                // §20.5.7.1.1 AggregateError(errors, message) — `errors` is an iterable of the
+                // collected errors (IteratorToList); `message` (if not undefined) becomes `.message`.
+                const proto: ?*Object = blk: {
+                    const pv = func.get("prototype") orelse break :blk null;
+                    break :blk if (pv == .object) pv.object else null;
+                };
+                const err = try Object.create(self.arena, proto);
+                try err.set("name", .{ .string = "AggregateError" });
+                const msg: Value = if (args.len > 1 and args[1] != .undefined)
+                    .{ .string = try self.toString(args[1]) }
+                else
+                    .{ .string = "" };
+                try err.set("message", msg);
+                // §20.5.7.1.1 step 4: ToList the `errors` iterable into the own `errors` data property.
+                const errs = try Object.createArray(self.arena, self.arrayProto());
+                if (args.len > 0) {
+                    var list: std.ArrayListUnmanaged(Value) = .empty;
+                    const lc = try self.iterateToList(args[0], &list);
+                    if (lc.isAbrupt()) return lc;
+                    try errs.elements.appendSlice(self.arena, list.items);
+                }
+                try err.defineData("errors", .{ .object = errs }, true, false, true);
                 return .{ .normal = .{ .object = err } };
             },
             .string_ctor => {
@@ -4003,6 +4184,7 @@ pub const Interpreter = struct {
             .array_values, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
             .generator_method, .generator_iterator => unreachable, // handled in the first switch
             .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch
+            .promise_all, .promise_all_settled, .promise_any, .promise_race, .promise_combinator_element => unreachable, // handled in the first switch
             .promise_resolve_fn, .promise_reject_fn, .promise_finally_thunk, .test_done => unreachable, // handled in the first switch
             .none => unreachable,
         }
