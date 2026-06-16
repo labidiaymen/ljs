@@ -258,7 +258,11 @@ pub const ClassElementValue = union(enum) {
     block: []const Stmt, // §15.7.11 ClassStaticBlock body (static_block only)
 };
 
-pub const DeclKind = enum { var_decl, let_decl, const_decl };
+/// §14.3 declaration kind. `using_decl` / `await_using_decl` (§14.3.1 Explicit Resource Management)
+/// are block-scoped like `let`, but each declarator's initialized value is also registered as a
+/// DisposableResource on the enclosing scope's dispose stack: at scope exit its `[@@dispose]`
+/// (`await using`: `[@@asyncDispose]`) is invoked in reverse declaration order (§ER DisposeResources).
+pub const DeclKind = enum { var_decl, let_decl, const_decl, using_decl, await_using_decl };
 
 /// §14.7.5 ForIn/ForOf head — the binding side of `for (HEAD in/of EXPR)`. Either a `var`/`let`/`const`
 /// declaration of a single ForBinding (`.decl`), or an existing assignment target expression — a plain

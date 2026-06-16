@@ -42,6 +42,15 @@ pub const AsyncDone = struct {
     message: []const u8 = "",
 };
 
+/// §ER CreateDisposableResource result — a resource value plus its dispose method (and the hint:
+/// `is_async` ⇒ `@@asyncDispose`, awaited at disposal). `method == null` only for a null/undefined
+/// resource (a no-op at disposal). `value` is the `this` passed to `method`.
+pub const DisposableResource = struct {
+    value: Value,
+    method: ?*Object,
+    is_async: bool,
+};
+
 pub const Interpreter = struct {
     arena: std.mem.Allocator,
     steps: u64 = 0,
@@ -99,6 +108,16 @@ pub const Interpreter = struct {
     /// `continue` against an empty label set needs no comparison).
     pending_labels: std.ArrayListUnmanaged([]const u8) = .empty,
 
+    /// §ER DisposeCapability — the per-interpreter stack of DisposableResource records pushed by
+    /// `using` / `await using` declarations, a LIFO. A scope (Block / FunctionBody / for-loop /
+    /// for-of iteration) that lexically contains a `using` snapshots `disposables.items.len` on entry
+    /// and, at exit (normal OR abrupt), runs `disposeFrom(marker, completion)` to dispose every
+    /// resource pushed since (in reverse order) and pop them. A scope with NO `using` never grows this
+    /// stack, so its exit pays a single length-compare (perf gate: ordinary block exit is unchanged).
+    /// Per-interpreter (not shared): each generator/async body interpreter runs one-at-a-time and its
+    /// `using` scopes open + close entirely within that body, so its own stack suffices.
+    disposables: std.ArrayListUnmanaged(DisposableResource) = .empty,
+
     /// §14.9/§14.8: is an abrupt `.brk`/`.cont` completion (carrying `comp_label`) targeted at a loop
     /// whose applicable labels are `my_labels`? An unlabeled completion (`comp_label == null`) targets
     /// the innermost loop (always a match); a labelled one matches only if its label is among `my_labels`.
@@ -152,7 +171,10 @@ pub const Interpreter = struct {
                 //       initialized, so the `!initialized` check below is staged, not yet live;
                 //   (c) duplicate lexical declarations are not yet a SyntaxError (§14.3.1).
                 // Tightened in later M1 cycles. None of these affect the US1 acceptance scenarios.
-                const mutable = d.kind != .const_decl;
+                // §14.3.1 `using`/`await using` are immutable (const-like) block-scoped bindings that
+                // additionally register a DisposableResource on the enclosing scope's dispose stack.
+                const is_using = d.kind == .using_decl or d.kind == .await_using_decl;
+                const mutable = d.kind != .const_decl and !is_using;
                 for (d.decls) |dec| {
                     var v: Value = .undefined;
                     if (dec.init) |ie| {
@@ -163,6 +185,13 @@ pub const Interpreter = struct {
                         // anonymous function/class initializer of a single-identifier binding gets the
                         // binding name. (Pattern targets are not naming contexts.)
                         if (dec.target.* == .identifier) try self.maybeSetAnonName(ie, v, dec.target.identifier);
+                    }
+                    // §ER AddDisposableResource: for `using`/`await using`, resolve + validate the
+                    // dispose method and push the resource (before binding — a non-callable
+                    // `[@@dispose]` is a TypeError that aborts the declaration).
+                    if (is_using) {
+                        const pc = try self.disposePush(v, d.kind == .await_using_decl);
+                        if (pc.isAbrupt()) return pc;
                     }
                     // Fast path: a plain `var x = …` binds directly, skipping pattern matching so
                     // the common case pays no destructuring cost (perf gate).
@@ -177,9 +206,11 @@ pub const Interpreter = struct {
             },
             .block => |stmts| {
                 // §14.2 Block. Allocate a child scope only when the block actually has lexical
-                // declarations (let/const/function); declaration-free blocks (e.g. hot loop
+                // declarations (let/const/using/function); declaration-free blocks (e.g. hot loop
                 // bodies) reuse the parent env — avoids a per-iteration allocation.
-                if (blockNeedsScope(stmts)) return self.runBlock(stmts, try Environment.create(self.arena, env));
+                // §ER: a block lexically containing a `using` runs DisposeResources at exit (normal OR
+                // abrupt) — handled by `runScope`. Gated so an ordinary block never touches the path.
+                if (blockNeedsScope(stmts)) return self.runScope(stmts, try Environment.create(self.arena, env));
                 return self.runBlock(stmts, env);
             },
             .func_decl => |f| {
@@ -253,29 +284,17 @@ pub const Interpreter = struct {
             .for_stmt => |s| {
                 // §14.7.4 ForStatement — loop bindings in a fresh scope.
                 const loop_env = try Environment.create(self.arena, env);
-                if (s.init) |i| {
-                    const ic = try self.evalStmt(i.*, loop_env);
-                    if (ic.isAbrupt()) return ic;
+                // §ER: `for (using x = … ; … ; … )` — the using resource(s) are created once in the
+                // head and disposed when the WHOLE loop completes (normal OR abrupt). Gated: only a
+                // using-headed for-loop touches the dispose stack.
+                const for_uses = if (s.init) |i| i.* == .declaration and
+                    (i.*.declaration.kind == .using_decl or i.*.declaration.kind == .await_using_decl) else false;
+                if (for_uses) {
+                    const marker = self.disposables.items.len;
+                    const lc = try self.runForBody(s, loop_env, my_labels);
+                    return self.disposeFrom(marker, lc);
                 }
-                while (true) {
-                    if (s.cond) |t| {
-                        const tc = try self.evalExpr(t, loop_env);
-                        if (tc.isAbrupt()) return tc;
-                        if (!toBoolean(tc.normal)) break;
-                    }
-                    const bc = try self.evalStmt(s.body.*, loop_env);
-                    switch (bc) {
-                        .normal => {}, // fall through to the update
-                        .cont => |l| if (!loopHandles(l, my_labels)) return bc, // for our loop: fall through to update
-                        .brk => |l| if (loopHandles(l, my_labels)) break else return bc,
-                        .ret, .throw => return bc,
-                    }
-                    if (s.update) |u| {
-                        const uc = try self.evalExpr(u, loop_env);
-                        if (uc.isAbrupt()) return uc;
-                    }
-                }
-                return .{ .normal = .undefined };
+                return self.runForBody(s, loop_env, my_labels);
             },
             .for_in_stmt => |s| return self.evalForIn(s, env, my_labels),
             .for_of_stmt => |s| return if (s.is_await) self.evalForAwaitOf(s, env, my_labels) else self.evalForOf(s, env, my_labels),
@@ -286,15 +305,17 @@ pub const Interpreter = struct {
                 return .{ .throw = c.normal };
             },
             .try_stmt => |s| {
-                // §14.15 TryStatement — catch handles a throw; finally's abrupt completion wins.
-                var result = try self.runBlock(s.block, try Environment.create(self.arena, env));
+                // §14.15 TryStatement — catch handles a throw; finally's abrupt completion wins. Each
+                // of the try / catch / finally bodies is its own lexical scope; `runScope` applies the
+                // §ER dispose epilogue when that body directly contains a `using`/`await using`.
+                var result = try self.runScope(s.block, try Environment.create(self.arena, env));
                 if (result == .throw and s.catch_block != null) {
                     const catch_env = try Environment.create(self.arena, env);
                     if (s.catch_param) |p| try catch_env.declare(p, result.throw, true, true);
-                    result = try self.runBlock(s.catch_block.?, catch_env);
+                    result = try self.runScope(s.catch_block.?, catch_env);
                 }
                 if (s.finally_block) |fb| {
-                    const fc = try self.runBlock(fb, try Environment.create(self.arena, env));
+                    const fc = try self.runScope(fb, try Environment.create(self.arena, env));
                     if (fc.isAbrupt()) return fc;
                 }
                 return result;
@@ -401,6 +422,46 @@ pub const Interpreter = struct {
         return last;
     }
 
+    /// Run a StatementList that forms its OWN lexical scope (a Block, or a try / catch / finally
+    /// body), applying the §ER DisposeResources epilogue when it lexically contains a `using` / `await
+    /// using`. Gated on `blockHasUsing` so an ordinary scope is identical to a bare `runBlock` (perf:
+    /// no dispose-stack traffic for ordinary scope exit).
+    fn runScope(self: *Interpreter, stmts: []const ast.Stmt, env: *Environment) EvalError!Completion {
+        if (!blockHasUsing(stmts)) return self.runBlock(stmts, env);
+        const marker = self.disposables.items.len;
+        const c = try self.runBlock(stmts, env);
+        return self.disposeFrom(marker, c);
+    }
+
+    /// §14.7.4 ForStatement body — the init/cond/body/update loop (the `using`-head dispose epilogue,
+    /// when present, is applied by the caller around this). Returns the loop's completion; a `break`
+    /// targeting this loop is consumed (→ normal), other abrupt completions propagate.
+    fn runForBody(self: *Interpreter, s: anytype, loop_env: *Environment, my_labels: []const []const u8) EvalError!Completion {
+        if (s.init) |i| {
+            const ic = try self.evalStmt(i.*, loop_env);
+            if (ic.isAbrupt()) return ic;
+        }
+        while (true) {
+            if (s.cond) |t| {
+                const tc = try self.evalExpr(t, loop_env);
+                if (tc.isAbrupt()) return tc;
+                if (!toBoolean(tc.normal)) break;
+            }
+            const bc = try self.evalStmt(s.body.*, loop_env);
+            switch (bc) {
+                .normal => {}, // fall through to the update
+                .cont => |l| if (!loopHandles(l, my_labels)) return bc, // for our loop: fall through to update
+                .brk => |l| if (loopHandles(l, my_labels)) break else return bc,
+                .ret, .throw => return bc,
+            }
+            if (s.update) |u| {
+                const uc = try self.evalExpr(u, loop_env);
+                if (uc.isAbrupt()) return uc;
+            }
+        }
+        return .{ .normal = .undefined };
+    }
+
     /// §14.7.5 `for (HEAD in EXPR)` — ForIn/OfHeadEvaluation (enumerate) + ForIn/OfBodyEvaluation.
     fn evalForIn(self: *Interpreter, s: anytype, env: *Environment, my_labels: []const []const u8) EvalError!Completion {
         // §14.7.5.6 step 7.a: a null/undefined operand → the body never runs (no throw).
@@ -438,6 +499,8 @@ pub const Interpreter = struct {
             .abrupt => |c| return c,
             .iterator => |it| it,
         };
+        // §ER: a `for (using x of …)` head disposes the iterated resource at the END OF EACH ITERATION.
+        const head_uses = s.head == .decl and (s.head.decl.kind == .using_decl or s.head.decl.kind == .await_using_decl);
         while (true) {
             try self.tick(); // §reliability: an infinite iterable terminates via the step watchdog, never hangs
             const step = try self.iteratorStep(iterator);
@@ -446,12 +509,16 @@ pub const Interpreter = struct {
                 .done => break,
                 .value => |val| val,
             };
+            const marker = self.disposables.items.len;
             const hb = try self.bindForHead(s.head, v, env);
             if (hb.completion.isAbrupt()) {
+                const after = try self.disposeFrom(marker, hb.completion); // dispose any pushed before the throw
                 try self.iteratorClose(iterator); // §7.4.11 abrupt binding → close the iterator
-                return hb.completion;
+                return after;
             }
-            const bc = try self.evalStmt(s.body.*, hb.env);
+            var bc = try self.evalStmt(s.body.*, hb.env);
+            // §ER DisposeResources at end of iteration (normal OR abrupt), before the iterator-close logic.
+            if (head_uses) bc = try self.disposeFrom(marker, bc);
             switch (bc) {
                 .normal => {},
                 .cont => |l| {
@@ -554,9 +621,16 @@ pub const Interpreter = struct {
     fn bindForHead(self: *Interpreter, head: ast.ForHead, item: Value, env: *Environment) EvalError!HeadBinding {
         switch (head) {
             .decl => |d| {
-                const mutable = d.kind != .const_decl;
-                // §14.7.5.7: let/const create a fresh binding each iteration; var reuses the loop env.
+                const is_using = d.kind == .using_decl or d.kind == .await_using_decl;
+                const mutable = d.kind != .const_decl and !is_using;
+                // §14.7.5.7: let/const/using create a fresh binding each iteration; var reuses the loop env.
                 const target_env = if (d.kind == .var_decl) env else try Environment.create(self.arena, env);
+                // §ER: a `for (using x of …)` head registers the iterated value as a DisposableResource
+                // (disposed at the end of each iteration by `evalForOf`). A non-callable @@dispose throws.
+                if (is_using) {
+                    const pc = try self.disposePush(item, d.kind == .await_using_decl);
+                    if (pc.isAbrupt()) return .{ .env = env, .completion = pc };
+                }
                 if (d.target.* == .identifier) {
                     try target_env.declare(d.target.identifier, item, mutable, true);
                 } else {
@@ -2074,6 +2148,29 @@ pub const Interpreter = struct {
         self.pending_labels = .empty;
         defer self.pending_labels = saved_labels;
 
+        // §ER: a FunctionBody lexically containing a `using`/`await using` disposes its resources on
+        // exit (normal return OR throw). Gated on `blockHasUsing` so an ordinary body pays nothing.
+        if (blockHasUsing(fd.body)) {
+            const marker = self.disposables.items.len;
+            var body_c: Completion = .{ .normal = .undefined };
+            for (fd.body) |stmt| {
+                const c = try self.evalStmt(stmt, call_env);
+                switch (c) {
+                    .normal => {},
+                    .ret, .throw => {
+                        body_c = c;
+                        break;
+                    },
+                    .brk, .cont => {},
+                }
+            }
+            const disposed = try self.disposeFrom(marker, body_c);
+            return switch (disposed) {
+                .ret => |v| .{ .normal = v },
+                .throw => disposed,
+                else => .{ .normal = .undefined },
+            };
+        }
         for (fd.body) |stmt| {
             const c = try self.evalStmt(stmt, call_env);
             switch (c) {
@@ -2592,6 +2689,129 @@ pub const Interpreter = struct {
         if (b.value != .object) return null;
         const pv = b.value.object.get("toPrimitive") orelse return null;
         return if (pv == .symbol) pv.symbol else null;
+    }
+
+    /// A well-known Symbol identity (`Symbol.<name>`) held on the `Symbol` constructor. Null only in a
+    /// realm-less unit eval (no `Symbol`). Used by the §ER dispose machinery (`dispose`/`asyncDispose`).
+    fn wellKnownSymbol(self: *Interpreter, name: []const u8) ?*Symbol {
+        const g = self.globals orelse return null;
+        const b = g.lookup("Symbol") orelse return null;
+        if (b.value != .object) return null;
+        const pv = b.value.object.get(name) orelse return null;
+        return if (pv == .symbol) pv.symbol else null;
+    }
+
+    /// §ER AddDisposableResource / CreateDisposableResource / GetDisposeMethod — push the resource
+    /// `v` (the initialized `using`/`await using` value) onto the dispose stack. A null/undefined `v`
+    /// for a sync `using` is a no-op (no resource pushed). Otherwise `v` must be an Object whose
+    /// `[@@dispose]` (sync) — or `[@@asyncDispose]`, falling back to `[@@dispose]` (async) — is a
+    /// callable method; a missing or non-callable method is a TypeError. Returns an abrupt completion
+    /// on that TypeError (or a throw while reading the method); a normal completion when pushed/skipped.
+    fn disposePush(self: *Interpreter, v: Value, is_async: bool) EvalError!Completion {
+        // §ER CreateDisposableResource step 1.a: a null/undefined sync-dispose resource is a no-op.
+        // (For async-dispose, null/undefined is likewise allowed and disposes to a no-op.)
+        if (v == .null or v == .undefined) {
+            try self.disposables.append(self.arena, .{ .value = .undefined, .method = null, .is_async = is_async });
+            return .{ .normal = .undefined };
+        }
+        // §ER CreateDisposableResource step 1.b.i: a non-Object resource is a TypeError.
+        if (v != .object) return self.throwError("TypeError", "using value is not an object");
+        var method: ?*Object = null;
+        if (is_async) {
+            // §ER GetDisposeMethod (async-dispose): try @@asyncDispose, then fall back to @@dispose.
+            if (self.wellKnownSymbol("asyncDispose")) |sym| {
+                const mc = try self.getSymbolProperty(v, sym);
+                if (mc.isAbrupt()) return mc;
+                method = try self.disposeMethodOf(mc.normal);
+                if (mc.normal != .undefined and mc.normal != .null and method == null) {
+                    return self.throwError("TypeError", "Symbol.asyncDispose is not a function");
+                }
+            }
+            if (method == null) {
+                if (self.wellKnownSymbol("dispose")) |sym| {
+                    const mc = try self.getSymbolProperty(v, sym);
+                    if (mc.isAbrupt()) return mc;
+                    method = try self.disposeMethodOf(mc.normal);
+                    if (mc.normal != .undefined and mc.normal != .null and method == null) {
+                        return self.throwError("TypeError", "Symbol.dispose is not a function");
+                    }
+                }
+            }
+            if (method == null) return self.throwError("TypeError", "using value has no Symbol.asyncDispose method");
+        } else {
+            // §ER GetDisposeMethod (sync-dispose): @@dispose, which must be callable.
+            const sym = self.wellKnownSymbol("dispose") orelse return self.throwError("TypeError", "Symbol.dispose unavailable");
+            const mc = try self.getSymbolProperty(v, sym);
+            if (mc.isAbrupt()) return mc;
+            method = try self.disposeMethodOf(mc.normal);
+            if (method == null) {
+                // §ER GetMethod: undefined/null → no method (then CreateDisposableResource throws),
+                // a non-callable value → TypeError directly.
+                if (mc.normal == .undefined or mc.normal == .null) {
+                    return self.throwError("TypeError", "using value has no Symbol.dispose method");
+                }
+                return self.throwError("TypeError", "Symbol.dispose is not a function");
+            }
+        }
+        try self.disposables.append(self.arena, .{ .value = v, .method = method, .is_async = is_async });
+        return .{ .normal = .undefined };
+    }
+
+    /// §7.3.11 GetMethod tail: a callable function value → that function; undefined/null/non-callable
+    /// → null (the caller decides whether null is a TypeError or a no-op).
+    fn disposeMethodOf(self: *Interpreter, m: Value) EvalError!?*Object {
+        _ = self;
+        if (m != .object) return null;
+        if (!isCallable(m.object)) return null;
+        return m.object;
+    }
+
+    /// §ER DisposeResources — at scope exit, dispose every resource pushed since `marker` in REVERSE
+    /// (LIFO) order, threading `completion` (the body's completion). A disposer that throws while a
+    /// throw completion is already pending is aggregated into a `SuppressedError { error, suppressed }`
+    /// (the newest disposer error becomes `.error`, the prior pending completion becomes `.suppressed`);
+    /// otherwise the disposer's throw simply replaces a previously-normal completion. The popped
+    /// resources are removed from the stack. For an `await using`, the dispose result is awaited
+    /// (via the body's await substrate when available). A normal `completion` and no throwing disposer
+    /// returns `completion` unchanged.
+    fn disposeFrom(self: *Interpreter, marker: usize, completion: Completion) EvalError!Completion {
+        var result = completion;
+        // Reverse order over the slice pushed since `marker`.
+        var i = self.disposables.items.len;
+        while (i > marker) {
+            i -= 1;
+            const res = self.disposables.items[i];
+            // §ER Dispose: result ← (method undefined) undefined : Call(method, V). For an `await
+            // using`, the result is then Awaited — even when method is undefined (a null/undefined
+            // async resource still yields a microtask boundary at disposal).
+            var disp: Completion = .{ .normal = .undefined };
+            if (res.method) |m| {
+                disp = try self.callFunction(m, &.{}, res.value);
+            }
+            if (res.is_async and !disp.isAbrupt()) {
+                disp = try self.awaitDisposeResult(disp.normal);
+            }
+            if (disp == .throw) {
+                result = try self.combineDisposeError(disp.throw, result);
+            }
+        }
+        // Pop the disposed resources.
+        self.disposables.items.len = marker;
+        return result;
+    }
+
+    /// §ER DisposeResources step 1.b: fold a disposer error into the pending completion. If the
+    /// pending completion is itself a throw, build a SuppressedError `{ error: <new>, suppressed:
+    /// <pending> }`; otherwise the disposer error becomes the (new) throw completion.
+    fn combineDisposeError(self: *Interpreter, err: Value, pending: Completion) EvalError!Completion {
+        if (pending != .throw) return .{ .throw = err };
+        // SuppressedError { error: err, suppressed: pending.throw }.
+        const g = self.globals orelse return .{ .throw = err };
+        const ctor_b = g.lookup("SuppressedError") orelse return .{ .throw = err };
+        if (ctor_b.value != .object) return .{ .throw = err };
+        const sc = try self.callFunction(ctor_b.value.object, &.{ err, pending.throw }, .undefined);
+        if (sc.isAbrupt()) return sc;
+        return .{ .throw = sc.normal };
     }
 
     /// §7.1.1 ToPrimitive ( input, hint ) — convert a value to a primitive. Primitives pass through
@@ -3172,6 +3392,30 @@ pub const Interpreter = struct {
         if (abrupt) |c| return c;
         self.this_val = gen.this_val;
         self.home_object = gen.home_object;
+        // §ER: a GeneratorBody / AsyncFunctionBody / AsyncGeneratorBody lexically containing a
+        // `using`/`await using` disposes its resources on body exit (return OR throw). Gated on
+        // `blockHasUsing` so an ordinary body pays nothing.
+        if (blockHasUsing(fd.body)) {
+            const marker = self.disposables.items.len;
+            var body_c: Completion = .{ .normal = .undefined };
+            for (fd.body) |stmt| {
+                const c = try self.evalStmt(stmt, call_env);
+                switch (c) {
+                    .normal => {},
+                    .ret, .throw => {
+                        body_c = c;
+                        break;
+                    },
+                    .brk, .cont => {},
+                }
+            }
+            const disposed = try self.disposeFrom(marker, body_c);
+            return switch (disposed) {
+                .ret => |v| .{ .normal = v },
+                .throw => disposed,
+                else => .{ .normal = .undefined },
+            };
+        }
         for (fd.body) |stmt| {
             const c = try self.evalStmt(stmt, call_env);
             switch (c) {
@@ -3752,6 +3996,16 @@ pub const Interpreter = struct {
     /// the ping-pong handoff (`transfer_kind = .yield`, reusing `doYieldRaw`), park until the caller's
     /// reaction Job resumes us with the settlement (`.next` value → await result; `.throw` reason →
     /// throw at the await point). Only runs on an async body thread (`current_gen.is_async`).
+    /// §ER Dispose step 3.a — `Await(result)` of an `await using` disposer's return value. Only an
+    /// async body thread can suspend on an await; when running there (`current_gen.is_async`) we await
+    /// via the normal handoff, so a thenable disposal result is adopted. Outside an async body (which
+    /// `await using` should never be, but guard defensively) the value passes through unawaited.
+    fn awaitDisposeResult(self: *Interpreter, value: Value) EvalError!Completion {
+        const cg = self.current_gen orelse return .{ .normal = value };
+        if (!cg.is_async) return .{ .normal = value };
+        return self.doAwait(value);
+    }
+
     fn doAwait(self: *Interpreter, value: Value) EvalError!Completion {
         // §27.6.3.8: in an async generator the servicer must distinguish an await from a yield (both are
         // `.yield`-kind handoffs); mark this transfer as an await so it registers resumption reactions.
@@ -5416,6 +5670,21 @@ pub const Interpreter = struct {
                 try err.defineData("errors", .{ .object = errs }, true, false, true);
                 return .{ .normal = .{ .object = err } };
             },
+            .suppressed_error_ctor => {
+                // §20.5.8.1 SuppressedError ( error, suppressed, message ) — own `error` / `suppressed`
+                // data properties (writable/non-enumerable/configurable) + optional `message`.
+                const proto: ?*Object = blk: {
+                    const pv = func.get("prototype") orelse break :blk null;
+                    break :blk if (pv == .object) pv.object else null;
+                };
+                const err = try Object.create(self.arena, proto);
+                if (args.len > 2 and args[2] != .undefined) {
+                    try err.set("message", .{ .string = try self.toString(args[2]) });
+                }
+                try err.defineData("error", if (args.len > 0) args[0] else .undefined, true, false, true);
+                try err.defineData("suppressed", if (args.len > 1) args[1] else .undefined, true, false, true);
+                return .{ .normal = .{ .object = err } };
+            },
             .string_ctor => {
                 // §22.1.1.1 String ( value ) — `String(sym)` is the ALLOWED Symbol→string conversion
                 // (SymbolDescriptiveString), so it routes through the infallible ToString, not the
@@ -5704,8 +5973,21 @@ fn shouldAssign(op: ast.LogicalOp, cur: Value) bool {
 /// only declaration is a class still needs its own scope or the class name leaks to the parent.
 fn blockNeedsScope(stmts: []const ast.Stmt) bool {
     for (stmts) |s| switch (s) {
-        .declaration => |d| if (d.kind != .var_decl) return true,
+        .declaration => |d| if (d.kind != .var_decl) return true, // let/const/using/await-using are lexical
         .func_decl, .class_decl => return true,
+        else => {},
+    };
+    return false;
+}
+
+/// §14.2 / §ER: does this statement list lexically contain a `using` / `await using` declaration?
+/// Only such a block sets up + runs a DisposeCapability at exit — every ordinary block skips the
+/// dispose epilogue entirely (perf gate: ordinary block exit pays nothing). Shallow scan: a `using`
+/// is only ever a direct child of the block's StatementList (nested blocks/loops run their own
+/// epilogue), so we do not descend.
+fn blockHasUsing(stmts: []const ast.Stmt) bool {
+    for (stmts) |s| switch (s) {
+        .declaration => |d| if (d.kind == .using_decl or d.kind == .await_using_decl) return true,
         else => {},
     };
     return false;

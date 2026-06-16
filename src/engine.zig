@@ -2708,3 +2708,75 @@ test "M31: §15.7.14 base class `C.prototype.[[Prototype]]` is %Object.prototype
     // A derived class chains to the superclass's `.prototype`.
     try expectBool("class C{}; class D extends C{}; Object.getPrototypeOf(D.prototype)===C.prototype", true);
 }
+
+test "M32: §14.3.1 `using` disposes at block exit (LIFO, normal + abrupt)" {
+    // Dispose runs at block exit, after the body — completion is "body,d".
+    try expectStr(
+        "var log=[]; { using x = { [Symbol.dispose](){ log.push('d'); } }; log.push('body'); } log.join(',')",
+        "body,d",
+    );
+    // Two `using` in one block dispose in REVERSE (LIFO) order: b then a.
+    try expectStr(
+        "var log=[]; { using a = { [Symbol.dispose](){ log.push('a'); } }, b = { [Symbol.dispose](){ log.push('b'); } }; } log.join(',')",
+        "b,a",
+    );
+    // Dispose runs on an early `throw` out of the block (try/catch around the using block).
+    try expectBool(
+        "var d=false; try { { using x = { [Symbol.dispose](){ d=true; } }; throw 1; } } catch(e){} d",
+        true,
+    );
+    // `using y = null` is a no-op (no dispose, no throw) and the block runs normally.
+    try expectStr("var log=[]; { using y = null; log.push('ok'); } log.join(',')", "ok");
+    // The `this` inside the disposer is the resource value.
+    try expectBool(
+        "var ok=false; var r={ [Symbol.dispose](){ ok = (this===r); } }; { using x = r; } ok",
+        true,
+    );
+}
+
+test "M32: §14.3.1 `using` is a const-like immutable binding; values readable in-block" {
+    // The binding holds the initialized value within the block.
+    try expectNumber("var v; { using x = { val: 7, [Symbol.dispose](){} }; v = x.val; } v", 7);
+    // `Symbol.dispose` / `Symbol.asyncDispose` are well-known symbols (same identity as a property read).
+    try expectBool("typeof Symbol.dispose === 'symbol' && typeof Symbol.asyncDispose === 'symbol'", true);
+}
+
+test "M32: §ER non-callable / missing `[Symbol.dispose]` is a TypeError" {
+    // A non-callable @@dispose property → TypeError.
+    try expectStr(
+        "var n; try { { using x = { [Symbol.dispose]: 1 }; } } catch(e){ n = e.name; } n",
+        "TypeError",
+    );
+    // An object with NO @@dispose method → TypeError.
+    try expectStr(
+        "var n; try { { using x = {}; } } catch(e){ n = e.name; } n",
+        "TypeError",
+    );
+}
+
+test "M32: §20.5.8 SuppressedError aggregation (last disposer error wraps the prior completion)" {
+    // A body throw + a disposer throw aggregate into SuppressedError { error: disposerErr, suppressed: bodyErr }.
+    try expectStr(
+        "var n; try { { using a = { [Symbol.dispose](){ throw 'da'; } }; throw 'body'; } } catch(e){ n = (e instanceof SuppressedError) ? e.error+','+e.suppressed : 'plain'; } n",
+        "da,body",
+    );
+    // A single disposer error (no pending completion) rethrows as-is (no SuppressedError wrapper).
+    try expectBool(
+        "var plain=false; try { { using a = { [Symbol.dispose](){ throw new TypeError('x'); } }; } } catch(e){ plain = (e instanceof TypeError); } plain",
+        true,
+    );
+}
+
+test "M32: §14.3.1 `using` is a CONTEXTUAL keyword (identifier elsewhere)" {
+    // `var using = 5; using` → 5 — `using` is an ordinary identifier when not heading a declaration.
+    try expectNumber("var using = 5; using", 5);
+    // `using` not followed by a same-line BindingIdentifier is an ordinary identifier reference.
+    try expectNumber("var using = 3; using + 1", 4);
+    // `using` followed by a LineTerminator then an identifier is two statements (ASI), not a decl:
+    // `using` is read as the identifier (7), then `r = using` assigns it.
+    try expectNumber("var using = 7, r; using\nr = using; r", 7);
+    // A `using`-headed declaration at the top level of a Script is a SyntaxError (must be in a Block/etc.).
+    try expectSyntaxError("using x = null;");
+    // `using x = …` is allowed inside a block.
+    try expectStr("var log=[]; { using x = { [Symbol.dispose](){ log.push('d'); } }; } log.join(',')", "d");
+}

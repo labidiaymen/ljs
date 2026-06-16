@@ -103,6 +103,16 @@ pub const Parser = struct {
     iteration_depth: usize = 0,
     switch_depth: usize = 0,
 
+    /// §14.3.1.1 Explicit Resource Management Early Error: a UsingDeclaration is a Syntax Error in the
+    /// Script goal unless contained (directly/indirectly) within a Block, ForStatement, ForInOfStatement,
+    /// FunctionBody, GeneratorBody, AsyncGeneratorBody, AsyncFunctionBody, ClassStaticBlockBody, or
+    /// ClassBody. We only parse the Script goal (module tests are skipped by the runner), so the rule
+    /// reduces to "not at the top level of the Program statement list": this is `false` while parsing
+    /// the Program's top-level StatementList and `true` once inside any Block / for-header / function
+    /// body / static block. (`switch` case/default clauses are NOT in the allow-list — `using` there is
+    /// a Syntax Error even inside a block-bearing switch — but a `{}`-wrapped clause body re-allows it.)
+    using_allowed: bool = false,
+
     /// `mode == .strict` starts the whole Script in strict context (the Test262 runner runs each
     /// test in both modes, expecting the engine to honor `RunMode`). An explicit `"use strict"`
     /// directive prologue is detected independently in `parseProgram`.
@@ -448,6 +458,11 @@ pub const Parser = struct {
             is_await = true;
         }
         _ = try self.expect(.lparen);
+        // §14.3.1.1: a ForStatement / ForInOfStatement is a UsingDeclaration allow-list context — the
+        // head and body may contain `using`/`await using`. Enter it for the whole `for`.
+        const saved_using = self.using_allowed;
+        self.using_allowed = true;
+        defer self.using_allowed = saved_using;
         var init_stmt: ?*const ast.Stmt = null;
         switch (self.peek().kind) {
             // §14.7.5: `for await (; …)` is a SyntaxError — `for await` has no C-style form.
@@ -507,6 +522,40 @@ pub const Parser = struct {
                 _ = try self.expect(.semicolon);
             },
             else => {
+                // §14.7.5 for-head UsingDeclaration: `for (using x of …)` (for-of, no initializer) or
+                // `for (using x = … ; … )` (C-style). `using` is contextual — `for (using of …)` is
+                // the for-of of the identifier `using` (excluded via `in_for`), so it is NOT a using
+                // head. `for (using x in …)` is a Syntax Error (`using` may not head a for-in).
+                if (self.atAwaitUsingDeclStart(true) or self.atUsingDeclStart(true)) {
+                    const ukind: ast.DeclKind = if (self.peek().kind == .identifier and std.mem.eql(u8, self.peek().lexeme, "await")) .await_using_decl else .using_decl;
+                    const saved_no_in2 = self.no_in;
+                    self.no_in = true;
+                    const ustmt = try self.parseUsingDecl(ukind, true);
+                    self.no_in = saved_no_in2;
+                    // §14.7.5: `for (using x in …)` is a Syntax Error; the for-of form has no initializer.
+                    if (self.peek().kind == .kw_in) return ParseError.UnexpectedToken;
+                    if (self.peekIsOf()) {
+                        if (ustmt.declaration.decls.len != 1 or ustmt.declaration.decls[0].init != null) return ParseError.UnexpectedToken;
+                        _ = self.advance(); // `of`
+                        return self.finishForInOf(.{ .decl = .{ .kind = ukind, .target = ustmt.declaration.decls[0].target } }, true, is_await);
+                    }
+                    // C-style head: `for (using x = … ; cond ; upd )`. Each binding required an
+                    // initializer (enforced in parseUsingDecl with for_head=false semantics below).
+                    if (is_await) return ParseError.UnexpectedToken; // `for await` has no C-style form
+                    for (ustmt.declaration.decls) |d| if (d.init == null) return ParseError.UnexpectedToken;
+                    init_stmt = try self.allocStmt(ustmt);
+                    _ = try self.expect(.semicolon);
+                    var cond2: ?*const ast.Node = null;
+                    if (self.peek().kind != .semicolon) cond2 = try self.parseExpression();
+                    _ = try self.expect(.semicolon);
+                    var update2: ?*const ast.Node = null;
+                    if (self.peek().kind != .rparen) update2 = try self.parseExpression();
+                    _ = try self.expect(.rparen);
+                    self.iteration_depth += 1;
+                    defer self.iteration_depth -= 1;
+                    const body2 = try self.allocStmt(try self.parseSubStmt(true));
+                    return .{ .for_stmt = .{ .init = init_stmt, .cond = cond2, .update = update2, .body = body2 } };
+                }
                 // §14.7.4/§14.7.5: parse the first clause as an Expression with `in` suppressed
                 // (`[~In]`), then disambiguate. `for (LHS in/of …)` is for-in/for-of (LHS must be a
                 // simple assignment target); otherwise it is a C-style init Expression.
@@ -570,6 +619,14 @@ pub const Parser = struct {
         self.iteration_depth += 1;
         defer self.iteration_depth -= 1;
         const body = try self.allocStmt(try self.parseSubStmt(true));
+        // §14.7.5.1 Early Error: a `using`/`await using` ForDeclaration's BoundName may not also be a
+        // VarDeclaredName of the loop body (`for (using x of []) { var x; }`). Enforced for the using
+        // forms (the M32 feature); the let/const variants are a separate (unenforced) M-subset cut.
+        if (head == .decl and (head.decl.kind == .using_decl or head.decl.kind == .await_using_decl)) {
+            if (head.decl.target.* == .identifier and bodyVarDeclaresName(body, head.decl.target.identifier)) {
+                return ParseError.UnexpectedToken;
+            }
+        }
         if (is_of) return .{ .for_of_stmt = .{ .head = head, .right = right, .body = body, .is_await = is_await } };
         return .{ .for_in_stmt = .{ .head = head, .right = right, .body = body } };
     }
@@ -582,6 +639,12 @@ pub const Parser = struct {
         _ = try self.expect(.lbrace);
         self.switch_depth += 1;
         defer self.switch_depth -= 1;
+        // §14.3.1.1: a CaseClause / DefaultClause StatementList is NOT a UsingDeclaration allow-list
+        // context — `case 0: using x = …;` is a Syntax Error (a `{}`-wrapped clause body re-allows it
+        // via `parseBlock`). The CaseBlock `{ … }` braces are the switch's own, not a Block.
+        const saved_using = self.using_allowed;
+        self.using_allowed = false;
+        defer self.using_allowed = saved_using;
         var cases: std.ArrayList(ast.Case) = .empty;
         while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
             var test_expr: ?*const ast.Node = null;
@@ -702,6 +765,10 @@ pub const Parser = struct {
                 // Declaration, never a valid sub-statement (like `function*`/`class`) — reject it in
                 // `if`/`else`/loop body position (`if (x) async function f(){}`).
                 if (self.atAsyncFunctionStart()) return ParseError.UnexpectedToken;
+                // §14.3.1: a UsingDeclaration (`using x = …` / `await using x = …`) is likewise a
+                // Declaration, not a Statement — forbidden as a single-statement body
+                // (`if (true) using x = null;`, `while (0) await using x = null;`).
+                if (self.atUsingDeclStart(false) or self.atAwaitUsingDeclStart(false)) return ParseError.UnexpectedToken;
                 if (self.idx + 1 < self.tokens.len and self.tokens[self.idx + 1].kind == .colon) {
                     return self.parseLabeled(true);
                 }
@@ -786,6 +853,13 @@ pub const Parser = struct {
                 return .{ .continue_stmt = label };
             },
             else => {
+                // §14.3.1 UsingDeclaration `using [no LineTerminator here] BindingIdentifier …` — a
+                // block-scoped Explicit Resource Management declaration. `using` is contextual: it heads
+                // a declaration only when a same-line BindingIdentifier follows (else it is an ordinary
+                // IdentifierReference ExpressionStatement). Detected before the label / expression
+                // fallthrough. `await using …` (the async form) likewise heads off here.
+                if (self.atAwaitUsingDeclStart(false)) return self.parseUsingDecl(.await_using_decl, false);
+                if (self.atUsingDeclStart(false)) return self.parseUsingDecl(.using_decl, false);
                 // §15.8 AsyncFunctionDeclaration `async [no LineTerminator here] function …` in
                 // statement position — a Declaration (hoisted), parsed before the label / expression
                 // fallthrough. `async` is the contextual modifier ONLY when `function` follows on the
@@ -1484,6 +1558,12 @@ pub const Parser = struct {
 
     fn parseBlock(self: *Parser) ParseError![]const ast.Stmt {
         _ = try self.expect(.lbrace);
+        // §14.3.1.1: a Block (also a FunctionBody / GeneratorBody / AsyncFunctionBody / try/catch/
+        // finally body / ClassStaticBlockBody — all of which parse through here) is a UsingDeclaration
+        // allow-list context. Enter it for the duration of this brace pair.
+        const saved_using = self.using_allowed;
+        self.using_allowed = true;
+        defer self.using_allowed = saved_using;
         var stmts: std.ArrayList(ast.Stmt) = .empty;
         while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
             try stmts.append(self.arena, try self.parseStmt());
@@ -1523,6 +1603,47 @@ pub const Parser = struct {
             break;
         }
         if (self.peek().kind == .semicolon) _ = self.advance();
+        return .{ .declaration = .{ .kind = kind, .decls = decls.items } };
+    }
+
+    /// §14.3.1 UsingDeclaration `using BindingList ;` / `await using BindingList ;`. The contextual
+    /// `using` (and the leading `await` for the async form) have already been verified by
+    /// `atUsingDeclStart` / `atAwaitUsingDeclStart` but NOT consumed. `kind` is `.using_decl` or
+    /// `.await_using_decl`. §14.3.1.1 Early Errors enforced here: the Script-top-level prohibition
+    /// (`using_allowed`), each LexicalBinding is exactly `BindingIdentifier Initializer` (a
+    /// BindingPattern target or a missing Initializer is a SyntaxError), and the bound name may not be
+    /// `let`. `for_head` (set by `parseFor`) skips both the trailing `;` and the initializer-required
+    /// check (a for-of head has no `= init`, and the for-header's own logic consumes the terminator).
+    fn parseUsingDecl(self: *Parser, kind: ast.DeclKind, for_head: bool) ParseError!ast.Stmt {
+        // §14.3.1.1: a UsingDeclaration is a Syntax Error at the top level of a Script.
+        if (!self.using_allowed and !for_head) return ParseError.UnexpectedToken;
+        if (kind == .await_using_decl) _ = self.advance(); // `await`
+        _ = self.advance(); // `using`
+        var decls: std.ArrayList(ast.Declarator) = .empty;
+        while (true) {
+            // §14.3.1: each binding's target is a BindingIdentifier — a BindingPattern is a Syntax Error.
+            const target = try self.parsePattern();
+            if (target.* != .identifier) return ParseError.UnexpectedToken;
+            // §14.3.1.1: the bound name may not be `let` (a lexical binding cannot be named `let`).
+            if (std.mem.eql(u8, target.identifier, "let")) return ParseError.UnexpectedToken;
+            if (self.strict and patternHasStrictReserved(target)) return ParseError.UnexpectedToken;
+            var init_expr: ?*const ast.Node = null;
+            if (self.peek().kind == .assign) {
+                _ = self.advance();
+                init_expr = try self.parseAssignment();
+            }
+            // §14.3.1.1: every `using`/`await using` LexicalBinding requires an Initializer — EXCEPT in
+            // a for head, where a for-of binding has no `= init` (and the C-style-vs-for-of and
+            // per-binding-initializer rules are settled by `parseFor` once `of`/`;` is seen).
+            if (init_expr == null and !for_head) return ParseError.UnexpectedToken;
+            try decls.append(self.arena, .{ .target = target, .init = init_expr });
+            if (self.peek().kind == .comma) {
+                _ = self.advance();
+                continue;
+            }
+            break;
+        }
+        if (!for_head and self.peek().kind == .semicolon) _ = self.advance();
         return .{ .declaration = .{ .kind = kind, .decls = decls.items } };
     }
 
@@ -1618,6 +1739,50 @@ pub const Parser = struct {
             }
         }
         return false;
+    }
+
+    /// §14.3.1: is the current token a `using` contextual keyword starting a UsingDeclaration
+    /// `using [no LineTerminator here] BindingIdentifier …`? `using` is the declaration head only when
+    /// the FOLLOWING token is an identifier (a candidate BindingIdentifier) on the SAME line (no
+    /// intervening LineTerminator — else ASI ends an expression statement `using`). `in_for` excludes
+    /// `of` (`for (using of …)` is the for-of of an identifier `using`, not a using-decl of `of`).
+    /// An escaped `using` is NOT the keyword (§12.7.1 — terminals appear verbatim).
+    fn atUsingDeclStart(self: *Parser, in_for: bool) bool {
+        const t = self.peek();
+        if (t.kind != .identifier or t.had_escape or !std.mem.eql(u8, t.lexeme, "using")) return false;
+        if (self.idx + 1 >= self.tokens.len) return false;
+        const nxt = self.tokens[self.idx + 1];
+        if (nxt.newline_before) return false; // §14.3.1 `using [no LineTerminator here]` — ASI splits it
+        if (nxt.kind != .identifier) return false; // BindingList must start with a BindingIdentifier
+        // §14.7.5 for-head disambiguation: `for (using of …)` is ALWAYS the for-of of the IDENTIFIER
+        // `using` (the `of` is the iteration keyword), NOT a using-decl of a binding named `of` — UNLESS
+        // an `=` follows the `of`, which is the only C-style reading (`for (using of = …;;)`, a using-
+        // decl of binding `of`). So: `using of` heads a decl only when the token after `of` is `=`.
+        if (in_for and std.mem.eql(u8, nxt.lexeme, "of") and !nxt.had_escape) {
+            const after = if (self.idx + 2 < self.tokens.len) self.tokens[self.idx + 2] else return false;
+            if (after.kind != .assign) return false; // `for (using of of …)` / `for (using of [..])` → identifier
+        }
+        return true;
+    }
+
+    /// §14.3.1: is the current token an `await` keyword starting an `await using` declaration
+    /// `await [no LineTerminator here] using [no LineTerminator here] BindingIdentifier …`? Only inside
+    /// an async context (`in_async`) is `await` a keyword. The `using` must follow on the same line, and
+    /// `using` must in turn be followed by a same-line BindingIdentifier.
+    fn atAwaitUsingDeclStart(self: *Parser, in_for: bool) bool {
+        _ = in_for;
+        if (!self.in_async) return false;
+        const t = self.peek();
+        if (t.kind != .identifier or t.had_escape or !std.mem.eql(u8, t.lexeme, "await")) return false;
+        if (self.idx + 2 >= self.tokens.len) return false;
+        const u = self.tokens[self.idx + 1];
+        if (u.newline_before or u.kind != .identifier or u.had_escape or !std.mem.eql(u8, u.lexeme, "using")) return false;
+        const nxt = self.tokens[self.idx + 2];
+        if (nxt.newline_before or nxt.kind != .identifier) return false;
+        // §14.7.5: unlike plain `using`, `await using <ident>` is UNAMBIGUOUSLY a declaration head even
+        // when the binding is `of` (`for (await using of of …)` = await-using of binding `of`, then the
+        // for-of keyword) — `await` cannot be a for-of loop variable here, so there is no `of` exclusion.
+        return true;
     }
 
     /// §15.8: is the current token an `async` contextual keyword starting an AsyncFunctionDeclaration
@@ -2854,6 +3019,76 @@ fn nodeReferencesAwait(node: *const ast.Node) bool {
         .call => |c| nodeReferencesAwait(c.callee),
         else => false,
     };
+}
+
+/// §8.2.7 VarDeclaredNames (subset) — does the statement `stmt` (a for-of/for-in body) `var`-declare
+/// a binding named `name`? Recurses through the nested Statement productions that share the function's
+/// VarScope (blocks, if/else, loops, try/catch/finally, switch, with, labels) but DOES NOT descend
+/// into nested function/class bodies (those open a new VarScope). Only the `using` for-head Early
+/// Error consumes this, so it runs off the hot path. A `var`'s pattern can bind multiple names; we
+/// check each. (let/const declarations are LexicallyDeclaredNames, not VarDeclaredNames — skipped.)
+fn bodyVarDeclaresName(stmt: *const ast.Stmt, name: []const u8) bool {
+    switch (stmt.*) {
+        .declaration => |d| {
+            if (d.kind != .var_decl) return false;
+            for (d.decls) |dec| if (patternBindsName(dec.target, name)) return true;
+            return false;
+        },
+        .block => |stmts| {
+            for (stmts) |*s| if (bodyVarDeclaresName(s, name)) return true;
+            return false;
+        },
+        .if_stmt => |s| {
+            if (bodyVarDeclaresName(s.then, name)) return true;
+            if (s.otherwise) |e| return bodyVarDeclaresName(e, name);
+            return false;
+        },
+        .while_stmt => |s| return bodyVarDeclaresName(s.body, name),
+        .do_while_stmt => |s| return bodyVarDeclaresName(s.body, name),
+        .for_stmt => |s| {
+            if (s.init) |i| if (bodyVarDeclaresName(i, name)) return true;
+            return bodyVarDeclaresName(s.body, name);
+        },
+        .for_in_stmt => |s| {
+            if (s.head == .decl and s.head.decl.kind == .var_decl and patternBindsName(s.head.decl.target, name)) return true;
+            return bodyVarDeclaresName(s.body, name);
+        },
+        .for_of_stmt => |s| {
+            if (s.head == .decl and s.head.decl.kind == .var_decl and patternBindsName(s.head.decl.target, name)) return true;
+            return bodyVarDeclaresName(s.body, name);
+        },
+        .try_stmt => |s| {
+            for (s.block) |*b| if (bodyVarDeclaresName(b, name)) return true;
+            if (s.catch_block) |cb| for (cb) |*b| if (bodyVarDeclaresName(b, name)) return true;
+            if (s.finally_block) |fb| for (fb) |*b| if (bodyVarDeclaresName(b, name)) return true;
+            return false;
+        },
+        .switch_stmt => |s| {
+            for (s.cases) |c| for (c.body) |*b| if (bodyVarDeclaresName(b, name)) return true;
+            return false;
+        },
+        .with_stmt => |s| return bodyVarDeclaresName(s.body, name),
+        .labeled_stmt => |s| return bodyVarDeclaresName(s.body, name),
+        else => return false, // func_decl/class_decl open a new VarScope; expr/ret/break/… bind nothing
+    }
+}
+
+/// Does the binding pattern `pat` bind an identifier named `name`? Walks nested array/object patterns
+/// and rest elements (mirrors `patternHasStrictReserved`).
+fn patternBindsName(pat: *const ast.Pattern, name: []const u8) bool {
+    switch (pat.*) {
+        .identifier => |n| return std.mem.eql(u8, n, name),
+        .array => |ap| {
+            for (ap.elements) |el| if (el.target) |t| if (patternBindsName(t, name)) return true;
+            if (ap.rest) |r| return patternBindsName(r, name);
+            return false;
+        },
+        .object => |op| {
+            for (op.properties) |prop| if (patternBindsName(prop.target, name)) return true;
+            if (op.rest) |r| return std.mem.eql(u8, r, name);
+            return false;
+        },
+    }
 }
 
 /// §15.1.3 IsSimpleParameterList — true iff every parameter is a plain BindingIdentifier with no

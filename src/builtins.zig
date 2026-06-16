@@ -223,7 +223,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     const symbol_fn = try Object.createNative(arena, .symbol_ctor, "Symbol");
     symbol_fn.prototype = function_proto; // §20.2.3 the Symbol constructor → %Function.prototype%
     // §20.4.2 well-known symbols — installed non-writable/non-enumerable/non-configurable per spec.
-    const well_known = [_][]const u8{ "iterator", "asyncIterator", "toStringTag", "hasInstance", "toPrimitive" };
+    const well_known = [_][]const u8{ "iterator", "asyncIterator", "toStringTag", "hasInstance", "toPrimitive", "dispose", "asyncDispose" };
     for (well_known) |name| {
         const desc = try std.fmt.allocPrint(arena, "Symbol.{s}", .{name});
         const sym = try newSymbol(arena, desc);
@@ -380,6 +380,33 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         }
         try defineConstructorBackref(ctor); // §20.5.7.3.1 AggregateError.prototype.constructor === AggregateError
         try env.declare("AggregateError", .{ .object = ctor }, true, true);
+    }
+
+    // §20.5.8 SuppressedError — the error produced by §ER DisposeResources when a disposer throws
+    // while another error is already pending. `new SuppressedError(error, suppressed, message)` (and
+    // the engine-internal aggregation) carries own `error` / `suppressed` data properties.
+    // §20.5.8.3 SuppressedError.prototype inherits %Error.prototype% (so `instanceof Error` holds).
+    {
+        const ctor = try Object.createNative(arena, .suppressed_error_ctor, "SuppressedError");
+        ctor.prototype = function_proto; // §20.2.3 the constructor function object → %Function.prototype%
+        // §20.5.8.2 SuppressedError extends Error — its [[Prototype]] is %Error% (the Error ctor).
+        if (env.lookup("Error")) |eb| if (eb.value == .object) {
+            ctor.prototype = eb.value.object;
+        };
+        if (ctor.get("prototype")) |pv| {
+            if (pv == .object) {
+                // §20.5.8.3 SuppressedError.prototype.[[Prototype]] = %Error.prototype%.
+                if (env.lookup("Error")) |eb| if (eb.value == .object) {
+                    if (eb.value.object.get("prototype")) |epv| if (epv == .object) {
+                        pv.object.prototype = epv.object;
+                    };
+                };
+                try pv.object.set("name", .{ .string = "SuppressedError" });
+                try pv.object.set("message", .{ .string = "" });
+            }
+        }
+        try defineConstructorBackref(ctor); // §20.5.8.3.1 SuppressedError.prototype.constructor === SuppressedError
+        try env.declare("SuppressedError", .{ .object = ctor }, true, true);
     }
 
     // §19.3 / §9.3.4 globalThis — a reified global object whose own properties MIRROR the global

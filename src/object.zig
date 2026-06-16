@@ -316,6 +316,7 @@ pub const NativeId = enum {
     /// and `any`'s reject — `native_name` selects the variant.
     promise_combinator_element,
     aggregate_error_ctor, // §20.5.7 AggregateError(errors, message) — thrown by Promise.any when all reject
+    suppressed_error_ctor, // §20.5.8 SuppressedError(error, suppressed, message) — §ER DisposeResources aggregation
     /// §27.2.1.3 the resolve / reject functions passed to an executor (and to a thenable's `then`).
     /// `promise_slot` (on the function object) is the promise they settle; `native_name` selects
     /// "resolve" vs "reject". These also back the finally-handler thunks (native_name "finally_*").
