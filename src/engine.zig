@@ -427,6 +427,71 @@ test "M7 destructuring assignment: cover-grammar early errors (§13.2.5.1 / §13
     try expectNumber("var x = [1, , 3]; x.length", 3);
 }
 
+test "M8 Symbol primitive: typeof, description, identity (§20.4)" {
+    try expectStr("typeof Symbol()", "symbol");
+    try expectStr("typeof Symbol('d')", "symbol");
+    try expectStr("typeof Symbol.iterator", "symbol"); // well-known symbol
+    // §20.4.3.3 toString / String() are the allowed Symbol→string conversions; both keep the description.
+    try expectBool("Symbol('d').toString().indexOf('d') >= 0", true);
+    try expectBool("String(Symbol('hi')).indexOf('hi') >= 0", true);
+    // §6.1.5: distinct calls yield distinct identities; a symbol equals itself.
+    try expectBool("Symbol('x') === Symbol('x')", false);
+    try expectBool("var s = Symbol(); s === s", true);
+    try expectBool("Symbol.iterator === Symbol.iterator", true);
+    // §7.1.17: a bare Symbol→string coercion (template / `+`) throws a TypeError.
+    try expectThrows("'' + Symbol()");
+    try expectThrows("`${Symbol()}`");
+    // §20.4.1: `new Symbol()` is a TypeError (Symbol has no [[Construct]]).
+    try expectThrows("new Symbol()");
+}
+
+test "M8 Symbol-keyed properties (§6.1.7)" {
+    // a symbol key stores/reads via the separate symbol store; ToString is skipped.
+    try expectNumber("var s = Symbol(); var o = {}; o[s] = 5; o[s]", 5);
+    // symbol keys are NOT enumerated by Object.keys / for-in.
+    try expectNumber("var s = Symbol(); var o = {a: 1}; o[s] = 2; Object.keys(o).length", 1);
+    try expectStr("var s = Symbol(); var o = {a: 1}; o[s] = 2; var r = ''; for (var k in o) r += k; r", "a");
+    // a computed symbol key in an object literal.
+    try expectNumber("var s = Symbol(); var o = {[s]: 7}; o[s]", 7);
+    // two distinct symbols don't collide.
+    try expectNumber("var s1 = Symbol(), s2 = Symbol(); var o = {}; o[s1] = 1; o[s2] = 2; o[s1] + o[s2]", 3);
+}
+
+test "M8 iteration protocol: custom iterable (§7.4)" {
+    // §7.4.2 GetIterator → §7.4.4 IteratorStep: a hand-written iterable drives for-of.
+    const it_src =
+        \\var it = { [Symbol.iterator]() { var i = 0; return { next() { return i < 3 ? {value: i++, done: false} : {value: undefined, done: true}; } }; } };
+        \\var t = 0; for (var v of it) t += v; t
+    ;
+    try expectNumber(it_src, 3); // 0 + 1 + 2
+    // spread over the same custom iterable.
+    const spread_src =
+        \\var it = { [Symbol.iterator]() { var i = 0; return { next() { return i < 3 ? {value: i++, done: false} : {value: undefined, done: true}; } }; } };
+        \\[...it].length
+    ;
+    try expectNumber(spread_src, 3);
+    // array destructuring over the same custom iterable.
+    const dstr_src =
+        \\var it = { [Symbol.iterator]() { var i = 0; return { next() { return i < 3 ? {value: i++, done: false} : {value: undefined, done: true}; } }; } };
+        \\var a, b; [a, b] = it; a + b
+    ;
+    try expectNumber(dstr_src, 1); // 0 + 1
+}
+
+test "M8 iteration protocol: Array/String native iterators (§22.1.5 / §23.1.5)" {
+    // Array.prototype[Symbol.iterator] resolves and yields the elements.
+    try expectBool("typeof [][Symbol.iterator] === 'function'", true);
+    try expectNumber("var s = 0; for (var v of [10, 20, 30]) s += v; s", 60);
+    // the iterator object's next() yields {value, done}.
+    try expectNumber("var it = [9][Symbol.iterator](); it.next().value", 9);
+    try expectBool("var it = [][Symbol.iterator](); it.next().done", true);
+    // String.prototype[Symbol.iterator] yields characters.
+    try expectStr("var r = ''; for (var c of 'abc') r += c; r", "abc");
+    // for-of over a non-iterable still throws (§7.4.2 GetIterator).
+    try expectThrows("for (var x of 5) {}");
+    try expectThrows("for (var x of {}) {}");
+}
+
 test "M3 arrow functions: bodies & param forms (US5, §15.3)" {
     // expression body (implicit return), single un-parenthesized param
     try expectNumber("var f = x => x + 1; f(41)", 42);

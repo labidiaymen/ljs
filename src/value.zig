@@ -1,7 +1,17 @@
-//! ECMAScript language values (ECMA-262 §6.1). M1 adds the Object reference; Symbol and
-//! BigInt arrive in later milestones.
+//! ECMAScript language values (ECMA-262 §6.1). M1 adds the Object reference; M8 adds Symbol;
+//! BigInt arrives in a later milestone.
 const std = @import("std");
 const Object = @import("object.zig").Object;
+
+/// §6.1.5 The Symbol Type — a unique, immutable primitive value. Each Symbol has a stable
+/// identity (pointer equality is the spec's SameValue for Symbols) and an optional [[Description]]
+/// string. Allocated in the realm arena; `===` / SameValue compare by pointer. Well-known symbols
+/// (`Symbol.iterator`, …) are ordinary `Symbol` values held on the `Symbol` constructor object.
+pub const Symbol = struct {
+    /// A process-unique id, purely for cheap display/debugging; identity is by pointer (`*Symbol`).
+    id: u64,
+    description: ?[]const u8 = null,
+};
 
 pub const Value = union(enum) {
     undefined,
@@ -11,6 +21,8 @@ pub const Value = union(enum) {
     number: f64,
     /// §6.1.4 String — UTF-8 bytes owned by the evaluation arena.
     string: []const u8,
+    /// §6.1.5 Symbol — a unique primitive identity (reference into the realm arena).
+    symbol: *Symbol,
     /// §6.1.7 Object — reference into the realm arena.
     object: *Object,
 
@@ -24,6 +36,11 @@ pub const Value = union(enum) {
             .boolean => |b| try w.writeAll(if (b) "true" else "false"),
             .number => |n| try writeNumber(w, n),
             .string => |s| try w.print("\"{s}\"", .{s}),
+            .symbol => |s| { // §20.4.3.3 SymbolDescriptiveString: `Symbol(desc)`
+                try w.writeAll("Symbol(");
+                if (s.description) |d| try w.writeAll(d);
+                try w.writeAll(")");
+            },
             .object => |o| {
                 if (o.kind == .array) {
                     try w.writeAll("[");

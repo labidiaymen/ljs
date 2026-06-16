@@ -136,6 +136,20 @@ non-assignable-leaf / parenthesized-literal parse-phase early errors keep the ne
 the full iterator protocol (`Symbol.iterator` / iterator-close / generators) for the `assignment/dstr` +
 `object/dstr` remainder. Generators/async next.
 
+**M8 result (iterator protocol + Symbol, harness metric):** `test/language/expressions` → **6,825 passed =
+40.2%**. A minimal §20.4 Symbol (the `symbol` primitive — `typeof "symbol"`, identity equality,
+description, implicit Symbol→string throws but `String()`/`.toString()` allowed; `Symbol()` callable that
+rejects `new`; the well-known symbols `iterator`/`asyncIterator`/`toStringTag`/`hasInstance`; a separate
+non-enumerated symbol-keyed property store leaving the string get/set hot path untouched) unblocks the
+§7.4 iteration protocol (`getIterator`/`iteratorStep`/`iteratorClose`/`iterateToList`), which is then wired
+into for-of (with IteratorClose on break/return/throw), spread, and array destructuring — so a user object
+with `[Symbol.iterator]` is iterable everywhere, with native `Array`/`String` iterators on a fast-path.
+Cycle 1: **39.6% → 40.2%** (passed 6,718 → 6,825, **+107**), 0 true regressions / 107 recoveries by
+`mode+path`, bench-green (the symbol store is a separate map; the for-of/spread native-iterator fast-path
+keeps Arrays/Strings off the per-element `.next()` dispatch). Deferred: the Symbol registry
+(`Symbol.for`/`keyFor`), the full Symbol surface, `Map`/`Set`, async iteration, and — the big remaining
+lever — generators/`yield` (the language-level iterator producer), next.
+
 ## Roadmap
 
 | Milestone | Focus | Status |
@@ -148,7 +162,8 @@ the full iterator protocol (`Symbol.iterator` / iterator-close / generators) for
 | **M5** | **`for-in` / `for-of`** — enumeration parse + iteration scaffold | ✅ done (held 35.8%; the enumeration prerequisite for M6's enumerable-awareness) |
 | **M6** | **reflection / property descriptors** — §6.1.7.1 attributes + `[[Extensible]]`, `Object.defineProperty`/`getOwnPropertyDescriptor(s)`/`getOwnPropertyNames`/`keys`/`values`/`entries`/`create`/`assign`/`is`/`getPrototypeOf`/`setPrototypeOf`/`freeze`/`seal`/`preventExtensions`, `Object.prototype.hasOwnProperty`/`propertyIsEnumerable`/`isPrototypeOf`, `Function.prototype.call`/`apply`/`bind`; unblocks `propertyHelper.js` + `compareArray.js` | ✅ done (35.8% → 38.4% of expressions, harness metric, +432; bench green, ljs 0.2–0.5× Node) |
 | **M7** | **destructuring assignment** — §13.15.5 cover-grammar refinement (`[a,b]=arr`, `({x,y}=obj)`) + `assignPattern` (holes / defaults / array+object rest / nested / member-index-private targets, single RHS eval) + §13.2.5.1/§13.15.5.1 early errors | ✅ done (38.4% → 39.6% of expressions, harness metric, +209; bench green, ljs 0.2–0.5× Node) |
-| M8+ | generators / async — climbing Test262 % | next |
+| **M8** | **iterator protocol + Symbol** — minimal §20.4 Symbol (the `symbol` primitive + `Symbol()` + well-known symbols + a non-enumerated symbol-keyed store) + the §7.4 protocol (`getIterator`/`iteratorStep`/`iteratorClose`) wired into for-of (IteratorClose on break/return/throw) / spread / array destructuring + native `Array`/`String` iterators | ✅ done (39.6% → 40.2% of expressions, harness metric, +107; bench green, ljs 0.2–0.5× Node) |
+| M9+ | generators / `yield` (the next lever), then `Map`/`Set` / async — climbing Test262 % | next |
 | Later | bytecode VM, then optimizing tiers — graduated when the benchmarks justify it | future |
 
 M3's nine cycles: operators (`**`, bitwise, shifts, `in`) · template literals · spread/rest ·

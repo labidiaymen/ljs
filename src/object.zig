@@ -5,7 +5,31 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const Value = @import("value.zig").Value;
+const Symbol = @import("value.zig").Symbol;
 const Environment = @import("environment.zig").Environment;
+
+/// §22.1.5 / §23.1.5 native iterator state for an Array/String Iterator object produced by
+/// `Array.prototype[Symbol.iterator]` / `String.prototype[Symbol.iterator]`. The `next` native
+/// reads/advances this slot. Present iff the object is such a native iterator (`Object.iter` != null).
+pub const IterState = struct {
+    /// The array being iterated (its `elements`), or null for a string iterator.
+    array: ?*Object = null,
+    /// The string being iterated (UTF-8 bytes), or null for an array iterator.
+    string: ?[]const u8 = null,
+    /// The current cursor: the next array index / byte offset to yield.
+    cursor: usize = 0,
+};
+
+/// §6.1.7.1 one symbol-keyed own property: the Symbol identity plus its value/attribute payload.
+/// Symbol-keyed properties live in a SEPARATE store from the string-keyed `properties` map so the
+/// hot string get/set path is untouched; they are also (correctly) never surfaced by for-in /
+/// Object.keys / getOwnPropertyNames (§7.3.23 OrdinaryOwnPropertyKeys lists Symbol keys last and
+/// those reflection ops filter them out). Few per object → a linear-scan list (keyed by pointer
+/// identity), not a hash map.
+pub const SymbolProperty = struct {
+    key: *Symbol,
+    pv: PropertyValue,
+};
 
 pub const Kind = enum { ordinary, function, array };
 
@@ -52,6 +76,12 @@ pub const NativeId = enum {
     function_proto_noop, // %Function.prototype% itself — a callable that returns undefined (§20.2.3)
     // §21.3 Math — `native_name` is the method (`pow`/`floor`/…). The Math namespace object holds these.
     math_method, // Math.<native_name>
+    // §20.4 Symbol (M8) — the constructor + Symbol.prototype.toString + the iterator natives.
+    symbol_ctor, // Symbol([description]) — callable, not a constructor
+    symbol_to_string, // Symbol.prototype.toString / Symbol.prototype.valueOf (native_name selects)
+    array_values, // Array.prototype[Symbol.iterator] / .values — returns an Array Iterator
+    string_iterator, // String.prototype[Symbol.iterator] — returns a String Iterator
+    iterator_next, // %ArrayIteratorPrototype%.next / %StringIteratorPrototype%.next (native_name selects)
 };
 
 /// §10.4.1 A Bound Function Exotic Object's internal slots: the wrapped target, the bound `this`, and
@@ -197,6 +227,14 @@ pub const Object = struct {
     /// path pays nothing. A private method/accessor stores a function descriptor here; a field stores
     /// data. Accessing a private name on an object missing the brand is a runtime TypeError (caller).
     private_fields: std.StringHashMapUnmanaged(PropertyValue) = .{},
+    /// §6.1.7 Symbol-keyed own properties (e.g. `obj[Symbol.iterator]`). Stored SEPARATELY from the
+    /// string-keyed `properties` map so the string get/set hot path never branches on symbols; only a
+    /// computed `[expr]` / index whose key evaluates to a Symbol touches this list. Lazily populated
+    /// (most objects have none → zero cost). Never enumerated by for-in / Object.keys (correct per spec).
+    symbol_props: std.ArrayListUnmanaged(SymbolProperty) = .empty,
+    /// §22.1.5/§23.1.5 native Array/String Iterator state — present iff this object is such an iterator
+    /// (its `next` native reads/advances it). Null for every ordinary object (zero cost).
+    iter: ?IterState = null,
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);
@@ -310,6 +348,80 @@ pub const Object = struct {
             .enumerable = enumerable,
             .configurable = configurable,
         });
+    }
+
+    // ── §6.1.7 Symbol-keyed own properties ──────────────────────────────────────
+    // A separate own-property store keyed by Symbol identity (pointer). Walks the prototype chain like
+    // the string-keyed ops; never enumerated. Linear scan (few symbol keys per object).
+
+    /// §10.1.8 [[Get]] for a Symbol key — own symbol property, else walk the prototype chain. Returns
+    /// the full descriptor + holder so the interpreter can invoke an accessor with the receiver.
+    pub fn getSymbolProp(self: *Object, key: *Symbol) ?Located {
+        var obj: ?*Object = self;
+        while (obj) |o| {
+            for (o.symbol_props.items) |*sp| {
+                if (sp.key == key) return .{ .pv = sp.pv, .holder = o };
+            }
+            obj = o.prototype;
+        }
+        return null;
+    }
+
+    /// §10.1.9 [[Set]]/define for a Symbol key — overwrite an existing own symbol data property
+    /// (honoring [[Writable]]) or append a new all-true data property. Accessor handling for symbol
+    /// keys is via the located descriptor (interpreter), mirroring the string path.
+    pub fn setSymbol(self: *Object, key: *Symbol, value: Value) std.mem.Allocator.Error!void {
+        for (self.symbol_props.items) |*sp| {
+            if (sp.key == key) {
+                switch (sp.pv.payload) {
+                    .data => {
+                        if (!sp.pv.writable) return; // §10.1.9.2: non-writable data rejects the write
+                        sp.pv.payload = .{ .data = value };
+                        return;
+                    },
+                    .accessor => {}, // replaced by an all-true data property below
+                }
+                sp.pv = PropertyValue.dataDefault(value);
+                return;
+            }
+        }
+        if (!self.extensible) return; // §10.1.9: no new props on a non-extensible object
+        try self.symbol_props.append(self.arena, .{ .key = key, .pv = PropertyValue.dataDefault(value) });
+    }
+
+    /// Create/replace a symbol-keyed own property with explicit attributes — used to install
+    /// well-known-symbol methods (e.g. `Array.prototype[Symbol.iterator]`, non-enumerable).
+    pub fn defineSymbolData(self: *Object, key: *Symbol, value: Value, writable: bool, enumerable: bool, configurable: bool) std.mem.Allocator.Error!void {
+        const pv: PropertyValue = .{ .payload = .{ .data = value }, .writable = writable, .enumerable = enumerable, .configurable = configurable };
+        for (self.symbol_props.items) |*sp| {
+            if (sp.key == key) {
+                sp.pv = pv;
+                return;
+            }
+        }
+        try self.symbol_props.append(self.arena, .{ .key = key, .pv = pv });
+    }
+
+    /// §13.2.5.6 a symbol-keyed accessor (`{ get [sym](){} }`) — merge `get`/`set` into the symbol slot
+    /// (mirrors `defineAccessor` for the string map). Enumerable + configurable, no [[Writable]].
+    pub fn defineSymbolAccessor(self: *Object, key: *Symbol, getter: ?*Object, setter: ?*Object) std.mem.Allocator.Error!void {
+        var acc: struct { get: ?*Object = null, set: ?*Object = null } = .{};
+        for (self.symbol_props.items) |*sp| {
+            if (sp.key == key) {
+                if (sp.pv.payload == .accessor) acc = .{ .get = sp.pv.payload.accessor.get, .set = sp.pv.payload.accessor.set };
+                break;
+            }
+        }
+        if (getter) |g| acc.get = g;
+        if (setter) |s| acc.set = s;
+        const pv: PropertyValue = .{ .payload = .{ .accessor = .{ .get = acc.get, .set = acc.set } }, .enumerable = true, .configurable = true };
+        for (self.symbol_props.items) |*sp| {
+            if (sp.key == key) {
+                sp.pv = pv;
+                return;
+            }
+        }
+        try self.symbol_props.append(self.arena, .{ .key = key, .pv = pv });
     }
 
     /// §13.2.5.6 PropertyDefinitionEvaluation for an accessor — merge `get`/`set` into the own
@@ -489,6 +601,7 @@ fn sameValueLoose(a: Value, b: Value) bool {
         .boolean => |x| b == .boolean and b.boolean == x,
         .number => |x| b == .number and (x == b.number or (std.math.isNan(x) and std.math.isNan(b.number))),
         .string => |x| b == .string and std.mem.eql(u8, x, b.string),
+        .symbol => |x| b == .symbol and b.symbol == x,
         .object => |x| b == .object and b.object == x,
     };
 }

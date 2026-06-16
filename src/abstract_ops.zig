@@ -17,6 +17,7 @@ pub fn toNumber(v: Value) f64 {
             if (t.len == 0) break :blk 0;
             break :blk std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
         },
+        .symbol => std.math.nan(f64), // §7.1.4: ToNumber(Symbol) throws — surfaced as NaN here (caller checks)
         .object => std.math.nan(f64), // ToPrimitive deferred → NaN
     };
 }
@@ -28,6 +29,7 @@ pub fn toBoolean(v: Value) bool {
         .boolean => |b| b,
         .number => |n| n != 0 and !std.math.isNan(n),
         .string => |s| s.len != 0,
+        .symbol => true, // §7.1.2: a Symbol is always truthy
         .object => true,
     };
 }
@@ -40,6 +42,13 @@ pub fn toString(arena: std.mem.Allocator, v: Value) error{OutOfMemory}![]const u
         .null => "null",
         .boolean => |b| if (b) "true" else "false",
         .number => |n| numberToString(arena, n),
+        // §7.1.17 ToString(Symbol) throws a TypeError; that throw is raised by the interpreter's
+        // `toString` wrapper before reaching here. This descriptive form is only a fallback for the
+        // ALLOWED conversions (`String(sym)` / `sym.toString()`), which route here deliberately.
+        .symbol => |s| if (s.description) |d|
+            try std.fmt.allocPrint(arena, "Symbol({s})", .{d})
+        else
+            "Symbol()",
         .object => |o| blk: {
             if (o.kind != .array) break :blk "[object Object]"; // §20.1.3.6 (ToPrimitive deferred)
             var buf: std.ArrayList(u8) = .empty;
@@ -86,6 +95,7 @@ pub fn typeOf(v: Value) []const u8 {
         .boolean => "boolean",
         .number => "number",
         .string => "string",
+        .symbol => "symbol", // §13.5.3
         .object => |o| if (o.kind == .function) "function" else "object",
     };
 }
@@ -122,6 +132,7 @@ pub fn strictEquals(l: Value, r: Value) bool {
         .boolean => |b| r == .boolean and r.boolean == b,
         .number => |n| r == .number and r.number == n,
         .string => |s| r == .string and std.mem.eql(u8, s, r.string),
+        .symbol => |s| r == .symbol and r.symbol == s, // §6.1.5: Symbols are equal iff the same identity
         .object => |o| r == .object and r.object == o, // reference equality
     };
 }

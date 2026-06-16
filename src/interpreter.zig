@@ -5,6 +5,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const Value = @import("value.zig").Value;
+const Symbol = @import("value.zig").Symbol;
 const Completion = @import("completion.zig").Completion;
 const Environment = @import("environment.zig").Environment;
 const object_mod = @import("object.zig");
@@ -267,22 +268,42 @@ pub const Interpreter = struct {
         return .{ .normal = .undefined };
     }
 
-    /// §14.7.5 `for (HEAD of EXPR)` — ForIn/OfHeadEvaluation (iterate) + ForIn/OfBodyEvaluation.
+    /// §14.7.5 `for (HEAD of EXPR)` — ForIn/OfHeadEvaluation (§7.4.2 GetIterator) + ForIn/OfBodyEvaluation,
+    /// driven by the real iterator protocol: `GetIterator(EXPR)`, then per iteration `IteratorStep` →
+    /// `IteratorValue` → bind to HEAD → run body, and `IteratorClose` (call `return()`) on an early exit
+    /// (`break`/`return`/`throw`). Any object with a `[Symbol.iterator]` works; Arrays/Strings use a fast
+    /// native iterator. A non-iterable operand → TypeError.
     fn evalForOf(self: *Interpreter, s: anytype, env: *Environment) EvalError!Completion {
         const rc = try self.evalExpr(s.right, env);
         if (rc.isAbrupt()) return rc;
-        // §14.7.5.6 → §7.4.2 GetIterator: a non-iterable operand is a TypeError. The M-subset iterates
-        // Arrays (elements) and Strings (characters) via the engine's spread model (`iterableToSlice`).
-        const items = try self.iterableToSlice(rc.normal);
-        if (items == null) return self.throwError("TypeError", "value is not iterable");
-        for (items.?) |v| {
+        const git = try self.getIterator(rc.normal);
+        const iterator = switch (git) {
+            .abrupt => |c| return c,
+            .iterator => |it| it,
+        };
+        while (true) {
+            const step = try self.iteratorStep(iterator);
+            const v = switch (step) {
+                .abrupt => |c| return c, // a throwing next() — already an abrupt completion
+                .done => break,
+                .value => |val| val,
+            };
             const hb = try self.bindForHead(s.head, v, env);
-            if (hb.completion.isAbrupt()) return hb.completion;
+            if (hb.completion.isAbrupt()) {
+                try self.iteratorClose(iterator); // §7.4.11 abrupt binding → close the iterator
+                return hb.completion;
+            }
             const bc = try self.evalStmt(s.body.*, hb.env);
             switch (bc) {
                 .normal, .cont => {},
-                .brk => break,
-                .ret, .throw => return bc,
+                .brk => {
+                    try self.iteratorClose(iterator); // §14.7.5.7 step 11.b.iii: break closes the iterator
+                    break;
+                },
+                .ret, .throw => {
+                    try self.iteratorClose(iterator);
+                    return bc;
+                },
             }
         }
         return .{ .normal = .undefined };
@@ -337,7 +358,7 @@ pub const Interpreter = struct {
                 if (oc.isAbrupt()) return oc;
                 const kc = try self.evalExpr(ix.key, env);
                 if (kc.isAbrupt()) return kc;
-                return self.setProperty(oc.normal, try self.toString(kc.normal), value);
+                return self.setPropertyV(oc.normal, kc.normal, value);
             },
             // §13.3.2 `obj.#x` as a destructuring target — write the private slot (TypeError if `obj`
             // lacks the brand). The `=` was not folded here (no default), so the node is `private_member`.
@@ -489,7 +510,7 @@ pub const Interpreter = struct {
                 if (oc.isAbrupt()) return oc;
                 const kc = try self.evalExpr(ix.key, env);
                 if (kc.isAbrupt()) return kc;
-                return self.getProperty(oc.normal, try self.toString(kc.normal));
+                return self.getPropertyV(oc.normal, kc.normal);
             },
             .assign_member => |am| {
                 const oc = try self.evalExpr(am.object, env);
@@ -505,7 +526,7 @@ pub const Interpreter = struct {
                 if (kc.isAbrupt()) return kc;
                 const vc = try self.evalExpr(ai.value, env);
                 if (vc.isAbrupt()) return vc;
-                return self.setProperty(oc.normal, try self.toString(kc.normal), vc.normal);
+                return self.setPropertyV(oc.normal, kc.normal, vc.normal);
             },
             .function => |f| return self.evalFunctionExpr(f, env),
             .class_expr => |c| return self.evalClass(c, env),
@@ -556,11 +577,10 @@ pub const Interpreter = struct {
                         if (oc.isAbrupt()) return oc;
                         const kc = try self.evalExpr(ix.key, env);
                         if (kc.isAbrupt()) return kc;
-                        const key = try self.toString(kc.normal);
-                        const cur = try self.getProperty(oc.normal, key);
+                        const cur = try self.getPropertyV(oc.normal, kc.normal);
                         if (cur.isAbrupt()) return cur;
                         const old = toNumber(cur.normal);
-                        const sc = try self.setProperty(oc.normal, key, .{ .number = old + delta });
+                        const sc = try self.setPropertyV(oc.normal, kc.normal, .{ .number = old + delta });
                         if (sc.isAbrupt()) return sc;
                         return .{ .normal = .{ .number = if (u.prefix) old + delta else old } };
                     },
@@ -586,7 +606,11 @@ pub const Interpreter = struct {
                     if (idx < t.exprs.len) {
                         const c = try self.evalExpr(t.exprs[idx], env);
                         if (c.isAbrupt()) return c;
-                        try buf.appendSlice(self.arena, try self.toString(c.normal));
+                        const s = try self.toStringCoerce(c.normal); // §13.2.8.5: ToString throws on a Symbol
+                        switch (s) {
+                            .abrupt => |a| return a,
+                            .string => |str| try buf.appendSlice(self.arena, str),
+                        }
                     }
                 }
                 return .{ .normal = .{ .string = buf.items } };
@@ -824,6 +848,8 @@ pub const Interpreter = struct {
         if (ctor.call) |fd| {
             if (fd.is_arrow) return self.throwError("TypeError", "value is not a constructor");
         }
+        // §20.4.1: the `Symbol` constructor has no [[Construct]] — `new Symbol()` is a TypeError.
+        if (ctor.native == .symbol_ctor) return self.throwError("TypeError", "Symbol is not a constructor");
         var proto: ?*Object = null;
         if (ctor.get("prototype")) |pv| {
             if (pv == .object) proto = pv.object;
@@ -965,10 +991,13 @@ pub const Interpreter = struct {
                     const fc = try self.evalExpr(p.value, env);
                     if (fc.isAbrupt()) return fc;
                     const f = fc.normal.object; // a `function` node always yields a function object
-                    if (p.kind == .get) {
-                        try obj.defineAccessor(key.key, f, null);
+                    const getter: ?*Object = if (p.kind == .get) f else null;
+                    const setter: ?*Object = if (p.kind == .set) f else null;
+                    if (key.symbol) |sym| {
+                        // §13.2.5: a symbol-keyed accessor → the symbol store (merged get+set).
+                        try obj.defineSymbolAccessor(sym, getter, setter);
                     } else {
-                        try obj.defineAccessor(key.key, null, f);
+                        try obj.defineAccessor(key.key, getter, setter);
                     }
                 },
                 .init => {
@@ -976,7 +1005,11 @@ pub const Interpreter = struct {
                     if (key.isAbrupt()) return key.completion;
                     const c = try self.evalExpr(p.value, env);
                     if (c.isAbrupt()) return c;
-                    try obj.set(key.key, c.normal);
+                    if (key.symbol) |sym| {
+                        try obj.setSymbol(sym, c.normal); // §13.2.5 symbol-keyed data property
+                    } else {
+                        try obj.set(key.key, c.normal);
+                    }
                 },
             }
         }
@@ -985,18 +1018,22 @@ pub const Interpreter = struct {
 
     const KeyResult = struct {
         key: []const u8 = "",
+        /// Non-null when a computed `[expr]` key evaluated to a Symbol (§13.2.5 ComputedPropertyName +
+        /// §7.1.19 ToPropertyKey) — the property is symbol-keyed, not string-keyed.
+        symbol: ?*Symbol = null,
         completion: Completion = .{ .normal = .undefined },
         fn isAbrupt(self: KeyResult) bool {
             return self.completion.isAbrupt();
         }
     };
 
-    /// Resolve a PropertyDefinition's key: a computed `[expr]` (evaluated + ToString'd) or the
-    /// static identifier/string/numeric key parsed earlier.
+    /// Resolve a PropertyDefinition's key: a computed `[expr]` (evaluated → §7.1.19 ToPropertyKey: a
+    /// Symbol stays a Symbol, else ToString) or the static identifier/string/numeric key parsed earlier.
     fn propKey(self: *Interpreter, p: ast.Property, env: *Environment) EvalError!KeyResult {
         if (p.computed_key) |ck| {
             const c = try self.evalExpr(ck, env);
             if (c.isAbrupt()) return .{ .completion = c };
+            if (c.normal == .symbol) return .{ .symbol = c.normal.symbol };
             return .{ .key = try self.toString(c.normal) };
         }
         return .{ .key = p.key };
@@ -1091,7 +1128,7 @@ pub const Interpreter = struct {
             .index => |key_node| {
                 const kc = try self.evalExpr(key_node, env);
                 if (kc.isAbrupt()) return .{ .completion = kc };
-                const gc = try self.getProperty(base.value, try self.toString(kc.normal));
+                const gc = try self.getPropertyV(base.value, kc.normal);
                 if (gc.isAbrupt()) return .{ .completion = gc };
                 return .{ .value = gc.normal, .this_val = base.value };
             },
@@ -1371,16 +1408,13 @@ pub const Interpreter = struct {
     fn evalSpreadList(self: *Interpreter, nodes: []const *const ast.Node, env: *Environment, out: *std.ArrayListUnmanaged(Value)) EvalError!Completion {
         for (nodes) |n| {
             if (n.* == .spread) {
+                // §13.2.4.1 SpreadElement — iterate the source via the full §7.4 protocol (Arrays/Strings
+                // fast-pathed inside `iterateToList`), appending each yielded value. Any object with a
+                // `[Symbol.iterator]` spreads; a non-iterable → TypeError.
                 const sc = try self.evalExpr(n.spread, env);
                 if (sc.isAbrupt()) return sc;
-                switch (sc.normal) {
-                    .object => |o| {
-                        if (o.kind != .array) return self.throwError("TypeError", "spread target is not iterable");
-                        for (o.elements.items) |el| try out.append(self.arena, el);
-                    },
-                    .string => |s| for (s, 0..) |_, i| try out.append(self.arena, .{ .string = s[i .. i + 1] }),
-                    else => return self.throwError("TypeError", "spread target is not iterable"),
-                }
+                const ic = try self.iterateToList(sc.normal, out);
+                if (ic.isAbrupt()) return ic;
             } else {
                 const c = try self.evalExpr(n, env);
                 if (c.isAbrupt()) return c;
@@ -1410,7 +1444,7 @@ pub const Interpreter = struct {
                 this_for_call = oc.normal;
                 const kc = try self.evalExpr(ix.key, env);
                 if (kc.isAbrupt()) return kc;
-                const got = try self.getProperty(oc.normal, try self.toString(kc.normal));
+                const got = try self.getPropertyV(oc.normal, kc.normal);
                 if (got.isAbrupt()) return got;
                 callee = got.normal;
             },
@@ -1569,11 +1603,12 @@ pub const Interpreter = struct {
                 return .{ .normal = .undefined };
             },
             .array => |ap| {
-                // §13.15.5.3 ArrayBindingPattern: pull values positionally from an iterable.
-                // We support Arrays and Strings as iterables (matching the engine's spread model).
-                const items = try self.iterableToSlice(value);
-                if (items == null) return self.throwError("TypeError", "value is not iterable");
-                const slice = items.?;
+                // §13.15.5.3 ArrayBindingPattern: pull values positionally from an iterable, materialized
+                // via the §7.4 iterator protocol (Arrays/Strings fast-pathed; any `[Symbol.iterator]` works).
+                var list: std.ArrayListUnmanaged(Value) = .empty;
+                const ic = try self.iterateToList(value, &list);
+                if (ic.isAbrupt()) return ic;
+                const slice = list.items;
                 for (ap.elements, 0..) |el, i| {
                     if (el.target == null) continue; // elision / hole — skip this position
                     var v: Value = if (i < slice.len) slice[i] else .undefined;
@@ -1654,11 +1689,12 @@ pub const Interpreter = struct {
     fn assignPattern(self: *Interpreter, target: *const ast.Node, value: Value, env: *Environment) EvalError!Completion {
         switch (target.*) {
             .array_literal => |elems| {
-                // §13.15.5.3 ArrayAssignmentPattern — pull positionally from the iterable (Arrays /
-                // Strings in the engine's iterable model).
-                const items = try self.iterableToSlice(value);
-                if (items == null) return self.throwError("TypeError", "value is not iterable");
-                const slice = items.?;
+                // §13.15.5.3 ArrayAssignmentPattern — pull positionally from the iterable, materialized
+                // via the §7.4 iterator protocol (Arrays/Strings fast-pathed; any `[Symbol.iterator]` works).
+                var list: std.ArrayListUnmanaged(Value) = .empty;
+                const ic = try self.iterateToList(value, &list);
+                if (ic.isAbrupt()) return ic;
+                const slice = list.items;
                 for (elems, 0..) |el, i| {
                     if (el.* == .elision) continue; // hole — skip this position
                     if (el.* == .spread) {
@@ -1763,7 +1799,7 @@ pub const Interpreter = struct {
                 if (kc.isAbrupt()) return kc;
                 const v = try self.applyDefault(value, ix.value, env);
                 if (v.isAbrupt()) return v;
-                return self.setProperty(oc.normal, try self.toString(kc.normal), v.normal);
+                return self.setPropertyV(oc.normal, kc.normal, v.normal);
             },
             .private_assign => |pa| {
                 const oc = try self.evalExpr(pa.object, env);
@@ -1789,24 +1825,6 @@ pub const Interpreter = struct {
         switch (target.*) {
             .array_literal, .object_literal => return self.assignPattern(target, value, env),
             else => return self.assignToTarget(target, value, env),
-        }
-    }
-
-    /// Materialize an iterable `value` into a slice of element Values, for array destructuring
-    /// (§13.15.5.3 IteratorBindingInitialization). Supports Arrays and Strings (the engine's
-    /// iterable model); returns null for non-iterables so the caller can throw a TypeError.
-    fn iterableToSlice(self: *Interpreter, value: Value) EvalError!?[]const Value {
-        switch (value) {
-            .object => |o| {
-                if (o.kind != .array) return null;
-                return o.elements.items;
-            },
-            .string => |s| {
-                var list: std.ArrayListUnmanaged(Value) = .empty;
-                for (0..s.len) |i| try list.append(self.arena, .{ .string = s[i .. i + 1] });
-                return list.items;
-            },
-            else => return null,
         }
     }
 
@@ -1841,6 +1859,17 @@ pub const Interpreter = struct {
                     return .{ .normal = if (i < s.len) .{ .string = s[i .. i + 1] } else .undefined };
                 }
                 if (self.stringProto()) |proto| {
+                    if (proto.get(key)) |m| return .{ .normal = m };
+                }
+                return .{ .normal = .undefined };
+            },
+            .symbol => |sym| {
+                // §20.4: transparent boxing — `sym.toString`/`valueOf` resolve on Symbol.prototype, and
+                // `sym.description` (§20.4.3.2) reads the [[Description]] directly.
+                if (std.mem.eql(u8, key, "description")) {
+                    return .{ .normal = if (sym.description) |d| .{ .string = d } else .undefined };
+                }
+                if (self.globalProto("Symbol")) |proto| {
                     if (proto.get(key)) |m| return .{ .normal = m };
                 }
                 return .{ .normal = .undefined };
@@ -1892,6 +1921,179 @@ pub const Interpreter = struct {
             },
             .undefined, .null => return self.throwError("TypeError", "Cannot set properties of null or undefined"),
             else => return .{ .normal = value },
+        }
+    }
+
+    /// §13.3.3 / §7.1.19 ToPropertyKey-aware [[Get]] for a computed key (`a[k]`). A Symbol key routes
+    /// to the symbol-keyed store (no ToString); any other key ToString's and takes the ordinary string
+    /// path (the hot path, unchanged). Keeps the string get fast — the symbol branch is taken only when
+    /// the key actually IS a Symbol.
+    fn getPropertyV(self: *Interpreter, base: Value, key: Value) EvalError!Completion {
+        if (key == .symbol) return self.getSymbolProperty(base, key.symbol);
+        return self.getProperty(base, try self.toString(key));
+    }
+
+    /// §13.3.3 ToPropertyKey-aware [[Set]] for a computed key (`a[k] = v`). Symbol → symbol store; else
+    /// ToString + the ordinary string path.
+    fn setPropertyV(self: *Interpreter, base: Value, key: Value, value: Value) EvalError!Completion {
+        if (key == .symbol) return self.setSymbolProperty(base, key.symbol, value);
+        return self.setProperty(base, try self.toString(key), value);
+    }
+
+    /// §10.1.8 [[Get]] for a Symbol key — own/inherited symbol property (data or accessor). A primitive
+    /// base with no symbol slot yields undefined; null/undefined throws (matching the string path).
+    fn getSymbolProperty(self: *Interpreter, base: Value, key: *Symbol) EvalError!Completion {
+        switch (base) {
+            .object => |o| {
+                const loc = o.getSymbolProp(key) orelse return .{ .normal = .undefined };
+                switch (loc.pv.payload) {
+                    .data => |v| return .{ .normal = v },
+                    .accessor => |a| {
+                        const getter = a.get orelse return .{ .normal = .undefined };
+                        return self.callFunction(getter, &.{}, base);
+                    },
+                }
+            },
+            .string => {
+                // §22.1: a primitive String boxes to String.prototype for symbol keys too (so
+                // `"ab"[Symbol.iterator]` resolves the iterator method).
+                if (self.stringProto()) |proto| {
+                    if (proto.getSymbolProp(key)) |loc| switch (loc.pv.payload) {
+                        .data => |v| return .{ .normal = v },
+                        .accessor => |a| {
+                            const getter = a.get orelse return .{ .normal = .undefined };
+                            return self.callFunction(getter, &.{}, base);
+                        },
+                    };
+                }
+                return .{ .normal = .undefined };
+            },
+            .undefined, .null => return self.throwError("TypeError", "Cannot read properties of null or undefined"),
+            else => return .{ .normal = .undefined },
+        }
+    }
+
+    /// §10.1.9 [[Set]] for a Symbol key — invoke an inherited setter if present, else define an own
+    /// symbol data property. Setting on null/undefined throws; on other primitives is a no-op.
+    fn setSymbolProperty(self: *Interpreter, base: Value, key: *Symbol, value: Value) EvalError!Completion {
+        switch (base) {
+            .object => |o| {
+                if (o.getSymbolProp(key)) |loc| {
+                    if (loc.pv.payload == .accessor) {
+                        const setter = loc.pv.payload.accessor.set orelse return .{ .normal = value };
+                        const sc = try self.callFunction(setter, &.{value}, base);
+                        if (sc.isAbrupt()) return sc;
+                        return .{ .normal = value };
+                    }
+                }
+                try o.setSymbol(key, value);
+                return .{ .normal = value };
+            },
+            .undefined, .null => return self.throwError("TypeError", "Cannot set properties of null or undefined"),
+            else => return .{ .normal = value },
+        }
+    }
+
+    // ── §7.4 Iteration protocol (Symbol.iterator) ───────────────────────────────
+
+    /// The realm's well-known `Symbol.iterator` identity (the same value held on the `Symbol`
+    /// constructor), used by GetIterator. Null only in a realm-less unit-test eval (no `Symbol`).
+    fn wellKnownIterator(self: *Interpreter) ?*Symbol {
+        const g = self.globals orelse return null;
+        const b = g.lookup("Symbol") orelse return null;
+        if (b.value != .object) return null;
+        const pv = b.value.object.get("iterator") orelse return null;
+        return if (pv == .symbol) pv.symbol else null;
+    }
+
+    const IterResult = union(enum) { iterator: *Object, abrupt: Completion };
+
+    /// §7.4.2 GetIterator ( obj ) — read `obj[Symbol.iterator]`, call it with `this` = obj, and
+    /// require the result to be an object (the iterator). Returns the iterator object, or an abrupt
+    /// completion (TypeError) if the value is not iterable. Null `iter_sym` (realm-less) → not iterable.
+    fn getIterator(self: *Interpreter, obj: Value) EvalError!IterResult {
+        const iter_sym = self.wellKnownIterator() orelse
+            return .{ .abrupt = try self.throwError("TypeError", "value is not iterable") };
+        const mc = try self.getSymbolProperty(obj, iter_sym);
+        if (mc.isAbrupt()) return .{ .abrupt = mc };
+        if (mc.normal != .object or mc.normal.object.kind != .function) {
+            return .{ .abrupt = try self.throwError("TypeError", "value is not iterable") };
+        }
+        const rc = try self.callFunction(mc.normal.object, &.{}, obj);
+        if (rc.isAbrupt()) return .{ .abrupt = rc };
+        if (rc.normal != .object) {
+            return .{ .abrupt = try self.throwError("TypeError", "Result of the Symbol.iterator method is not an object") };
+        }
+        return .{ .iterator = rc.normal.object };
+    }
+
+    const StepResult = union(enum) { value: Value, done, abrupt: Completion };
+
+    /// §7.4.4 IteratorStep + §7.4.5 IteratorValue — call `iterator.next()`, require an object result,
+    /// and return its `value` (or `.done` when `done` is truthy). An abrupt completion from `next` (or
+    /// a non-object result) propagates as `.abrupt`.
+    fn iteratorStep(self: *Interpreter, iterator: *Object) EvalError!StepResult {
+        const nc = try self.getProperty(.{ .object = iterator }, "next");
+        if (nc.isAbrupt()) return .{ .abrupt = nc };
+        if (nc.normal != .object or nc.normal.object.kind != .function) {
+            return .{ .abrupt = try self.throwError("TypeError", "iterator.next is not a function") };
+        }
+        const rc = try self.callFunction(nc.normal.object, &.{}, .{ .object = iterator });
+        if (rc.isAbrupt()) return .{ .abrupt = rc };
+        if (rc.normal != .object) {
+            return .{ .abrupt = try self.throwError("TypeError", "Iterator result is not an object") };
+        }
+        const result = rc.normal.object;
+        const dc = try self.getProperty(.{ .object = result }, "done");
+        if (dc.isAbrupt()) return .{ .abrupt = dc };
+        if (toBoolean(dc.normal)) return .done;
+        const vc = try self.getProperty(.{ .object = result }, "value");
+        if (vc.isAbrupt()) return .{ .abrupt = vc };
+        return .{ .value = vc.normal };
+    }
+
+    /// §7.4.11 IteratorClose ( iterator, completion ) — best-effort: call `iterator.return()` if it
+    /// exists, ignoring its result (the original completion is what matters). Called on an early exit
+    /// from a for-of loop (`break`/`return`/`throw`). A missing/non-callable `return` is a no-op.
+    fn iteratorClose(self: *Interpreter, iterator: *Object) EvalError!void {
+        const rc = try self.getProperty(.{ .object = iterator }, "return");
+        if (rc.isAbrupt()) return; // swallow — don't mask the original completion
+        if (rc.normal != .object or rc.normal.object.kind != .function) return;
+        // A throwing `return()` is swallowed (the original completion wins, §7.4.11 step 6); but an
+        // engine error (OOM / step-limit) still propagates via `try`.
+        _ = try self.callFunction(rc.normal.object, &.{}, .{ .object = iterator });
+    }
+
+    /// §7.4.1 GetIterator + drain — materialize an iterable `value` into a slice of its yielded values
+    /// via the full Symbol.iterator protocol. Used by spread / array destructuring (which need the
+    /// whole sequence up front). Arrays/Strings have native iterators (fast), but ANY object with a
+    /// `[Symbol.iterator]` returning a `next`-having object works. A non-iterable → abrupt TypeError.
+    fn iterateToList(self: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!Completion {
+        // Fast path: an Array iterates its `elements` directly (skips the per-element next() call),
+        // preserving the hot spread/destructuring path. Strings keep their native code-unit walk.
+        if (value == .object and value.object.kind == .array) {
+            for (value.object.elements.items) |el| try out.append(self.arena, el);
+            return .{ .normal = .undefined };
+        }
+        if (value == .string) {
+            const s = value.string;
+            for (0..s.len) |i| try out.append(self.arena, .{ .string = s[i .. i + 1] });
+            return .{ .normal = .undefined };
+        }
+        const git = try self.getIterator(value);
+        switch (git) {
+            .abrupt => |c| return c,
+            .iterator => |iterator| {
+                while (true) {
+                    const step = try self.iteratorStep(iterator);
+                    switch (step) {
+                        .abrupt => |c| return c,
+                        .done => break,
+                        .value => |v| try out.append(self.arena, v),
+                    }
+                }
+                return .{ .normal = .undefined };
+            },
         }
     }
 
@@ -1993,6 +2195,9 @@ pub const Interpreter = struct {
 
         switch (op) {
             .add => { // §13.8.1 Addition / §13.15.3 ApplyStringOrNumericBinaryOperator: concat if either is String, else numeric.
+                // §13.8.1: a Symbol operand makes ToString (string case) or ToNumber (numeric case)
+                // throw a TypeError — `sym + ""` / `"" + sym` / `sym + 1` are all errors.
+                if (l == .symbol or r == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a string");
                 if (l == .string or r == .string) {
                     const ls = try self.toString(l);
                     const rs = try self.toString(r);
@@ -2643,6 +2848,10 @@ pub const Interpreter = struct {
             .array_method => return builtin_array.call(self, func.native_name, this_val, args),
             .string_method => return builtin_string.call(self, func.native_name, this_val, args),
             .math_method => return self.mathMethod(func.native_name, args),
+            .array_values => return self.makeArrayIterator(this_val), // §23.1.3.34 / Array.prototype[Symbol.iterator]
+            .string_iterator => return self.makeStringIterator(this_val), // §22.1.3.36 String.prototype[Symbol.iterator]
+            .iterator_next => return self.iteratorNext(this_val), // §23.1.5.2.1 / §22.1.5.2.1 %…IteratorPrototype%.next
+            .symbol_to_string => return self.symbolToString(this_val), // §20.4.3.3 / §20.4.3.4
             else => {},
         }
         switch (func.native) {
@@ -2661,6 +2870,9 @@ pub const Interpreter = struct {
                 return .{ .normal = .{ .object = err } };
             },
             .string_ctor => {
+                // §22.1.1.1 String ( value ) — `String(sym)` is the ALLOWED Symbol→string conversion
+                // (SymbolDescriptiveString), so it routes through the infallible ToString, not the
+                // throwing coercion. Other values stringify normally.
                 const v: Value = if (args.len > 0) args[0] else .undefined;
                 return .{ .normal = .{ .string = try self.toString(v) } };
             },
@@ -2694,14 +2906,111 @@ pub const Interpreter = struct {
             .object_property_is_enumerable => return self.objectPropertyIsEnumerable(this_val, args),
             .object_is_prototype_of => return self.objectIsPrototypeOf(this_val, args),
             .function_method => return self.functionPrototypeMethod(func.native_name, this_val, args),
+            .symbol_ctor => return self.symbolConstructor(args), // §20.4.1.1 Symbol([description])
             .array_ctor, .array_method, .string_method, .math_method => unreachable, // handled in the first switch
+            .array_values, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
             .none => unreachable,
         }
     }
 
-    /// §7.1.17 ToString — delegates to the abstract operation (handles Array join).
+    // ── §20.4 Symbol + §22.1.5/§23.1.5 native iterators ─────────────────────────
+
+    /// §20.4.1.1 Symbol ( [ description ] ) — mint a fresh unique Symbol whose [[Description]] is
+    /// ToString(description) (or undefined when omitted). Called only as a function (`new Symbol()` is
+    /// rejected in `construct`).
+    fn symbolConstructor(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const desc: ?[]const u8 = if (args.len > 0 and args[0] != .undefined)
+            try self.toString(args[0]) // §20.4.1.1 step 2: ToString(description)
+        else
+            null;
+        const sym = try builtins.newSymbol(self.arena, desc);
+        return .{ .normal = .{ .symbol = sym } };
+    }
+
+    /// §20.4.3.3 Symbol.prototype.toString / §20.4.3.4 Symbol.prototype.valueOf — `this` must be a
+    /// Symbol; `toString` returns its SymbolDescriptiveString, `valueOf` the Symbol itself. (The
+    /// native_name selection is implicit: both share this handler, distinguished by the return.)
+    fn symbolToString(self: *Interpreter, this_val: Value) EvalError!Completion {
+        if (this_val != .symbol) return self.throwError("TypeError", "Symbol.prototype.toString requires that 'this' be a Symbol");
+        return .{ .normal = .{ .string = try self.toString(this_val) } };
+    }
+
+    /// §23.1.5.1 CreateArrayIterator — a fresh Array Iterator object (proto = %Object.prototype% in the
+    /// M-subset) carrying the array + cursor in its native `iter` slot, with a `next` method.
+    fn makeArrayIterator(self: *Interpreter, this_val: Value) EvalError!Completion {
+        if (this_val != .object) return self.throwError("TypeError", "Array.prototype.values requires an object");
+        const iter = try Object.create(self.arena, self.objectProto());
+        iter.iter = .{ .array = this_val.object, .cursor = 0 };
+        try self.installIteratorNext(iter);
+        return .{ .normal = .{ .object = iter } };
+    }
+
+    /// §22.1.5.1 CreateStringIterator — a fresh String Iterator object over the primitive string's
+    /// code units (M-subset: byte-at-a-time, matching the engine's String indexing model).
+    fn makeStringIterator(self: *Interpreter, this_val: Value) EvalError!Completion {
+        const s: []const u8 = switch (this_val) {
+            .string => |str| str,
+            else => return self.throwError("TypeError", "String.prototype[Symbol.iterator] requires a string"),
+        };
+        const iter = try Object.create(self.arena, self.objectProto());
+        iter.iter = .{ .string = s, .cursor = 0 };
+        try self.installIteratorNext(iter);
+        return .{ .normal = .{ .object = iter } };
+    }
+
+    /// Install the `next` native (non-enumerable) on a freshly created native iterator object. (The
+    /// M-subset puts `next` directly on the iterator; the real %ArrayIteratorPrototype% is deferred.)
+    fn installIteratorNext(self: *Interpreter, iter: *Object) EvalError!void {
+        const next_fn = try Object.createNative(self.arena, .iterator_next, "next");
+        next_fn.prototype = self.functionProto();
+        try iter.defineData("next", .{ .object = next_fn }, true, false, true);
+    }
+
+    /// §23.1.5.2.1 / §22.1.5.2.1 %…IteratorPrototype%.next — advance the native iterator and return a
+    /// fresh `{ value, done }` IteratorResult object. Reads/advances the `iter` slot; `{value:undefined,
+    /// done:true}` once exhausted.
+    fn iteratorNext(self: *Interpreter, this_val: Value) EvalError!Completion {
+        if (this_val != .object or this_val.object.iter == null) {
+            return self.throwError("TypeError", "next called on a non-iterator");
+        }
+        const st = &this_val.object.iter.?;
+        var value: Value = .undefined;
+        var done = true;
+        if (st.array) |arr| {
+            if (st.cursor < arr.elements.items.len) {
+                value = arr.elements.items[st.cursor];
+                st.cursor += 1;
+                done = false;
+            }
+        } else if (st.string) |s| {
+            if (st.cursor < s.len) {
+                value = .{ .string = s[st.cursor .. st.cursor + 1] };
+                st.cursor += 1;
+                done = false;
+            }
+        }
+        const result = try Object.create(self.arena, self.objectProto());
+        try result.set("value", value);
+        try result.set("done", .{ .boolean = done });
+        return .{ .normal = .{ .object = result } };
+    }
+
+    /// §7.1.17 ToString — delegates to the abstract operation (handles Array join). Used for property
+    /// keys and engine-internal stringification, where a Symbol never reaches it (computed keys route
+    /// to the symbol store first). The user-facing string COERCION contexts (template / `+`) use
+    /// `toStringCoerce`, which throws on a Symbol per spec.
     pub fn toString(self: *Interpreter, v: Value) EvalError![]const u8 {
         return ops.toString(self.arena, v);
+    }
+
+    const CoerceResult = union(enum) { string: []const u8, abrupt: Completion };
+
+    /// §7.1.17 ToString in a coercion context (template substitution, string `+`): a Symbol is a
+    /// TypeError (§7.1.17 step 3) — it must NOT be silently stringified. All other types delegate to
+    /// the ordinary ToString.
+    fn toStringCoerce(self: *Interpreter, v: Value) EvalError!CoerceResult {
+        if (v == .symbol) return .{ .abrupt = try self.throwError("TypeError", "Cannot convert a Symbol value to a string") };
+        return .{ .string = try self.toString(v) };
     }
 };
 

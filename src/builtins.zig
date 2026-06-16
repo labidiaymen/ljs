@@ -6,7 +6,18 @@
 //! resolve universally (M6 Cycle 2 — the propertyHelper.js unblock).
 const std = @import("std");
 const Object = @import("object.zig").Object;
+const Symbol = @import("value.zig").Symbol;
 const Environment = @import("environment.zig").Environment;
+
+/// Process-global Symbol id source — purely for display/debug; Symbol identity is by pointer.
+var symbol_id_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
+
+/// §6.1.5 mint a fresh unique Symbol with an optional description, allocated in the realm arena.
+pub fn newSymbol(arena: std.mem.Allocator, description: ?[]const u8) std.mem.Allocator.Error!*Symbol {
+    const s = try arena.create(Symbol);
+    s.* = .{ .id = symbol_id_counter.fetchAdd(1, .monotonic), .description = description };
+    return s;
+}
 
 pub const error_names = [_][]const u8{
     "Error",       "TypeError", "RangeError", "ReferenceError",
@@ -143,6 +154,51 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     }
     try defineMethod(arena, array_fn, "isArray", .array_method, "isArray");
     try env.declare("Array", .{ .object = array_fn }, true, true);
+
+    // §20.4 Symbol — the constructor (callable, NOT a constructor: `new Symbol` throws, §20.4.1) plus
+    // the well-known symbols held as own data properties (`Symbol.iterator`, …, §20.4.2). Each
+    // well-known symbol is a fresh unique identity; user code reads `Symbol.iterator` as an ordinary
+    // property, and the engine's GetIterator resolves the SAME identity (interpreter.wellKnownIterator).
+    const symbol_fn = try Object.createNative(arena, .symbol_ctor, "Symbol");
+    symbol_fn.prototype = function_proto; // §20.2.3 the Symbol constructor → %Function.prototype%
+    // §20.4.2 well-known symbols — installed non-writable/non-enumerable/non-configurable per spec.
+    const well_known = [_][]const u8{ "iterator", "asyncIterator", "toStringTag", "hasInstance" };
+    for (well_known) |name| {
+        const desc = try std.fmt.allocPrint(arena, "Symbol.{s}", .{name});
+        const sym = try newSymbol(arena, desc);
+        try symbol_fn.defineData(name, .{ .symbol = sym }, false, false, false);
+    }
+    // §20.4.3 Symbol.prototype — `toString`/`valueOf` (the only Symbol→string conversions allowed).
+    if (symbol_fn.get("prototype")) |pv| {
+        if (pv == .object) {
+            pv.object.prototype = object_proto; // §20.4.3 Symbol.prototype inherits %Object.prototype%
+            try defineMethod(arena, pv.object, "toString", .symbol_to_string, "toString");
+            try defineMethod(arena, pv.object, "valueOf", .symbol_to_string, "valueOf");
+        }
+    }
+    try env.declare("Symbol", .{ .object = symbol_fn }, true, true);
+
+    // §23.1.5.1 / §22.1.5.1 install the iteration protocol on Array.prototype / String.prototype:
+    // a `[Symbol.iterator]` method (non-enumerable) returning a native iterator object. Keyed by the
+    // SAME `Symbol.iterator` identity created above, so `arr[Symbol.iterator]` and the engine's
+    // GetIterator both find it. Array.prototype also exposes `.values` (the same native).
+    const iter_pv = symbol_fn.get("iterator") orelse unreachable; // just installed above
+    const iter_sym: *Symbol = iter_pv.symbol;
+    if (array_fn.get("prototype")) |pv| {
+        if (pv == .object) {
+            const values_fn = try Object.createNative(arena, .array_values, "[Symbol.iterator]");
+            values_fn.prototype = function_proto;
+            try pv.object.defineSymbolData(iter_sym, .{ .object = values_fn }, true, false, true);
+            try defineMethod(arena, pv.object, "values", .array_values, "values"); // §23.1.3.34
+        }
+    }
+    if (string_fn.get("prototype")) |pv| {
+        if (pv == .object) {
+            const siter_fn = try Object.createNative(arena, .string_iterator, "[Symbol.iterator]");
+            siter_fn.prototype = function_proto;
+            try pv.object.defineSymbolData(iter_sym, .{ .object = siter_fn }, true, false, true);
+        }
+    }
 
     // §21.3 Math — a namespace object (not a constructor): non-enumerable function-valued methods
     // (proto = %Object.prototype%). The minimal subset the harness needs: propertyHelper.js's
