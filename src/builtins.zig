@@ -158,6 +158,44 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try defineConstructorBackref(string_fn); // §22.1.3.1 String.prototype.constructor === String
     try env.declare("String", .{ .object = string_fn }, true, true);
 
+    // §21.1 Number( x ) — ToNumber (Number() → 0); constants + static predicates.
+    const number_fn = try Object.createNative(arena, .number_ctor, "Number");
+    number_fn.prototype = function_proto;
+    if (number_fn.get("prototype")) |pv| {
+        if (pv == .object) {
+            pv.object.prototype = object_proto; // §21.1.3 Number.prototype inherits %Object.prototype%
+            try defineMethod(arena, pv.object, "toString", .number_method, "toString");
+            try defineMethod(arena, pv.object, "valueOf", .number_method, "valueOf");
+        }
+    }
+    // §21.1.2 Number value properties (non-writable / non-enumerable / non-configurable).
+    try number_fn.defineData("MAX_SAFE_INTEGER", .{ .number = 9007199254740991 }, false, false, false);
+    try number_fn.defineData("MIN_SAFE_INTEGER", .{ .number = -9007199254740991 }, false, false, false);
+    try number_fn.defineData("MAX_VALUE", .{ .number = 1.7976931348623157e308 }, false, false, false);
+    try number_fn.defineData("MIN_VALUE", .{ .number = 5e-324 }, false, false, false);
+    try number_fn.defineData("POSITIVE_INFINITY", .{ .number = std.math.inf(f64) }, false, false, false);
+    try number_fn.defineData("NEGATIVE_INFINITY", .{ .number = -std.math.inf(f64) }, false, false, false);
+    try number_fn.defineData("NaN", .{ .number = std.math.nan(f64) }, false, false, false);
+    try number_fn.defineData("EPSILON", .{ .number = 2.220446049250313e-16 }, false, false, false);
+    for ([_][]const u8{ "isNaN", "isFinite", "isInteger", "isSafeInteger" }) |m| {
+        try defineMethod(arena, number_fn, m, .number_static, m); // §21.1.2.2–.5 (no coercion)
+    }
+    try defineConstructorBackref(number_fn); // §21.1.3.1 Number.prototype.constructor === Number
+    try env.declare("Number", .{ .object = number_fn }, true, true);
+
+    // §20.3 Boolean( x ) — ToBoolean.
+    const boolean_fn = try Object.createNative(arena, .boolean_ctor, "Boolean");
+    boolean_fn.prototype = function_proto;
+    if (boolean_fn.get("prototype")) |pv| {
+        if (pv == .object) {
+            pv.object.prototype = object_proto;
+            try defineMethod(arena, pv.object, "toString", .boolean_method, "toString");
+            try defineMethod(arena, pv.object, "valueOf", .boolean_method, "valueOf");
+        }
+    }
+    try defineConstructorBackref(boolean_fn); // §20.3.3.1 Boolean.prototype.constructor === Boolean
+    try env.declare("Boolean", .{ .object = boolean_fn }, true, true);
+
     // §23.1 Array — constructor, Array.prototype methods, Array.isArray. Array literals
     // proto-link to this Array.prototype (interpreter.arrayProto looks it up here).
     const array_fn = try Object.createNative(arena, .array_ctor, "Array");

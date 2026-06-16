@@ -771,6 +771,22 @@ test "M21 with statement: object environment record (§14.11)" {
     try expectSyntaxError("\"use strict\"; with ({}) {}"); // §14.11.1 strict-mode SyntaxError
 }
 
+test "M22 Number / Boolean constructors + Number statics (§21.1 / §20.3)" {
+    try expectNumber("Number('42') + 1", 43); // §21.1.1.1 ToNumber
+    try expectNumber("Number()", 0);
+    try expectBool("Boolean(0)", false); // §20.3.1.1 ToBoolean
+    try expectBool("Boolean('x')", true);
+    try expectBool("Number.isNaN(0 / 0)", true); // no coercion
+    try expectBool("Number.isNaN('NaN')", false); // a string is not NaN
+    try expectBool("Number.isFinite(1 / 0)", false);
+    try expectBool("Number.isInteger(4)", true);
+    try expectBool("Number.isInteger(4.5)", false);
+    try expectBool("Number.isSafeInteger(9007199254740991)", true);
+    try expectNumber("Number.MAX_SAFE_INTEGER", 9007199254740991);
+    try expectStr("typeof Number + typeof Boolean", "functionfunction");
+    try expectBool("Number.prototype.constructor === Number", true); // §21.1.3.1
+}
+
 test "M9 generators: function* returns a generator; .next drives yield (§15.5 / §27.5, US1-US2)" {
     // §15.5.4: calling a generator returns a generator object (the body does NOT run yet).
     try expectStr("function* g(){} typeof g", "function");

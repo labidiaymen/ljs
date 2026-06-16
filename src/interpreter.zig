@@ -5108,6 +5108,39 @@ pub const Interpreter = struct {
                 const v: Value = if (args.len > 0) args[0] else .undefined;
                 return .{ .normal = .{ .string = try self.toString(v) } };
             },
+            .number_ctor => return .{ .normal = .{ .number = if (args.len > 0) toNumber(args[0]) else 0 } }, // §21.1.1.1
+            .boolean_ctor => return .{ .normal = .{ .boolean = args.len > 0 and toBoolean(args[0]) } }, // §20.3.1.1
+            .number_static => { // §21.1.2.2–.5 isNaN/isFinite/isInteger/isSafeInteger — no coercion
+                const x: Value = if (args.len > 0) args[0] else .undefined;
+                const isnum = x == .number;
+                const v: f64 = if (isnum) x.number else 0;
+                const name = func.native_name;
+                const res = if (std.mem.eql(u8, name, "isNaN"))
+                    isnum and std.math.isNan(v)
+                else if (std.mem.eql(u8, name, "isFinite"))
+                    isnum and std.math.isFinite(v)
+                else if (std.mem.eql(u8, name, "isInteger"))
+                    isnum and std.math.isFinite(v) and @floor(v) == v
+                else // isSafeInteger
+                    isnum and std.math.isFinite(v) and @floor(v) == v and @abs(v) <= 9007199254740991;
+                return .{ .normal = .{ .boolean = res } };
+            },
+            .number_method => { // §21.1.3 Number.prototype.toString/valueOf (M-subset: primitive `this`)
+                const n: f64 = switch (this_val) {
+                    .number => |x| x,
+                    else => return self.throwError("TypeError", "Number.prototype method called on incompatible receiver"),
+                };
+                if (std.mem.eql(u8, func.native_name, "valueOf")) return .{ .normal = .{ .number = n } };
+                return .{ .normal = .{ .string = try self.toString(.{ .number = n }) } };
+            },
+            .boolean_method => { // §20.3.3 Boolean.prototype.toString/valueOf (M-subset: primitive `this`)
+                const b: bool = switch (this_val) {
+                    .boolean => |x| x,
+                    else => return self.throwError("TypeError", "Boolean.prototype method called on incompatible receiver"),
+                };
+                if (std.mem.eql(u8, func.native_name, "valueOf")) return .{ .normal = .{ .boolean = b } };
+                return .{ .normal = .{ .string = if (b) "true" else "false" } };
+            },
             .object_ctor => {
                 if (args.len > 0 and args[0] == .object) return .{ .normal = args[0] };
                 return .{ .normal = .{ .object = try Object.create(self.arena, null) } };

@@ -266,6 +266,12 @@ pub const NativeId = enum {
     function_proto_noop, // %Function.prototype% itself — a callable that returns undefined (§20.2.3)
     // §21.3 Math — `native_name` is the method (`pow`/`floor`/…). The Math namespace object holds these.
     math_method, // Math.<native_name>
+    // §21.1 Number / §20.3 Boolean — the constructors (callable conversion) + Number statics.
+    number_ctor, // Number( x ) — ToNumber (Number() → 0)
+    boolean_ctor, // Boolean( x ) — ToBoolean
+    number_static, // Number.<native_name> (isNaN/isFinite/isInteger/isSafeInteger/parseInt/parseFloat)
+    number_method, // Number.prototype.<native_name> (toString/valueOf)
+    boolean_method, // Boolean.prototype.<native_name> (toString/valueOf)
     // §20.4 Symbol (M8) — the constructor + Symbol.prototype.toString + the iterator natives.
     symbol_ctor, // Symbol([description]) — callable, not a constructor
     symbol_to_string, // Symbol.prototype.toString / Symbol.prototype.valueOf (native_name selects)
