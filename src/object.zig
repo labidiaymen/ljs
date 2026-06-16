@@ -33,6 +33,64 @@ pub const SymbolProperty = struct {
 
 pub const Kind = enum { ordinary, function, array };
 
+/// §27.2.6 [[PromiseState]] — a Promise is pending until settled, then fulfilled or rejected (once).
+pub const PromiseState = enum { pending, fulfilled, rejected };
+
+/// §27.2.1.2 a PromiseReaction record — one handler queued on a (still-pending) promise's fulfill or
+/// reject list. When the promise settles, each reaction becomes a Job (§27.2.2.1 NewPromiseReactionJob)
+/// enqueued on the realm Job queue. `handler` is the user `onFulfilled`/`onRejected` (null ⇒ the default
+/// "identity"/"thrower" pass-through, §27.2.4.7.1/.2); `capability` is the derived promise this reaction
+/// resolves/rejects (its resolve/reject functions), so `then` can chain.
+pub const PromiseReaction = struct {
+    /// Whether this reaction fires on fulfillment or rejection of the promise it's attached to.
+    kind: enum { fulfill, reject },
+    /// The user-supplied handler (`onFulfilled` / `onRejected`), or null for the default pass-through.
+    handler: ?*Object,
+    /// The capability (derived promise) this reaction settles. Null for a reaction with no derived
+    /// promise (e.g. the internal await reaction, which resumes a thread instead).
+    capability: ?*Object,
+    /// §27.7 await: when set, running this reaction resumes the async body thread `gen` with the
+    /// settlement value (fulfill → `.next(value)`; reject → `.throw(value)`) instead of calling a
+    /// handler / settling a capability. `capability`/`handler` are null in that case.
+    await_gen: ?*Generator = null,
+};
+
+/// §27.2.6 [[PromiseFulfillReactions]] / [[PromiseRejectReactions]] / [[PromiseResult]] state, present
+/// iff an Object is a Promise (`Object.promise != null`). Allocated in the realm arena.
+pub const PromiseData = struct {
+    state: PromiseState = .pending,
+    /// The settled value (fulfillment value or rejection reason); undefined while pending.
+    result: Value = .undefined,
+    /// §27.2.1.3.1 [[AlreadyResolved]] — a Promise's resolve/reject pair fires at most once. Set the
+    /// first time the promise is resolved OR rejected (through its resolving functions / then-adoption).
+    already_resolved: bool = false,
+    /// §27.2.6 the reaction records queued while pending; flushed (→ Jobs) on settlement, then cleared.
+    fulfill_reactions: std.ArrayListUnmanaged(PromiseReaction) = .empty,
+    reject_reactions: std.ArrayListUnmanaged(PromiseReaction) = .empty,
+};
+
+/// §9.5 a Job enqueued on the realm Job (microtask) queue. The engine drains the queue once the
+/// execution stack is empty. Two kinds (the two HostEnqueuePromiseJob callers in §27.2):
+///   • `.reaction` — §27.2.2.1 NewPromiseReactionJob: run a settled promise's reaction (call its
+///     handler / resume an awaiting body, then settle the derived capability).
+///   • `.thenable` — §27.2.2.2 NewPromiseResolveThenableJob: a promise was resolved with a thenable,
+///     so call `thenable.then(resolve, reject)` to adopt its eventual state.
+pub const Job = union(enum) {
+    reaction: struct {
+        reaction: PromiseReaction,
+        /// The settlement value passed to the handler / used to resume the awaiting body.
+        argument: Value,
+    },
+    thenable: struct {
+        /// The promise being resolved (whose resolving functions are handed to `then`).
+        promise: *Object,
+        /// The thenable object resolved-with.
+        thenable: Value,
+        /// Its `then` method (already extracted, §27.2.1.3.2).
+        then_fn: *Object,
+    },
+};
+
 /// §27.5 Generator object internal state ([[GeneratorState]]). A generator created by calling a
 /// `function*` starts `suspended_start`; `.next` spawns the body thread and runs it to the first
 /// `yield`/return (→ `suspended_yield` / `completed`); each subsequent `.next` resumes from a parked
@@ -84,6 +142,16 @@ pub const Generator = struct {
     /// cleanup so a never-consumed generator's thread does not linger). The body checks this after
     /// each resume and abandons execution if set.
     abandon: bool = false,
+    /// §27.7 set iff this suspension drives an ASYNC FUNCTION body (vs a `function*` generator). The
+    /// body suspends at each `await` via the same ping-pong handoff, but: (a) calling the function
+    /// runs the body immediately (to the first await / completion), it is NOT a lazy iterator; (b) the
+    /// terminal completion resolves/rejects `promise` instead of producing an IteratorResult; (c) a
+    /// suspension carries the awaited value out (so the caller can register reactions on it) rather
+    /// than yielding to a `.next` consumer.
+    is_async: bool = false,
+    /// §27.7 the Promise returned by the async function call — resolved on normal return, rejected on
+    /// an uncaught throw. Null for ordinary generators.
+    promise: ?*Object = null,
 };
 
 /// Built-in (Zig-implemented) function identity. Dispatched by the interpreter's callNative;
@@ -138,6 +206,24 @@ pub const NativeId = enum {
     // §27.5 Generator — %GeneratorPrototype% methods + [Symbol.iterator].
     generator_method, // %GeneratorPrototype%.next / .return / .throw (native_name selects)
     generator_iterator, // %GeneratorPrototype%[Symbol.iterator] — returns `this`
+    // §27.2 Promise — the constructor, prototype methods, and statics.
+    promise_ctor, // new Promise(executor)
+    promise_then, // Promise.prototype.then
+    promise_catch, // Promise.prototype.catch
+    promise_finally, // Promise.prototype.finally
+    promise_resolve, // Promise.resolve(x)
+    promise_reject, // Promise.reject(x)
+    /// §27.2.1.3 the resolve / reject functions passed to an executor (and to a thenable's `then`).
+    /// `promise_slot` (on the function object) is the promise they settle; `native_name` selects
+    /// "resolve" vs "reject". These also back the finally-handler thunks (native_name "finally_*").
+    promise_resolve_fn,
+    promise_reject_fn,
+    /// §27.2.5.3.1 the `finally` then-onFinally wrappers (value-thunk / thrower-thunk). `promise_slot`
+    /// carries the captured onFinally function via its `bound`-like slot; `native_name` selects which.
+    promise_finally_thunk,
+    /// Runner-injected `$DONE` (Test262 async completion callback). Not part of ECMA-262 — installed
+    /// only by the conformance runner to drive [async] tests; ordinary evals never see it.
+    test_done,
 };
 
 /// §10.4.1 A Bound Function Exotic Object's internal slots: the wrapped target, the bound `this`, and
@@ -179,10 +265,10 @@ pub const FunctionData = struct {
     /// object (it does NOT run the body); `yield` inside the body is the §14.4 yield operator. Ordinary
     /// functions and arrows leave this false (the hot call path is unchanged — no thread, no overhead).
     is_generator: bool = false,
-    /// §15.8: this function is async (`async function f(){}`, `async () => …`, `async m(){}`). The
-    /// async *runtime* (returning a Promise, the §15.8 await microtask machinery) is deferred to M11
-    /// Cycle 2; for now calling an async function raises a "not yet supported" runtime error (parse /
-    /// early-error tests never reach runtime, and the executable async tests are skipped by the runner).
+    /// §15.8: this function is async (`async function f(){}`, `async () => …`, `async m(){}`). Calling
+    /// it returns a Promise and runs the body on the generator thread substrate, suspending at each
+    /// `await` (§27.7; M11 Cycle 2). Ordinary functions/arrows leave this false (the hot call path takes
+    /// one extra optional-field branch after the `is_generator` check — no thread, no overhead).
     is_async: bool = false,
     /// §9.2.5 / §15.7.14 [[HomeObject]]: for a class/object method the object the method is defined
     /// on — its `.prototype` (instance method) or the constructor (static method). `super.x` inside
@@ -304,6 +390,17 @@ pub const Object = struct {
     /// Holds the suspendable-execution machinery (body thread + ping-pong semaphores). Null for every
     /// other object (zero cost). The %GeneratorPrototype% `next`/`return`/`throw` natives drive it.
     generator: ?*Generator = null,
+    /// §27.2.6 Promise state — present iff this object is a Promise (`new Promise`, `Promise.resolve`,
+    /// the result of `then`/`catch`/`finally`, or an async function's returned promise). Null for
+    /// every other object (zero cost). The %PromisePrototype% / Promise statics + the Job queue read it.
+    promise: ?*PromiseData = null,
+    /// §27.2.1.3 the promise a `promise_resolve_fn`/`promise_reject_fn` native settles — set on those
+    /// function objects only. (For a `promise_finally_thunk` it instead carries the captured constant
+    /// via `finally_value`.) Null for every other object.
+    promise_slot: ?*Object = null,
+    /// §27.2.5.3.1 the captured `onFinally` callback for a `promise_finally_thunk` native (or the
+    /// captured constant value to re-yield). Null elsewhere.
+    finally_value: ?*Object = null,
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);

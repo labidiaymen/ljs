@@ -219,6 +219,26 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     }
     try env.declare("%GeneratorPrototype%", .{ .object = gen_proto }, false, true);
 
+    // §27.2 Promise — the constructor + %PromisePrototype% (then/catch/finally) + the statics
+    // (resolve/reject). `new Promise(executor)` / `Promise.resolve` / `.then` produce Promise objects
+    // (proto = Promise.prototype); the async-function runtime + the microtask Job queue (interpreter)
+    // drive settlement. The constructor's `.prototype` IS %PromisePrototype% — also stashed under the
+    // sentinel global name so `interpreter.promiseProto` resolves it for engine-created promises.
+    const promise_fn = try Object.createNative(arena, .promise_ctor, "Promise");
+    promise_fn.prototype = function_proto; // §20.2.3 the Promise constructor → %Function.prototype%
+    if (promise_fn.get("prototype")) |pv| {
+        if (pv == .object) {
+            pv.object.prototype = object_proto; // §27.2.3.2 Promise.prototype inherits %Object.prototype%
+            try defineMethod(arena, pv.object, "then", .promise_then, "then"); // §27.2.5.4
+            try defineMethod(arena, pv.object, "catch", .promise_catch, "catch"); // §27.2.5.1
+            try defineMethod(arena, pv.object, "finally", .promise_finally, "finally"); // §27.2.5.3
+            try env.declare("%PromisePrototype%", .{ .object = pv.object }, false, true);
+        }
+    }
+    try defineMethod(arena, promise_fn, "resolve", .promise_resolve, "resolve"); // §27.2.4.5
+    try defineMethod(arena, promise_fn, "reject", .promise_reject, "reject"); // §27.2.4.4
+    try env.declare("Promise", .{ .object = promise_fn }, true, true);
+
     // §21.3 Math — a namespace object (not a constructor): non-enumerable function-valued methods
     // (proto = %Object.prototype%). The minimal subset the harness needs: propertyHelper.js's
     // `Math.pow(2, 32)` (§21.3.2.26); the common companions round out a usable surface for tests.

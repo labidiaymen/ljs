@@ -20,6 +20,81 @@ pub const EvaluationResult = union(enum) {
 
 pub const default_step_limit: u64 = 10_000_000;
 
+/// The classified result of a Test262 `[async]` test (driven via the runner-injected `$DONE`). The
+/// runner maps this to pass/fail. Not part of ECMA-262 — the conformance harness's async contract.
+pub const AsyncTestResult = union(enum) {
+    /// `$DONE` was called with no/undefined/falsy argument → the async test passed.
+    async_pass,
+    /// `$DONE` was called with a truthy argument (the failure value, stringified) → async fail.
+    async_fail: []const u8,
+    /// `$DONE` was NEVER called (after draining all microtasks) → the async test did not report → fail.
+    never_done,
+    /// The script failed to parse.
+    syntax_error: []const u8,
+    /// The step watchdog fired (runaway sync code OR microtask loop) → fail.
+    step_limit,
+    /// The synchronous script threw before reaching/arming the async machinery → fail.
+    sync_throw: Value,
+};
+
+/// Evaluate a Test262 `[async]` test: inject a native `$DONE(err)` global (the async completion
+/// callback) plus its shared sink, run the script, DRAIN the microtask Job queue (so async-function
+/// continuations and Promise reactions complete), then classify via whether/how `$DONE` was called.
+/// This is the engine surface the conformance runner uses for `[async]` tests (it no longer skips
+/// them). Deterministic — no real timers; the drain is step-bounded so a never-settling promise or a
+/// runaway microtask loop terminates rather than hangs.
+pub fn evaluateAsyncTest(arena: std.mem.Allocator, source: []const u8, mode: RunMode, step_limit: u64) error{OutOfMemory}!AsyncTestResult {
+    const interp_mod = @import("interpreter.zig");
+    const obj_mod = @import("object.zig");
+    const program = Parser.parseMode(arena, source, mode == .strict) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .syntax_error = @errorName(e) },
+    };
+    const global = Environment.create(arena, null) catch return error.OutOfMemory;
+    builtins.setup(arena, global) catch return error.OutOfMemory;
+    // Inject the native `$DONE` global (overriding any harness-defined one for the common case where
+    // the test references `$DONE` directly). It records completion on the shared sink the runner reads.
+    const done_sink = arena.create(interp_mod.AsyncDone) catch return error.OutOfMemory;
+    done_sink.* = .{};
+    const done_fn = obj_mod.Object.createNative(arena, .test_done, "$DONE") catch return error.OutOfMemory;
+    {
+        const fp = global.lookup("Function");
+        if (fp) |b| if (b.value == .object) {
+            if (b.value.object.get("prototype")) |pv| if (pv == .object) {
+                done_fn.prototype = pv.object;
+            };
+        };
+    }
+    global.declare("$DONE", .{ .object = done_fn }, true, true) catch return error.OutOfMemory;
+    var gen_registry: std.ArrayListUnmanaged(*obj_mod.Generator) = .empty;
+    var job_queue: std.ArrayListUnmanaged(obj_mod.Job) = .empty;
+    var interp = Interpreter{ .arena = arena, .step_limit = step_limit, .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue, .async_done = done_sink };
+    const completion = interp.run(program, global) catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
+    // A synchronous throw before the async machinery is armed → the test failed synchronously (unless
+    // it already reported via $DONE in a prior statement — the sink check below handles that order).
+    if (completion == .throw and !done_sink.called) {
+        interp.cleanupGenerators();
+        return .{ .sync_throw = completion.throw };
+    }
+    interp.drainJobs() catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
+    interp.cleanupGenerators();
+    if (!done_sink.called) return .never_done;
+    if (done_sink.failed) return .{ .async_fail = done_sink.message };
+    return .async_pass;
+}
+
 pub fn evaluate(arena: std.mem.Allocator, source: []const u8, mode: RunMode) error{OutOfMemory}!EvaluationResult {
     return evaluateWithLimit(arena, source, mode, default_step_limit);
 }
@@ -39,7 +114,10 @@ pub fn evaluateWithLimit(arena: std.mem.Allocator, source: []const u8, mode: Run
     // §27.5 generator registry — the main interpreter tracks every generator created in this realm so
     // any never-fully-consumed generator's parked body thread can be unwound + joined at end-of-run.
     var gen_registry: std.ArrayListUnmanaged(*@import("object.zig").Generator) = .empty;
-    var interp = Interpreter{ .arena = arena, .step_limit = step_limit, .globals = global, .gen_registry = &gen_registry };
+    // §9.5 the realm Job (microtask) queue — drained once the synchronous script completes (Promise
+    // reactions / async-function continuations run here). Empty for a script with no promises (no-op).
+    var job_queue: std.ArrayListUnmanaged(@import("object.zig").Job) = .empty;
+    var interp = Interpreter{ .arena = arena, .step_limit = step_limit, .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
     const completion = interp.run(program, global) catch |e| {
         interp.cleanupGenerators(); // join/abandon any parked generator threads before unwinding
         return switch (e) {
@@ -47,7 +125,17 @@ pub fn evaluateWithLimit(arena: std.mem.Allocator, source: []const u8, mode: Run
             error.StepLimitExceeded => .step_limit,
         };
     };
-    interp.cleanupGenerators(); // join/abandon any parked generator threads (no lingering OS thread)
+    // §9.5 RunJobs: drain the microtask queue (Promise reactions + await resumptions) now the stack is
+    // empty. Step-bounded — a runaway microtask loop terminates as `step_limit`, never hangs. A script
+    // with no promises has an empty queue (no-op; non-async tests classify exactly as before).
+    interp.drainJobs() catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
+    interp.cleanupGenerators(); // join/abandon any parked generator/async threads (no lingering OS thread)
     return switch (completion) {
         .normal => |v| .{ .normal = v },
         .throw => |v| .{ .thrown = v },
@@ -142,6 +230,41 @@ fn expectUndefined(src: []const u8) !void {
     defer arena_state.deinit();
     const r = try evaluate(arena_state.allocator(), src, .sloppy);
     try testing.expect(r == .normal and r.normal == .undefined);
+}
+
+/// Run `src` in a fresh realm, DRAIN the microtask Job queue (so Promise reactions / async
+/// continuations complete), then read the global variable `name`. Used by the async-runtime tests to
+/// observe a value a `.then`/async continuation writes AFTER the synchronous script returns (the
+/// microtask drain is the only deterministic post-script hook — no real timers). Mirrors
+/// `evaluateWithLimit` but keeps the realm env alive so the global is readable post-drain.
+fn evalGlobalAfterDrain(arena: std.mem.Allocator, src: []const u8, name: []const u8) !Value {
+    const program = try Parser.parseMode(arena, src, false);
+    const global = try Environment.create(arena, null);
+    try builtins.setup(arena, global);
+    var gen_registry: std.ArrayListUnmanaged(*@import("object.zig").Generator) = .empty;
+    var job_queue: std.ArrayListUnmanaged(@import("object.zig").Job) = .empty;
+    var interp = Interpreter{ .arena = arena, .step_limit = default_step_limit, .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
+    _ = try interp.run(program, global);
+    try interp.drainJobs();
+    interp.cleanupGenerators();
+    const b = global.lookup(name) orelse return .undefined;
+    return b.value;
+}
+
+fn expectGlobalNumberAfterDrain(src: []const u8, name: []const u8, want: f64) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const v = try evalGlobalAfterDrain(arena_state.allocator(), src, name);
+    try testing.expect(v == .number);
+    try testing.expectEqual(want, v.number);
+}
+
+fn expectGlobalStringAfterDrain(src: []const u8, name: []const u8, want: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const v = try evalGlobalAfterDrain(arena_state.allocator(), src, name);
+    try testing.expect(v == .string);
+    try testing.expectEqualStrings(want, v.string);
 }
 
 test "bindings: var/let/const, assignment, block scope (US1)" {
@@ -617,8 +740,53 @@ test "M11 async: function/arrow/method parse; typeof; runtime stub (§15.8, Cycl
     try expectNoSyntaxErrorStrict("class C { async m(){} }");
     try expectNoSyntaxErrorStrict("class C { static async m(){} }");
     try expectNoSyntaxErrorStrict("class C { async ['x'](){} }");
-    // Runtime deferred to Cycle 2: calling an async function throws the not-yet-supported stub.
-    try expectThrows("async function f(){ return 1; } f()");
+    // §27.7.5.1 (Cycle 2): calling an async function returns a Promise object (not a thrown stub).
+    try expectStr("async function f(){ return 1; } typeof f()", "object");
+    try expectBool("async function f(){ return 1; } f() instanceof Promise", true);
+}
+
+test "M11 async runtime: async fn returns a fulfilling Promise (§27.7.5)" {
+    // §27.7.5.2 a plain `return 42` fulfills the function's promise with 42 (observed via .then).
+    try expectGlobalNumberAfterDrain("var r; async function f(){ return 42; } f().then(function(v){ r = v; });", "r", 42);
+    // §27.7.5.3 a single `await` of a resolved promise yields the value; the body continues.
+    try expectGlobalNumberAfterDrain("var r; async function f(){ var x = await Promise.resolve(3); return x + 1; } f().then(function(v){ r = v; });", "r", 4);
+    // §27.7.5.3 await of a plain (non-promise) value resolves to that value.
+    try expectGlobalNumberAfterDrain("var r; async function f(){ return (await 7) + 1; } f().then(function(v){ r = v; });", "r", 8);
+}
+
+test "M11 async runtime: await of a rejected promise is catchable in the body (§27.7.5.3)" {
+    // §27.7.5.3 a rejected await throws into the body at the await point — a try/catch catches it.
+    try expectGlobalStringAfterDrain(
+        "var r; async function f(){ try { await Promise.reject('boom'); return 'no'; } catch (e) { return 'caught:' + e; } } f().then(function(v){ r = v; });",
+        "r",
+        "caught:boom",
+    );
+    // §27.7.5.2 an uncaught throw rejects the function's promise (observed via .catch / .then onRejected).
+    try expectGlobalStringAfterDrain(
+        "var r; async function f(){ throw 'oops'; } f().then(function(){ r = 'F'; }, function(e){ r = 'R:' + e; });",
+        "r",
+        "R:oops",
+    );
+}
+
+test "M11 Promise: then chaining, resolve adoption, microtask ordering (§27.2)" {
+    // §27.2.5.4 then returns a new promise; the chained handler sees the prior result + 1.
+    try expectGlobalNumberAfterDrain("var r; Promise.resolve(10).then(function(v){ return v + 5; }).then(function(v){ r = v; });", "r", 15);
+    // §27.2.1.3.2 resolving with a thenable adopts its eventual value (Promise.resolve(promise) flattens).
+    try expectGlobalNumberAfterDrain("var r; Promise.resolve(Promise.resolve(99)).then(function(v){ r = v; });", "r", 99);
+    // §9.5 microtasks run AFTER synchronous code: the sync assignment wins first, the reaction overwrites.
+    try expectGlobalStringAfterDrain("var log = ''; Promise.resolve().then(function(){ log = log + 'micro'; }); log = log + 'sync';", "log", "syncmicro");
+    // §27.2.5.1 catch handles a rejection; §27.2.5.3 finally passes the value through.
+    try expectGlobalStringAfterDrain("var r; Promise.reject('e').catch(function(x){ return 'C:' + x; }).then(function(v){ r = v; });", "r", "C:e");
+}
+
+test "M11 Promise: new Promise(executor) resolve/reject + executor throw (§27.2.3.1)" {
+    // §27.2.3.1 the executor's resolve fulfills the promise.
+    try expectGlobalNumberAfterDrain("var r; new Promise(function(res){ res(5); }).then(function(v){ r = v; });", "r", 5);
+    // §27.2.3.1 step 10: a throwing executor rejects the promise.
+    try expectGlobalStringAfterDrain("var r; new Promise(function(){ throw 'x'; }).then(function(){ r = 'F'; }, function(e){ r = 'R:' + e; });", "r", "R:x");
+    // §27.2.3.1 step 2: a non-callable executor is a TypeError.
+    try expectThrows("new Promise(42)");
 }
 
 test "M11 async: `await` as identifier outside async; operator only inside async (§15.8)" {

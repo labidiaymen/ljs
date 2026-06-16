@@ -28,6 +28,17 @@ const numberToString = ops.numberToString;
 
 pub const EvalError = error{ StepLimitExceeded, OutOfMemory };
 
+/// Test262 `[async]` completion state, written by the runner-injected `$DONE` native (`test_done`) and
+/// read by the runner after draining the Job queue. `called` distinguishes "never called" (→ fail:
+/// the async test never reported) from a real outcome; `failed` is true iff `$DONE` was called with a
+/// truthy argument (→ async fail), false for no/undefined/falsy (→ async pass). Not part of ECMA-262.
+pub const AsyncDone = struct {
+    called: bool = false,
+    failed: bool = false,
+    /// The string form of the failure argument (for diagnostics), valid when `failed`.
+    message: []const u8 = "",
+};
+
 pub const Interpreter = struct {
     arena: std.mem.Allocator,
     steps: u64 = 0,
@@ -58,6 +69,18 @@ pub const Interpreter = struct {
     /// it, so a never-fully-consumed generator does not leave a lingering OS thread. The body
     /// interpreters share the same registry pointer.
     gen_registry: ?*std.ArrayListUnmanaged(*object_mod.Generator) = null,
+    /// §9.5 the realm's Job (microtask) queue — a FIFO of PromiseReaction / PromiseResolveThenable jobs
+    /// enqueued by Promise settlement / resolution (HostEnqueuePromiseJob). The engine drains it once
+    /// the synchronous execution stack is empty (`drainJobs`). Shared (pointer) across the main and
+    /// async-body interpreters so a job enqueued on a body thread reaches the same queue. Null in a
+    /// realm-less unit eval (no promises → no jobs). The drain is bounded by the step limit (no hangs).
+    job_queue: ?*std.ArrayListUnmanaged(object_mod.Job) = null,
+    /// Test262 async completion sink — the runner injects a `$DONE(err)` global (native `test_done`)
+    /// for `[async]` tests; calling it records the outcome here, which the runner reads after draining
+    /// the Job queue (no arg / falsy → async pass; truthy → async fail). Shared (pointer) across the
+    /// main + async-body interpreters so a `$DONE` from inside a `.then` job is observed. Null for
+    /// ordinary evaluation (no `$DONE` installed → never written).
+    async_done: ?*AsyncDone = null,
     /// The process-global threaded Io — supplies the raw-OS-futex backing `std.Io.Semaphore.wait/post`
     /// for the generator ping-pong handoff. `global_single_threaded` spins up no thread pool (futex ops
     /// are pool-independent), so this is free for ordinary (non-generator) execution.
@@ -637,13 +660,16 @@ pub const Interpreter = struct {
                 return self.doYield(arg);
             },
             .await_expr => |operand| {
-                // §15.8 AwaitExpression — evaluate the operand (so side effects / errors surface),
-                // then raise the deferred-runtime error. The real Promise-resolution + microtask
-                // suspension is M11 Cycle 2; parse / early-error tests never reach here, and executable
-                // async tests are `[async]`-flagged and skipped by the runner.
+                // §27.7.5.3 AwaitExpression — evaluate the operand, then suspend the async body via the
+                // ping-pong handoff: the awaited value is carried out, the caller registers fulfill/
+                // reject reactions on PromiseResolve(value) that resume this body when it settles. Legal
+                // only on an async body thread (`current_gen.is_async`); the parser rejects `await`
+                // outside async, but guard defensively for a stray top-level await.
                 const oc = try self.evalExpr(operand, env);
                 if (oc.isAbrupt()) return oc;
-                return self.throwError("Error", "await is not yet supported at runtime (M11 Cycle 2)");
+                const cg = self.current_gen orelse return self.throwError("SyntaxError", "await outside an async function");
+                if (!cg.is_async) return self.throwError("SyntaxError", "await outside an async function");
+                return self.doAwait(oc.normal);
             },
             .call => |c| return self.evalCall(c, env),
             .new_expr => |n| return self.evalNew(n, env),
@@ -1626,10 +1652,11 @@ pub const Interpreter = struct {
         // Checked before the depth bump so it pays no recursion budget; ordinary functions skip it.
         if (func.call) |fd0| {
             if (fd0.is_generator and !fd0.is_async) return self.createGenerator(func, args, this_val);
-            // §15.8: an async function's [[Call]] returns a Promise and runs the body as a Job —
-            // deferred to M11 Cycle 2 (Promise + microtask queue). Parse / early-error tests never
-            // reach here; the executable async tests are `[async]`-flagged and skipped by the runner.
-            if (fd0.is_async) return self.throwError("Error", "async functions are not yet supported at runtime (M11 Cycle 2)");
+            // §27.7.5.1 an async function's [[Call]] returns a Promise immediately and runs the body on
+            // a generator-style thread, suspending at each `await`. (Async generators — both is_async
+            // and is_generator — are deferred; they currently fall through to this async path, running
+            // the body without a yield surface, which is acceptable until M11 Cycle 3.)
+            if (fd0.is_async) return self.callAsyncFunction(func, args, this_val);
         }
         // Each call stacks several heavy native frames — count call depth too so the guard
         // fires before the native stack overflows (these frames are bigger than expr frames).
@@ -2625,6 +2652,513 @@ pub const Interpreter = struct {
         }
     }
 
+    // ── §27.2 Promise + §9.5 Job (microtask) queue + §27.7 async functions ───────
+    //
+    // A Promise object carries a PromiseData slot (state / result / reaction lists). `then` queues a
+    // reaction; on settlement each reaction becomes a Job on the realm queue. The engine drains the
+    // queue once the synchronous stack is empty (`drainJobs`, step-bounded — no hangs). An async
+    // function reuses the GENERATOR thread substrate: its body runs on a std.Thread, suspending at each
+    // `await` via the ping-pong handoff (`Generator.is_async = true`); the awaited value is carried out,
+    // the caller registers fulfill/reject reactions on it, and the reaction Jobs resume the body thread.
+
+    /// %PromisePrototype% — the [[Prototype]] of every Promise object. Stashed under a sentinel global
+    /// name by `builtins.setup` (like %GeneratorPrototype%). Null only in a realm-less unit eval.
+    fn promiseProto(self: *Interpreter) ?*Object {
+        const g = self.globals orelse return null;
+        const b = g.lookup("%PromisePrototype%") orelse return null;
+        return if (b.value == .object) b.value.object else null;
+    }
+
+    /// §27.2.3.1 CreatePromise / NewPromiseCapability — a fresh pending Promise object (proto =
+    /// %PromisePrototype%) with empty reaction lists.
+    fn newPromise(self: *Interpreter) EvalError!*Object {
+        const obj = try Object.create(self.arena, self.promiseProto());
+        const pd = try self.arena.create(object_mod.PromiseData);
+        pd.* = .{};
+        obj.promise = pd;
+        return obj;
+    }
+
+    /// §9.5 HostEnqueuePromiseJob — append a Job to the realm's microtask FIFO (drained when the stack
+    /// is empty). A realm-less eval (no `job_queue`) silently drops it (no promises reach here).
+    fn enqueueJob(self: *Interpreter, job: object_mod.Job) EvalError!void {
+        const q = self.job_queue orelse return;
+        try q.append(self.arena, job);
+    }
+
+    /// §27.2.1.4 FulfillPromise — transition a pending promise to fulfilled with `value` and schedule
+    /// its fulfill reactions as Jobs (then clear both reaction lists).
+    fn fulfillPromise(self: *Interpreter, promise: *Object, value: Value) EvalError!void {
+        const pd = promise.promise.?;
+        if (pd.state != .pending) return;
+        pd.result = value;
+        pd.state = .fulfilled;
+        for (pd.fulfill_reactions.items) |reaction| {
+            try self.enqueueJob(.{ .reaction = .{ .reaction = reaction, .argument = value } });
+        }
+        pd.fulfill_reactions.clearRetainingCapacity();
+        pd.reject_reactions.clearRetainingCapacity();
+    }
+
+    /// §27.2.1.7 RejectPromise — transition a pending promise to rejected with `reason` and schedule
+    /// its reject reactions as Jobs.
+    fn rejectPromise(self: *Interpreter, promise: *Object, reason: Value) EvalError!void {
+        const pd = promise.promise.?;
+        if (pd.state != .pending) return;
+        pd.result = reason;
+        pd.state = .rejected;
+        for (pd.reject_reactions.items) |reaction| {
+            try self.enqueueJob(.{ .reaction = .{ .reaction = reaction, .argument = reason } });
+        }
+        pd.fulfill_reactions.clearRetainingCapacity();
+        pd.reject_reactions.clearRetainingCapacity();
+    }
+
+    /// §27.2.1.3.2 the resolve function's behavior — resolve `promise` with `resolution`. If
+    /// `resolution` is the promise itself → reject with a TypeError (chaining cycle). If it is a
+    /// thenable (an object with a callable `then`) → enqueue a PromiseResolveThenableJob to adopt its
+    /// eventual state. Otherwise fulfill with the value. `already_resolved` guards single settlement.
+    fn resolvePromise(self: *Interpreter, promise: *Object, resolution: Value) EvalError!void {
+        const pd = promise.promise.?;
+        if (pd.already_resolved) return;
+        pd.already_resolved = true;
+        // §27.2.1.3.2 step 6: resolving a promise with itself is a TypeError rejection.
+        if (resolution == .object and resolution.object == promise) {
+            const tc = try self.throwError("TypeError", "Chaining cycle detected for promise");
+            return self.rejectPromiseRaw(promise, tc.throw);
+        }
+        if (resolution != .object) return self.fulfillPromiseRaw(promise, resolution);
+        // §27.2.1.3.2 step 8–9: read `resolution.then`; a throw there rejects the promise.
+        const then_c = try self.getProperty(resolution, "then");
+        if (then_c.isAbrupt()) return self.rejectPromiseRaw(promise, then_c.throw);
+        const then_v = then_c.normal;
+        if (then_v != .object or !isCallable(then_v.object)) {
+            // §27.2.1.3.2 step 10: not a thenable → fulfill with the resolution value.
+            return self.fulfillPromiseRaw(promise, resolution);
+        }
+        // §27.2.1.3.2 step 12: a thenable → adopt its state via a job (calls then(resolve, reject)).
+        try self.enqueueJob(.{ .thenable = .{ .promise = promise, .thenable = resolution, .then_fn = then_v.object } });
+    }
+
+    /// Internal fulfill that bypasses the [[AlreadyResolved]] guard (used by `resolvePromise` after it
+    /// has claimed resolution). Identical to FulfillPromise.
+    fn fulfillPromiseRaw(self: *Interpreter, promise: *Object, value: Value) EvalError!void {
+        return self.fulfillPromise(promise, value);
+    }
+
+    /// Internal reject that ALSO marks already_resolved (the resolve-function path must block a later
+    /// resolve). Mirrors §27.2.1.3.1 setting [[AlreadyResolved]] before rejecting.
+    fn rejectPromiseRaw(self: *Interpreter, promise: *Object, reason: Value) EvalError!void {
+        promise.promise.?.already_resolved = true;
+        return self.rejectPromise(promise, reason);
+    }
+
+    /// Build a resolve or reject function object (§27.2.1.3) bound to `promise` via `promise_slot`.
+    fn makeResolvingFunction(self: *Interpreter, promise: *Object, id: object_mod.NativeId) EvalError!*Object {
+        const f = try Object.createNative(self.arena, id, "");
+        f.prototype = self.functionProto();
+        f.promise_slot = promise;
+        return f;
+    }
+
+    /// §27.2.4.7 PromiseResolve(x) — if `x` is already a promise, return it; otherwise wrap it in a
+    /// fresh resolved promise. Used by `Promise.resolve` and by `await` (§27.7.5.3 step 2). (M-subset:
+    /// no subclass/species — every promise is a %Promise%, so the "is it already a promise" test is the
+    /// `.promise != null` slot check.)
+    fn promiseResolveValue(self: *Interpreter, x: Value) EvalError!*Object {
+        if (x == .object and x.object.promise != null) return x.object;
+        const p = try self.newPromise();
+        try self.resolvePromise(p, x);
+        return p;
+    }
+
+    /// §27.2.5.4.1 PerformPromiseThen — attach a fulfill/reject reaction pair to `promise`, returning
+    /// the derived result promise (`capability`). If `promise` is already settled, the matching
+    /// reaction is enqueued as a Job immediately; otherwise it is appended to the pending list.
+    /// `on_fulfilled`/`on_rejected` are the user handlers (null ⇒ default pass-through). When
+    /// `result_promise` is provided it is used as the capability (so `await`/internal callers can pass
+    /// null for "no derived promise"); a normal `then` always creates one.
+    fn performPromiseThen(self: *Interpreter, promise: *Object, on_fulfilled: ?*Object, on_rejected: ?*Object, capability: ?*Object) EvalError!void {
+        const pd = promise.promise.?;
+        const fulfill_reaction: object_mod.PromiseReaction = .{ .kind = .fulfill, .handler = on_fulfilled, .capability = capability };
+        const reject_reaction: object_mod.PromiseReaction = .{ .kind = .reject, .handler = on_rejected, .capability = capability };
+        switch (pd.state) {
+            .pending => {
+                try pd.fulfill_reactions.append(self.arena, fulfill_reaction);
+                try pd.reject_reactions.append(self.arena, reject_reaction);
+            },
+            .fulfilled => try self.enqueueJob(.{ .reaction = .{ .reaction = fulfill_reaction, .argument = pd.result } }),
+            .rejected => try self.enqueueJob(.{ .reaction = .{ .reaction = reject_reaction, .argument = pd.result } }),
+        }
+    }
+
+    /// §27.2.2.1 PromiseReactionJob — run one settled-promise reaction (the body of a queued Job). For
+    /// a user handler: call it with the settlement value; resolve the derived capability with the
+    /// result (or reject it if the handler throws). For a DEFAULT handler (null): fulfill→resolve the
+    /// capability with the value; reject→reject it with the reason (§27.2.4.7.1/.2). For an AWAIT
+    /// reaction (`await_gen` set): resume the awaiting async body thread (fulfill→`.next(value)`,
+    /// reject→`.throw(value)`) instead. Runs on the MAIN interpreter while draining the queue.
+    fn runReactionJob(self: *Interpreter, reaction: object_mod.PromiseReaction, argument: Value) EvalError!void {
+        // §27.7.5.3 await: a reaction with no capability/handler resumes the parked async body thread.
+        if (reaction.await_gen) |gen| {
+            const kind: object_mod.ResumeKind = if (reaction.kind == .fulfill) .next else .throw;
+            return self.resumeAsync(gen, kind, argument);
+        }
+        const cap = reaction.capability;
+        if (reaction.handler) |h| {
+            const hc = try self.callFunction(h, &.{argument}, .undefined);
+            if (cap) |c| {
+                switch (hc) {
+                    .normal => |v| try self.resolvePromise(c, v),
+                    .throw => |e| try self.rejectPromiseRaw(c, e),
+                    else => {},
+                }
+            }
+            return;
+        }
+        // Default handler (§27.2.4.7.1 identity / §27.2.4.7.2 thrower).
+        if (cap) |c| switch (reaction.kind) {
+            .fulfill => try self.resolvePromise(c, argument),
+            .reject => try self.rejectPromiseRaw(c, argument),
+        };
+    }
+
+    /// §27.2.2.2 PromiseResolveThenableJob — `promise` was resolved with a thenable; call
+    /// `thenable.then(resolveFn, rejectFn)` so the thenable drives `promise`'s eventual settlement. A
+    /// throw from `then` rejects `promise`.
+    fn runThenableJob(self: *Interpreter, promise: *Object, thenable: Value, then_fn: *Object) EvalError!void {
+        const resolve_fn = try self.makeResolvingFunction(promise, .promise_resolve_fn);
+        const reject_fn = try self.makeResolvingFunction(promise, .promise_reject_fn);
+        const rc = try self.callFunction(then_fn, &.{ .{ .object = resolve_fn }, .{ .object = reject_fn } }, thenable);
+        if (rc == .throw) {
+            // §27.2.2.2 step 4: a throw from `then` rejects the promise (if not already resolved).
+            try self.resolvePromiseReject(promise, rc.throw);
+        }
+    }
+
+    /// Reject `promise` honoring [[AlreadyResolved]] (used when a thenable's `then` throws): only the
+    /// FIRST settlement wins, so a `then` that both called resolve and then threw is a no-op here.
+    fn resolvePromiseReject(self: *Interpreter, promise: *Object, reason: Value) EvalError!void {
+        const pd = promise.promise.?;
+        if (pd.already_resolved) return;
+        pd.already_resolved = true;
+        return self.rejectPromise(promise, reason);
+    }
+
+    /// §9.5 drain the Job (microtask) queue to completion: while non-empty, dequeue (FIFO) and run the
+    /// front job; each job may enqueue more. Bounded by the interpreter step limit — a runaway microtask
+    /// loop (e.g. a promise that re-schedules itself forever) terminates via StepLimitExceeded rather
+    /// than hanging. Runs on the MAIN interpreter after the synchronous script completes. A job that
+    /// throws unhandled is swallowed (an unhandled rejection is not a host error — there is no host).
+    pub fn drainJobs(self: *Interpreter) EvalError!void {
+        const q = self.job_queue orelse return;
+        var head: usize = 0;
+        while (head < q.items.len) {
+            try self.tick(); // §9.5 bound the drain by the step watchdog (no hangs)
+            const job = q.items[head];
+            head += 1;
+            switch (job) {
+                .reaction => |r| {
+                    // A reaction job may itself throw (the handler / await resume); swallow it — there
+                    // is no host to report an unhandled rejection to, and the derived promise (if any)
+                    // already captured the outcome inside runReactionJob.
+                    self.runReactionJob(r.reaction, r.argument) catch |e| {
+                        if (e == error.StepLimitExceeded) return e; // the watchdog must propagate
+                    };
+                },
+                .thenable => |t| {
+                    self.runThenableJob(t.promise, t.thenable, t.then_fn) catch |e| {
+                        if (e == error.StepLimitExceeded) return e;
+                    };
+                },
+            }
+            // Periodically compact the consumed prefix so a long-running drain doesn't grow unbounded.
+            if (head >= 256 and head * 2 >= q.items.len) {
+                std.mem.copyForwards(object_mod.Job, q.items[0 .. q.items.len - head], q.items[head..]);
+                q.items.len -= head;
+                head = 0;
+            }
+        }
+        q.clearRetainingCapacity();
+    }
+
+    // ── §27.7 async functions (thread-suspended body, await ↔ promise reactions) ─
+
+    /// §27.7.5.1 AsyncFunctionStart — calling an async function returns a Promise immediately and runs
+    /// the body on a generator-style thread. The body suspends at each `await`; on normal return the
+    /// promise fulfills, on an uncaught throw it rejects. Reuses the `Generator` substrate with
+    /// `is_async = true` and runs to the FIRST suspension (await) or completion synchronously (so the
+    /// returned promise is already settled when the body has no awaits).
+    fn callAsyncFunction(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
+        const promise = try self.newPromise();
+        const gen = try self.arena.create(object_mod.Generator);
+        const args_copy = try self.arena.dupe(Value, args);
+        gen.* = .{
+            .func = func,
+            .args = args_copy,
+            .this_val = this_val,
+            .home_object = if (func.call) |fd| fd.home_object else null,
+            .is_async = true,
+            .promise = promise,
+        };
+        if (self.gen_registry) |reg| try reg.append(self.arena, gen);
+        // §27.7.5.2 AsyncBlockStart: spawn the body thread and run it to the first await / completion.
+        gen.state = .executing;
+        gen.resume_kind = .next;
+        gen.sent_value = .undefined;
+        const t = std.Thread.spawn(.{}, asyncBodyThread, .{ self, gen }) catch {
+            gen.state = .completed;
+            return self.throwError("RangeError", "Cannot spawn async function thread");
+        };
+        gen.thread = t;
+        gen.to_caller.waitUncancelable(self.io); // wait for the first await suspension / completion
+        try self.settleAsyncTransfer(gen);
+        return .{ .normal = .{ .object = promise } };
+    }
+
+    /// Resume a suspended async body (from a settled-await reaction Job) with `kind`/`value`, run it to
+    /// the next await / completion, and process the resulting transfer. `.next` → the await evaluates to
+    /// `value`; `.throw` → the await throws `value` into the body.
+    fn resumeAsync(self: *Interpreter, gen: *object_mod.Generator, kind: object_mod.ResumeKind, value: Value) EvalError!void {
+        if (gen.state == .completed) return; // a settled body never resumes (defensive)
+        gen.state = .executing;
+        gen.resume_kind = kind;
+        gen.sent_value = value;
+        gen.resume_gen.post(self.io); // wake the parked await
+        gen.to_caller.waitUncancelable(self.io); // wait for the next await / completion
+        try self.settleAsyncTransfer(gen);
+    }
+
+    /// After an async body handoff: an `await` transfer (kind `.yield`) registers fulfill/reject
+    /// reactions on the awaited promise that will resume the body; a terminal `.ret`/`.throw` resolves
+    /// /rejects the function's promise and joins the thread (§27.7.5.2).
+    fn settleAsyncTransfer(self: *Interpreter, gen: *object_mod.Generator) EvalError!void {
+        switch (gen.transfer_kind) {
+            .yield => {
+                // §27.7.5.3 Await: `transfer_value` is the AWAITED value. Wrap it via PromiseResolve and
+                // register internal reactions that resume THIS body on settlement.
+                gen.state = .suspended_yield;
+                const awaited = try self.promiseResolveValue(gen.transfer_value);
+                const on_f: object_mod.PromiseReaction = .{ .kind = .fulfill, .handler = null, .capability = null, .await_gen = gen };
+                const on_r: object_mod.PromiseReaction = .{ .kind = .reject, .handler = null, .capability = null, .await_gen = gen };
+                const pd = awaited.promise.?;
+                switch (pd.state) {
+                    .pending => {
+                        try pd.fulfill_reactions.append(self.arena, on_f);
+                        try pd.reject_reactions.append(self.arena, on_r);
+                    },
+                    .fulfilled => try self.enqueueJob(.{ .reaction = .{ .reaction = on_f, .argument = pd.result } }),
+                    .rejected => try self.enqueueJob(.{ .reaction = .{ .reaction = on_r, .argument = pd.result } }),
+                }
+            },
+            .ret => {
+                gen.state = .completed;
+                if (gen.thread) |t| {
+                    t.join();
+                    gen.thread = null;
+                }
+                try self.resolvePromise(gen.promise.?, gen.transfer_value);
+            },
+            .throw => {
+                gen.state = .completed;
+                if (gen.thread) |t| {
+                    t.join();
+                    gen.thread = null;
+                }
+                // §27.7.5.2: an uncaught throw rejects the function's promise.
+                const promise = gen.promise.?;
+                const pd = promise.promise.?;
+                if (!pd.already_resolved) {
+                    pd.already_resolved = true;
+                    try self.rejectPromise(promise, gen.transfer_value);
+                }
+            },
+        }
+    }
+
+    /// The async-body thread entry (mirrors `generatorBodyThread`): a fresh per-body interpreter sharing
+    /// the arena + globals + job queue, with `current_gen` set so `await` reaches the handoff. Runs the
+    /// body and posts the terminal completion. Engine errors become a thrown completion.
+    fn asyncBodyThread(parent: *Interpreter, gen: *object_mod.Generator) void {
+        var body: Interpreter = .{
+            .arena = parent.arena,
+            .step_limit = parent.step_limit,
+            .globals = parent.globals,
+            .gen_registry = parent.gen_registry,
+            .job_queue = parent.job_queue,
+            .io = parent.io,
+            .current_gen = gen,
+        };
+        const comp = body.runGeneratorBody(gen) catch |e| blk: {
+            const kind: []const u8 = if (e == error.StepLimitExceeded) "RangeError" else "Error";
+            const msg: []const u8 = if (e == error.StepLimitExceeded) "step limit exceeded" else "out of memory";
+            const tc = body.throwError(kind, msg) catch break :blk Completion{ .throw = .undefined };
+            break :blk tc;
+        };
+        switch (comp) {
+            .normal => |v| {
+                gen.transfer_value = v;
+                gen.transfer_kind = .ret;
+            },
+            .ret => |v| {
+                gen.transfer_value = v;
+                gen.transfer_kind = .ret;
+            },
+            .throw => |v| {
+                gen.transfer_value = v;
+                gen.transfer_kind = .throw;
+            },
+            .brk, .cont => {
+                gen.transfer_value = .undefined;
+                gen.transfer_kind = .ret;
+            },
+        }
+        gen.to_caller.post(body.io);
+    }
+
+    /// §27.7.5.3 the `await x` runtime — on the async body thread: hand `x` (the awaited value) out via
+    /// the ping-pong handoff (`transfer_kind = .yield`, reusing `doYieldRaw`), park until the caller's
+    /// reaction Job resumes us with the settlement (`.next` value → await result; `.throw` reason →
+    /// throw at the await point). Only runs on an async body thread (`current_gen.is_async`).
+    fn doAwait(self: *Interpreter, value: Value) EvalError!Completion {
+        const r = self.doYieldRaw(value);
+        if (r.abandon) return .{ .ret = .undefined }; // realm teardown woke us to unwind
+        return switch (r.kind) {
+            .next => .{ .normal = r.value }, // §27.7.5.3: await evaluates to the fulfillment value
+            .throw => .{ .throw = r.value }, // a rejected await throws the reason into the body
+            .ret => .{ .ret = r.value }, // teardown injection (unwind, run finally blocks)
+        };
+    }
+
+    /// §27.2.3.1 the Promise constructor — `new Promise(executor)`: create a pending promise, build its
+    /// resolve/reject functions, call `executor(resolve, reject)`, and reject the promise if the
+    /// executor throws (§27.2.3.1 step 9–10). `executor` must be callable (§27.2.3.1 step 2 TypeError).
+    fn promiseConstructor(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const executor: Value = if (args.len > 0) args[0] else .undefined;
+        if (executor != .object or !isCallable(executor.object)) {
+            return self.throwError("TypeError", "Promise resolver is not a function");
+        }
+        const promise = try self.newPromise();
+        const resolve_fn = try self.makeResolvingFunction(promise, .promise_resolve_fn);
+        const reject_fn = try self.makeResolvingFunction(promise, .promise_reject_fn);
+        const rc = try self.callFunction(executor.object, &.{ .{ .object = resolve_fn }, .{ .object = reject_fn } }, .undefined);
+        if (rc == .throw) {
+            // §27.2.3.1 step 10: an executor that throws rejects the promise (unless already resolved).
+            const pd = promise.promise.?;
+            if (!pd.already_resolved) {
+                pd.already_resolved = true;
+                try self.rejectPromise(promise, rc.throw);
+            }
+        }
+        return .{ .normal = .{ .object = promise } };
+    }
+
+    /// §27.2.4.5 Promise.resolve(x) / §27.2.4.4 Promise.reject(r) — the `this`-static factories. resolve
+    /// returns `x` unchanged if it is already a promise, else a promise resolved with `x`; reject always
+    /// makes a fresh rejected promise.
+    fn promiseStaticResolve(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const x: Value = if (args.len > 0) args[0] else .undefined;
+        const p = try self.promiseResolveValue(x);
+        return .{ .normal = .{ .object = p } };
+    }
+    fn promiseStaticReject(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const r: Value = if (args.len > 0) args[0] else .undefined;
+        const p = try self.newPromise();
+        try self.rejectPromiseRaw(p, r);
+        return .{ .normal = .{ .object = p } };
+    }
+
+    /// §27.2.5.4 Promise.prototype.then(onFulfilled, onRejected) — `this` must be a promise; attach the
+    /// (callable-or-ignored) handlers and return the derived result promise.
+    fn promiseThen(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
+        if (this_val != .object or this_val.object.promise == null) {
+            return self.throwError("TypeError", "Promise.prototype.then called on a non-Promise");
+        }
+        const on_f = handlerArg(args, 0);
+        const on_r = handlerArg(args, 1);
+        const result = try self.newPromise();
+        try self.performPromiseThen(this_val.object, on_f, on_r, result);
+        return .{ .normal = .{ .object = result } };
+    }
+
+    /// §27.2.5.1 Promise.prototype.catch(onRejected) — `this.then(undefined, onRejected)`.
+    fn promiseCatch(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
+        const on_r = handlerArg(args, 0);
+        if (this_val != .object or this_val.object.promise == null) {
+            return self.throwError("TypeError", "Promise.prototype.catch called on a non-Promise");
+        }
+        const result = try self.newPromise();
+        try self.performPromiseThen(this_val.object, null, on_r, result);
+        return .{ .normal = .{ .object = result } };
+    }
+
+    /// §27.2.5.3 Promise.prototype.finally(onFinally) — `this.then(thunk, thrower)` where the thunks run
+    /// `onFinally()` and then pass through the original value / re-throw the reason. If `onFinally` is
+    /// not callable, both handlers are it (so `then` treats them as the default pass-through).
+    fn promiseFinally(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
+        if (this_val != .object or this_val.object.promise == null) {
+            return self.throwError("TypeError", "Promise.prototype.finally called on a non-Promise");
+        }
+        const on_finally: Value = if (args.len > 0) args[0] else .undefined;
+        const result = try self.newPromise();
+        if (on_finally != .object or !isCallable(on_finally.object)) {
+            // §27.2.5.3 step 6/8: a non-callable onFinally → both reactions are the default pass-through.
+            try self.performPromiseThen(this_val.object, null, null, result);
+            return .{ .normal = .{ .object = result } };
+        }
+        // §27.2.5.3.1/.2 the thunks: each captures onFinally; the value-thunk re-fulfills with the
+        // original value after onFinally(), the thrower-thunk re-throws the reason.
+        const value_thunk = try Object.createNative(self.arena, .promise_finally_thunk, "value");
+        value_thunk.prototype = self.functionProto();
+        value_thunk.finally_value = on_finally.object;
+        const thrower_thunk = try Object.createNative(self.arena, .promise_finally_thunk, "thrower");
+        thrower_thunk.prototype = self.functionProto();
+        thrower_thunk.finally_value = on_finally.object;
+        try self.performPromiseThen(this_val.object, value_thunk, thrower_thunk, result);
+        return .{ .normal = .{ .object = result } };
+    }
+
+    /// The finally value/thrower thunk body (§27.2.5.3.1/.2): call the captured onFinally(); on the
+    /// "value" thunk return the original argument (after awaiting onFinally is M-subset-simplified to a
+    /// synchronous call — onFinally's own promise is not awaited here); on "thrower" re-throw `arg`.
+    fn promiseFinallyThunk(self: *Interpreter, func: *Object, args: []const Value) EvalError!Completion {
+        const arg: Value = if (args.len > 0) args[0] else .undefined;
+        const on_finally = func.finally_value orelse return .{ .normal = arg };
+        const fc = try self.callFunction(on_finally, &.{}, .undefined);
+        if (fc == .throw) return fc; // onFinally threw → propagate (rejects the derived promise)
+        if (std.mem.eql(u8, func.native_name, "thrower")) return .{ .throw = arg };
+        return .{ .normal = arg };
+    }
+
+    /// The resolve/reject function bodies (§27.2.1.3.2 / §27.2.1.3.1) — settle the captured
+    /// `promise_slot` with the argument. resolve → ResolvePromise (thenable-aware); reject → RejectPromise.
+    fn promiseResolvingFn(self: *Interpreter, func: *Object, args: []const Value) EvalError!Completion {
+        const promise = func.promise_slot orelse return .{ .normal = .undefined };
+        const arg: Value = if (args.len > 0) args[0] else .undefined;
+        if (func.native == .promise_resolve_fn) {
+            try self.resolvePromise(promise, arg);
+        } else {
+            try self.resolvePromiseReject(promise, arg);
+        }
+        return .{ .normal = .undefined };
+    }
+
+    /// Runner-injected `$DONE(err)` (Test262 asyncHelpers.js / doneprintHandle.js contract): record the
+    /// async test's completion. No/undefined/falsy arg → async PASS; a truthy arg → async FAIL (with the
+    /// argument stringified for diagnostics). Only the FIRST call counts (a re-`$DONE` is ignored, per
+    /// the harness). Writes the shared `async_done` sink the runner reads after draining the Job queue.
+    fn testDone(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const sink = self.async_done orelse return .{ .normal = .undefined };
+        if (sink.called) return .{ .normal = .undefined }; // idempotent: first $DONE wins
+        sink.called = true;
+        const arg: Value = if (args.len > 0) args[0] else .undefined;
+        if (arg != .undefined and toBoolean(arg)) {
+            sink.failed = true;
+            sink.message = self.toString(arg) catch "async test failed";
+        }
+        return .{ .normal = .undefined };
+    }
+
     fn evalUnary(self: *Interpreter, op: ast.UnaryOp, operand: *const ast.Node, env: *Environment) EvalError!Completion {
         if (op == .typeof_) {
             // §13.5.3: typeof of an *unresolved* identifier is "undefined" — it must NOT throw
@@ -3400,6 +3934,15 @@ pub const Interpreter = struct {
                 return self.generatorResume(this_val, kind, arg);
             },
             .generator_iterator => return .{ .normal = this_val }, // §27.5.1.1 returns `this`
+            // §27.2 Promise — the prototype methods (need `this`) + the resolving/finally thunks.
+            .promise_then => return self.promiseThen(this_val, args),
+            .promise_catch => return self.promiseCatch(this_val, args),
+            .promise_finally => return self.promiseFinally(this_val, args),
+            .promise_resolve => return self.promiseStaticResolve(args),
+            .promise_reject => return self.promiseStaticReject(args),
+            .promise_resolve_fn, .promise_reject_fn => return self.promiseResolvingFn(func, args),
+            .promise_finally_thunk => return self.promiseFinallyThunk(func, args),
+            .test_done => return self.testDone(args),
             else => {},
         }
         switch (func.native) {
@@ -3455,9 +3998,12 @@ pub const Interpreter = struct {
             .object_is_prototype_of => return self.objectIsPrototypeOf(this_val, args),
             .function_method => return self.functionPrototypeMethod(func.native_name, this_val, args),
             .symbol_ctor => return self.symbolConstructor(args), // §20.4.1.1 Symbol([description])
+            .promise_ctor => return self.promiseConstructor(args), // §27.2.3.1 Promise(executor) called w/o new
             .array_ctor, .array_method, .string_method, .math_method => unreachable, // handled in the first switch
             .array_values, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
             .generator_method, .generator_iterator => unreachable, // handled in the first switch
+            .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch
+            .promise_resolve_fn, .promise_reject_fn, .promise_finally_thunk, .test_done => unreachable, // handled in the first switch
             .none => unreachable,
         }
     }
@@ -3562,6 +4108,22 @@ pub const Interpreter = struct {
         return .{ .string = try self.toString(v) };
     }
 };
+
+/// §7.2.3 IsCallable — true iff `obj` is a function object (an AST closure, native, or bound function;
+/// `kind == .function` covers all three). Used by the Promise machinery (executor / handlers / thenable
+/// `then` must be callable).
+fn isCallable(obj: *Object) bool {
+    return obj.kind == .function;
+}
+
+/// §27.2.5.4.1: a `then`/`catch` handler argument is used only if it is callable; a non-callable (incl.
+/// undefined) handler means "use the default pass-through" (null). Reads `args[idx]` (absent → null).
+fn handlerArg(args: []const Value, idx: usize) ?*Object {
+    if (idx >= args.len) return null;
+    const v = args[idx];
+    if (v == .object and isCallable(v.object)) return v.object;
+    return null;
+}
 
 /// §13.15.2: should a LogicalAssignment write, given the operator and the target's current value?
 ///   • `&&=` (and_)      — only when the current value is truthy.

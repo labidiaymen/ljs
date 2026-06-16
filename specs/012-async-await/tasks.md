@@ -73,8 +73,55 @@ microtask/Job queue + the await suspension) DEFERRED to Cycle 2.**
   the async RUNTIME — Promise, the microtask/Job queue, async-fn [[Call]] returning a Promise, the
   `await` suspension/resume, and the Test262 runner's `[async]` / `$DONE` support.
 
-## Cycle 2 — async RUNTIME (NEXT, not this cycle)
-- Promise (`%Promise%`, resolve/reject/then/catch/finally) + the microtask / Job queue.
-- AsyncFunction [[Call]] → returns a Promise; run the body, suspending at each `await` (resume on the
-  awaited value's settlement via a Job). AsyncGenerator (`async function*`) + `for await`.
-- Test262 runner: honor `[async]` / `$DONE` (drive the Job queue to completion, await `$DONE`).
+## Cycle 2 — async RUNTIME 🎯 (DONE)
+
+**Result (full `language/` tree, harness): passed 16,117 → 16,326 (+209), 47.0% → 37.4%. The `%`
+DROPPED only because un-skipping `[async]` tests changed the denominator — `skipped` fell 5,594 → 809
+(~4,785 previously-skipped async executables now RUN; many of the deferred ones — async generators,
+`for await` — fail), and `%` = passed/(passed+failed) so the added failures dilute it. The gate metric is
+`passed` (≥ 16,117) and the per-test regression diff, not the ratio. Regression hunt by `mode+path`
+(`--update-baseline` BEFORE vs AFTER + `comm`): 209 recoveries / 0 TRUE regressions. All 209 recoveries
+are async runtime: `statements/async-function` (44), `expressions/async-function` (30),
+`expressions/async-arrow-function` (26), `expressions/await` (10), async object/class methods (~50),
+forbidden-ext annex-B async (~25). Continuity `language/expressions`: 8,066 → 8,192 (+126). Bench:
+`perf: ok (no ljs-vs-self regression)`, ljs 0.2–0.6× Node — ordinary calls pay only one extra optional-
+field branch (the `is_async` test after the existing `is_generator` check); the Job drain on a
+promise-free script is a no-op (empty queue). NO HANGS: a never-settling `await` is reaped at realm
+teardown (reuses `cleanupGenerators`); a runaway microtask loop is bounded by the step watchdog
+(`drainJobs` ticks per job → `step_limit`, not a hang) — both verified.**
+
+- [x] **Promise core (§27.2)** — a Promise object (`Object.promise: ?*PromiseData` — state / result /
+  fulfill+reject reaction lists). `new Promise(executor)` (§27.2.3.1, executor `(resolve, reject)`,
+  executor-throw rejects); `Promise.prototype.then(onF, onR)` (§27.2.5.4, returns a derived promise,
+  schedules reactions as JOBS); `catch` (§27.2.5.1), `finally` (§27.2.5.3, value/thrower thunks);
+  `Promise.resolve(x)` (§27.2.4.5 — already-a-promise passthrough, thenable adoption) / `Promise.reject`
+  (§27.2.4.4). Resolving with a thenable schedules a PromiseResolveThenableJob (§27.2.1.3.2). Single
+  settlement via `[[AlreadyResolved]]`.
+- [x] **Microtask / Job queue (§9.5)** — a FIFO (`Interpreter.job_queue`, shared across the main +
+  async-body interpreters). `enqueueJob` (HostEnqueuePromiseJob); `drainJobs` runs the queue to empty
+  after the script returns (engine), step-bounded (no hangs), compacting the consumed prefix. Reaction
+  jobs (§27.2.2.1) + thenable jobs (§27.2.2.2).
+- [x] **Async function runtime (§27.7)** — calling an `is_async` function returns a Promise immediately
+  and runs the body on the GENERATOR thread substrate (`Generator.is_async = true`, reusing the
+  ping-pong handoff + teardown). `await x`: PromiseResolve(x), suspend the body (carry the value out),
+  register internal fulfill/reject reactions that RESUME the body thread (fulfill → await value; reject
+  → throw at the await). Normal return resolves / uncaught throw rejects the function's promise. Async
+  arrows + async methods (object/class, static/computed) reuse the same path.
+- [x] **Runner `[async]` support** — the runner no longer SKIPS `meta.flags.is_async`; `evaluateAsyncTest`
+  injects a native `$DONE(err)` global, runs, DRAINS the Job queue, and classifies: PASS iff `$DONE`
+  called with no/falsy arg; FAIL on a truthy arg, never-called, sync throw, parse error, or step-limit.
+  Non-async tests are unchanged (they drain a now-usually-empty queue — a no-op).
+- [x] **Tests (`src/engine.zig`, all green)** — async fn fulfills with the return value (42); `await`
+  of `Promise.resolve(3)` continues (→ 4); `await` of a rejected promise is `try/catch`-catchable;
+  uncaught async throw rejects (observed via `.then` onRejected); `then` chaining, thenable adoption,
+  microtask-after-sync ordering, `catch`/`finally`; `new Promise` resolve/reject + executor-throw +
+  non-callable-executor TypeError. A post-drain global-read test helper (`evalGlobalAfterDrain`) gives
+  deterministic assertions (no real timers).
+
+**Deferred (note, not attempted this cycle):** `Promise.all`/`race`/`allSettled`/`any`; async
+generators (`async function*` — currently routed through the plain-async path: the body runs but `yield`
+has no async-generator surface) + `for await`; AsyncFromSyncIterator; Promise subclassing / `@@species`;
+`globalThis` (so `asyncHelpers.js`'s `asyncTest` — which checks `globalThis.$DONE` ownership — works;
+those ~127 tests fail rather than pass, but were skipped before so it's not a regression). The
+`finally` onFinally is called synchronously (its returned promise is not awaited) — a minor §27.2.5.3.1
+simplification.

@@ -10,6 +10,8 @@ pub const RunMode = engine.RunMode;
 pub const EvaluationResult = engine.EvaluationResult;
 pub const evaluate = engine.evaluate;
 pub const evaluateWithLimit = engine.evaluateWithLimit;
+pub const evaluateAsyncTest = engine.evaluateAsyncTest;
+pub const AsyncTestResult = engine.AsyncTestResult;
 pub const default_step_limit = engine.default_step_limit;
 
 test {

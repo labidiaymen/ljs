@@ -105,9 +105,9 @@ pub const Node = union(enum) {
     yield_expr: struct { argument: ?*const Node, delegate: bool },
     /// §15.8 AwaitExpression — `await UnaryExpression`. Legal only inside an async function / async
     /// arrow / async method body (a parse-phase SyntaxError otherwise, §15.8.1). Parses at the
-    /// UnaryExpression precedence level (like a prefix unary operator). The async *runtime* (Promise
-    /// resolution + the microtask/Job queue) is deferred to M11 Cycle 2; evaluating this node before
-    /// then raises a "not yet supported" error (parse/early-error tests never reach runtime).
+    /// UnaryExpression precedence level (like a prefix unary operator). At runtime (§27.7.5.3, M11
+    /// Cycle 2) it suspends the async body via the generator thread substrate and resumes on the
+    /// awaited value's settlement (a fulfill/reject reaction Job on PromiseResolve(value)).
     await_expr: *const Node,
 };
 
@@ -200,7 +200,8 @@ pub const Function = struct {
     /// (`async function f(){}`, `async () => …`, `async m(){}`). When set, `await` is the §15.8
     /// operator inside the body. May combine with `is_generator` (§15.6 AsyncGeneratorDeclaration
     /// `async function* g(){}`, where both `await` and `yield` are operators) and with `is_arrow`
-    /// (async arrows). The async *runtime* (returning a Promise) is deferred to M11 Cycle 2.
+    /// (async arrows). At runtime (M11 Cycle 2) calling it returns a Promise and runs the body on the
+    /// generator thread substrate, suspending at each `await` (§27.7).
     is_async: bool = false,
 };
 

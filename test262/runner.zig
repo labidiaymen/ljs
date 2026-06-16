@@ -66,8 +66,10 @@ fn readHarness(io: std.Io, arena: Allocator, hdir: []const u8, name: []const u8)
 fn runOne(io: std.Io, arena: Allocator, opts: Options, prelude: []const u8, source: []const u8, path: []const u8, report: *rep.Report) RunError!void {
     const meta = md.parse(arena, source) catch return; // not a test (no frontmatter) → skip silently
 
-    // Unsupported execution modes at M1 → skip (not fail).
-    if (meta.flags.module or meta.flags.is_async) {
+    // Module linking is still unsupported at M11 → skip (not fail). `[async]` tests are now RUN
+    // (M11 Cycle 2): the engine injects a `$DONE` callback, drains the microtask Job queue, and the
+    // outcome is classified below — no longer skipped.
+    if (meta.flags.module) {
         try report.add(.{ .path = path, .mode = .strict, .outcome = .skip, .reason = .unsupported_flag });
         return;
     }
@@ -89,8 +91,44 @@ fn runOne(io: std.Io, arena: Allocator, opts: Options, prelude: []const u8, sour
 fn execOne(io: std.Io, arena: Allocator, opts: Options, prelude: []const u8, meta: md.Metadata, source: []const u8, path: []const u8, mode: Mode, report: *rep.Report) RunError!void {
     const full = try buildSource(io, arena, opts, prelude, meta, source, mode);
     const engine_mode: ljs.RunMode = if (mode == .strict) .strict else .sloppy;
+    // §[async]: drive the test through the $DONE / microtask-drain path; a parse-negative async test
+    // still classifies on the parse error (handled in classifyAsync).
+    if (meta.flags.is_async) {
+        const ar = try ljs.evaluateAsyncTest(arena, full, engine_mode, opts.step_limit);
+        try report.add(classifyAsync(meta, ar, mode, path));
+        return;
+    }
     const result = try ljs.evaluateWithLimit(arena, full, engine_mode, opts.step_limit);
     try report.add(classify(meta, result, mode, path));
+}
+
+/// Classify an `[async]` test result (§ Test262 async contract): PASS iff `$DONE` was called with no
+/// error; FAIL if called with an error, never called, threw synchronously, parse-errored, or hit the
+/// step watchdog. A `negative: parse` async test passes on a syntax_error (some async tests are
+/// parse-negatives that still carry the flag).
+fn classifyAsync(meta: md.Metadata, ar: ljs.AsyncTestResult, mode: Mode, path: []const u8) TestResult {
+    const r = struct {
+        fn mk(p: []const u8, m: Mode, o: Outcome, reason: Reason) TestResult {
+            return .{ .path = p, .mode = m, .outcome = o, .reason = reason };
+        }
+    };
+    // A parse-phase negative async test passes precisely when the source fails to parse.
+    if (meta.negative) |neg| {
+        if (neg.phase == .parse) {
+            return switch (ar) {
+                .syntax_error => r.mk(path, mode, .pass, .none),
+                else => r.mk(path, mode, .fail, .no_error_expected_throw),
+            };
+        }
+    }
+    return switch (ar) {
+        .async_pass => r.mk(path, mode, .pass, .none),
+        .async_fail => r.mk(path, mode, .fail, .unexpected_error),
+        .never_done => r.mk(path, mode, .fail, .no_error_expected_throw),
+        .sync_throw => r.mk(path, mode, .fail, .unexpected_error),
+        .syntax_error => r.mk(path, mode, .fail, .parse_error),
+        .step_limit => r.mk(path, mode, .fail, .step_limit),
+    };
 }
 
 /// Assemble the source fed to the engine (INTERPRETING.md): strict prologue (non-raw strict),
