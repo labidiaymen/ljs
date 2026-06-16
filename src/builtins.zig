@@ -39,6 +39,9 @@ var function_proto: ?*Object = null;
 fn defineMethod(arena: std.mem.Allocator, target: *Object, name: []const u8, id: NativeId, native_name: []const u8) std.mem.Allocator.Error!void {
     const fn_obj = try Object.createNative(arena, id, native_name);
     fn_obj.prototype = function_proto;
+    // §20.2.4.2: a built-in method's `name` own property is its property key (non-enumerable,
+    // non-writable, configurable). (`length` per-native is deferred — see specs/015 spec.md.)
+    try fn_obj.defineData("name", .{ .string = name }, false, false, true);
     try target.defineData(name, .{ .object = fn_obj }, true, false, true);
 }
 

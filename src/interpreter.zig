@@ -152,6 +152,10 @@ pub const Interpreter = struct {
                         const c = try self.evalExpr(ie, env);
                         if (c.isAbrupt()) return c;
                         v = c.normal;
+                        // §8.4 NamedEvaluation: `let f = function(){}` / `() => {}` / `class {}` — an
+                        // anonymous function/class initializer of a single-identifier binding gets the
+                        // binding name. (Pattern targets are not naming contexts.)
+                        if (dec.target.* == .identifier) try self.maybeSetAnonName(ie, v, dec.target.identifier);
                     }
                     // Fast path: a plain `var x = …` binds directly, skipping pattern matching so
                     // the common case pays no destructuring cost (perf gate).
@@ -175,6 +179,9 @@ pub const Interpreter = struct {
                 // §15.2 — bind a function object to its name in the current scope.
                 const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env, .is_generator = f.is_generator, .is_async = f.is_async });
                 obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
+                // §20.2.4.1/.2: a declaration always has a name; install `length` + `name`.
+                try setFunctionLength(obj, paramCount(f.params));
+                try self.setFunctionName(obj, f.name orelse "", "");
                 if (f.name) |name| try env.declare(name, .{ .object = obj }, true, true);
                 return .{ .normal = .undefined };
             },
@@ -641,6 +648,8 @@ pub const Interpreter = struct {
                 // §13.15.2 AssignmentExpression; mutation via §6.2.5.6 PutValue (identifier target).
                 const c = try self.evalExpr(a.value, env);
                 if (c.isAbrupt()) return c;
+                // §13.15.2 / §8.4: `f = function(){}` (anonymous RHS, identifier LHS) → NamedEvaluation.
+                try self.maybeSetAnonName(a.value, c.normal, a.name);
                 const b = env.lookup(a.name) orelse return self.throwError("ReferenceError", a.name);
                 if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
                 b.value = c.normal;
@@ -1148,8 +1157,12 @@ pub const Interpreter = struct {
                 const ic = try self.evalExpr(ie, field_env);
                 if (ic.isAbrupt()) return ic;
                 v = ic.normal;
+                // §15.7.10 / §8.4 NamedEvaluation: a field with an anonymous function/class initializer
+                // gets the field name (string key, or "[desc]" for a symbol-keyed field).
+                const fname = if (field.key_symbol) |sym| try self.symbolPropName(sym) else field.key;
+                try self.maybeSetAnonName(ie, v, fname);
             }
-            try instance.set(field.key, v);
+            if (field.key_symbol) |sym| try instance.setSymbol(sym, v) else try instance.set(field.key, v);
         }
         return .{ .normal = .undefined };
     }
@@ -1207,6 +1220,9 @@ pub const Interpreter = struct {
                     const fc = try self.evalExpr(p.value, env);
                     if (fc.isAbrupt()) return fc;
                     const f = fc.normal.object; // a `function` node always yields a function object
+                    // §13.2.5.6: an accessor's name is "get x" / "set x" (the key with the kind prefix).
+                    const name_key = if (key.symbol) |sym| try self.symbolPropName(sym) else key.key;
+                    try self.setFunctionName(f, name_key, if (p.kind == .get) "get" else "set");
                     const getter: ?*Object = if (p.kind == .get) f else null;
                     const setter: ?*Object = if (p.kind == .set) f else null;
                     if (key.symbol) |sym| {
@@ -1221,9 +1237,16 @@ pub const Interpreter = struct {
                     if (key.isAbrupt()) return key.completion;
                     const c = try self.evalExpr(p.value, env);
                     if (c.isAbrupt()) return c;
+                    // §13.2.5 PropertyDefinitionEvaluation / §8.4 NamedEvaluation: an object-literal
+                    // method (`{m(){}}`, normalized to an anonymous `function` value) OR an anonymous
+                    // function/class property value (`{f: function(){}}`) gets the property key as its
+                    // name. Object-literal members stay ENUMERABLE (ordinary properties) — only the
+                    // function NAME is set, never the enumerability.
                     if (key.symbol) |sym| {
+                        try self.maybeSetAnonName(p.value, c.normal, try self.symbolPropName(sym));
                         try obj.setSymbol(sym, c.normal); // §13.2.5 symbol-keyed data property
                     } else {
+                        try self.maybeSetAnonName(p.value, c.normal, key.key);
                         try obj.set(key.key, c.normal);
                     }
                 },
@@ -1262,6 +1285,7 @@ pub const Interpreter = struct {
         if (el.computed_key) |ck| {
             const c = try self.evalExpr(ck, env);
             if (c.isAbrupt()) return .{ .completion = c };
+            if (c.normal == .symbol) return .{ .symbol = c.normal.symbol }; // §7.1.19 ToPropertyKey: Symbol stays
             return .{ .key = try self.toString(c.normal) };
         }
         return .{ .key = el.key };
@@ -1437,7 +1461,14 @@ pub const Interpreter = struct {
         // constructor resolves against `Super.prototype`); the ctor reads its own `super_ctor` for
         // `super(...)` via `proto.constructor`.
         if (ctor.call) |*fd| fd.home_object = proto;
-        try proto.set("constructor", .{ .object = ctor });
+        // §15.7.14: the `constructor` own property of `.prototype` is non-enumerable (writable +
+        // configurable). `set` would make it enumerable, so define it explicitly.
+        try proto.defineData("constructor", .{ .object = ctor }, true, false, true);
+        // §20.2.4.1/.2: the constructor's `length` = ExpectedArgumentCount of its params; its `name`
+        // is the class name (or "" for an anonymous class expression — a NamedEvaluation site may
+        // rename it). §15.7.14 step 17/18 SetFunctionName/SetFunctionLength on the constructor.
+        try setFunctionLength(ctor, paramCount(ctor.call.?.params));
+        try self.setFunctionName(ctor, c.name orelse "", "");
 
         // §15.7.14 link the prototype chains for inheritance.
         if (is_derived) {
@@ -1485,6 +1516,8 @@ pub const Interpreter = struct {
                         // §15.7: a private method. Static → install on the ctor's private slot now;
                         // instance → record for per-instance install (the brand is added on each `new`).
                         if (f.call) |*mfd| mfd.is_private_method = true;
+                        // §15.7.14: a private method's name is `#m` (its key includes the `#`).
+                        try self.setFunctionName(f, el.key, "");
                         if (el.is_static) {
                             try ctor.setPrivate(el.key, fc.normal);
                         } else {
@@ -1493,7 +1526,15 @@ pub const Interpreter = struct {
                     } else {
                         const key = try self.classElementKey(el, class_env);
                         if (key.isAbrupt()) return key.completion;
-                        try target.set(key.key, fc.normal);
+                        // §15.7.14: a class method's `name` is its property key (symbol → "[desc]").
+                        try self.setFunctionName(f, if (key.symbol) |sym| try self.symbolPropName(sym) else key.key, "");
+                        // §15.7.x: class methods are NON-enumerable (writable + configurable). Define
+                        // explicitly (vs `set`, which would make it enumerable like an object method).
+                        if (key.symbol) |sym| {
+                            try target.defineSymbolData(sym, fc.normal, true, false, true);
+                        } else {
+                            try target.defineData(key.key, fc.normal, true, false, true);
+                        }
                     }
                 },
                 .get, .set => {
@@ -1508,6 +1549,8 @@ pub const Interpreter = struct {
                     if (el.is_private) {
                         // §15.7: a private accessor. Static → merge into the ctor's private slot now;
                         // instance → record (merged per-instance at construction).
+                        // §15.7.14: a private accessor's name is "get #x" / "set #x".
+                        try self.setFunctionName(f, el.key, if (el.kind == .get) "get" else "set");
                         if (el.is_static) {
                             if (el.kind == .get) {
                                 try ctor.definePrivateAccessor(el.key, f, null);
@@ -1524,10 +1567,15 @@ pub const Interpreter = struct {
                     } else {
                         const key = try self.classElementKey(el, class_env);
                         if (key.isAbrupt()) return key.completion;
-                        if (el.kind == .get) {
-                            try target.defineAccessor(key.key, f, null);
+                        // §15.7.14: a class accessor's name is "get x" / "set x" (symbol → "[desc]").
+                        try self.setFunctionName(f, if (key.symbol) |sym| try self.symbolPropName(sym) else key.key, if (el.kind == .get) "get" else "set");
+                        const getter: ?*Object = if (el.kind == .get) f else null;
+                        const setter: ?*Object = if (el.kind == .set) f else null;
+                        // §15.7.x: class accessors are NON-enumerable (configurable). Define explicitly.
+                        if (key.symbol) |sym| {
+                            try target.defineSymbolAccessorEx(sym, getter, setter, false);
                         } else {
-                            try target.defineAccessor(key.key, null, f);
+                            try target.defineAccessorEx(key.key, getter, setter, false);
                         }
                     }
                 },
@@ -1554,6 +1602,9 @@ pub const Interpreter = struct {
                     }
                     const key = try self.classElementKey(el, class_env);
                     if (key.isAbrupt()) return key.completion;
+                    // §15.7.10: a field's name (string key, or "[desc]" for a symbol key) is the
+                    // NamedEvaluation name for an anonymous function/class initializer.
+                    const field_name = if (key.symbol) |sym| try self.symbolPropName(sym) else key.key;
                     if (el.is_static) {
                         // §15.7.14: a static field initializer runs at class definition with `this` =
                         // the constructor object.
@@ -1565,12 +1616,13 @@ pub const Interpreter = struct {
                             self.this_val = saved_this;
                             if (ic.isAbrupt()) return ic;
                             v = ic.normal;
+                            try self.maybeSetAnonName(ie, v, field_name); // §8.4 NamedEvaluation
                         }
-                        try ctor.set(key.key, v);
+                        if (key.symbol) |sym| try ctor.setSymbol(sym, v) else try ctor.set(key.key, v);
                     } else {
                         // §15.7.14: the instance FieldDefinition's name is evaluated now (definition
                         // order); the initializer is run per-instance by initInstanceFields.
-                        try fields.append(self.arena, .{ .key = key.key, .init = el.value.field_init });
+                        try fields.append(self.arena, .{ .key = key.key, .init = el.value.field_init, .key_symbol = key.symbol });
                     }
                 },
             }
@@ -1603,6 +1655,67 @@ pub const Interpreter = struct {
         return .{ .normal = .undefined };
     }
 
+    /// §15.1.5 ExpectedArgumentCount — the `length` value: the count of leading FormalParameters
+    /// before the first one with a default initializer, a destructuring BindingPattern, or the rest
+    /// element. (A simple identifier param with no default counts; the first non-simple param or the
+    /// rest element stops the count.) `rest` is never counted (only stops the leading run).
+    fn paramCount(params: []const ast.Param) f64 {
+        var n: f64 = 0;
+        for (params) |p| {
+            if (p.default != null or p.pattern.* != .identifier) break;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// §20.2.4.1 install the `length` own data property — `{ writable:false, enumerable:false,
+    /// configurable:true }`. Created at function-object creation (outside hot loops, so the two
+    /// inserts cost nothing in the bench).
+    fn setFunctionLength(obj: *Object, n: f64) std.mem.Allocator.Error!void {
+        try obj.defineData("length", .{ .number = n }, false, false, true);
+    }
+
+    /// §20.2.4.2 / §10.2.9 SetFunctionName — install the `name` own data property `{ writable:false,
+    /// enumerable:false, configurable:true }`. `prefix` (when non-empty) is space-joined ahead of the
+    /// name ("get"/"set"/"bound"). Names are interned in the realm arena so they outlive the call.
+    fn setFunctionName(self: *Interpreter, obj: *Object, name: []const u8, prefix: []const u8) std.mem.Allocator.Error!void {
+        const full = if (prefix.len == 0) name else try std.fmt.allocPrint(self.arena, "{s} {s}", .{ prefix, name });
+        try obj.defineData("name", .{ .string = full }, false, false, true);
+    }
+
+    /// §10.2.9 SetFunctionName for a Symbol key — the name is `"[" + description + "]"`, or `""` when
+    /// the symbol has no description (`[[Description]]` is undefined). Interned in the realm arena.
+    fn symbolPropName(self: *Interpreter, sym: *Symbol) std.mem.Allocator.Error![]const u8 {
+        const desc = sym.description orelse return "";
+        return std.fmt.allocPrint(self.arena, "[{s}]", .{desc});
+    }
+
+    /// True iff a function object currently has no `name` own property, or an empty-string one — i.e.
+    /// it is "anonymous" and eligible for §8.4 NamedEvaluation to assign it a binding/property name.
+    fn isAnonymousFn(obj: *Object) bool {
+        if (obj.properties.getPtr("name")) |pv| {
+            return pv.payload == .data and pv.payload.data == .string and pv.payload.data.string.len == 0;
+        }
+        return true;
+    }
+
+    /// §8.4 NamedEvaluation — if `node` is an anonymous function/arrow/class expression and the
+    /// evaluated `value` is the resulting (still-anonymous) function object, set its `name` to the
+    /// binding/property name. Covers the common naming contexts: `var/let/const f = <anon>`,
+    /// `f = <anon>` (identifier assignment), object-literal `{f: <anon>}`, and default initializers.
+    /// A no-op for any non-anonymous-function value, so callers can apply it unconditionally.
+    fn maybeSetAnonName(self: *Interpreter, node: *const ast.Node, value: Value, name: []const u8) std.mem.Allocator.Error!void {
+        switch (node.*) {
+            .function, .class_expr => {},
+            else => return, // only an anonymous function/class literal is a NamedEvaluation site
+        }
+        if (value != .object) return;
+        const obj = value.object;
+        if (obj.kind != .function) return;
+        if (!isAnonymousFn(obj)) return; // a NAMED function/class expression keeps its own name
+        try self.setFunctionName(obj, name, "");
+    }
+
     fn evalFunctionExpr(self: *Interpreter, f: *const ast.Function, env: *Environment) EvalError!Completion {
         // §15.3: an arrow captures the enclosing `this` at creation time (lexical `this`); an
         // ordinary function gets `this` bound per-call instead.
@@ -1617,6 +1730,10 @@ pub const Interpreter = struct {
             .captured_this = if (f.is_arrow) self.this_val else .undefined,
         });
         obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
+        // §20.2.4.1/.2: install `length` (ExpectedArgumentCount) and `name` (the declared name, or
+        // "" for an anonymous expression — a NamedEvaluation site may rename it via maybeSetAnonName).
+        try setFunctionLength(obj, paramCount(f.params));
+        try self.setFunctionName(obj, f.name orelse "", "");
         return .{ .normal = .{ .object = obj } };
     }
 
@@ -4534,6 +4651,17 @@ pub const Interpreter = struct {
                 .bound_this = this_arg,
                 .bound_args = bound_args,
             });
+            // §20.2.3.2 step 4–8: a bound function's `length` is max(0, target.length - boundArgs)
+            // (target.length coerced to an integer; a non-number/absent → 0); its `name` is
+            // "bound " + target.name (target.name coerced to string; a non-string → "").
+            var target_len: f64 = 0;
+            if (target.get("length")) |lv| if (lv == .number and lv.number > 0 and std.math.isFinite(lv.number)) {
+                target_len = @trunc(lv.number);
+            };
+            const bound_len = @max(0, target_len - @as(f64, @floatFromInt(bound_args.len)));
+            try setFunctionLength(bf, bound_len);
+            const target_name = if (target.get("name")) |nv| (if (nv == .string) nv.string else "") else "";
+            try self.setFunctionName(bf, target_name, "bound");
             return .{ .normal = .{ .object = bf } };
         }
 

@@ -2125,3 +2125,60 @@ test "M6 Object.getOwnPropertyDescriptors (Cycle 3, §20.1.2.9)" {
     try expectBool("var o={a:1}; Object.getOwnPropertyDescriptors(o).a.enumerable", true);
     try expectNumber("var o={a:1}; Object.defineProperty(o,'h',{value:9,enumerable:false}); Object.keys(Object.getOwnPropertyDescriptors(o)).length", 2);
 }
+
+test "M14 function length: ExpectedArgumentCount (§20.2.4.1)" {
+    try expectNumber("function f(a,b){} f.length", 2);
+    try expectNumber("(function(){}).length", 0);
+    try expectNumber("(()=>{}).length", 0);
+    // §15.1.5: stops at the first default / pattern / rest.
+    try expectNumber("function f(a,b=1,c){} f.length", 1);
+    try expectNumber("function f(a,[b],c){} f.length", 1);
+    try expectNumber("function f(a,...rest){} f.length", 1);
+    // accessor lengths: getter 0, setter 1.
+    try expectNumber("class C{get x(){}} Object.getOwnPropertyDescriptor(C.prototype,'x').get.length", 0);
+    try expectNumber("class C{set x(v){}} Object.getOwnPropertyDescriptor(C.prototype,'x').set.length", 1);
+    // constructor length = constructor param count.
+    try expectNumber("class C{constructor(a,b){}} C.length", 2);
+    // §20.2.4.1 length descriptor: writable:false, enumerable:false, configurable:true.
+    try expectBool("function f(){} Object.getOwnPropertyDescriptor(f,'length').writable", false);
+    try expectBool("function f(){} Object.getOwnPropertyDescriptor(f,'length').enumerable", false);
+    try expectBool("function f(){} Object.getOwnPropertyDescriptor(f,'length').configurable", true);
+}
+
+test "M14 function name + NamedEvaluation (§20.2.4.2 / §8.4)" {
+    try expectStr("function f(a,b){} f.name", "f");
+    try expectStr("var g = function(){}; g.name", "g"); // NamedEvaluation (named-fn-expr is anon here)
+    try expectStr("var h = () => {}; h.name", "h"); // arrow NamedEvaluation
+    try expectStr("let k; k = function(){}; k.name", "k"); // identifier-assignment NamedEvaluation
+    try expectStr("(function(){}).name", ""); // bare anonymous → ""
+    try expectStr("(class C{}).name", "C");
+    try expectStr("var C = class{}; C.name", "C"); // anon class NamedEvaluation
+    try expectStr("function* gen(){} gen.name", "gen");
+    try expectStr("async function af(){} af.name", "af");
+    // object-literal property value + method.
+    try expectStr("var o = {f: function(){}}; o.f.name", "f");
+    try expectStr("var o = {m(){}}; o.m.name", "m");
+    // class method / accessor names.
+    try expectStr("class C{m(a){}} C.prototype.m.name", "m");
+    try expectStr("class C{get x(){}} Object.getOwnPropertyDescriptor(C.prototype,'x').get.name", "get x");
+    try expectStr("class C{set x(v){}} Object.getOwnPropertyDescriptor(C.prototype,'x').set.name", "set x");
+    // §20.2.4.2 name descriptor: writable:false, enumerable:false, configurable:true.
+    try expectBool("function f(){} Object.getOwnPropertyDescriptor(f,'name').writable", false);
+    try expectBool("function f(){} Object.getOwnPropertyDescriptor(f,'name').configurable", true);
+    // bound function name (§20.2.3.2).
+    try expectStr("function f(){} f.bind(null).name", "bound f");
+    try expectNumber("function f(a,b,c){} f.bind(null,1).length", 2);
+}
+
+test "M14 class member attributes: methods non-enumerable, fields enumerable (§15.7.x)" {
+    // class methods are NON-enumerable...
+    try expectBool("class C{m(){}} Object.getOwnPropertyDescriptor(C.prototype,'m').enumerable", false);
+    try expectBool("class C{static m(){}} Object.getOwnPropertyDescriptor(C,'m').enumerable", false);
+    try expectBool("class C{get x(){}} Object.getOwnPropertyDescriptor(C.prototype,'x').enumerable", false);
+    // ...but OBJECT-literal methods stay ENUMERABLE (ordinary properties).
+    try expectBool("Object.getOwnPropertyDescriptor({m(){}},'m').enumerable", true);
+    try expectBool("Object.getOwnPropertyDescriptor({get x(){}},'x').enumerable", true);
+    // class fields are enumerable data; the `constructor` slot is non-enumerable.
+    try expectBool("class C{f=1} Object.getOwnPropertyDescriptor(new C(),'f').enumerable", true);
+    try expectBool("class C{} Object.getOwnPropertyDescriptor(C.prototype,'constructor').enumerable", false);
+}

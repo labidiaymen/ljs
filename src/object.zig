@@ -369,6 +369,9 @@ pub const FunctionData = struct {
 pub const FieldInit = struct {
     key: []const u8,
     init: ?*const ast.Node,
+    /// §15.7.14: a computed FieldDefinition whose name evaluated to a Symbol (`[sym] = …`). When set,
+    /// the field is installed under this Symbol key (and `key` is unused); null for ordinary string keys.
+    key_symbol: ?*Symbol = null,
 };
 
 /// §15.7 one instance PrivateName element to install on each `new` instance (adding its brand).
@@ -550,6 +553,11 @@ pub const Object = struct {
         obj.native_name = name;
         const proto = try create(arena, null);
         try obj.set("prototype", .{ .object = proto });
+        // §20.2.4.2: a built-in function's `name` own property (non-enumerable, non-writable,
+        // configurable). For a method installed via `defineMethod` this is overwritten with the
+        // property key; for a constructor / standalone native this name (the passed identifier) is
+        // already the spec name. (Per-native `length` is deferred — see specs/015.)
+        try obj.defineData("name", .{ .string = name }, false, false, true);
         return obj;
     }
 
@@ -672,8 +680,15 @@ pub const Object = struct {
     }
 
     /// §13.2.5.6 a symbol-keyed accessor (`{ get [sym](){} }`) — merge `get`/`set` into the symbol slot
-    /// (mirrors `defineAccessor` for the string map). Enumerable + configurable, no [[Writable]].
+    /// (mirrors `defineAccessor` for the string map). Object-literal: enumerable + configurable.
     pub fn defineSymbolAccessor(self: *Object, key: *Symbol, getter: ?*Object, setter: ?*Object) std.mem.Allocator.Error!void {
+        return self.defineSymbolAccessorEx(key, getter, setter, true);
+    }
+
+    /// §13.2.5.6 / §15.7.x a symbol-keyed accessor with explicit [[Enumerable]] — object-literal
+    /// accessors are enumerable; class accessors are non-enumerable. Always configurable, no
+    /// [[Writable]] (accessor descriptor). Merges with an existing get/set half on the same key.
+    pub fn defineSymbolAccessorEx(self: *Object, key: *Symbol, getter: ?*Object, setter: ?*Object, enumerable: bool) std.mem.Allocator.Error!void {
         var acc: struct { get: ?*Object = null, set: ?*Object = null } = .{};
         for (self.symbol_props.items) |*sp| {
             if (sp.key == key) {
@@ -683,7 +698,7 @@ pub const Object = struct {
         }
         if (getter) |g| acc.get = g;
         if (setter) |s| acc.set = s;
-        const pv: PropertyValue = .{ .payload = .{ .accessor = .{ .get = acc.get, .set = acc.set } }, .enumerable = true, .configurable = true };
+        const pv: PropertyValue = .{ .payload = .{ .accessor = .{ .get = acc.get, .set = acc.set } }, .enumerable = enumerable, .configurable = true };
         for (self.symbol_props.items) |*sp| {
             if (sp.key == key) {
                 sp.pv = pv;
@@ -697,6 +712,13 @@ pub const Object = struct {
     /// property `key`, preserving the other half if it was already defined this literal. Object-literal
     /// accessors are enumerable + configurable (and have no [[Writable]]).
     pub fn defineAccessor(self: *Object, key: []const u8, getter: ?*Object, setter: ?*Object) std.mem.Allocator.Error!void {
+        return self.defineAccessorEx(key, getter, setter, true);
+    }
+
+    /// §13.2.5.6 / §15.7.x an accessor with explicit [[Enumerable]] — object-literal accessors are
+    /// enumerable; class accessors are non-enumerable. Always configurable, no [[Writable]]. Merges
+    /// with an existing get/set half already defined for the same key.
+    pub fn defineAccessorEx(self: *Object, key: []const u8, getter: ?*Object, setter: ?*Object, enumerable: bool) std.mem.Allocator.Error!void {
         var acc: struct { get: ?*Object = null, set: ?*Object = null } = .{};
         if (self.properties.get(key)) |existing| switch (existing.payload) {
             .accessor => |a| acc = .{ .get = a.get, .set = a.set },
@@ -706,7 +728,7 @@ pub const Object = struct {
         if (setter) |s| acc.set = s;
         try self.properties.put(self.arena, key, .{
             .payload = .{ .accessor = .{ .get = acc.get, .set = acc.set } },
-            .enumerable = true,
+            .enumerable = enumerable,
             .configurable = true,
         });
     }
