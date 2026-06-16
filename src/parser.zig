@@ -50,6 +50,13 @@ pub const Parser = struct {
     /// directly within a static block; a nested ordinary function/arrow body un-reserves it (reset in
     /// `parseFunction`/`finishArrow`, like `in_method`).
     in_static_block: bool = false,
+    /// §15.5 `[+Yield]` grammar parameter: true while parsing a generator FunctionBody. Inside one,
+    /// `yield` is the §14.4 yield operator (not an IdentifierReference) and `yield` as a
+    /// BindingIdentifier is a §15.5.1 SyntaxError; outside one, `yield` outside strict mode is an
+    /// ordinary identifier and a `yield` operator is a SyntaxError. Saved/restored around every function
+    /// body (`parseFunction`/`finishArrow`); an ordinary function/arrow un-sets it (yield does NOT cross
+    /// into a nested non-generator), a `function*` sets it.
+    in_generator: bool = false,
     /// §14.7.5 `[~In]` grammar: while parsing the FIRST clause of a `for (…)` header, the relational
     /// `in` operator is suppressed so `for (a in b)` is recognized as a for-in head (not the binary
     /// expression `a in b`). Honored in `parseExprFrom` (skips `kw_in` at the relational level). Reset
@@ -144,6 +151,9 @@ pub const Parser = struct {
             .identifier => {
                 // §15.7.11: `await` is reserved as a BindingIdentifier inside a static block.
                 if (self.in_static_block and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
+                // §15.5.1: inside a generator body `yield` may not be a BindingIdentifier
+                // (`var yield`, `function* g(){ var yield }`, a destructuring target `[yield]`).
+                if (self.in_generator and std.mem.eql(u8, self.peek().lexeme, "yield")) return ParseError.UnexpectedToken;
                 return self.allocPattern(.{ .identifier = self.advance().lexeme });
             },
             else => return ParseError.UnexpectedToken,
@@ -576,7 +586,10 @@ pub const Parser = struct {
         }
     }
 
-    /// §15.2: `function [name] (params) { body }` — shared by declarations and expressions.
+    /// §15.2 / §15.5: `function [*] [name] (params) { body }` — shared by declarations and expressions.
+    /// The current token is the one AFTER `function` (the caller consumed `function`); a leading `*`
+    /// (§15.5 GeneratorDeclaration / GeneratorExpression) is consumed here and flips the generator
+    /// context for the body.
     fn parseFunction(self: *Parser) ParseError!*const ast.Function {
         const enclosing_strict = self.strict;
         defer self.strict = enclosing_strict; // §11.2.2: never un-strict an inner scope on the way out
@@ -586,19 +599,37 @@ pub const Parser = struct {
         const saved_in_method = self.in_method;
         const saved_in_derived = self.in_derived_ctor;
         const saved_in_static = self.in_static_block;
+        const saved_in_generator = self.in_generator;
         defer self.in_method = saved_in_method;
         defer self.in_derived_ctor = saved_in_derived;
         defer self.in_static_block = saved_in_static;
+        defer self.in_generator = saved_in_generator;
         self.in_method = false;
         self.in_derived_ctor = false;
         self.in_static_block = false; // §15.7.11: a nested ordinary function un-reserves `await`
+        // §15.5: a leading `*` marks a generator. `yield` is the §14.4 operator only inside ITS body;
+        // an ordinary nested function un-sets `in_generator` (yield does not cross into it).
+        const is_generator = self.peek().kind == .star;
+        if (is_generator) _ = self.advance();
+        // §15.5: the BODY parses with `[+Yield]`, but the FormalParameters are restricted — a `yield`
+        // operator in a default is a §15.5.1 SyntaxError. We keep `in_generator` false across the name +
+        // params (so `yield` as an operator there does not parse), set it true only for the body, and
+        // explicitly reject `yield` as the generator's name / a param BindingIdentifier below.
+        self.in_generator = false;
         var name: ?[]const u8 = null;
         if (self.peek().kind == .identifier) name = self.advance().lexeme;
         // §13.1.1: a strict function's name (BindingIdentifier) may not be `eval`/`arguments`/a
         // future-reserved word. Checked against the *enclosing* strictness (the name is declared
         // in the outer scope).
         if (enclosing_strict) if (name) |nm| if (isStrictReservedBindingName(nm)) return ParseError.UnexpectedToken;
+        // §15.5.1: a generator's BindingIdentifier may not be `yield`, and (in a generator) `yield` may
+        // not be a parameter BindingIdentifier (`function* g(yield){}` / `function* yield(){}`).
+        if (is_generator) if (name) |nm| if (std.mem.eql(u8, nm, "yield")) return ParseError.UnexpectedToken;
         const pl = try self.parseParams();
+        if (is_generator and paramsHaveYield(pl)) return ParseError.UnexpectedToken;
+        // §15.5.1: a GeneratorDeclaration/Expression has UniqueFormalParameters — no duplicate bound
+        // names, in EVERY mode (not only strict), so `function*(x = 0, x){}` is a SyntaxError sloppy too.
+        if (is_generator and hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
         // §11.2.2 lexical inheritance: the body is strict if the enclosing scope is, OR it carries
         // its own "use strict" prologue. Prescan the body tokens (current token is `{`) so the
         // param/body Early Errors below see the function's own strictness.
@@ -611,12 +642,13 @@ pub const Parser = struct {
             if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
         }
         self.strict = body_strict;
+        self.in_generator = is_generator; // §15.5: the GeneratorBody parses with `[+Yield]`
         const body = try self.parseBlock();
         // §15.1.1 Early Error: a "use strict" directive is forbidden when the parameter list is
         // non-simple (has defaults, patterns, or a rest element).
         if (!isSimpleParameterList(pl) and bodyHasUseStrict(body)) return ParseError.UnexpectedToken;
         const f = try self.arena.create(ast.Function);
-        f.* = .{ .name = name, .params = pl.params, .rest = pl.rest, .body = body };
+        f.* = .{ .name = name, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = is_generator };
         return f;
     }
 
@@ -1088,6 +1120,10 @@ pub const Parser = struct {
         // §15.3.1 Early Error: an ArrowFunction's BoundNames must contain no duplicates (unlike a
         // non-strict ordinary function, this holds in every mode).
         if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
+        // §15.5.1: an arrow appearing inside a generator parses its params with `[+Yield]`, so a
+        // YieldExpression in an arrow's parameters (`function* g(){ (x = yield) => {} }`) is a
+        // SyntaxError (the params were parsed with `in_generator` set, folding `yield` into a yield node).
+        if (self.in_generator and paramsHaveYield(pl)) return ParseError.UnexpectedToken;
         _ = try self.expect(.fat_arrow);
         // §11.2.2 lexical inheritance: a `{ … }` concise body may carry its own "use strict"; an
         // expression body cannot. The arrow's params are subject to strict binding restrictions
@@ -1159,6 +1195,13 @@ pub const Parser = struct {
 
     /// §13.15 Assignment (right-associative). Only identifier targets in M1 Cycle A.
     fn parseAssignment(self: *Parser) ParseError!*const ast.Node {
+        // §14.4 YieldExpression — `AssignmentExpression : [+Yield] YieldExpression`. Inside a generator
+        // body `yield` is always the operator (never an IdentifierReference). Parsed here at the
+        // assignment level (its operand is itself an AssignmentExpression, giving `yield` its very low,
+        // right-associative precedence: `yield a + b` ≡ `yield (a + b)`, `x = yield y` ≡ `x = (yield y)`).
+        if (self.in_generator and self.peek().kind == .identifier and std.mem.eql(u8, self.peek().lexeme, "yield")) {
+            return self.parseYield();
+        }
         // §15.3 ArrowFunction (cover grammar, checked before the precedence climb):
         //   • `Identifier =>` — a single un-parenthesized parameter.
         //   • `( … ) =>` — a parenthesized formal list (lookahead to the matching `)`).
@@ -1231,6 +1274,31 @@ pub const Parser = struct {
             }
         }
         return left;
+    }
+
+    /// §14.4 YieldExpression — the current token is the `yield` identifier (caller verified
+    /// `in_generator`). Forms: `yield` (bare → yields undefined), `yield AssignmentExpression`, and
+    /// `yield* AssignmentExpression` (delegation, parsed here; full §15.5.5 semantics are Cycle 2).
+    /// Restricted production: a LineTerminator after `yield` forces the bare form (ASI), and `yield`
+    /// followed by a token that cannot start an expression (`)`, `]`, `}`, `,`, `;`, `:`, eof) is bare.
+    fn parseYield(self: *Parser) ParseError!*const ast.Node {
+        _ = self.advance(); // yield
+        // §14.4 `yield [no LineTerminator here] * AssignmentExpression` — delegation. The `*` IS part of
+        // the restricted production: a newline before it forces a bare `yield` (so `yield\n* 1` is NOT
+        // `yield*` — the leftover `* 1` then fails to parse, a SyntaxError, matching the spec).
+        if (self.peek().kind == .star and !self.peek().newline_before) {
+            _ = self.advance();
+            const arg = try self.parseAssignment();
+            return self.alloc(.{ .yield_expr = .{ .argument = arg, .delegate = true } });
+        }
+        // §14.4 restricted production: `yield [no LineTerminator here] AssignmentExpression`. A newline,
+        // or a token that cannot begin an AssignmentExpression, makes this a bare `yield`.
+        const nxt = self.peek();
+        if (nxt.newline_before or !startsYieldArgument(nxt.kind)) {
+            return self.alloc(.{ .yield_expr = .{ .argument = null, .delegate = false } });
+        }
+        const arg = try self.parseAssignment();
+        return self.alloc(.{ .yield_expr = .{ .argument = arg, .delegate = false } });
     }
 
     /// §13.15.1 / §13.15.5.1 — refine an ArrayLiteral / ObjectLiteral (the cover grammar) into an
@@ -1417,6 +1485,9 @@ pub const Parser = struct {
             const target = try self.parseUnary();
             // §13.3.9.1 Early Error: `++a?.b` — a prefix-update operand may not be an OptionalChain.
             if (target.* == .optional) return ParseError.UnexpectedToken;
+            // §13.4.1.1 Early Error: an UpdateExpression operand must be a simple assignment target; a
+            // (parenthesized) YieldExpression is not (`++(yield)` in a generator is a SyntaxError).
+            if (target.* == .yield_expr) return ParseError.UnexpectedToken;
             // §13.4.1.1 Early Error: in strict, the operand of a prefix update may not be the
             // reference `eval`/`arguments`.
             if (self.strict) switch (target.*) {
@@ -1578,6 +1649,9 @@ pub const Parser = struct {
                 .identifier => |n| if (isEvalOrArguments(n)) return ParseError.UnexpectedToken,
                 else => {},
             };
+            // §13.4.1.1 Early Error: a (parenthesized) YieldExpression is not a simple assignment
+            // target — `(yield)++` in a generator is a SyntaxError.
+            if (expr.* == .yield_expr) return ParseError.UnexpectedToken;
             const op: ast.UpdateOp = if (self.peek().kind == .plus_plus) .inc else .dec;
             _ = self.advance();
             expr = try self.alloc(.{ .update = .{ .op = op, .prefix = false, .target = expr } });
@@ -1685,9 +1759,10 @@ pub const Parser = struct {
                 // (non-computed, non-string-keyed) identifier name; a computed/string key with no
                 // `:`/`(` is a SyntaxError.
                 if (name.computed != null or !name.is_ident) return ParseError.UnexpectedToken;
-                // §13.1.1 / §15.7.11: a shorthand IdentifierReference may not be a reserved word —
-                // `yield` in strict, `await` inside a static block (`({ yield })` / `({ await })`).
-                if (self.strict and std.mem.eql(u8, name.key, "yield")) return ParseError.UnexpectedToken;
+                // §13.1.1 / §15.5.1 / §15.7.11: a shorthand IdentifierReference may not be a reserved
+                // word — `yield` in strict OR inside a generator body (`({ yield })` / `({ yield } = o)`
+                // in a `function*`), `await` inside a static block.
+                if ((self.strict or self.in_generator) and std.mem.eql(u8, name.key, "yield")) return ParseError.UnexpectedToken;
                 if (self.in_static_block and std.mem.eql(u8, name.key, "await")) return ParseError.UnexpectedToken;
                 // §13.2.5.1 CoverInitializedName `{x = default}`: legal ONLY as the cover grammar for an
                 // object AssignmentPattern. We parse it (recording the default) so `({x = 1} = o)` works;
@@ -1779,6 +1854,11 @@ pub const Parser = struct {
                 // IdentifierReference (a primary expression, e.g. a `m(x = yield)` param default
                 // inside an always-strict class body) is a SyntaxError.
                 if (self.strict and std.mem.eql(u8, t.lexeme, "yield")) return ParseError.UnexpectedToken;
+                // §14.4 / §15.5.1: inside a generator body `yield` is ALWAYS the yield operator (parsed
+                // at the assignment level by `parseYield`), never an IdentifierReference — so a `yield`
+                // reaching the primary position (`void yield`, `yield + x`, `(yield)`, the second
+                // `yield` in `yield 3 + yield 4`) is a SyntaxError.
+                if (self.in_generator and std.mem.eql(u8, t.lexeme, "yield")) return ParseError.UnexpectedToken;
                 // §15.7.11: `await` is reserved as an IdentifierReference inside a static block body.
                 if (self.in_static_block and std.mem.eql(u8, t.lexeme, "await")) return ParseError.UnexpectedToken;
                 _ = self.advance();
@@ -1875,6 +1955,16 @@ fn isEvalOrArguments(name: []const u8) bool {
 /// `arguments`, and the strict future-reserved words. (`let`/`static`/`yield` are contextual; as a
 /// *binding name* they are forbidden in strict. `let` is already lexed as a keyword so it never
 /// reaches here as an identifier lexeme, but listing it keeps the set complete.)
+/// §14.4: may a token begin a YieldExpression's argument (an AssignmentExpression)? Everything except
+/// the tokens that close/separate the enclosing context (`)`, `]`, `}`, `,`, `;`, `:`) and eof. (`:`
+/// closes a conditional/case/label; `}` closes a block/object; the rest are list/group separators.)
+fn startsYieldArgument(kind: lex.TokenKind) bool {
+    return switch (kind) {
+        .rparen, .rbracket, .rbrace, .comma, .semicolon, .colon, .eof => false,
+        else => true,
+    };
+}
+
 fn isStrictReservedBindingName(name: []const u8) bool {
     if (isEvalOrArguments(name)) return true;
     const reserved = [_][]const u8{
@@ -1926,6 +2016,60 @@ fn paramsHaveStrictReserved(pl: Parser.ParamList) bool {
     }
     if (pl.rest) |r| return patternHasStrictReserved(r);
     return false;
+}
+
+/// §15.5.1 Early Error: a GeneratorDeclaration/Expression's FormalParameters may neither bind nor
+/// reference `yield` (the params are outside the `[+Yield]` body but `yield` is still restricted). A
+/// param BindingIdentifier `yield` (`function* g(yield){}`) or a default that references `yield`
+/// (`function* g(a = yield){}` — parsed as the identifier `yield` since params are `~Yield`) is invalid.
+fn paramsHaveYield(pl: Parser.ParamList) bool {
+    for (pl.params) |p| {
+        if (patternBindsYield(p.pattern)) return true;
+        if (p.default) |d| if (nodeReferencesYield(d)) return true;
+    }
+    if (pl.rest) |r| return patternBindsYield(r);
+    return false;
+}
+
+fn patternBindsYield(pattern: *const ast.Pattern) bool {
+    switch (pattern.*) {
+        .identifier => |n| return std.mem.eql(u8, n, "yield"),
+        .array => |ap| {
+            for (ap.elements) |el| {
+                if (el.target) |t| if (patternBindsYield(t)) return true;
+                if (el.default) |d| if (nodeReferencesYield(d)) return true;
+            }
+            if (ap.rest) |r| return patternBindsYield(r);
+            return false;
+        },
+        .object => |op| {
+            for (op.properties) |prop| {
+                if (patternBindsYield(prop.target)) return true;
+                if (prop.default) |d| if (nodeReferencesYield(d)) return true;
+            }
+            if (op.rest) |r| return std.mem.eql(u8, r, "yield");
+            return false;
+        },
+    }
+}
+
+/// Shallow scan for a `yield` IdentifierReference or a `yield_expr` node in `node` — enough to reject a
+/// `yield` in a generator's FormalParameters (§15.5.1). Covers the common default-value expressions; a
+/// deeply buried `yield` (e.g. inside a nested function literal default) is not chased (rare; a nested
+/// non-generator function un-restricts `yield` anyway).
+fn nodeReferencesYield(node: *const ast.Node) bool {
+    return switch (node.*) {
+        .identifier => |n| std.mem.eql(u8, n, "yield"),
+        .yield_expr => true,
+        .unary => |u| nodeReferencesYield(u.operand),
+        .binary => |b| nodeReferencesYield(b.left) or nodeReferencesYield(b.right),
+        .logical => |l| nodeReferencesYield(l.left) or nodeReferencesYield(l.right),
+        .conditional => |c| nodeReferencesYield(c.cond) or nodeReferencesYield(c.then) or nodeReferencesYield(c.otherwise),
+        .assign => |a| nodeReferencesYield(a.value),
+        .comma => |c| nodeReferencesYield(c.left) or nodeReferencesYield(c.right),
+        .call => |c| nodeReferencesYield(c.callee),
+        else => false,
+    };
 }
 
 /// §15.1.3 IsSimpleParameterList — true iff every parameter is a plain BindingIdentifier with no
@@ -2106,6 +2250,7 @@ fn containsArguments(node: *const ast.Node) bool {
         // class (they bind/scope their own `arguments`).
         .function => |f| return f.is_arrow and bodyContainsArguments(f.body),
         .class_expr => return false,
+        .yield_expr => |y| return if (y.argument) |a| containsArguments(a) else false,
     }
 }
 

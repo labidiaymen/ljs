@@ -36,11 +36,18 @@ pub fn evaluateWithLimit(arena: std.mem.Allocator, source: []const u8, mode: Run
     };
     const global = Environment.create(arena, null) catch return error.OutOfMemory;
     builtins.setup(arena, global) catch return error.OutOfMemory;
-    var interp = Interpreter{ .arena = arena, .step_limit = step_limit, .globals = global };
-    const completion = interp.run(program, global) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.StepLimitExceeded => return .step_limit,
+    // §27.5 generator registry — the main interpreter tracks every generator created in this realm so
+    // any never-fully-consumed generator's parked body thread can be unwound + joined at end-of-run.
+    var gen_registry: std.ArrayListUnmanaged(*@import("object.zig").Generator) = .empty;
+    var interp = Interpreter{ .arena = arena, .step_limit = step_limit, .globals = global, .gen_registry = &gen_registry };
+    const completion = interp.run(program, global) catch |e| {
+        interp.cleanupGenerators(); // join/abandon any parked generator threads before unwinding
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
     };
+    interp.cleanupGenerators(); // join/abandon any parked generator threads (no lingering OS thread)
     return switch (completion) {
         .normal => |v| .{ .normal = v },
         .throw => |v| .{ .thrown = v },
@@ -490,6 +497,63 @@ test "M8 iteration protocol: Array/String native iterators (§22.1.5 / §23.1.5)
     // for-of over a non-iterable still throws (§7.4.2 GetIterator).
     try expectThrows("for (var x of 5) {}");
     try expectThrows("for (var x of {}) {}");
+}
+
+test "M9 generators: function* returns a generator; .next drives yield (§15.5 / §27.5, US1-US2)" {
+    // §15.5.4: calling a generator returns a generator object (the body does NOT run yet).
+    try expectStr("function* g(){} typeof g", "function");
+    try expectStr("function* g(){} var it = g(); typeof it", "object");
+    // §27.5.1.2: .next() drives the body to each yield; the final {value, done:true} carries return.
+    try expectNumber("function* g(){ yield 1; yield 2 } var it = g(); it.next().value", 1);
+    try expectNumber("function* g(){ yield 1; yield 2 } var it = g(); it.next(); it.next().value", 2);
+    try expectBool("function* g(){ yield 1 } var it = g(); it.next(); it.next().done", true);
+    // a generator that returns a value carries it on the final result (done:true).
+    try expectNumber("function* g(){ yield 1; return 7 } var it = g(); it.next(); it.next().value", 7);
+    try expectBool("function* g(){ yield 1; return 7 } var it = g(); it.next(); it.next().done", true);
+    // body does not run before the first .next (a side effect is deferred).
+    try expectNumber("var ran = 0; function* g(){ ran = 1; yield } var it = g(); ran", 0);
+    try expectNumber("var ran = 0; function* g(){ ran = 1; yield } var it = g(); it.next(); ran", 1);
+}
+
+test "M9 generators: yield receives the sent value (§14.4 / §15.5.5, US3)" {
+    // §27.5.3.3: yield evaluates to the value passed to the NEXT .next(v).
+    try expectNumber("function* g(){ var x = yield; return x } var it = g(); it.next(); it.next(5).value", 5);
+    try expectNumber("function* g(){ var a = yield; var b = yield; return a + b } var it = g(); it.next(); it.next(2); it.next(3).value", 5);
+    // yield's low precedence: `yield a + b` yields the sum; `x = yield` assigns the sent value.
+    try expectNumber("function* g(){ yield 1 + 2 } g().next().value", 3);
+}
+
+test "M9 generators: iterable via for-of / spread / destructuring (§27.5.1.1 / §7.4, US4)" {
+    // a generator is iterable (%GeneratorPrototype%[Symbol.iterator]() returns this).
+    try expectStr("function* g(){ yield 'h'; yield 'i' } var s = ''; for (var c of g()) s += c; s", "hi");
+    try expectNumber("function* g(){ yield 1; yield 2; yield 3 } [...g()].length", 3);
+    try expectNumber("function* g(){ yield 1; yield 2; yield 3 } var a = [...g()]; a[0] + a[1] + a[2]", 6);
+    try expectNumber("function* g(){ yield 10; yield 20 } var [a, b] = g(); a + b", 30);
+    // a finite-range generator summed by for-of.
+    try expectNumber("function* range(n){ var i = 0; while (i < n) { yield i; i++ } } var t = 0; for (var x of range(5)) t += x; t", 10);
+}
+
+test "M9 generators: .return / .throw (§27.5.1.4 / §27.5.1.5, US5)" {
+    // §27.5.1.4 .return(v) finishes early → {value:v, done:true}, then the generator is done.
+    try expectNumber("function* g(){ yield 1; yield 2 } var it = g(); it.next(); it.return(9).value", 9);
+    try expectBool("function* g(){ yield 1; yield 2 } var it = g(); it.next(); it.return(9); it.next().done", true);
+    // §27.5.1.5 .throw injects a throw at the suspension point — caught by a body try/catch.
+    try expectStr("function* g(){ try { yield 1 } catch (e) { yield 'caught:' + e } } var it = g(); it.next(); it.throw('x').value", "caught:x");
+    // an uncaught .throw propagates to the caller and completes the generator.
+    try expectThrows("function* g(){ yield 1 } var it = g(); it.next(); it.throw('boom')");
+    // .next on a completed generator → {value:undefined, done:true}.
+    try expectBool("function* g(){ yield 1 } var it = g(); it.next(); it.next(); it.next().done", true);
+}
+
+test "M9 generators: yield parse early errors (§15.5.1, US6)" {
+    // §15.5.1: `yield` as an operator outside a generator is a SyntaxError (it stays an identifier
+    // in sloppy mode, so a *standalone* `yield expr` is the binary/call interpretation — but a
+    // generator's `yield value` form is only legal inside one). A param/binding named `yield` in a
+    // generator is a SyntaxError.
+    try expectSyntaxError("function* g(yield){}");
+    try expectSyntaxError("function* yield(){}");
+    // inside a generator, a bare `yield` parses; this generator yields undefined then completes.
+    try expectBool("function* g(){ yield } g().next().done", false);
 }
 
 test "M3 arrow functions: bodies & param forms (US5, §15.3)" {

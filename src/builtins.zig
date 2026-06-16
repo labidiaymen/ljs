@@ -200,6 +200,25 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         }
     }
 
+    // §27.5 %GeneratorPrototype% — the [[Prototype]] of every Generator object (made by calling a
+    // `function*`). Carries `next`/`return`/`throw` (§27.5.1.2/.4/.5) and `[Symbol.iterator]()` (which
+    // returns `this`, §27.5.1.1) so a generator is iterable through the M8 §7.4 protocol (for-of /
+    // spread / destructuring). Stashed under a sentinel global name (not a valid identifier, so user
+    // code can't reach or shadow it); `interpreter.generatorProto` resolves it. Its [[Prototype]] is
+    // %Object.prototype% (the M-subset elides the intermediate %IteratorPrototype%).
+    const gen_proto = try Object.create(arena, object_proto);
+    try defineMethod(arena, gen_proto, "next", .generator_method, "next"); // §27.5.1.2
+    try defineMethod(arena, gen_proto, "return", .generator_method, "return"); // §27.5.1.4
+    try defineMethod(arena, gen_proto, "throw", .generator_method, "throw"); // §27.5.1.5
+    {
+        // §27.5.1.1 %GeneratorPrototype%[Symbol.iterator]() returns `this` — keyed by the SAME
+        // Symbol.iterator identity, so GetIterator(gen) finds it and for-of/spread consume the generator.
+        const giter_fn = try Object.createNative(arena, .generator_iterator, "[Symbol.iterator]");
+        giter_fn.prototype = function_proto;
+        try gen_proto.defineSymbolData(iter_sym, .{ .object = giter_fn }, true, false, true);
+    }
+    try env.declare("%GeneratorPrototype%", .{ .object = gen_proto }, false, true);
+
     // §21.3 Math — a namespace object (not a constructor): non-enumerable function-valued methods
     // (proto = %Object.prototype%). The minimal subset the harness needs: propertyHelper.js's
     // `Math.pow(2, 32)` (§21.3.2.26); the common companions round out a usable surface for tests.

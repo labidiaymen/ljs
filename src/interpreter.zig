@@ -49,6 +49,19 @@ pub const Interpreter = struct {
     /// The realm's global environment — used to resolve the Error family for engine-thrown
     /// errors (so they carry the right prototype + name). Set by the engine after setup.
     globals: ?*Environment = null,
+    /// §27.5 the generator whose body THIS interpreter is currently executing (set on the per-generator
+    /// body interpreter spawned for a `function*`; null for the main interpreter and ordinary calls).
+    /// A `yield` is legal only when this is non-null; evaluating `yield x` reaches the handoff via it.
+    current_gen: ?*object_mod.Generator = null,
+    /// All generators created in this realm (tracked on the MAIN interpreter only, via `gen_registry`).
+    /// At realm teardown `cleanupGenerators` signals any still-parked body thread to unwind and joins
+    /// it, so a never-fully-consumed generator does not leave a lingering OS thread. The body
+    /// interpreters share the same registry pointer.
+    gen_registry: ?*std.ArrayListUnmanaged(*object_mod.Generator) = null,
+    /// The process-global threaded Io — supplies the raw-OS-futex backing `std.Io.Semaphore.wait/post`
+    /// for the generator ping-pong handoff. `global_single_threaded` spins up no thread pool (futex ops
+    /// are pool-independent), so this is free for ordinary (non-generator) execution.
+    io: std.Io = std.Io.Threaded.global_single_threaded.io(),
 
     pub fn run(self: *Interpreter, program: ast.Program, env: *Environment) EvalError!Completion {
         var last: Completion = .{ .normal = .undefined };
@@ -105,7 +118,7 @@ pub const Interpreter = struct {
             },
             .func_decl => |f| {
                 // §15.2 — bind a function object to its name in the current scope.
-                const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env });
+                const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env, .is_generator = f.is_generator });
                 obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
                 if (f.name) |name| try env.declare(name, .{ .object = obj }, true, true);
                 return .{ .normal = .undefined };
@@ -530,6 +543,21 @@ pub const Interpreter = struct {
             },
             .function => |f| return self.evalFunctionExpr(f, env),
             .class_expr => |c| return self.evalClass(c, env),
+            .yield_expr => |y| {
+                // §14.4 YieldExpression — legal only on a generator body thread (`current_gen` set).
+                // A `yield` reached outside a generator at runtime should not occur (the parser rejects
+                // it), but guard defensively. `yield* x` delegation is parsed but its full §15.5.5
+                // semantics are Cycle 2 — Cycle 1 yields the (already-iterable) operand value as one
+                // step rather than draining it, so it does not crash.
+                if (self.current_gen == null) return self.throwError("SyntaxError", "yield outside a generator");
+                var arg: Value = .undefined;
+                if (y.argument) |an| {
+                    const ac = try self.evalExpr(an, env);
+                    if (ac.isAbrupt()) return ac;
+                    arg = ac.normal;
+                }
+                return self.doYield(arg);
+            },
             .call => |c| return self.evalCall(c, env),
             .new_expr => |n| return self.evalNew(n, env),
             .logical => |l| {
@@ -1396,6 +1424,7 @@ pub const Interpreter = struct {
             .body = f.body,
             .closure = env,
             .is_arrow = f.is_arrow,
+            .is_generator = f.is_generator,
             .captured_this = if (f.is_arrow) self.this_val else .undefined,
         });
         obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
@@ -1504,6 +1533,12 @@ pub const Interpreter = struct {
             return self.callFunction(b.target, merged, b.bound_this);
         }
         if (func.native != .none) return self.callNative(func, args, this_val);
+        // §15.5.4 / §27.5: calling a generator function does NOT run the body — it returns a fresh
+        // Generator object in `suspended_start` (the body runs on its own thread later, on `.next`).
+        // Checked before the depth bump so it pays no recursion budget; ordinary functions skip it.
+        if (func.call) |fd0| {
+            if (fd0.is_generator) return self.createGenerator(func, args, this_val);
+        }
         // Each call stacks several heavy native frames — count call depth too so the guard
         // fires before the native stack overflows (these frames are bigger than expr frames).
         self.depth += 1;
@@ -2097,6 +2132,280 @@ pub const Interpreter = struct {
         }
     }
 
+    // ── §27.5 Generators (thread-per-generator, strict ping-pong handoff) ────────
+    //
+    // A tree-walker recurses on the native stack and cannot suspend mid-evaluation, so a generator
+    // body runs on its OWN std.Thread, alternating strictly with the consumer: exactly ONE side runs
+    // at a time (the two semaphores establish happens-before), so the body and the caller never touch
+    // the shared realm arena concurrently. The dance, per `.next`/`yield`:
+    //   caller:  resume_gen.post() ─────────►  body wakes from resume_gen.wait()
+    //   caller:  to_caller.wait()  ◄───────── body posts to_caller at the next yield/return/throw
+    // On the FIRST `.next` the body thread is spawned (it immediately runs to the first suspension and
+    // posts to_caller), so the caller's first step is just `to_caller.wait()` (no resume_gen.post()).
+
+    /// §15.5.4 / §27.5.2 generator-function [[Call]] — instead of running the body, create and return a
+    /// Generator object in `suspended_start`. The args / this / home are captured now; the body binds
+    /// and runs them on its own thread when first resumed (`.next`).
+    fn createGenerator(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
+        const gen = try self.arena.create(object_mod.Generator);
+        // Copy the args into the arena (the caller's `args` slice may be transient).
+        const args_copy = try self.arena.dupe(Value, args);
+        gen.* = .{
+            .func = func,
+            .args = args_copy,
+            .this_val = this_val,
+            .home_object = if (func.call) |fd| fd.home_object else null,
+        };
+        if (self.gen_registry) |reg| try reg.append(self.arena, gen);
+        const obj = try Object.create(self.arena, self.generatorProto());
+        obj.generator = gen;
+        return .{ .normal = .{ .object = obj } };
+    }
+
+    /// §27.5.1.2/.4/.5 %GeneratorPrototype%.next/return/throw — resume the generator with the given
+    /// completion kind and value, producing the next IteratorResult `{ value, done }` (or re-throwing
+    /// on a throw completion that escapes the body). Runs on the CALLER thread.
+    fn generatorResume(self: *Interpreter, this_val: Value, kind: object_mod.ResumeKind, value: Value) EvalError!Completion {
+        if (this_val != .object or this_val.object.generator == null) {
+            return self.throwError("TypeError", "Generator method called on a non-generator");
+        }
+        const gen = this_val.object.generator.?;
+
+        // §27.5.3.3 step 2 / GeneratorValidate: a generator already executing cannot be re-entered.
+        if (gen.state == .executing) return self.throwError("TypeError", "Generator is already running");
+
+        // §27.5.1.2/.4/.5 on a COMPLETED generator: `.next` → {undefined, done:true}; `.return(v)` →
+        // {v, done:true}; `.throw(e)` → re-throw e.
+        if (gen.state == .completed) {
+            return switch (kind) {
+                .next => self.iterResult(.undefined, true),
+                .ret => self.iterResult(value, true),
+                .throw => .{ .throw = value },
+            };
+        }
+
+        // §27.5.1.4/.5 on a SUSPENDED-START generator (the body never ran): `.return(v)`/`.throw(e)`
+        // complete it immediately WITHOUT running the body. `.next` spawns the body thread.
+        if (gen.state == .suspended_start) {
+            if (kind == .ret) {
+                gen.state = .completed;
+                return self.iterResult(value, true);
+            }
+            if (kind == .throw) {
+                gen.state = .completed;
+                return .{ .throw = value };
+            }
+            // `.next` (start): spawn the body thread; it runs to the first suspension and posts.
+            gen.state = .executing;
+            gen.sent_value = value;
+            gen.resume_kind = .next;
+            const t = std.Thread.spawn(.{}, generatorBodyThread, .{ self, gen }) catch {
+                gen.state = .completed;
+                return self.throwError("RangeError", "Cannot spawn generator thread");
+            };
+            gen.thread = t;
+            gen.to_caller.waitUncancelable(self.io); // wait for the first yield/return/throw
+            return self.collectTransfer(gen);
+        }
+
+        // §27.5.3.3/.4 SUSPENDED-YIELD: hand the resume kind + value to the parked `yield`, run.
+        gen.state = .executing;
+        gen.sent_value = value;
+        gen.resume_kind = kind;
+        gen.resume_gen.post(self.io); // wake the parked yield
+        gen.to_caller.waitUncancelable(self.io); // wait for the next yield/return/throw
+        return self.collectTransfer(gen);
+    }
+
+    /// Read the gen→caller transfer slot after a handoff and turn it into the caller-side completion:
+    /// a `yield` → `{ value, done:false }`; a `return` → `{ value, done:true }` (+ join the finished
+    /// thread); a `throw` → re-throw in the caller (+ join). Marks `completed` on return/throw.
+    fn collectTransfer(self: *Interpreter, gen: *object_mod.Generator) EvalError!Completion {
+        switch (gen.transfer_kind) {
+            .yield => {
+                gen.state = .suspended_yield;
+                return self.iterResult(gen.transfer_value, false);
+            },
+            .ret => {
+                gen.state = .completed;
+                if (gen.thread) |t| {
+                    t.join();
+                    gen.thread = null;
+                }
+                return self.iterResult(gen.transfer_value, true);
+            },
+            .throw => {
+                gen.state = .completed;
+                if (gen.thread) |t| {
+                    t.join();
+                    gen.thread = null;
+                }
+                return .{ .throw = gen.transfer_value };
+            },
+        }
+    }
+
+    /// The body-thread entry point (§27.5.3.3 step 4 — run the FunctionBody). Builds a fresh per-
+    /// generator Interpreter that SHARES the arena + globals (safe: only one thread runs at a time)
+    /// with `current_gen` set so `yield` reaches the handoff, binds params/this, runs the body, and
+    /// posts the terminal completion (return/throw) to the caller. Never returns a Zig error to the
+    /// thread runtime — engine errors (OOM / step-limit) are surfaced as a thrown completion.
+    fn generatorBodyThread(parent: *Interpreter, gen: *object_mod.Generator) void {
+        var body: Interpreter = .{
+            .arena = parent.arena,
+            .step_limit = parent.step_limit,
+            .globals = parent.globals,
+            .gen_registry = parent.gen_registry,
+            .io = parent.io,
+            .current_gen = gen,
+        };
+        const comp = body.runGeneratorBody(gen) catch |e| blk: {
+            // §27.5.3.3: an engine error (step-limit / OOM) on the body thread completes the generator
+            // with a thrown completion (best-effort — surface it to the caller rather than crash).
+            const kind: []const u8 = if (e == error.StepLimitExceeded) "RangeError" else "Error";
+            const msg: []const u8 = if (e == error.StepLimitExceeded) "step limit exceeded" else "out of memory";
+            const tc = body.throwError(kind, msg) catch break :blk Completion{ .throw = .undefined };
+            break :blk tc;
+        };
+        // Translate the body completion into the terminal transfer (return / throw).
+        switch (comp) {
+            .normal => |v| {
+                gen.transfer_value = v;
+                gen.transfer_kind = .ret;
+            },
+            .ret => |v| {
+                gen.transfer_value = v;
+                gen.transfer_kind = .ret;
+            },
+            .throw => |v| {
+                gen.transfer_value = v;
+                gen.transfer_kind = .throw;
+            },
+            .brk, .cont => {
+                // Not producible by a well-formed body (loops consume them); treat as a plain finish.
+                gen.transfer_value = .undefined;
+                gen.transfer_kind = .ret;
+            },
+        }
+        gen.to_caller.post(body.io);
+    }
+
+    /// Bind the generator's params/this/home and run its body, honoring a `.return`/`.throw` injected
+    /// at the very start (`suspended_start` + abrupt resume is handled by the caller, so here the first
+    /// resume is always `.next`). Mirrors the ordinary [[Call]] body setup.
+    fn runGeneratorBody(self: *Interpreter, gen: *object_mod.Generator) EvalError!Completion {
+        const func = gen.func;
+        const fd = func.call.?;
+        const args = gen.args;
+        const call_env = try Environment.create(self.arena, fd.closure);
+        for (fd.params, 0..) |param, i| {
+            var v: Value = if (i < args.len) args[i] else .undefined;
+            if (v == .undefined) {
+                if (param.default) |dn| {
+                    const dc = try self.evalExpr(dn, call_env);
+                    if (dc.isAbrupt()) return dc;
+                    v = dc.normal;
+                }
+            }
+            if (param.pattern.* == .identifier) {
+                try call_env.declare(param.pattern.identifier, v, true, true);
+            } else {
+                const bc = try self.bindPattern(param.pattern, v, call_env, true);
+                if (bc.isAbrupt()) return bc;
+            }
+        }
+        if (fd.rest) |rest_pat| {
+            const rest_arr = try Object.createArray(self.arena, self.arrayProto());
+            if (args.len > fd.params.len) {
+                for (args[fd.params.len..]) |a| try rest_arr.elements.append(self.arena, a);
+            }
+            if (rest_pat.* == .identifier) {
+                try call_env.declare(rest_pat.identifier, .{ .object = rest_arr }, true, true);
+            } else {
+                const bc = try self.bindPattern(rest_pat, .{ .object = rest_arr }, call_env, true);
+                if (bc.isAbrupt()) return bc;
+            }
+        }
+        if (call_env.lookupLocal("arguments") == null) {
+            const ao = try Object.create(self.arena, self.objectProto());
+            for (args, 0..) |a, i| {
+                const key = try numberToString(self.arena, @floatFromInt(i));
+                try ao.set(key, a);
+            }
+            try ao.defineData("length", .{ .number = @floatFromInt(args.len) }, true, false, true);
+            try call_env.declare("arguments", .{ .object = ao }, true, true);
+        }
+        self.this_val = gen.this_val;
+        self.home_object = gen.home_object;
+        for (fd.body) |stmt| {
+            const c = try self.evalStmt(stmt, call_env);
+            switch (c) {
+                .normal => {},
+                .ret => |v| return .{ .normal = v },
+                .throw => return c,
+                .brk, .cont => {},
+            }
+        }
+        return .{ .normal = .undefined };
+    }
+
+    /// §14.4.14 / §27.5.3.7 the `yield x` runtime — the body-thread side of the handoff. Posts the
+    /// yielded value to the caller, parks on `resume_gen`, and on resume returns the sent value (a
+    /// normal `.next(v)`), throws (an injected `.throw(e)`), or returns (an injected `.return(v)` →
+    /// propagated as a return completion so the body's `finally` blocks run). Only ever runs on a
+    /// generator body thread (`current_gen` non-null).
+    fn doYield(self: *Interpreter, value: Value) EvalError!Completion {
+        const gen = self.current_gen.?;
+        // Abandonment (realm teardown): once signaled, every further `yield` immediately unwinds the
+        // body with a return completion (without parking), so a `yield` reached inside a `finally`
+        // during the unwind cannot re-park and deadlock the joining thread.
+        if (gen.abandon) return .{ .ret = .undefined };
+        gen.transfer_value = value;
+        gen.transfer_kind = .yield;
+        gen.to_caller.post(self.io); // hand control to the caller
+        gen.resume_gen.waitUncancelable(self.io); // park until the next .next/.return/.throw
+        if (gen.abandon) return .{ .ret = .undefined }; // woken by cleanup → unwind
+        // §27.5.3.3/.4 the resume kind decides what the yield expression "evaluates to".
+        switch (gen.resume_kind) {
+            .next => return .{ .normal = gen.sent_value }, // yield evaluates to the sent value
+            .throw => return .{ .throw = gen.sent_value }, // §27.5.3.4 inject a throw at the yield
+            .ret => return .{ .ret = gen.sent_value }, // §27.5.3.4 inject a return (runs finally blocks)
+        }
+    }
+
+    /// Construct an IteratorResult `{ value, done }` object (§7.4.1 CreateIterResultObject), proto =
+    /// %Object.prototype%. Used to package generator `.next`/`.return` results.
+    fn iterResult(self: *Interpreter, value: Value, done: bool) EvalError!Completion {
+        const obj = try Object.create(self.arena, self.objectProto());
+        try obj.set("value", value);
+        try obj.set("done", .{ .boolean = done });
+        return .{ .normal = .{ .object = obj } };
+    }
+
+    /// Realm teardown: any generator left suspended (never fully consumed) has a body thread parked on
+    /// `resume_gen`. Signal each to abandon and resume it so the thread unwinds and we can join it —
+    /// otherwise the OS thread would linger past the realm. Best-effort (a body that ignores `abandon`
+    /// would still be joined once it next yields/completes). Runs on the MAIN interpreter at end-of-run.
+    pub fn cleanupGenerators(self: *Interpreter) void {
+        const reg = self.gen_registry orelse return;
+        for (reg.items) |gen| {
+            if (gen.thread) |t| {
+                if (gen.state == .suspended_yield or gen.state == .suspended_start) {
+                    // Signal abandonment and wake the parked body; it unwinds (its next yield returns a
+                    // return-completion that finishes the body) and posts to_caller, then we join.
+                    gen.abandon = true;
+                    gen.resume_kind = .ret;
+                    gen.sent_value = .undefined;
+                    gen.resume_gen.post(self.io);
+                    gen.to_caller.waitUncancelable(self.io);
+                }
+                t.join();
+                gen.thread = null;
+                gen.state = .completed;
+            }
+        }
+    }
+
     fn evalUnary(self: *Interpreter, op: ast.UnaryOp, operand: *const ast.Node, env: *Environment) EvalError!Completion {
         if (op == .typeof_) {
             // §13.5.3: typeof of an *unresolved* identifier is "undefined" — it must NOT throw
@@ -2288,6 +2597,15 @@ pub const Interpreter = struct {
     /// `arguments` exotic). Null only in a realm-less unit-test eval.
     pub fn objectProto(self: *Interpreter) ?*Object {
         return self.globalProto("Object");
+    }
+
+    /// §27.5 %GeneratorPrototype% — the [[Prototype]] of every Generator object (carries
+    /// `next`/`return`/`throw` + `[Symbol.iterator]`). Stashed under the sentinel global name by
+    /// `builtins.setup`. Null only in a realm-less unit-test eval (those don't create generators).
+    fn generatorProto(self: *Interpreter) ?*Object {
+        const g = self.globals orelse return null;
+        const b = g.lookup("%GeneratorPrototype%") orelse return null;
+        return if (b.value == .object) b.value.object else null;
     }
 
     // ── §20.1.2 / §20.1.3 Object reflection ─────────────────────────────────
@@ -2852,6 +3170,17 @@ pub const Interpreter = struct {
             .string_iterator => return self.makeStringIterator(this_val), // §22.1.3.36 String.prototype[Symbol.iterator]
             .iterator_next => return self.iteratorNext(this_val), // §23.1.5.2.1 / §22.1.5.2.1 %…IteratorPrototype%.next
             .symbol_to_string => return self.symbolToString(this_val), // §20.4.3.3 / §20.4.3.4
+            .generator_method => { // §27.5.1.2/.4/.5 %GeneratorPrototype%.next/return/throw
+                const arg: Value = if (args.len > 0) args[0] else .undefined;
+                const kind: object_mod.ResumeKind = if (std.mem.eql(u8, func.native_name, "return"))
+                    .ret
+                else if (std.mem.eql(u8, func.native_name, "throw"))
+                    .throw
+                else
+                    .next;
+                return self.generatorResume(this_val, kind, arg);
+            },
+            .generator_iterator => return .{ .normal = this_val }, // §27.5.1.1 returns `this`
             else => {},
         }
         switch (func.native) {
@@ -2909,6 +3238,7 @@ pub const Interpreter = struct {
             .symbol_ctor => return self.symbolConstructor(args), // §20.4.1.1 Symbol([description])
             .array_ctor, .array_method, .string_method, .math_method => unreachable, // handled in the first switch
             .array_values, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
+            .generator_method, .generator_iterator => unreachable, // handled in the first switch
             .none => unreachable,
         }
     }

@@ -97,6 +97,12 @@ pub const Node = union(enum) {
     /// §13.10.1 RelationalExpression PrivateIdentifier `in` ShiftExpression — the ergonomic brand
     /// check `#x in obj` → boolean (does `obj` carry the private name `#x`?). `name` includes the `#`.
     private_in: struct { name: []const u8, object: *const Node },
+    /// §14.4 YieldExpression — `yield` / `yield AssignmentExpression` / `yield* AssignmentExpression`.
+    /// Legal only inside a generator body (a parse-phase SyntaxError otherwise, §15.5.1). `argument` is
+    /// null for a bare `yield` (yields `undefined`); `delegate` marks the `yield*` delegation form
+    /// (§15.5.5 — parsed in Cycle 1, full delegation semantics deferred to Cycle 2). `yield` has very
+    /// low precedence (just above the comma/sequence operator, below assignment).
+    yield_expr: struct { argument: ?*const Node, delegate: bool },
 };
 
 /// One link of an optional chain: the access applied to the (non-nullish) base. `call` carries the
@@ -179,6 +185,11 @@ pub const Function = struct {
     /// An expression-body arrow (`x => x + 1`) is normalized at parse time into a body holding a
     /// single `return expr` statement, so `body` is uniform across function kinds.
     is_arrow: bool = false,
+    /// §15.5 GeneratorDeclaration / GeneratorExpression (`function* g(){}`). When set, calling the
+    /// function object returns a §27.5 Generator object (it does NOT run the body) and `yield` is the
+    /// §14.4 yield operator inside the body. Mutually exclusive with `is_arrow` (arrows can't be
+    /// generators in the grammar).
+    is_generator: bool = false,
 };
 
 /// §15.7 Class Definitions. A `Class` is the shared shape of a ClassDeclaration (statement) and a

@@ -33,6 +33,59 @@ pub const SymbolProperty = struct {
 
 pub const Kind = enum { ordinary, function, array };
 
+/// §27.5 Generator object internal state ([[GeneratorState]]). A generator created by calling a
+/// `function*` starts `suspended_start`; `.next` spawns the body thread and runs it to the first
+/// `yield`/return (→ `suspended_yield` / `completed`); each subsequent `.next` resumes from a parked
+/// `yield`. `executing` guards against re-entrant `.next` on a running generator (§27.5.3.3).
+pub const GeneratorState = enum { suspended_start, suspended_yield, executing, completed };
+
+/// What the consumer is asking a parked `yield` to do on resume (§27.5.3.3 GeneratorResume /
+/// §27.5.3.4 GeneratorResumeAbrupt): a normal `.next(v)` (the yield evaluates to `v`), or an abrupt
+/// `.return(v)` / `.throw(e)` injected at the suspension point.
+pub const ResumeKind = enum { next, ret, throw };
+
+/// The gen→caller transfer: what the body thread handed back at a suspension/completion point.
+pub const TransferKind = enum { yield, ret, throw };
+
+/// §27.5 A Generator object's suspendable-execution state. Because a tree-walker recurses on the
+/// native stack and cannot suspend mid-evaluation, the body runs on its OWN `std.Thread`, alternating
+/// strictly with the consumer (ping-pong: exactly ONE side runs at a time — the two semaphores
+/// establish happens-before, so the shared realm arena is touched by only one thread at a time and
+/// stays safe). The two sides hand control back and forth through `resume_gen` (caller→body) and
+/// `to_caller` (body→caller); the slots carry the transferred values.
+///
+/// Allocated in the realm arena (lives as long as the realm). A generator that is never fully
+/// consumed leaves its body thread parked forever on `resume_gen` — acceptable for the short-lived
+/// Test262 harness; `Interpreter.cleanupGenerators` signals such threads to exit at realm teardown.
+pub const Generator = struct {
+    /// The generator function object (its `call` FunctionData carries body + closure + flags).
+    func: *Object,
+    /// The argument values the generator was called with (bound to the params when the body starts).
+    args: []const Value,
+    /// The `this` binding the generator was called with (the body runs with this `this`).
+    this_val: Value,
+    /// The active [[HomeObject]] for `super` resolution inside the body (null for plain generators).
+    home_object: ?*Object,
+    state: GeneratorState = .suspended_start,
+    /// The body thread (spawned on the first `.next`). Null until then; joined on completion.
+    thread: ?std.Thread = null,
+    /// Caller→body handoff: posted by `.next`/`.return`/`.throw` to resume the parked body. The
+    /// Generator is arena-allocated (stable address), so the body thread may hold `&gen.resume_gen`.
+    resume_gen: std.Io.Semaphore = .{},
+    /// Body→caller handoff: posted by the body at each `yield` and on completion.
+    to_caller: std.Io.Semaphore = .{},
+    /// gen→caller slot: the value yielded/returned/thrown and which it was.
+    transfer_value: Value = .undefined,
+    transfer_kind: TransferKind = .yield,
+    /// caller→gen slot: the value sent into the resumed `yield` (or the return/throw payload).
+    sent_value: Value = .undefined,
+    resume_kind: ResumeKind = .next,
+    /// Set by the realm at teardown: instructs a parked body thread to unwind and exit (best-effort
+    /// cleanup so a never-consumed generator's thread does not linger). The body checks this after
+    /// each resume and abandons execution if set.
+    abandon: bool = false,
+};
+
 /// Built-in (Zig-implemented) function identity. Dispatched by the interpreter's callNative;
 /// `none` means an ordinary AST-closure function. Avoids an fn-pointer ↔ interpreter import
 /// cycle — the behavior lives in the interpreter, keyed by this id (+ `native_name` within a
@@ -82,6 +135,9 @@ pub const NativeId = enum {
     array_values, // Array.prototype[Symbol.iterator] / .values — returns an Array Iterator
     string_iterator, // String.prototype[Symbol.iterator] — returns a String Iterator
     iterator_next, // %ArrayIteratorPrototype%.next / %StringIteratorPrototype%.next (native_name selects)
+    // §27.5 Generator — %GeneratorPrototype% methods + [Symbol.iterator].
+    generator_method, // %GeneratorPrototype%.next / .return / .throw (native_name selects)
+    generator_iterator, // %GeneratorPrototype%[Symbol.iterator] — returns `this`
 };
 
 /// §10.4.1 A Bound Function Exotic Object's internal slots: the wrapped target, the bound `this`, and
@@ -119,6 +175,10 @@ pub const FunctionData = struct {
     /// §15.7: a private METHOD `#m(){}` (vs a private field holding a function). A private method slot
     /// is read-only — `this.#m = …` is a TypeError (a brand on the instance, not a mutable field).
     is_private_method: bool = false,
+    /// §15.5: this function is a generator (`function* g(){}`). Calling it returns a §27.5 Generator
+    /// object (it does NOT run the body); `yield` inside the body is the §14.4 yield operator. Ordinary
+    /// functions and arrows leave this false (the hot call path is unchanged — no thread, no overhead).
+    is_generator: bool = false,
     /// §9.2.5 / §15.7.14 [[HomeObject]]: for a class/object method the object the method is defined
     /// on — its `.prototype` (instance method) or the constructor (static method). `super.x` inside
     /// the method resolves against `home_object.[[Prototype]]`. Null for ordinary functions/arrows.
@@ -235,6 +295,10 @@ pub const Object = struct {
     /// §22.1.5/§23.1.5 native Array/String Iterator state — present iff this object is such an iterator
     /// (its `next` native reads/advances it). Null for every ordinary object (zero cost).
     iter: ?IterState = null,
+    /// §27.5 Generator state — present iff this object is a Generator (made by calling a `function*`).
+    /// Holds the suspendable-execution machinery (body thread + ping-pong semaphores). Null for every
+    /// other object (zero cost). The %GeneratorPrototype% `next`/`return`/`throw` natives drive it.
+    generator: ?*Generator = null,
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);
