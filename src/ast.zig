@@ -170,12 +170,15 @@ pub const ArrayPattern = struct {
     rest: ?*const Pattern = null, // §13.3.3 BindingRestElement `...rest`
 };
 
-/// One `key: target = default` property of an object binding pattern. `computed` keys are not yet
-/// supported (deferred with object-literal computed keys); keys are identifier/string literals.
+/// One `key: target = default` property of an object binding pattern. `key` is the static
+/// PropertyName (identifier / string / ToString'd numeric literal). For a ComputedPropertyName
+/// `{ [expr]: target }`, `computed` holds the key expression — evaluated (ToPropertyKey) at bind
+/// time — and `key` is unused (empty).
 pub const ObjectBindingProperty = struct {
     key: []const u8,
     target: *const Pattern,
     default: ?*const Node = null,
+    computed: ?*const Node = null,
 };
 
 pub const ObjectPattern = struct {

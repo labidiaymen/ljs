@@ -564,8 +564,13 @@ pub const Interpreter = struct {
                 return .{ .env = target_env };
             },
             .target => |t| {
-                // §13.15.2 PutValue to an existing reference (identifier / member / index).
-                const wc = try self.assignToTarget(t, item, env);
+                // §14.7.5.6 ForIn/OfBodyEvaluation (lhsKind = assignment): an ArrayLiteral / ObjectLiteral
+                // head is an AssignmentPattern — DestructuringAssignmentEvaluation (§13.15.5.2), which runs
+                // its own §7.4 IteratorClose on an abrupt element/default. A simple target is a PutValue.
+                const wc = switch (t.*) {
+                    .array_literal, .object_literal => try self.assignPattern(t, item, env),
+                    else => try self.assignToTarget(t, item, env),
+                };
                 return .{ .env = env, .completion = if (wc.isAbrupt()) wc else .{ .normal = .undefined } };
             },
         }
@@ -2140,8 +2145,21 @@ pub const Interpreter = struct {
                 if (value == .undefined or value == .null) {
                     return self.throwError("TypeError", "Cannot destructure null or undefined");
                 }
+                // §14.3.3 with a BindingRestProperty: the set of property keys bound by the explicit
+                // properties is excluded from the rest. A ComputedPropertyName is evaluated ONCE (in
+                // source order, before its value is read) — record the resolved string key so the rest
+                // excludes it too (a symbol-valued computed key never collides with the string rest copy).
+                var excluded: std.ArrayList([]const u8) = .empty;
                 for (op.properties) |prop| {
-                    const gc = try self.getProperty(value, prop.key);
+                    var key_val: Value = .{ .string = prop.key };
+                    if (prop.computed) |ck| {
+                        // §13.2.5 ComputedPropertyName + §7.1.19 ToPropertyKey, evaluated at bind time.
+                        const kc = try self.evalExpr(ck, env);
+                        if (kc.isAbrupt()) return kc;
+                        key_val = if (kc.normal == .symbol) kc.normal else .{ .string = try self.toString(kc.normal) };
+                    }
+                    if (op.rest != null and key_val == .string) try excluded.append(self.arena, key_val.string);
+                    const gc = try self.getPropertyV(value, key_val);
                     if (gc.isAbrupt()) return gc;
                     var v = gc.normal;
                     if (v == .undefined) {
@@ -2167,8 +2185,8 @@ pub const Interpreter = struct {
                         while (it.next()) |entry| {
                             const k = entry.key_ptr.*;
                             var taken = false;
-                            for (op.properties) |prop| {
-                                if (std.mem.eql(u8, prop.key, k)) {
+                            for (excluded.items) |ek| {
+                                if (std.mem.eql(u8, ek, k)) {
                                     taken = true;
                                     break;
                                 }

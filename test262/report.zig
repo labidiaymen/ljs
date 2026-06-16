@@ -91,13 +91,16 @@ pub const Report = struct {
 
     // ── baseline / regression detection (US3, FR-009) ────────────────────────
 
-    fn isPassing(self: Report, arena: std.mem.Allocator, id: []const u8) std.mem.Allocator.Error!bool {
+    /// The set of currently-passing test ids ("path#mode"), as a string hash set. Built once and
+    /// reused so regression detection is O(results + baseline) instead of O(baseline × results) —
+    /// the quadratic form OOMs at the full-`language/` corpus size (allocPrint per comparison).
+    fn passingIdSet(self: Report, arena: std.mem.Allocator) std.mem.Allocator.Error!std.StringHashMap(void) {
+        var set = std.StringHashMap(void).init(arena);
         for (self.results.items) |r| {
             if (r.outcome != .pass) continue;
-            const rid = try idFor(arena, r);
-            if (std.mem.eql(u8, rid, id)) return true;
+            try set.put(try idFor(arena, r), {});
         }
-        return false;
+        return set;
     }
 
     /// Serialize the set of currently-passing test ids ("path#mode") as a JSON string array.
@@ -118,12 +121,13 @@ pub const Report = struct {
 
     /// Baseline ids that are no longer passing in this run (regressions). A baseline id that
     /// now fails OR is skipped/absent counts as a regression (strict "a baseline pass must
-    /// still pass" definition, FR-009). O(baseline × results) — fine at M0 scale; switch to a
-    /// hash set of passing ids when the corpus grows.
+    /// still pass" definition, FR-009). O(results + baseline) via a one-shot passing-id hash set
+    /// (the corpus has grown past the point where the old O(baseline × results) form is viable).
     pub fn regressionsVs(self: Report, arena: std.mem.Allocator, baseline_ids: []const []const u8) std.mem.Allocator.Error![]const []const u8 {
+        var passing = try self.passingIdSet(arena);
         var regressed: std.ArrayList([]const u8) = .empty;
         for (baseline_ids) |bid| {
-            if (!try self.isPassing(arena, bid)) try regressed.append(arena, bid);
+            if (!passing.contains(bid)) try regressed.append(arena, bid);
         }
         return regressed.toOwnedSlice(arena);
     }

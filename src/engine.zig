@@ -2526,3 +2526,78 @@ test "M27 NamedEvaluation on destructuring/param defaults (§8.6.2 / §13.15.5.2
     // (An anonymous fn passed as an array element has name "" and stays "".)
     try expectStr("function f({w = function(){}}){ return w.name } var a=[function(){}]; f({w:a[0]})", "");
 }
+
+test "M28 for-of/for-in head is a DestructuringAssignment pattern (§14.7.5.6 / §13.15.5)" {
+    // §14.7.5.6 ForIn/OfBodyEvaluation, lhsKind = assignment: an ArrayLiteral / ObjectLiteral head is
+    // refined to an AssignmentPattern (no `var`/`let`/`const`) and assigned each iteration.
+    try expectNumber("var a, b; for ([a, b] of [[1, 2]]) {} a * 10 + b", 12);
+    try expectNumber("var a; for ({a} of [{a: 5}]) {} a", 5);
+    try expectNumber("var a, b; for ({x: a, y: b} of [{x: 3, y: 4}]) {} a * 10 + b", 34);
+    // element default applies when the matched value is undefined.
+    try expectNumber("var a; for ([a = 9] of [[]]) {} a", 9);
+    // member / index targets (PutValue into an existing reference).
+    try expectNumber("var o = {}; var arr = [0]; for ([o.p, arr[0]] of [[3, 4]]) {} o.p * 10 + arr[0]", 34);
+    // nested pattern + rest in the head.
+    try expectNumber("var a, r; for ([a, ...r] of [[1, 2, 3]]) {} a + r.length", 3);
+    // for-in over an object's keys with a pattern head.
+    try expectStr("var k; var out = ''; for ([k] of [['x'], ['y']]) { out += k; } out", "xy");
+    // §13.15.1: a PARENTHESIZED literal head is NOT the cover grammar → SyntaxError.
+    try expectSyntaxError("var a; for (({a}) of [{a: 1}]) {}");
+    // §13.15.5.3 IteratorClose: an abrupt element (a throwing default) closes the not-done iterator.
+    const close_on_throw =
+        \\var closeCount = 0;
+        \\var iter = { [Symbol.iterator]() { return {
+        \\  next() { return { value: undefined, done: false }; },
+        \\  return() { closeCount++; return {}; }
+        \\}; } };
+        \\var a;
+        \\try { for ([a = (function(){ throw 'boom'; })()] of [iter]) {} } catch (e) {}
+        \\closeCount
+    ;
+    try expectNumber(close_on_throw, 1);
+}
+
+test "M28 object binding-pattern computed & numeric/string property names (§14.3.3)" {
+    // numeric PropertyName → ToString'd key.
+    try expectNumber("var { 0: v } = [7]; v", 7);
+    try expectNumber("var { 1: v } = [7, 8]; v", 8);
+    // computed PropertyName `{ [expr]: target }` — evaluated (ToPropertyKey) at bind time.
+    try expectNumber("var k = 'a'; var { [k]: v } = { a: 9 }; v", 9);
+    try expectStr("var s = Symbol('s'); var o = {}; o[s] = 'hi'; var { [s]: v } = o; v", "hi");
+    // a keyword IdentifierName is a valid (colon) PropertyName: `{ if: x }`.
+    try expectNumber("var { if: v } = { if: 5 }; v", 5);
+    // §14.3.3 with a rest: an explicit computed key is excluded from the rest copy.
+    try expectNumber("var k = 'a'; var { [k]: v, ...r } = { a: 1, b: 2, c: 3 }; v * 100 + r.b + r.c", 105);
+    // computed key in a for-of head binding, and a rest-with-nested-object-pattern element.
+    try expectNumber("var sum = 0; for (var { [String(0)]: x } of [{ 0: 4 }, { 0: 6 }]) { sum += x; } sum", 10);
+    try expectNumber("var [...{ 0: a, length: n }] = [7, 8, 9]; a * 10 + n", 73);
+    // §13.2.5 ComputedPropertyName evaluation order: a throwing key expression propagates.
+    try expectThrows("var { [(function(){ throw new Error('k'); })()]: x } = {};");
+    // a string/numeric/computed PropertyName has NO shorthand form (must carry a `:`).
+    try expectSyntaxError("var { 0 } = [1];");
+    try expectSyntaxError("var { [k] } = {};");
+}
+
+test "M28 for-of over a custom iterable closes on break/throw (§7.4.11 IteratorClose)" {
+    // §14.7.5.6: a `break` from a for-of body is an abrupt completion → IteratorClose (return()).
+    const close_on_break =
+        \\var closeCount = 0;
+        \\var iter = { [Symbol.iterator]() { var n = 0; return {
+        \\  next() { return { value: n++, done: false }; },
+        \\  return() { closeCount++; return {}; }
+        \\}; } };
+        \\for (var v of iter) { if (v === 2) break; }
+        \\closeCount
+    ;
+    try expectNumber(close_on_break, 1);
+    // §7.4.4 IteratorStep: a next() result that is not an Object is a TypeError.
+    const bad_result =
+        \\var iter = { [Symbol.iterator]() { return { next() { return 42; } }; } };
+        \\var ok = false;
+        \\try { for (var v of iter) {} } catch (e) { ok = e instanceof TypeError; }
+        \\ok
+    ;
+    try expectBool(bad_result, true);
+    // §7.4.2: for-of over a String iterates its elements, binding each to the loop variable.
+    try expectStr("var out = ''; for (var c of 'abc') out = c + out; out", "cba");
+}

@@ -247,28 +247,33 @@ pub const Parser = struct {
                 rest = rt.lexeme;
                 break;
             }
-            const kt = self.advance();
-            const key = switch (kt.kind) {
-                .identifier => kt.lexeme,
-                .string => kt.string_value,
-                else => return ParseError.UnexpectedToken,
-            };
+            // §14.3.3 BindingProperty: a PropertyName (identifier / string / numeric / `[computed]`)
+            // followed by `: BindingElement`, OR a shorthand SingleNameBinding (a bare
+            // BindingIdentifier). A computed / string / numeric name has no shorthand form — it MUST
+            // carry a `:`. The shorthand key doubles as the BindingIdentifier.
+            const kt = self.peek();
+            const pn = try self.parsePropertyName();
+            var computed: ?*const ast.Node = null;
             const target: *const ast.Pattern = if (self.peek().kind == .colon) blk: {
-                // `key: target` (renaming / nested) — `key` is an IdentifierName (escaped reserved OK).
+                // `key: target` (renaming / nested) — `key` is an IdentifierName (escaped reserved OK)
+                // or a ComputedPropertyName evaluated at bind time.
                 _ = self.advance();
+                computed = pn.computed;
                 break :blk try self.parsePattern();
             } else blk: {
-                // shorthand `{x}` — key doubles as the BindingIdentifier, so an escaped §12.7.2
-                // ReservedWord (`{ with }`) is a SyntaxError (§12.7.1).
+                // shorthand `{x}` — only a plain identifier PropertyName has this form; a string /
+                // numeric / computed name without `:` is a SyntaxError.
+                if (!pn.is_ident) return ParseError.UnexpectedToken;
+                // §12.7.1: an escaped §12.7.2 ReservedWord (`{ with }`) is not a valid BindingIdentifier.
                 if (isEscapedReservedIdent(kt)) return ParseError.UnexpectedToken;
-                break :blk try self.allocPattern(.{ .identifier = key });
+                break :blk try self.allocPattern(.{ .identifier = pn.key });
             };
             var default: ?*const ast.Node = null;
             if (self.peek().kind == .assign) {
                 _ = self.advance();
                 default = try self.parseAssignment();
             }
-            try props.append(self.arena, .{ .key = key, .target = target, .default = default });
+            try props.append(self.arena, .{ .key = pn.key, .target = target, .default = default, .computed = computed });
             if (self.peek().kind == .comma) {
                 _ = self.advance();
                 continue;
@@ -511,8 +516,20 @@ pub const Parser = struct {
                 self.no_in = saved_no_in;
                 if (self.peek().kind == .kw_in or self.peekIsOf()) {
                     const is_of = self.peekIsOf();
-                    // §13.15.1: the for-in/of LHS must be a simple AssignmentTarget.
-                    if (!isSimpleAssignTarget(first)) return ParseError.UnexpectedToken;
+                    // §14.7.5 ForBinding (assignment form): the LHS is a LeftHandSideExpression refined
+                    // by AssignmentTargetType. A simple target (identifier / `a.b` / `a[k]`) is taken as
+                    // is; an ArrayLiteral / ObjectLiteral is the §13.15.5 DestructuringAssignment cover
+                    // grammar — refine it into an AssignmentPattern (this also discharges any
+                    // CoverInitializedName / duplicate-`__proto__` obligations). A parenthesized literal
+                    // (`for (({a}) of …)`) is NOT the cover grammar (AssignmentTargetType invalid) and a
+                    // call / other expression is not assignable — both are §13.15.1 SyntaxErrors.
+                    if (isSimpleAssignTarget(first)) {
+                        // ok — simple AssignmentTarget
+                    } else if (!self.last_was_paren and (first.* == .array_literal or first.* == .object_literal)) {
+                        try self.validateAssignmentPattern(first);
+                    } else {
+                        return ParseError.UnexpectedToken;
+                    }
                     // §14.7.5: `for await` requires the `of` form.
                     if (is_await and !is_of) return ParseError.UnexpectedToken;
                     _ = self.advance(); // `in` / `of`
@@ -2412,6 +2429,10 @@ pub const Parser = struct {
             break;
         }
         _ = try self.expect(.rbrace);
+        // §13.15.1: the literal itself is NOT a ParenthesizedExpression — clear any `last_was_paren`
+        // set by a parenthesized inner value/default (`{a: (b)}`, `{a = (1)}`), so the `=`/for-head
+        // cover-grammar refinement is not mis-rejected as a parenthesized target.
+        self.last_was_paren = false;
         return self.alloc(.{ .object_literal = props.items });
     }
 
@@ -2593,6 +2614,10 @@ pub const Parser = struct {
                     break;
                 }
                 _ = try self.expect(.rbracket);
+                // §13.15.1: the literal itself is NOT a ParenthesizedExpression — clear any
+                // `last_was_paren` set by a parenthesized inner default (`[a = (1)]`), so the
+                // `=`/for-head cover-grammar refinement is not mis-rejected as a parenthesized target.
+                self.last_was_paren = false;
                 return self.alloc(.{ .array_literal = elems.items });
             },
             .kw_function => {
