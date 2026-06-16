@@ -213,6 +213,12 @@ pub const Function = struct {
     /// (async arrows). At runtime (M11 Cycle 2) calling it returns a Promise and runs the body on the
     /// generator thread substrate, suspending at each `await` (§27.7).
     is_async: bool = false,
+    /// §15.4 MethodDefinition (class/object method, getter, setter, async method) — a function created
+    /// via DefineMethod / OrdinaryFunctionCreate with `kind: method`. Per §10.2.5 MakeMethod such a
+    /// function is NOT a constructor and gets NO own `prototype` property — EXCEPT a *generator* or
+    /// *async-generator* method, which (being a GeneratorFunction) still receives its generator
+    /// `prototype`. Plain function declarations/expressions and class constructors leave this false.
+    is_method: bool = false,
 };
 
 /// §15.7 Class Definitions. A `Class` is the shared shape of a ClassDeclaration (statement) and a

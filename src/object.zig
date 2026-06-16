@@ -378,6 +378,11 @@ pub const FunctionData = struct {
     /// `await` (§27.7; M11 Cycle 2). Ordinary functions/arrows leave this false (the hot call path takes
     /// one extra optional-field branch after the `is_generator` check — no thread, no overhead).
     is_async: bool = false,
+    /// §15.4 MethodDefinition — this function object was created with `kind: method` (a class/object
+    /// method, getter, setter, or async method). Per §10.2.5 MakeMethod it is NOT a constructor and has
+    /// NO own `prototype` property, UNLESS it is a generator/async-generator method (which still gets
+    /// its generator `prototype`). Mirrors `ast.Function.is_method`; ordinary functions leave it false.
+    is_method: bool = false,
     /// §9.2.5 / §15.7.14 [[HomeObject]]: for a class/object method the object the method is defined
     /// on — its `.prototype` (instance method) or the constructor (static method). `super.x` inside
     /// the method resolves against `home_object.[[Prototype]]`. Null for ordinary functions/arrows.
@@ -549,9 +554,17 @@ pub const Object = struct {
         const obj = try create(arena, null);
         obj.kind = .function;
         obj.call = data;
-        // §10.2.4: every ordinary function gets a `.prototype` object (used by `new`/`instanceof`).
-        // §15.3: arrow functions are not constructors and have no own `.prototype`.
-        if (!data.is_arrow) {
+        // §10.2.4 MakeConstructor decides who gets a `.prototype`. Only a "constructor" function does:
+        //   • a plain FunctionDeclaration/Expression (§15.2) — YES.
+        //   • a GeneratorFunction / AsyncGeneratorFunction (§15.5/§15.6) — YES (the *generator* prototype).
+        //   • an ArrowFunction (§15.3) — NO (not a constructor).
+        //   • an AsyncFunction (§15.8, non-generator) — NO (MakeConstructor is not called).
+        //   • a MethodDefinition (§15.4 — plain/async method, getter, setter) — NO (§10.2.5 MakeMethod).
+        // So: a generator (sync or async) always gets one; otherwise only a non-arrow, non-async,
+        // non-method (i.e. a plain function) does.
+        const wants_prototype = data.is_generator or
+            (!data.is_arrow and !data.is_async and !data.is_method);
+        if (wants_prototype) {
             const proto = try create(arena, null);
             try obj.set("prototype", .{ .object = proto });
         }

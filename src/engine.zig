@@ -2674,3 +2674,37 @@ test "M29 primitive wrapper objects unbox in coercion (§21.1.4.1 / §22.1.4.1 /
     // §7.2.15: `new Number(5) == "5"` (number↔string after unboxing).
     try expectBool("new Number(5) == \"5\"", true);
 }
+
+test "M31: §10.2.5 MethodDefinition functions have no own `.prototype`" {
+    // §15.4 / §10.2.5 MakeMethod: a class/object method, getter, setter, or async (non-generator)
+    // method is NOT a constructor — it has no own `prototype` property.
+    try expectBool("class C { m(){} } ('prototype' in C.prototype.m)", false);
+    try expectBool("class C { static sm(){} } ('prototype' in C.sm)", false);
+    try expectBool("class C { async m(){} } ('prototype' in C.prototype.m)", false);
+    try expectBool("class C { get g(){return 1} } ('prototype' in Object.getOwnPropertyDescriptor(C.prototype,'g').get)", false);
+    try expectBool("var o={m(){}}; ('prototype' in o.m)", false);
+    try expectBool("var o={get g(){return 1}}; ('prototype' in Object.getOwnPropertyDescriptor(o,'g').get)", false);
+    // §15.8: an async function (declaration / expression, non-generator) likewise has no `.prototype`.
+    try expectBool("async function af(){}; ('prototype' in af)", false);
+    try expectBool("var ae=async function(){}; ('prototype' in ae)", false);
+    // §15.3: an arrow is not a constructor either.
+    try expectBool("var a=()=>{}; ('prototype' in a)", false);
+    // A generator / async-generator method IS a GeneratorFunction → it DOES keep `.prototype`.
+    try expectBool("class C { *m(){} } ('prototype' in C.prototype.m)", true);
+    try expectBool("class C { async *m(){} } ('prototype' in C.prototype.m)", true);
+    // A plain function / generator / class constructor keeps `.prototype`.
+    try expectBool("function f(){}; ('prototype' in f) && f.prototype.constructor===f", true);
+    try expectBool("function* g(){}; ('prototype' in g)", true);
+    try expectBool("class C{}; ('prototype' in C)", true);
+    // `new` still works on plain functions and classes.
+    try expectBool("function f(){} new f() instanceof f", true);
+    try expectBool("class C{} new C() instanceof C", true);
+}
+
+test "M31: §15.7.14 base class `C.prototype.[[Prototype]]` is %Object.prototype%" {
+    // §15.7.14 step 6.a: a base class (no `extends`) has protoParent = %Object.prototype%.
+    try expectBool("class C{}; Object.getPrototypeOf(C.prototype)===Object.prototype", true);
+    try expectStr("class C{}; typeof C.prototype.hasOwnProperty", "function");
+    // A derived class chains to the superclass's `.prototype`.
+    try expectBool("class C{}; class D extends C{}; Object.getPrototypeOf(D.prototype)===C.prototype", true);
+}

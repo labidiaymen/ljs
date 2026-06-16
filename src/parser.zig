@@ -1264,7 +1264,7 @@ pub const Parser = struct {
             // §14.3.1 / §15.5.1: a method's params may not collide with its body's LexicallyDeclaredNames.
             if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
             const f = try self.arena.create(ast.Function);
-            f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = is_generator_method, .is_async = is_async_method };
+            f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = is_generator_method, .is_async = is_async_method, .is_method = true };
             return .{
                 .kind = if (is_ctor) .constructor else .method,
                 .is_static = is_static,
@@ -1387,7 +1387,7 @@ pub const Parser = struct {
         const body = try self.parseMethodBody(pl);
         if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
         const f = try self.arena.create(ast.Function);
-        f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body };
+        f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_method = true };
         return .{
             .kind = if (is_get) .get else .set,
             .is_static = is_static,
@@ -2304,7 +2304,7 @@ pub const Parser = struct {
                     // §14.3.1 / §15.5.1: params may not collide with the body's LexicallyDeclaredNames.
                     if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
                     const f = try self.arena.create(ast.Function);
-                    f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = om_is_gen, .is_async = om_is_async };
+                    f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = om_is_gen, .is_async = om_is_async, .is_method = true };
                     const fnode = try self.alloc(.{ .function = f });
                     try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = fnode });
                     if (self.peek().kind == .comma) {
@@ -2338,7 +2338,7 @@ pub const Parser = struct {
                 // §13.2.5.1 UniqueFormalParameters — a method/accessor's params have no duplicates.
                 if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
                 const f = try self.arena.create(ast.Function);
-                f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body };
+                f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_method = true };
                 const fnode = try self.alloc(.{ .function = f });
                 try props.append(self.arena, .{
                     .kind = if (is_get) .get else .set,
@@ -2370,7 +2370,7 @@ pub const Parser = struct {
                 // §14.3.1: params may not collide with the body's LexicallyDeclaredNames.
                 if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
                 const f = try self.arena.create(ast.Function);
-                f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body };
+                f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_method = true };
                 const fnode = try self.alloc(.{ .function = f });
                 try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = fnode });
             } else if (self.peek().kind == .colon) {

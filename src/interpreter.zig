@@ -1584,6 +1584,11 @@ pub const Interpreter = struct {
             // `ctor.[[Prototype]]` = `Super` (static inheritance). For `extends null` there is no
             // parent constructor, so static inheritance falls back to the default function proto chain.
             ctor.prototype = super_ctor;
+        } else {
+            // §15.7.14 step 6.a: a base class (no `extends`) has `protoParent` = %Object.prototype%, so
+            // `C.prototype.[[Prototype]]` is `Object.prototype` (the freshly-created proto object that
+            // `createFunction` made has a null [[Prototype]] — relink it here).
+            proto.prototype = self.objectProto();
         }
 
         // §15.7.14 ClassElementEvaluation: walk the ClassBody in definition order, installing methods,
@@ -1792,7 +1797,9 @@ pub const Interpreter = struct {
     /// creation (outside hot loops).
     fn setConstructorBackref(obj: *Object) std.mem.Allocator.Error!void {
         const fd = obj.call orelse return;
-        if (fd.is_arrow or fd.is_generator or fd.is_async) return; // not a MakeConstructor target
+        // Not a MakeConstructor target: arrows, generators/async-generators, async functions, and
+        // §10.2.5 MethodDefinitions (which have no own `.prototype` to hang a `constructor` on).
+        if (fd.is_arrow or fd.is_generator or fd.is_async or fd.is_method) return;
         const pv = obj.get("prototype") orelse return;
         if (pv != .object) return;
         try pv.object.defineData("constructor", .{ .object = obj }, true, false, true);
@@ -1850,6 +1857,7 @@ pub const Interpreter = struct {
             .is_arrow = f.is_arrow,
             .is_generator = f.is_generator,
             .is_async = f.is_async,
+            .is_method = f.is_method,
             .captured_this = if (f.is_arrow) self.this_val else .undefined,
         });
         obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
