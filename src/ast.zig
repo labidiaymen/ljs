@@ -140,6 +140,13 @@ pub const Property = struct {
     /// object literal it is a SyntaxError; the parser records it here and the evaluator rejects a
     /// literal that still carries it. Applied (when the matched value is `undefined`) by `assignPattern`.
     default: ?*const Node = null,
+    /// §B.3.1 `__proto__` Property Names in Object Initializers — set iff this is a `.init` colon
+    /// property whose LITERAL (non-computed) PropertyName is `__proto__` (`{__proto__: v}` or
+    /// `{"__proto__": v}`). Such a property sets the object's [[Prototype]] (when `v` is Object or
+    /// null) instead of creating an own `__proto__` property; a primitive `v` is ignored. A computed
+    /// `{["__proto__"]: v}`, a shorthand `{__proto__}`, or a method `{__proto__(){}}` is NOT this (it
+    /// is an ordinary own property). Two such colon-properties in one literal is a §B.3.1 Early Error.
+    is_proto: bool = false,
 };
 
 /// §13.3.3 BindingPattern (also reused for parameter binding, §15.1). A `Pattern` is the LHS of a

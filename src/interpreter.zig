@@ -1308,6 +1308,19 @@ pub const Interpreter = struct {
                     if (key.isAbrupt()) return key.completion;
                     const c = try self.evalExpr(p.value, env);
                     if (c.isAbrupt()) return c;
+                    // §B.3.1 `__proto__` Property Names in Object Initializers: a `{__proto__: v}`
+                    // colon property (literal, non-computed name) sets [[Prototype]] instead of
+                    // creating an own property — if `v` is an Object (set proto to it) or null (null
+                    // proto). Any other value (primitive) is IGNORED: no own `__proto__` property and
+                    // the prototype is unchanged.
+                    if (p.is_proto) {
+                        switch (c.normal) {
+                            .object => |o| obj.prototype = o,
+                            .null => obj.prototype = null,
+                            else => {}, // primitive → ignored
+                        }
+                        continue;
+                    }
                     // §13.2.5 PropertyDefinitionEvaluation / §8.4 NamedEvaluation: an object-literal
                     // method (`{m(){}}`, normalized to an anonymous `function` value) OR an anonymous
                     // function/class property value (`{f: function(){}}`) gets the property key as its
@@ -2007,12 +2020,7 @@ pub const Interpreter = struct {
         // when a parameter (or the rest binding) already binds the name `arguments` (it shadows). Arrows
         // inherit the enclosing `arguments` lexically, so they get none of their own.
         if (!fd.is_arrow and call_env.lookupLocal("arguments") == null) {
-            const ao = try Object.create(self.arena, self.objectProto());
-            for (args, 0..) |a, i| {
-                const key = try numberToString(self.arena, @floatFromInt(i));
-                try ao.set(key, a);
-            }
-            try ao.defineData("length", .{ .number = @floatFromInt(args.len) }, true, false, true);
+            const ao = try self.makeArgumentsObject(args);
             try call_env.declare("arguments", .{ .object = ao }, true, true);
         }
         // §15.3: an arrow has no own `this` binding — it uses the `this` captured at creation,
@@ -2949,12 +2957,7 @@ pub const Interpreter = struct {
             }
         }
         if (call_env.lookupLocal("arguments") == null) {
-            const ao = try Object.create(self.arena, self.objectProto());
-            for (args, 0..) |a, i| {
-                const key = try numberToString(self.arena, @floatFromInt(i));
-                try ao.set(key, a);
-            }
-            try ao.defineData("length", .{ .number = @floatFromInt(args.len) }, true, false, true);
+            const ao = try self.makeArgumentsObject(args);
             try call_env.declare("arguments", .{ .object = ao }, true, true);
         }
         self.this_val = gen.this_val;
@@ -5205,6 +5208,31 @@ pub const Interpreter = struct {
     fn symbolToString(self: *Interpreter, this_val: Value) EvalError!Completion {
         if (this_val != .symbol) return self.throwError("TypeError", "Symbol.prototype.toString requires that 'this' be a Symbol");
         return .{ .normal = .{ .string = try self.toString(this_val) } };
+    }
+
+    /// §10.4.4 CreateUnmappedArgumentsObject — the `arguments` exotic given to an ordinary
+    /// (non-arrow) function. M-subset: an ordinary object (NOT an Array exotic — `Array.isArray` is
+    /// false) with the call args as indexed data properties + a non-enumerable `length`. §10.4.4.7
+    /// installs `@@iterator` = %Array.prototype.values% (`array_values`), so `arguments` is iterable
+    /// (`for (x of arguments)`, `[...arguments]`). The `array_values` native iterates `.elements`, so
+    /// the args are mirrored there as the iterator's backing store (this does NOT make it an Array —
+    /// `kind` stays `.ordinary`, so indexed [[Get]]/`length` still read the `properties` map).
+    fn makeArgumentsObject(self: *Interpreter, args: []const Value) EvalError!*Object {
+        const ao = try Object.create(self.arena, self.objectProto());
+        for (args, 0..) |a, i| {
+            const key = try numberToString(self.arena, @floatFromInt(i));
+            try ao.set(key, a);
+            try ao.elements.append(self.arena, a); // backing store for the @@iterator (array_values)
+        }
+        try ao.defineData("length", .{ .number = @floatFromInt(args.len) }, true, false, true);
+        // §10.4.4.7: arguments[@@iterator] = %ArrayProto_values% (the array_values native, non-enumerable).
+        // Keyed by the realm's well-known Symbol.iterator (absent only in a realm-less unit-test eval).
+        if (self.wellKnownIterator()) |iter_sym| {
+            const values_fn = try Object.createNative(self.arena, .array_values, "[Symbol.iterator]");
+            values_fn.prototype = self.functionProto();
+            try ao.defineSymbolData(iter_sym, .{ .object = values_fn }, true, false, true);
+        }
+        return ao;
     }
 
     /// §23.1.5.1 CreateArrayIterator — a fresh Array Iterator object (proto = %Object.prototype% in the

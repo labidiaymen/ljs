@@ -81,6 +81,14 @@ pub const Parser = struct {
     /// value (`({x = 1});`, `f({a = 1})`) — a §13.2.5.1 SyntaxError. Snapshotted/checked in `parseStmt`.
     cover_init: usize = 0,
 
+    /// §B.3.1 duplicate-`__proto__` obligation counter (the inverse of `cover_init`). A SECOND
+    /// `__proto__:` colon-property in an object literal is a §B.3.1 Early Error ONLY when the literal
+    /// is a real ObjectLiteral value; it is ALLOWED once the literal is refined to an ObjectAssignment
+    /// pattern (§13.15.1 — "this does not apply to Object Assignment patterns"). Like `cover_init`, the
+    /// duplicate is recorded here at parse time and DISCHARGED by `validateAssignmentPattern` upon
+    /// refinement; a non-zero residue at statement end means it escaped as a real value (a SyntaxError).
+    proto_dup: usize = 0,
+
     /// §14.13.1 / §14.8.1 / §14.9.1 label & control-flow scope tracking (parse-phase Early Errors).
     /// `labels` is the set of LabelIdentifier names currently in scope (the enclosing
     /// LabelledStatements); a `break label` is a SyntaxError unless `label` ∈ `labels`. A subset,
@@ -631,8 +639,12 @@ pub const Parser = struct {
         // and verify no net increase. (Nested statements re-check their own slice; refined ones already
         // decremented, so the residue here reflects only THIS statement's leaked defaults.)
         const cover_before = self.cover_init;
+        // §B.3.1: an undischarged duplicate-`__proto__` (a real ObjectLiteral value, not refined to an
+        // assignment pattern) is likewise a SyntaxError — checked over this statement's slice.
+        const proto_before = self.proto_dup;
         const stmt = try self.parseStmtInner();
         if (self.cover_init > cover_before) return ParseError.UnexpectedToken;
+        if (self.proto_dup > proto_before) return ParseError.UnexpectedToken;
         return stmt;
     }
 
@@ -1842,6 +1854,14 @@ pub const Parser = struct {
                 }
             },
             .object_literal => |props| {
+                // §13.15.1: a duplicate `__proto__:` is ALLOWED in an ObjectAssignment pattern — this
+                // refinement legitimizes it, so discharge the §B.3.1 obligation recorded at parse time
+                // (one per `__proto__:` property beyond the first in THIS literal).
+                var proto_seen: usize = 0;
+                for (props) |p| if (p.is_proto) {
+                    proto_seen += 1;
+                    if (proto_seen > 1 and self.proto_dup > 0) self.proto_dup -= 1;
+                };
                 for (props, 0..) |p, i| {
                     // §13.2.5.1: this property's CoverInitializedName (if any) is now legitimized by
                     // the refinement — discharge the obligation recorded at parse time.
@@ -2210,6 +2230,9 @@ pub const Parser = struct {
     fn parseObjectLiteral(self: *Parser) ParseError!*const ast.Node {
         _ = try self.expect(.lbrace);
         var props: std.ArrayList(ast.Property) = .empty;
+        // §B.3.1 Early Error: at most ONE `__proto__:` colon-property (literal name, not computed) per
+        // object literal — a second is a SyntaxError. Counted as such proto-setter properties are added.
+        var proto_count: usize = 0;
         while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
             // §13.2.5 PropertyDefinition : `...AssignmentExpression` (object spread).
             if (self.peek().kind == .ellipsis) {
@@ -2341,7 +2364,19 @@ pub const Parser = struct {
                 // that folded `= init` and applies it as the property's destructuring default.
                 _ = self.advance();
                 const value = try self.parseAssignmentInBrackets();
-                try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = value });
+                // §B.3.1: a colon property with a LITERAL (non-computed) PropertyName `__proto__`
+                // — `{__proto__: v}` (identifier) or `{"__proto__": v}` (string) — is the [[Prototype]]
+                // setter, not an own property. A computed `{["__proto__"]: v}` (name.computed != null)
+                // is excluded. Two such properties is a §B.3.1 Early Error (a SyntaxError).
+                const is_proto = name.computed == null and std.mem.eql(u8, name.key, "__proto__");
+                if (is_proto) {
+                    proto_count += 1;
+                    // A SECOND `__proto__:` is recorded as a deferred §B.3.1 Early Error — discharged
+                    // only if this literal is later refined to an ObjectAssignment pattern (where
+                    // duplicates are allowed); otherwise `parseStmt` reports the residue as a SyntaxError.
+                    if (proto_count > 1) self.proto_dup += 1;
+                }
+                try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = value, .is_proto = is_proto });
             } else {
                 // §13.2.5 IdentifierReference shorthand `{x}` ≡ `{x: x}`. Only valid for a plain
                 // (non-computed, non-string-keyed) identifier name; a computed/string key with no

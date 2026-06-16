@@ -2460,3 +2460,41 @@ test "M23 escaped contextual keywords are not the keyword (§12.7.1)" {
     // §12.9.3: a NumericLiteral may not be immediately followed by an IdentifierStart (incl. `\\u`).
     try expectSyntaxError("0\\u00620;");
 }
+
+test "M26 arguments is iterable (§10.4.4 / §22.1.5)" {
+    // §10.4.4.7: the `arguments` object has @@iterator = %Array.prototype.values%, so it spreads
+    // and for-of's over its indexed elements.
+    try expectNumber("function f(){ return [...arguments].length } f(1,2,3)", 3);
+    try expectNumber("function f(){ var s=0; for (var x of arguments) s+=x; return s } f(1,2,3)", 6);
+    // Spread preserves order/values.
+    try expectNumber("function f(){ return [...arguments][1] } f(10,20,30)", 20);
+    // Zero args → empty iteration.
+    try expectNumber("function f(){ return [...arguments].length } f()", 0);
+    // Still an ordinary object, NOT an Array exotic.
+    try expectBool("function f(){ return Array.isArray(arguments) } f(1)", false);
+    // arguments[Symbol.iterator] is the array values native (callable, non-enumerable).
+    try expectBool("function f(){ return typeof arguments[Symbol.iterator] === 'function' } f()", true);
+    // A generator function's `arguments` is iterable too.
+    try expectNumber("function* g(){ yield [...arguments].length } g(1,2).next().value", 2);
+}
+
+test "M26 object-literal __proto__ sets [[Prototype]] (§B.3.1)" {
+    // `{__proto__: p}` (literal colon name) sets the prototype, no own `__proto__` property.
+    try expectNumber("var p={x:1}; var o={__proto__:p}; o.x", 1);
+    try expectBool("var p={x:1}; var o={__proto__:p}; o.hasOwnProperty('__proto__')", false);
+    try expectBool("var p={x:1}; var o={__proto__:p}; Object.getPrototypeOf(o)===p", true);
+    // `{__proto__: null}` → a null-prototype object.
+    try expectBool("Object.getPrototypeOf({__proto__:null})===null", true);
+    // A primitive value is IGNORED: prototype unchanged, no own `__proto__` property.
+    try expectBool("var o={__proto__:5}; Object.getPrototypeOf(o)===Object.prototype && !o.hasOwnProperty('__proto__')", true);
+    // A string literal name `"__proto__":` is also the proto setter (§B.3.1).
+    try expectBool("var p={x:1}; var o={\"__proto__\":p}; Object.getPrototypeOf(o)===p", true);
+    // A COMPUTED `{['__proto__']: v}` is an ORDINARY own property (proto NOT set).
+    try expectNumber("({['__proto__']:7}).__proto__", 7);
+    try expectBool("var o={['__proto__']:7}; o.hasOwnProperty('__proto__')", true);
+    // §B.3.1 Early Error: two `__proto__:` colon-properties is a SyntaxError.
+    try expectSyntaxError("({__proto__:1, __proto__:2})");
+    try expectSyntaxError("({__proto__:1, \"__proto__\":2})");
+    // But mixing a proto setter with a computed `__proto__` is NOT a duplicate (different definitions).
+    try expectNoSyntaxErrorStrict("var o = ({__proto__:{}, ['__proto__']:2});");
+}
