@@ -22,6 +22,18 @@ pub const NativeId = enum {
     array_ctor, // Array(...)
     array_method, // Array.prototype.<native_name> / Array.isArray
     string_method, // String.prototype.<native_name>
+    function_ctor, // Function(...) — minimal (the `.prototype` carrier for call/apply/bind)
+    // §20.1.2 Object static reflection
+    object_define_property, // Object.defineProperty
+    object_define_properties, // Object.defineProperties
+    object_get_own_property_descriptor, // Object.getOwnPropertyDescriptor
+    object_get_own_property_names, // Object.getOwnPropertyNames
+    // §20.1.3 Object.prototype reflection
+    object_has_own_property, // Object.prototype.hasOwnProperty
+    object_property_is_enumerable, // Object.prototype.propertyIsEnumerable
+    object_is_prototype_of, // Object.prototype.isPrototypeOf
+    // §20.2.3 Function.prototype methods (Cycle 2)
+    function_method, // Function.prototype.<native_name> (call/apply/bind)
 };
 
 /// The closure captured by a function object: parameter patterns, body, and defining scope.
@@ -83,12 +95,49 @@ pub const PrivateElement = struct {
     func: ?*Object = null, // method body / getter / setter (shared, [[HomeObject]] set)
 };
 
-/// A property's stored shape (§6.1.7.1 Property Attributes, M3 subset). Most properties are plain
-/// data (`{ value }`); §13.2.5.6 getters/setters are accessor pairs. The map stores this tagged
-/// union so the hot data-property path stays a single branch (see `get`/`getAccessor`/`set`).
-pub const PropertyValue = union(enum) {
+/// A property's value half (§6.1.7.1): a data value, or an §10.2 getter/setter accessor pair. The
+/// hot data-property read switches on this single tag (see `get`/`getProp`); attributes live beside
+/// it in `PropertyValue` and are NOT branched on for plain reads.
+pub const Payload = union(enum) {
     data: Value,
     accessor: struct { get: ?*Object = null, set: ?*Object = null }, // §10.2 getter/setter functions
+};
+
+/// A complete own property (§6.1.7.1 Property Attributes): the value/accessor payload plus the three
+/// attribute flags. `writable` is meaningful only for a data payload (accessor descriptors have no
+/// [[Writable]]). Ordinary creation (assignment / object-literal / class field / array element)
+/// defaults all three to true; `Object.defineProperty` of a NEW property defaults omitted attrs to
+/// false. The map stores this by value; the hot path reads `.payload` (a single switch) and ignores
+/// the bools for plain reads.
+pub const PropertyValue = struct {
+    payload: Payload,
+    writable: bool = true,
+    enumerable: bool = true,
+    configurable: bool = true,
+
+    /// A plain data property with all attributes true — the ordinary-creation default.
+    pub fn dataDefault(value: Value) PropertyValue {
+        return .{ .payload = .{ .data = value } };
+    }
+};
+
+/// §6.2.6 a Property Descriptor as supplied to [[DefineOwnProperty]] — each field is present-or-absent.
+/// A present `value`/`writable` marks a data descriptor; a present `get`/`set` an accessor descriptor.
+pub const Descriptor = struct {
+    value: ?Value = null,
+    has_value: bool = false,
+    get: ??*Object = null, // outer null = absent; inner null = `get: undefined`
+    set: ??*Object = null,
+    writable: ?bool = null,
+    enumerable: ?bool = null,
+    configurable: ?bool = null,
+
+    pub fn isAccessor(self: Descriptor) bool {
+        return self.get != null or self.set != null;
+    }
+    pub fn isData(self: Descriptor) bool {
+        return self.has_value or self.writable != null;
+    }
 };
 
 pub const Object = struct {
@@ -153,7 +202,7 @@ pub const Object = struct {
     pub fn get(self: *Object, key: []const u8) ?Value {
         var obj: ?*Object = self;
         while (obj) |o| {
-            if (o.properties.get(key)) |pv| switch (pv) {
+            if (o.properties.get(key)) |pv| switch (pv.payload) {
                 .data => |v| return v,
                 .accessor => return .undefined, // an accessor read without a receiver → undefined
             };
@@ -177,23 +226,115 @@ pub const Object = struct {
         return null;
     }
 
-    /// §10.1.9 OrdinarySet — create/update an own data property (M3: always writable). Replaces
-    /// any accessor with a data property (the simple definition path).
+    /// §10.1.9 OrdinarySet / the ordinary-creation define — set the own data property `key`. A NEW
+    /// property is created with all attributes true (§6.1.7.1 ordinary creation); an EXISTING data
+    /// property keeps its attributes (only `value` changes); an existing accessor is replaced by a
+    /// fresh all-true data property (the simple definition path — callers route accessor writes
+    /// through `getProp`/the setter, so reaching here means a plain data write).
     pub fn set(self: *Object, key: []const u8, value: Value) std.mem.Allocator.Error!void {
-        try self.properties.put(self.arena, key, .{ .data = value });
+        if (self.properties.getPtr(key)) |pv| switch (pv.payload) {
+            .data => {
+                pv.payload = .{ .data = value };
+                return;
+            },
+            .accessor => {}, // fall through: replace with an all-true data property
+        };
+        try self.properties.put(self.arena, key, PropertyValue.dataDefault(value));
+    }
+
+    /// Create/replace an own data property with explicit attributes (§6.1.7.1) — used by built-in
+    /// installation (non-enumerable methods) and array-element bookkeeping.
+    pub fn defineData(self: *Object, key: []const u8, value: Value, writable: bool, enumerable: bool, configurable: bool) std.mem.Allocator.Error!void {
+        try self.properties.put(self.arena, key, .{
+            .payload = .{ .data = value },
+            .writable = writable,
+            .enumerable = enumerable,
+            .configurable = configurable,
+        });
     }
 
     /// §13.2.5.6 PropertyDefinitionEvaluation for an accessor — merge `get`/`set` into the own
-    /// property `key`, preserving the other half if it was already defined this literal.
+    /// property `key`, preserving the other half if it was already defined this literal. Object-literal
+    /// accessors are enumerable + configurable (and have no [[Writable]]).
     pub fn defineAccessor(self: *Object, key: []const u8, getter: ?*Object, setter: ?*Object) std.mem.Allocator.Error!void {
         var acc: struct { get: ?*Object = null, set: ?*Object = null } = .{};
-        if (self.properties.get(key)) |existing| switch (existing) {
+        if (self.properties.get(key)) |existing| switch (existing.payload) {
             .accessor => |a| acc = .{ .get = a.get, .set = a.set },
             .data => {},
         };
         if (getter) |g| acc.get = g;
         if (setter) |s| acc.set = s;
-        try self.properties.put(self.arena, key, .{ .accessor = .{ .get = acc.get, .set = acc.set } });
+        try self.properties.put(self.arena, key, .{
+            .payload = .{ .accessor = .{ .get = acc.get, .set = acc.set } },
+            .enumerable = true,
+            .configurable = true,
+        });
+    }
+
+    /// True iff own property `key` exists and is enumerable (§6.1.7.1 [[Enumerable]]). Used by for-in,
+    /// object spread, and `Object.keys`-style enumeration. Array indices / String chars are enumerable
+    /// (handled by callers); `length` is not stored here so it is correctly absent.
+    pub fn isEnumerable(self: *Object, key: []const u8) bool {
+        return if (self.properties.get(key)) |pv| pv.enumerable else false;
+    }
+
+    /// §10.1.6 [[DefineOwnProperty]] — apply a §6.2.6 Descriptor to own property `key`. A NEW property
+    /// fills omitted attributes from `false` defaults (per §10.1.6.3 step 4.a.i); an EXISTING property
+    /// keeps unstated fields. Returns false (the caller throws a TypeError) on an incompatible
+    /// redefinition of a non-configurable property (basic guard — the full §10.1.6.3 invariant matrix
+    /// is M-subset-deferred). Data↔accessor and value/flag changes are allowed when configurable.
+    pub fn defineProperty(self: *Object, key: []const u8, d: Descriptor) std.mem.Allocator.Error!bool {
+        const existing = self.properties.getPtr(key);
+        if (existing) |cur| {
+            // §10.1.6.3 step 2–4: a non-configurable current property restricts the redefinition.
+            if (!cur.configurable) {
+                if (d.configurable orelse false) return false; // can't make it configurable
+                if (d.enumerable) |e| if (e != cur.enumerable) return false;
+                const cur_is_accessor = cur.payload == .accessor;
+                if (d.isAccessor() and !cur_is_accessor) return false;
+                if (d.isData() and cur_is_accessor) return false;
+                if (!cur_is_accessor and !cur.writable) {
+                    if (d.writable orelse false) return false; // can't make it writable
+                    if (d.has_value) {
+                        // a non-writable, non-configurable data prop: only an identical value is allowed
+                        if (!sameValueLoose(cur.payload.data, d.value.?)) return false;
+                    }
+                }
+            }
+        }
+        // Build the resulting property: start from the existing attrs (or false defaults for a new one).
+        var writable = if (existing) |c| c.writable else false;
+        var enumerable = if (existing) |c| c.enumerable else false;
+        var configurable = if (existing) |c| c.configurable else false;
+        if (d.enumerable) |e| enumerable = e;
+        if (d.configurable) |c| configurable = c;
+        var payload: Payload = if (existing) |c| c.payload else .{ .data = .undefined };
+        if (d.isAccessor()) {
+            var g: ?*Object = null;
+            var s: ?*Object = null;
+            if (payload == .accessor) {
+                g = payload.accessor.get;
+                s = payload.accessor.set;
+            }
+            if (d.get) |gv| g = gv;
+            if (d.set) |sv| s = sv;
+            payload = .{ .accessor = .{ .get = g, .set = s } };
+        } else {
+            // a data descriptor (or attributes-only on an existing data prop)
+            if (d.writable) |w| writable = w;
+            if (d.has_value) {
+                payload = .{ .data = d.value.? };
+            } else if (payload == .accessor) {
+                payload = .{ .data = .undefined }; // accessor→data with no value: value defaults undefined
+            }
+        }
+        try self.properties.put(self.arena, key, .{
+            .payload = payload,
+            .writable = writable,
+            .enumerable = enumerable,
+            .configurable = configurable,
+        });
+        return true;
     }
 
     // ── §15.7 PrivateName slots (Cycle 4) ──────────────────────────────────────
@@ -213,7 +354,7 @@ pub const Object = struct {
     /// Install/replace the data slot for PrivateName `key`. Used for private fields (per-instance)
     /// and private methods (the shared method object, copied into each instance's slot).
     pub fn setPrivate(self: *Object, key: []const u8, value: Value) std.mem.Allocator.Error!void {
-        try self.private_fields.put(self.arena, key, .{ .data = value });
+        try self.private_fields.put(self.arena, key, PropertyValue.dataDefault(value));
     }
 
     /// Install a private descriptor verbatim (data or accessor) — for private accessors `get/set #x`.
@@ -225,12 +366,26 @@ pub const Object = struct {
     /// for the private map): a matching get+set pair becomes one accessor descriptor.
     pub fn definePrivateAccessor(self: *Object, key: []const u8, getter: ?*Object, setter: ?*Object) std.mem.Allocator.Error!void {
         var acc: struct { get: ?*Object = null, set: ?*Object = null } = .{};
-        if (self.private_fields.get(key)) |existing| switch (existing) {
+        if (self.private_fields.get(key)) |existing| switch (existing.payload) {
             .accessor => |a| acc = .{ .get = a.get, .set = a.set },
             .data => {},
         };
         if (getter) |g| acc.get = g;
         if (setter) |s| acc.set = s;
-        try self.private_fields.put(self.arena, key, .{ .accessor = .{ .get = acc.get, .set = acc.set } });
+        try self.private_fields.put(self.arena, key, .{ .payload = .{ .accessor = .{ .get = acc.get, .set = acc.set } } });
     }
 };
+
+/// A loose value equality for the non-configurable redefinition guard (§10.1.6.3): primitives compare
+/// by value, objects by identity. This is simpler than §7.2.11 SameValue (NaN/±0 corner cases) but
+/// sufficient for the basic "redefine a frozen prop to its current value is allowed" check.
+fn sameValueLoose(a: Value, b: Value) bool {
+    return switch (a) {
+        .undefined => b == .undefined,
+        .null => b == .null,
+        .boolean => |x| b == .boolean and b.boolean == x,
+        .number => |x| b == .number and (x == b.number or (std.math.isNan(x) and std.math.isNan(b.number))),
+        .string => |x| b == .string and std.mem.eql(u8, x, b.string),
+        .object => |x| b == .object and b.object == x,
+    };
+}

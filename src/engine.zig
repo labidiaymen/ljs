@@ -1191,3 +1191,65 @@ test "M5 for-in/of: assignment-target heads + [~In] disambiguation (Cycle 1, §1
     try expectNumber("var s=0; for (var i=0, j=10; i<3; i++) s += i + j; s", 33);
     try expectNumber("var s=0; for (var i=0; i<3; i++) s+=i; s", 3);
 }
+
+test "M6 Object.defineProperty + getOwnPropertyDescriptor (Cycle 1, §20.1.2.4/.8)" {
+    // A defined data property is readable; omitted attributes default to false (§10.1.6.3).
+    try expectNumber("var o={}; Object.defineProperty(o,'x',{value:5,enumerable:false}); o.x", 5);
+    try expectNumber("var o={}; Object.defineProperty(o,'x',{value:5}); Object.getOwnPropertyDescriptor(o,'x').value", 5);
+    try expectBool("var o={}; Object.defineProperty(o,'x',{value:5}); Object.getOwnPropertyDescriptor(o,'x').enumerable", false);
+    try expectBool("var o={}; Object.defineProperty(o,'x',{value:5}); Object.getOwnPropertyDescriptor(o,'x').writable", false);
+    try expectBool("var o={}; Object.defineProperty(o,'x',{value:5}); Object.getOwnPropertyDescriptor(o,'x').configurable", false);
+    // A non-enumerable own property is skipped by for-in; an enumerable one is visited.
+    try expectStr("var o={}; Object.defineProperty(o,'x',{value:5,enumerable:false}); o.y=7; var s=''; for(var k in o)s+=k; s", "y");
+    // ordinary assignment → all attributes true (round-trips through the descriptor).
+    try expectBool("var o={}; o.a=1; Object.getOwnPropertyDescriptor(o,'a').enumerable", true);
+    try expectBool("var o={}; o.a=1; Object.getOwnPropertyDescriptor(o,'a').writable", true);
+    // getOwnPropertyDescriptor of an absent property → undefined.
+    try expectUndefined("Object.getOwnPropertyDescriptor({},'nope')");
+    // A getter installed via defineProperty is invoked on read; the descriptor exposes get/set.
+    try expectNumber("var g={}; Object.defineProperty(g,'v',{get:function(){return 42;}}); g.v", 42);
+    try expectBool("var g={}; Object.defineProperty(g,'v',{get:function(){return 1;}}); typeof Object.getOwnPropertyDescriptor(g,'v').get === 'function'", true);
+    // defineProperties applies each own enumerable descriptor.
+    try expectNumber("var o={}; Object.defineProperties(o,{a:{value:1},b:{value:2}}); o.a+o.b", 3);
+    // Redefining a non-configurable property incompatibly → TypeError.
+    try expectThrows("var o={}; Object.defineProperty(o,'x',{value:1}); Object.defineProperty(o,'x',{value:2});");
+    // ...but an existing property's omitted attributes are preserved (not reset to false).
+    try expectBool("var o={a:1}; Object.defineProperty(o,'a',{value:2}); Object.getOwnPropertyDescriptor(o,'a').enumerable", true);
+}
+
+test "M6 Object.getOwnPropertyNames (Cycle 1, §20.1.2.10)" {
+    // Includes a non-enumerable own name.
+    try expectNumber("var o={a:1}; Object.defineProperty(o,'h',{value:1,enumerable:false}); Object.getOwnPropertyNames(o).length", 2);
+    try expectBool("var o={a:1}; Object.defineProperty(o,'h',{value:1,enumerable:false}); Object.getOwnPropertyNames(o).indexOf('h') >= 0", true);
+    // Array: indices + "length".
+    try expectStr("Object.getOwnPropertyNames(['p','q']).join(',')", "0,1,length");
+}
+
+test "M6 Object.prototype.hasOwnProperty / propertyIsEnumerable / isPrototypeOf (Cycle 1, §20.1.3)" {
+    try expectBool("({a:1}).hasOwnProperty('a')", true);
+    try expectBool("({}).hasOwnProperty('a')", false);
+    // Inherited (a built-in proto method) is NOT an own property.
+    try expectBool("({}).hasOwnProperty('toString')", false);
+    // Array index/length are own.
+    try expectBool("[10].hasOwnProperty(0)", true);
+    try expectBool("[10].hasOwnProperty('length')", true);
+    // propertyIsEnumerable honors [[Enumerable]].
+    try expectBool("var o={a:1}; o.propertyIsEnumerable('a')", true);
+    try expectBool("var o={}; Object.defineProperty(o,'x',{value:1,enumerable:false}); o.propertyIsEnumerable('x')", false);
+    try expectBool("[1].propertyIsEnumerable('length')", false);
+    // isPrototypeOf walks the chain.
+    try expectBool("var p={}; var c=Object.create?({}):({}); p.isPrototypeOf({})", false);
+    try expectBool("var a=[]; Array.prototype.isPrototypeOf(a)", true);
+}
+
+test "M6 enumerable-awareness: for-in & spread skip non-enumerable / proto methods (Cycle 1, §7.3.25/§14.7.5)" {
+    // for-in over a plain object yields only its own enumerable keys (no Object.prototype methods).
+    try expectStr("var s=''; for(var k in {a:1}) s+=k; s", "a");
+    // for-in over an empty object / empty array yields nothing (built-in protos are non-enumerable).
+    try expectStr("var s='Z'; for(var k in {}) s+=k; s", "Z");
+    try expectStr("var s='Z'; for(var k in []) s+=k; s", "Z");
+    // object spread copies only own enumerable string keys (order is map-iteration; assert membership).
+    try expectNumber("var c=0; for(var k in {...{a:1,b:2}}) c++; c", 2);
+    try expectBool("var spread={...{a:1,b:2}}; spread.hasOwnProperty('a') && spread.hasOwnProperty('b')", true);
+    try expectStr("var o={}; Object.defineProperty(o,'h',{value:1,enumerable:false}); o.v=2; var s=''; for(var k in {...o}) s+=k; s", "v");
+}

@@ -7,7 +7,8 @@ const ast = @import("ast.zig");
 const Value = @import("value.zig").Value;
 const Completion = @import("completion.zig").Completion;
 const Environment = @import("environment.zig").Environment;
-const Object = @import("object.zig").Object;
+const object_mod = @import("object.zig");
+const Object = object_mod.Object;
 const ops = @import("abstract_ops.zig");
 const builtin_array = @import("builtin_array.zig");
 const builtin_string = @import("builtin_string.zig");
@@ -373,7 +374,8 @@ pub const Interpreter = struct {
                     while (it.next()) |entry| {
                         const key = entry.key_ptr.*;
                         if (seen.contains(key)) continue;
-                        try seen.put(self.arena, key, {});
+                        try seen.put(self.arena, key, {}); // a shadowed name is skipped even if non-enumerable here
+                        if (!entry.value_ptr.enumerable) continue; // §14.7.5: only enumerable own keys
                         try out.append(self.arena, .{ .string = key });
                     }
                     obj = o.prototype;
@@ -611,7 +613,7 @@ pub const Interpreter = struct {
         const o = base.object;
         const pv = o.getPrivate(key) orelse
             return self.throwError("TypeError", "Cannot read private member from an object whose class did not declare it");
-        switch (pv) {
+        switch (pv.payload) {
             .data => |v| return .{ .normal = v },
             .accessor => |a| {
                 const getter = a.get orelse return self.throwError("TypeError", "'#x' was defined without a getter");
@@ -628,7 +630,7 @@ pub const Interpreter = struct {
         const o = base.object;
         const pv = o.getPrivate(key) orelse
             return self.throwError("TypeError", "Cannot write private member to an object whose class did not declare it");
-        switch (pv) {
+        switch (pv.payload) {
             .data => |v| {
                 // A private METHOD slot holds a function and is not assignable; a private FIELD is.
                 if (v == .object and v.object.kind == .function and v.object.call != null and v.object.call.?.is_private_method) {
@@ -653,7 +655,7 @@ pub const Interpreter = struct {
         const home = self.home_object orelse return .{ .normal = .undefined };
         const base = home.prototype orelse return .{ .normal = .undefined };
         const loc = base.getProp(key) orelse return .{ .normal = .undefined };
-        switch (loc.pv) {
+        switch (loc.pv.payload) {
             .data => |v| return .{ .normal = v },
             // §10.2.x: a getter found on the super chain runs with `this` = the current receiver.
             .accessor => |a| {
@@ -980,6 +982,7 @@ pub const Interpreter = struct {
                 }
                 var it = o.properties.iterator();
                 while (it.next()) |entry| {
+                    if (!entry.value_ptr.enumerable) continue; // §7.3.25: own ENUMERABLE keys only
                     const gc = try self.getProperty(source, entry.key_ptr.*);
                     if (gc.isAbrupt()) return; // a throwing getter aborts copy (best-effort here)
                     try target.set(entry.key_ptr.*, gc.normal);
@@ -1594,7 +1597,7 @@ pub const Interpreter = struct {
                 // §10.1.8.1 OrdinaryGet — locate the property (data or accessor) on the chain.
                 // Data-property fast path: a single descriptor read, no accessor branch.
                 const loc = o.getProp(key) orelse return .{ .normal = .undefined };
-                switch (loc.pv) {
+                switch (loc.pv.payload) {
                     .data => |v| return .{ .normal = v },
                     .accessor => |a| {
                         // §10.2.x: invoke the getter with `this` = the original receiver (`base`).
@@ -1649,8 +1652,8 @@ pub const Interpreter = struct {
                 // no-op (sloppy). A data property (own or inherited) → define/overwrite an own data
                 // property. The common case (absent or own data) stays a single `set`.
                 if (o.getProp(key)) |loc| {
-                    if (loc.pv == .accessor) {
-                        const setter = loc.pv.accessor.set orelse return .{ .normal = value };
+                    if (loc.pv.payload == .accessor) {
+                        const setter = loc.pv.payload.accessor.set orelse return .{ .normal = value };
                         const sc = try self.callFunction(setter, &.{value}, base);
                         if (sc.isAbrupt()) return sc;
                         return .{ .normal = value };
@@ -1837,6 +1840,254 @@ pub const Interpreter = struct {
         return self.globalProto("Array");
     }
 
+    // ── §20.1.2 / §20.1.3 Object reflection ─────────────────────────────────
+
+    /// §6.2.6 ToPropertyDescriptor — read a descriptor object's own `value`/`writable`/`get`/`set`/
+    /// `enumerable`/`configurable` fields into a `Descriptor` (each present-or-absent via HasProperty).
+    /// `get`/`set` must be callable or `undefined` (TypeError otherwise). Returns null+throw on error.
+    fn toPropertyDescriptor(self: *Interpreter, attrs: Value) EvalError!union(enum) { desc: object_mod.Descriptor, abrupt: Completion } {
+        if (attrs != .object) return .{ .abrupt = (try self.throwError("TypeError", "Property description must be an object")) };
+        const o = attrs.object;
+        var d: object_mod.Descriptor = .{};
+        if (o.getProp("enumerable")) |_| {
+            const c = try self.getProperty(attrs, "enumerable");
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            d.enumerable = toBoolean(c.normal);
+        }
+        if (o.getProp("configurable")) |_| {
+            const c = try self.getProperty(attrs, "configurable");
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            d.configurable = toBoolean(c.normal);
+        }
+        if (o.getProp("value")) |_| {
+            const c = try self.getProperty(attrs, "value");
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            d.value = c.normal;
+            d.has_value = true;
+        }
+        if (o.getProp("writable")) |_| {
+            const c = try self.getProperty(attrs, "writable");
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            d.writable = toBoolean(c.normal);
+        }
+        if (o.getProp("get")) |_| {
+            const c = try self.getProperty(attrs, "get");
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            if (c.normal == .undefined) {
+                d.get = @as(?*Object, null);
+            } else if (c.normal == .object and c.normal.object.kind == .function) {
+                d.get = c.normal.object;
+            } else return .{ .abrupt = (try self.throwError("TypeError", "Getter must be a function")) };
+        }
+        if (o.getProp("set")) |_| {
+            const c = try self.getProperty(attrs, "set");
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            if (c.normal == .undefined) {
+                d.set = @as(?*Object, null);
+            } else if (c.normal == .object and c.normal.object.kind == .function) {
+                d.set = c.normal.object;
+            } else return .{ .abrupt = (try self.throwError("TypeError", "Setter must be a function")) };
+        }
+        if (d.isAccessor() and d.isData()) {
+            return .{ .abrupt = (try self.throwError("TypeError", "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute")) };
+        }
+        return .{ .desc = d };
+    }
+
+    /// §20.1.2.4 Object.defineProperty ( O, P, Attributes ).
+    fn objectDefineProperty(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const o = if (args.len > 0) args[0] else .undefined;
+        if (o != .object) return self.throwError("TypeError", "Object.defineProperty called on non-object");
+        const key = try self.toString(if (args.len > 1) args[1] else .undefined);
+        const r = try self.toPropertyDescriptor(if (args.len > 2) args[2] else .undefined);
+        switch (r) {
+            .abrupt => |c| return c,
+            .desc => |d| {
+                const ok = try o.object.defineProperty(key, d);
+                if (!ok) return self.throwError("TypeError", "Cannot redefine property");
+                return .{ .normal = o };
+            },
+        }
+    }
+
+    /// §20.1.2.5 Object.defineProperties ( O, Properties ) — DefinePropertiesHelper over each own
+    /// enumerable key of `Properties`.
+    fn objectDefineProperties(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const o = if (args.len > 0) args[0] else .undefined;
+        if (o != .object) return self.throwError("TypeError", "Object.defineProperties called on non-object");
+        const props = if (args.len > 1) args[1] else .undefined;
+        if (props != .object) return self.throwError("TypeError", "Cannot convert undefined or null to object");
+        var it = props.object.properties.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.enumerable) continue;
+            const key = entry.key_ptr.*;
+            const ac = try self.getProperty(props, key);
+            if (ac.isAbrupt()) return ac;
+            const r = try self.toPropertyDescriptor(ac.normal);
+            switch (r) {
+                .abrupt => |c| return c,
+                .desc => |d| {
+                    const ok = try o.object.defineProperty(key, d);
+                    if (!ok) return self.throwError("TypeError", "Cannot redefine property");
+                },
+            }
+        }
+        return .{ .normal = o };
+    }
+
+    /// §20.1.2.8 Object.getOwnPropertyDescriptor ( O, P ) → §6.2.6 FromPropertyDescriptor or undefined.
+    fn objectGetOwnPropertyDescriptor(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const o = if (args.len > 0) args[0] else .undefined;
+        if (o != .object) {
+            // §20.1.2.8 step 1: ToObject — a String boxes (index/length keys); else no own props.
+            if (o == .string) return self.stringDescriptor(o.string, try self.toString(if (args.len > 1) args[1] else .undefined));
+            if (o == .undefined or o == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
+            return .{ .normal = .undefined };
+        }
+        const key = try self.toString(if (args.len > 1) args[1] else .undefined);
+        // Array exotic: indices + `length` have synthetic descriptors (not in the property map).
+        if (o.object.kind == .array) {
+            if (std.mem.eql(u8, key, "length"))
+                return self.fromDataDescriptor(.{ .number = @floatFromInt(o.object.elements.items.len) }, true, false, false);
+            if (parseIndex(key)) |i| {
+                if (i < o.object.elements.items.len)
+                    return self.fromDataDescriptor(o.object.elements.items[i], true, true, true);
+            }
+        }
+        const pv = o.object.properties.get(key) orelse return .{ .normal = .undefined };
+        return self.fromPropertyValue(pv);
+    }
+
+    /// §6.2.6 FromPropertyDescriptor of a stored `PropertyValue` → a fresh descriptor object.
+    fn fromPropertyValue(self: *Interpreter, pv: object_mod.PropertyValue) EvalError!Completion {
+        const desc = try Object.create(self.arena, self.globalProto("Object"));
+        switch (pv.payload) {
+            .data => |v| {
+                try desc.set("value", v);
+                try desc.set("writable", .{ .boolean = pv.writable });
+            },
+            .accessor => |a| {
+                try desc.set("get", if (a.get) |g| .{ .object = g } else .undefined);
+                try desc.set("set", if (a.set) |s| .{ .object = s } else .undefined);
+            },
+        }
+        try desc.set("enumerable", .{ .boolean = pv.enumerable });
+        try desc.set("configurable", .{ .boolean = pv.configurable });
+        return .{ .normal = .{ .object = desc } };
+    }
+
+    fn fromDataDescriptor(self: *Interpreter, value: Value, writable: bool, enumerable: bool, configurable: bool) EvalError!Completion {
+        return self.fromPropertyValue(.{
+            .payload = .{ .data = value },
+            .writable = writable,
+            .enumerable = enumerable,
+            .configurable = configurable,
+        });
+    }
+
+    /// A String's own index/length property descriptor (the ToObject boxing path).
+    fn stringDescriptor(self: *Interpreter, s: []const u8, key: []const u8) EvalError!Completion {
+        if (std.mem.eql(u8, key, "length"))
+            return self.fromDataDescriptor(.{ .number = @floatFromInt(s.len) }, false, false, false);
+        if (parseIndex(key)) |i| {
+            if (i < s.len) return self.fromDataDescriptor(.{ .string = s[i .. i + 1] }, false, true, false);
+        }
+        return .{ .normal = .undefined };
+    }
+
+    /// §20.1.2.10 Object.getOwnPropertyNames ( O ) — all own string keys (enumerable or not). For an
+    /// Array: the indices (numeric order) + `"length"`, then ordinary string keys.
+    fn objectGetOwnPropertyNames(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const o = if (args.len > 0) args[0] else .undefined;
+        const arr = try Object.createArray(self.arena, self.arrayProto());
+        switch (o) {
+            .object => |obj| {
+                if (obj.kind == .array) {
+                    for (obj.elements.items, 0..) |_, i| {
+                        try arr.elements.append(self.arena, .{ .string = try numberToString(self.arena, @floatFromInt(i)) });
+                    }
+                    try arr.elements.append(self.arena, .{ .string = "length" });
+                }
+                var it = obj.properties.iterator();
+                while (it.next()) |entry| try arr.elements.append(self.arena, .{ .string = entry.key_ptr.* });
+            },
+            .string => |s| {
+                for (0..s.len) |i| try arr.elements.append(self.arena, .{ .string = try numberToString(self.arena, @floatFromInt(i)) });
+                try arr.elements.append(self.arena, .{ .string = "length" });
+            },
+            .undefined, .null => return self.throwError("TypeError", "Cannot convert undefined or null to object"),
+            else => {},
+        }
+        return .{ .normal = .{ .object = arr } };
+    }
+
+    /// §20.1.3.2 Object.prototype.hasOwnProperty ( V ) — own property only (no chain walk).
+    fn objectHasOwnProperty(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
+        const key = try self.toString(if (args.len > 0) args[0] else .undefined);
+        return .{ .normal = .{ .boolean = try self.hasOwnProp(this_val, key) } };
+    }
+
+    /// HasOwnProperty over the engine's value model (Array indices/length, String index/length,
+    /// ordinary own property map). Used by hasOwnProperty + propertyIsEnumerable.
+    fn hasOwnProp(self: *Interpreter, base: Value, key: []const u8) EvalError!bool {
+        switch (base) {
+            .object => |o| {
+                if (o.kind == .array) {
+                    if (std.mem.eql(u8, key, "length")) return true;
+                    if (parseIndex(key)) |i| if (i < o.elements.items.len) return true;
+                }
+                return o.properties.contains(key);
+            },
+            .string => |s| {
+                if (std.mem.eql(u8, key, "length")) return true;
+                if (parseIndex(key)) |i| return i < s.len;
+                return false;
+            },
+            .undefined, .null => {
+                _ = try self.throwError("TypeError", "Cannot convert undefined or null to object");
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// §20.1.3.4 Object.prototype.propertyIsEnumerable ( V ).
+    fn objectPropertyIsEnumerable(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
+        const key = try self.toString(if (args.len > 0) args[0] else .undefined);
+        const enumerable: bool = switch (this_val) {
+            .object => |o| blk: {
+                if (o.kind == .array) {
+                    if (std.mem.eql(u8, key, "length")) break :blk false; // Array length is non-enumerable
+                    if (parseIndex(key)) |i| if (i < o.elements.items.len) break :blk true;
+                }
+                break :blk o.isEnumerable(key);
+            },
+            .string => |s| blk: {
+                if (std.mem.eql(u8, key, "length")) break :blk false;
+                if (parseIndex(key)) |i| break :blk i < s.len; // String chars are enumerable
+                break :blk false;
+            },
+            .undefined, .null => return self.throwError("TypeError", "Cannot convert undefined or null to object"),
+            else => false,
+        };
+        return .{ .normal = .{ .boolean = enumerable } };
+    }
+
+    /// §20.1.3.3 Object.prototype.isPrototypeOf ( V ) — is `this` anywhere on V's prototype chain.
+    fn objectIsPrototypeOf(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
+        _ = self;
+        if (this_val != .object) return .{ .normal = .{ .boolean = false } };
+        const target = this_val.object;
+        const v = if (args.len > 0) args[0] else .undefined;
+        if (v != .object) return .{ .normal = .{ .boolean = false } };
+        var p: ?*Object = v.object.prototype;
+        while (p) |proto| {
+            if (proto == target) return .{ .normal = .{ .boolean = true } };
+            p = proto.prototype;
+        }
+        return .{ .normal = .{ .boolean = false } };
+    }
+
     /// Dispatch a built-in function (§19/§20). Behavior keyed by `func.native`.
     fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
         switch (func.native) {
@@ -1873,6 +2124,15 @@ pub const Interpreter = struct {
                 return .{ .normal = .{ .object = try Object.create(self.arena, null) } };
             },
             .object_to_string => return .{ .normal = .{ .string = "[object Object]" } },
+            .function_ctor => return self.throwError("TypeError", "Function constructor is not supported"),
+            .object_define_property => return self.objectDefineProperty(args),
+            .object_define_properties => return self.objectDefineProperties(args),
+            .object_get_own_property_descriptor => return self.objectGetOwnPropertyDescriptor(args),
+            .object_get_own_property_names => return self.objectGetOwnPropertyNames(args),
+            .object_has_own_property => return self.objectHasOwnProperty(this_val, args),
+            .object_property_is_enumerable => return self.objectPropertyIsEnumerable(this_val, args),
+            .object_is_prototype_of => return self.objectIsPrototypeOf(this_val, args),
+            .function_method => return self.throwError("TypeError", "Function.prototype method is not supported"),
             .array_ctor, .array_method, .string_method => unreachable, // handled in the first switch
             .none => unreachable,
         }
