@@ -196,19 +196,33 @@ pub const Lexer = struct {
         const c = self.src[self.pos];
         const start = self.pos;
 
-        // Numbers (decimal, optional fraction). §12.9.3 (subset).
+        // §12.9.3 NumericLiteral — decimal (int/fraction/exponent), `0x`/`0o`/`0b` radix prefixes, and
+        // `_` NumericLiteralSeparators. The value is computed by the parser from `lexeme` (BigInt `n`
+        // suffix is not consumed → deferred).
         if (isDigit(c) or (c == '.' and isDigit(self.peek2()))) {
-            self.pos += 1;
-            while (self.pos < self.src.len and (isDigit(self.src[self.pos]) or self.src[self.pos] == '.')) {
-                self.pos += 1;
+            if (c == '0' and self.pos + 1 < self.src.len and switch (self.src[self.pos + 1]) {
+                'x', 'X', 'o', 'O', 'b', 'B' => true,
+                else => false,
+            }) {
+                self.pos += 2; // 0x / 0o / 0b — over-accept hex digits; the parser validates per radix
+                while (self.pos < self.src.len and (isHexDigit(self.src[self.pos]) or self.src[self.pos] == '_')) self.pos += 1;
+            } else {
+                while (self.pos < self.src.len and (isDigit(self.src[self.pos]) or self.src[self.pos] == '_')) self.pos += 1;
+                if (self.pos < self.src.len and self.src[self.pos] == '.') {
+                    self.pos += 1;
+                    while (self.pos < self.src.len and (isDigit(self.src[self.pos]) or self.src[self.pos] == '_')) self.pos += 1;
+                }
+                if (self.pos < self.src.len and (self.src[self.pos] == 'e' or self.src[self.pos] == 'E')) {
+                    self.pos += 1;
+                    if (self.pos < self.src.len and (self.src[self.pos] == '+' or self.src[self.pos] == '-')) self.pos += 1;
+                    while (self.pos < self.src.len and (isDigit(self.src[self.pos]) or self.src[self.pos] == '_')) self.pos += 1;
+                }
             }
-            // §12.9.3 NOTE: "The SourceCharacter immediately following a NumericLiteral must not be an
-            // IdentifierStart or DecimalDigit." A `\` here begins a `\u` IdentifierStart escape (now that
-            // §12.7.1 identifier escapes are accepted) — e.g. `0b0` — which is likewise an Early
-            // Error. (Digits were already consumed by the loop above.)
+            // §12.9.3: the char immediately after a NumericLiteral must not be an IdentifierStart or a
+            // digit (a `\` begins a `\u` IdentifierStart escape) — an Early Error (catches `3in`, `0b0a`).
             if (self.pos < self.src.len) {
                 const nxt = self.src[self.pos];
-                if (isIdentStart(nxt) or nxt == '\\') return LexError.UnexpectedCharacter;
+                if (isIdentStart(nxt) or nxt == '\\' or isDigit(nxt)) return LexError.UnexpectedCharacter;
             }
             return .{ .kind = .number, .lexeme = self.src[start..self.pos] };
         }
@@ -782,6 +796,9 @@ fn tok(kind: TokenKind, lexeme: []const u8) Token {
 
 fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
+}
+fn isHexDigit(c: u8) bool {
+    return isDigit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
 }
 /// A single hex digit's value, or null if `c` is not `[0-9A-Fa-f]` (§12.9.4.1 HexDigit).
 fn hexDigit(c: u8) ?u4 {

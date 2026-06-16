@@ -2404,7 +2404,7 @@ pub const Parser = struct {
             .number => {
                 _ = self.advance();
                 // §13.2.5 numeric property names are ToString'd: `{0.5: 1}` → key "0.5".
-                const n = std.fmt.parseFloat(f64, t.lexeme) catch return ParseError.UnexpectedToken;
+                const n = self.parseNumericLiteral(t.lexeme) catch return ParseError.UnexpectedToken;
                 return .{ .key = try numericKey(self.arena, n) };
             },
             else => {
@@ -2418,12 +2418,52 @@ pub const Parser = struct {
         }
     }
 
+    /// §12.9.3 — the numeric value of a NumericLiteral lexeme: strip `_` separators, decode
+    /// `0x`/`0o`/`0b` by radix (accumulated into f64 to avoid u64 overflow), else parse as a decimal
+    /// (integer / fraction / exponent). (Legacy octal `0123` is treated as decimal — a documented
+    /// M-subset deviation; it is a strict-mode Early Error anyway.)
+    fn parseNumericLiteral(self: *Parser, lexeme: []const u8) ParseError!f64 {
+        if (!validNumericSeparators(lexeme)) return ParseError.UnexpectedToken; // §12.9.3 separator placement
+        // §12.9.3.1 Early Error: LegacyOctalIntegerLiteral / NonOctalDecimalIntegerLiteral (`0` followed
+        // by a decimal digit, e.g. `08`, `010`) is forbidden in strict mode.
+        if (self.strict and lexeme.len >= 2 and lexeme[0] == '0' and lexeme[1] >= '0' and lexeme[1] <= '9') {
+            return ParseError.UnexpectedToken;
+        }
+        var buf: std.ArrayList(u8) = .empty;
+        for (lexeme) |ch| if (ch != '_') try buf.append(self.arena, ch);
+        const s = buf.items;
+        if (s.len >= 2 and s[0] == '0') {
+            const radix: ?u8 = switch (s[1]) {
+                'x', 'X' => 16,
+                'o', 'O' => 8,
+                'b', 'B' => 2,
+                else => null,
+            };
+            if (radix) |r| {
+                if (s.len == 2) return ParseError.UnexpectedToken; // prefix with no digits
+                var v: f64 = 0;
+                for (s[2..]) |d| {
+                    const dv: u8 = switch (d) {
+                        '0'...'9' => d - '0',
+                        'a'...'f' => d - 'a' + 10,
+                        'A'...'F' => d - 'A' + 10,
+                        else => return ParseError.UnexpectedToken,
+                    };
+                    if (dv >= r) return ParseError.UnexpectedToken; // digit out of range for the radix
+                    v = v * @as(f64, @floatFromInt(r)) + @as(f64, @floatFromInt(dv));
+                }
+                return v;
+            }
+        }
+        return std.fmt.parseFloat(f64, s) catch ParseError.UnexpectedToken;
+    }
+
     fn parsePrimary(self: *Parser) ParseError!*const ast.Node {
         const t = self.peek();
         switch (t.kind) {
             .number => {
                 _ = self.advance();
-                const n = std.fmt.parseFloat(f64, t.lexeme) catch return ParseError.UnexpectedToken;
+                const n = self.parseNumericLiteral(t.lexeme) catch return ParseError.UnexpectedToken;
                 return self.alloc(.{ .number = n });
             },
             .string => {
@@ -3110,6 +3150,30 @@ fn isKeywordName(kind: lex.TokenKind) bool {
         .kw_true, .kw_false, .kw_null, .kw_var, .kw_let, .kw_const, .kw_function, .kw_return, .kw_this, .kw_if, .kw_else, .kw_while, .kw_do, .kw_for, .kw_throw, .kw_try, .kw_catch, .kw_finally, .kw_break, .kw_continue, .kw_typeof, .kw_void, .kw_delete, .kw_new, .kw_instanceof, .kw_switch, .kw_case, .kw_default, .kw_import, .kw_class, .kw_extends, .kw_super, .kw_in, .kw_with => true,
         else => false,
     };
+}
+
+/// §12.9.3 NumericLiteralSeparator placement: each `_` must sit immediately between two digits of
+/// the literal's radix (so no leading/trailing/doubled `_`, none adjacent to `.`/`e`/sign/prefix).
+/// Separators are forbidden entirely in a LegacyOctal / NonOctalDecimal literal (`0` followed by a
+/// digit, e.g. `0_7`, `08`). Returns false on any violation.
+fn validNumericSeparators(s: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, s, '_') == null) return true; // no separators → nothing to check
+    // Radix + the digit region. A `0` followed by a digit is LegacyOctal/NonOctalDecimal: no separators.
+    const hex = s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X');
+    const oct = s.len >= 2 and s[0] == '0' and (s[1] == 'o' or s[1] == 'O');
+    const bin = s.len >= 2 and s[0] == '0' and (s[1] == 'b' or s[1] == 'B');
+    if (s.len >= 2 and s[0] == '0' and !hex and !oct and !bin and ((s[1] >= '0' and s[1] <= '9') or s[1] == '_')) return false;
+    const isRadixDigit = struct {
+        fn f(c: u8, h: bool) bool {
+            return if (h) (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F') else (c >= '0' and c <= '9');
+        }
+    }.f;
+    for (s, 0..) |ch, i| {
+        if (ch != '_') continue;
+        if (i == 0 or i + 1 >= s.len) return false; // leading / trailing
+        if (!isRadixDigit(s[i - 1], hex) or !isRadixDigit(s[i + 1], hex)) return false; // not between two digits
+    }
+    return true;
 }
 
 /// ToString of a numeric PropertyName (§13.2.5 — `{1: x}` has key "1", `{0.5: x}` key "0.5").

@@ -787,6 +787,19 @@ test "M22 Number / Boolean constructors + Number statics (§21.1 / §20.3)" {
     try expectBool("Number.prototype.constructor === Number", true); // §21.1.3.1
 }
 
+test "M24 numeric literals: radix prefixes, separators, exponents (§12.9.3)" {
+    try expectNumber("0xFF", 255);
+    try expectNumber("0o17", 15);
+    try expectNumber("0b1010", 10);
+    try expectNumber("0XfF", 255); // uppercase prefix + mixed-case digits
+    try expectNumber("1_000_000", 1000000); // NumericLiteralSeparator
+    try expectNumber("0xFF_FF", 65535);
+    try expectNumber("1.5e3", 1500); // exponent
+    try expectNumber("1.5E-2 * 100", 1.5);
+    try expectNumber(".5 + 0.5", 1);
+    try expectSyntaxError("var x = 3in1"); // §12.9.3: identifier/digit immediately after a number → SyntaxError
+}
+
 test "M9 generators: function* returns a generator; .next drives yield (§15.5 / §27.5, US1-US2)" {
     // §15.5.4: calling a generator returns a generator object (the body does NOT run yet).
     try expectStr("function* g(){} typeof g", "function");
