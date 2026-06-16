@@ -2623,6 +2623,44 @@ test "M29 ToPrimitive — valueOf/toString invoked in operator coercion (§7.1.1
     try expectThrows("({valueOf: function(){return {};}, toString: function(){return {};}}) + 1");
 }
 
+test "M30 generator param FunctionDeclarationInstantiation is eager — call-time, not .next (§15.5.2 / §15.6.2)" {
+    // A throwing destructuring default in a SYNC generator method throws at the CALL site (param
+    // binding runs eagerly in [[Call]], before the generator object is returned / first `.next`).
+    try expectThrows(
+        \\function* g([x = (function(){ throw new Error("boom"); })()]) {}
+        \\g([undefined]);
+    );
+    // A throwing default in an ASYNC GENERATOR throws synchronously at the call site too (V8 parity).
+    try expectThrows(
+        \\async function* ag([x = (function(){ throw new Error("boom"); })()]) {}
+        \\ag([undefined]);
+    );
+    // Binding really happens BEFORE the body runs: a side effect in a default param fires at call
+    // time, even though the generator is never resumed (`.next` never called).
+    try expectBool(
+        \\var ran = false;
+        \\function* g(x = (function(){ ran = true; return 1; })()) { yield x; }
+        \\g(); // create only — do NOT call .next
+        \\ran;
+    , true);
+    // Destructuring a non-iterable as a generator param is a call-time TypeError (eager binding).
+    try expectThrows(
+        \\function* g([x]) {}
+        \\g(null);
+    );
+    // The bound params are still correct once the body runs (no regression): destructuring + default.
+    try expectNumber(
+        \\function* g([a, b = 10]) { yield a + b; }
+        \\g([5]).next().value;
+    , 15);
+    // A plain (non-generator) function with the same throwing default still throws at the call — the
+    // refactor must not change ordinary [[Call]] semantics.
+    try expectThrows(
+        \\function f([x = (function(){ throw new Error("boom"); })()]) {}
+        \\f([undefined]);
+    );
+}
+
 test "M29 primitive wrapper objects unbox in coercion (§21.1.4.1 / §22.1.4.1 / §20.3.4.1)" {
     // §21.1.3.3 thisNumberValue: a Number wrapper coerces back to its primitive.
     try expectNumber("new Number(5) + 0", 5);

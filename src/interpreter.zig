@@ -2951,6 +2951,12 @@ pub const Interpreter = struct {
             .this_val = this_val,
             .home_object = if (func.call) |fd| fd.home_object else null,
         };
+        // §15.5.2 EvaluateGeneratorBody step 1: FunctionDeclarationInstantiation runs EAGERLY here (on
+        // the caller thread), so a param destructuring/default error throws at the call site, before
+        // the generator object is created/returned and before any `.next`.
+        var abrupt: ?Completion = null;
+        gen.call_env = try self.instantiateGeneratorParams(gen, &abrupt);
+        if (abrupt) |c| return c;
         if (self.gen_registry) |reg| try reg.append(self.arena, gen);
         const obj = try Object.create(self.arena, self.generatorProto());
         obj.generator = gen;
@@ -3088,9 +3094,15 @@ pub const Interpreter = struct {
     /// Bind the generator's params/this/home and run its body, honoring a `.return`/`.throw` injected
     /// at the very start (`suspended_start` + abrupt resume is handled by the caller, so here the first
     /// resume is always `.next`). Mirrors the ordinary [[Call]] body setup.
-    fn runGeneratorBody(self: *Interpreter, gen: *object_mod.Generator) EvalError!Completion {
-        const func = gen.func;
-        const fd = func.call.?;
+    /// §9.2.6 FunctionDeclarationInstantiation for a generator/async-generator body — bind the params
+    /// (incl. destructuring patterns + default-value expressions) and the `arguments` object into a
+    /// fresh environment, returning it. Per §15.5.2 EvaluateGeneratorBody / §15.6.2
+    /// EvaluateAsyncGeneratorBody this runs EAGERLY when the generator object is created (on the caller
+    /// thread), so a destructuring/default error surfaces at the call site rather than at first `.next`.
+    /// An abrupt completion (a thrown default/pattern error) is returned via the `Completion` out-param.
+    fn instantiateGeneratorParams(self: *Interpreter, gen: *object_mod.Generator, abrupt: *?Completion) EvalError!*Environment {
+        abrupt.* = null;
+        const fd = gen.func.call.?;
         const args = gen.args;
         const call_env = try Environment.create(self.arena, fd.closure);
         for (fd.params, 0..) |param, i| {
@@ -3099,7 +3111,10 @@ pub const Interpreter = struct {
             if (v == .undefined) {
                 if (param.default) |dn| {
                     const dc = try self.evalExpr(dn, call_env);
-                    if (dc.isAbrupt()) return dc;
+                    if (dc.isAbrupt()) {
+                        abrupt.* = dc;
+                        return call_env;
+                    }
                     v = dc.normal;
                     defaulted = true;
                 }
@@ -3110,7 +3125,10 @@ pub const Interpreter = struct {
                 try call_env.declare(param.pattern.identifier, v, true, true);
             } else {
                 const bc = try self.bindPattern(param.pattern, v, call_env, true);
-                if (bc.isAbrupt()) return bc;
+                if (bc.isAbrupt()) {
+                    abrupt.* = bc;
+                    return call_env;
+                }
             }
         }
         if (fd.rest) |rest_pat| {
@@ -3122,13 +3140,28 @@ pub const Interpreter = struct {
                 try call_env.declare(rest_pat.identifier, .{ .object = rest_arr }, true, true);
             } else {
                 const bc = try self.bindPattern(rest_pat, .{ .object = rest_arr }, call_env, true);
-                if (bc.isAbrupt()) return bc;
+                if (bc.isAbrupt()) {
+                    abrupt.* = bc;
+                    return call_env;
+                }
             }
         }
         if (call_env.lookupLocal("arguments") == null) {
             const ao = try self.makeArgumentsObject(args);
             try call_env.declare("arguments", .{ .object = ao }, true, true);
         }
+        return call_env;
+    }
+
+    fn runGeneratorBody(self: *Interpreter, gen: *object_mod.Generator) EvalError!Completion {
+        const func = gen.func;
+        const fd = func.call.?;
+        // §15.5.2/§15.6.2: a sync/async GENERATOR's params were already bound on the caller thread
+        // (`gen.call_env` set in createGenerator/createAsyncGenerator). An ASYNC FUNCTION binds them
+        // here on the body thread (a param error rejects the promise — see callAsyncFunction).
+        var abrupt: ?Completion = null;
+        const call_env = gen.call_env orelse try self.instantiateGeneratorParams(gen, &abrupt);
+        if (abrupt) |c| return c;
         self.this_val = gen.this_val;
         self.home_object = gen.home_object;
         for (fd.body) |stmt| {
@@ -3828,6 +3861,12 @@ pub const Interpreter = struct {
             .is_async = true,
             .is_async_gen = true,
         };
+        // §15.6.2 EvaluateAsyncGeneratorBody: FunctionDeclarationInstantiation runs EAGERLY here (on the
+        // caller thread). A param destructuring/default error throws synchronously at the call site —
+        // the async-generator object is never created (matches V8: `ag(bad)` throws, not a rejected next).
+        var abrupt: ?Completion = null;
+        gen.call_env = try self.instantiateGeneratorParams(gen, &abrupt);
+        if (abrupt) |c| return c;
         const ag = try self.arena.create(object_mod.AsyncGenerator);
         ag.* = .{ .gen = gen };
         gen.async_gen = ag;

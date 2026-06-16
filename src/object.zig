@@ -145,6 +145,13 @@ pub const Generator = struct {
     this_val: Value,
     /// The active [[HomeObject]] for `super` resolution inside the body (null for plain generators).
     home_object: ?*Object,
+    /// §15.5.2 / §15.6.2: for a sync/async GENERATOR, FunctionDeclarationInstantiation (binding the
+    /// params — incl. destructuring patterns and default-value expressions — and the `arguments`
+    /// object) runs EAGERLY on the CALLER thread when the generator object is created, so a param
+    /// destructuring/default error throws at the call site (before the first `.next`). The resulting
+    /// environment is stashed here for the body thread to run statements in. Null for async functions
+    /// (whose params are bound on the body thread, since a param error rejects the returned promise).
+    call_env: ?*Environment = null,
     state: GeneratorState = .suspended_start,
     /// The body thread (spawned on the first `.next`). Null until then; joined on completion.
     thread: ?std.Thread = null,
