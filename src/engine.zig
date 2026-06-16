@@ -2203,3 +2203,38 @@ test "M15 eval: core + direct + indirect (§19.2.1 / §19.2.1.1)" {
     // globalThis.eval is the same intrinsic (indirect when called off globalThis).
     try expectNumber("globalThis.eval(\"2+3\")", 5);
 }
+
+test "M16 prototype.constructor back-reference (§19/§20/§22/§23)" {
+    // Built-in constructors: <Ctor>.prototype.constructor === <Ctor>, resolved through the chain.
+    try expectBool("[].constructor === Array", true);
+    try expectBool("({}).constructor === Object", true);
+    try expectBool("(function(){}).constructor === Function", true);
+    try expectBool("\"x\".constructor === String", true);
+    try expectBool("Array.prototype.constructor === Array", true);
+    try expectBool("Object.prototype.constructor === Object", true);
+    try expectBool("Error.prototype.constructor === Error", true);
+    try expectBool("TypeError.prototype.constructor === TypeError", true);
+    // User functions: §10.2.4 MakeConstructor — F.prototype.constructor === F; instances inherit it.
+    try expectBool("function F(){}; F.prototype.constructor === F", true);
+    try expectBool("function F(){}; new F().constructor === F", true);
+    // Classes: §15.7.14 — C.prototype.constructor === C; instances inherit; derived too.
+    try expectBool("class C{}; new C().constructor === C", true);
+    try expectBool("class C{}; C.prototype.constructor === C", true);
+    try expectBool("class B{}; class D extends B{}; new D().constructor === D", true);
+    // A thrown engine error resolves `.constructor` through its prototype (the assert.throws unblock).
+    try expectBool("(()=>{try{null.x}catch(e){return e.constructor===TypeError}})()", true);
+    try expectBool("(()=>{try{undefinedVar}catch(e){return e.constructor===ReferenceError}})()", true);
+    // The back-reference MUST be non-enumerable (else for-in / Object.keys would surface it).
+    try expectBool("Object.getOwnPropertyDescriptor(Array.prototype,\"constructor\").enumerable === false", true);
+    try expectBool("Object.getOwnPropertyDescriptor(Array.prototype,\"constructor\").writable === true", true);
+    try expectBool("Object.getOwnPropertyDescriptor(Array.prototype,\"constructor\").configurable === true", true);
+    try expectBool("Object.getOwnPropertyDescriptor((function F(){}).prototype,\"constructor\").enumerable === false", true);
+    // A Test262-style assert.throws mini-harness: it checks `thrown.constructor === expected`.
+    try expectBool(
+        \\function throwsRightCtor(Ctor, fn){
+        \\  try { fn(); } catch(e){ return e.constructor === Ctor; }
+        \\  return false;
+        \\}
+        \\throwsRightCtor(TypeError, function(){ null.x })
+    , true);
+}

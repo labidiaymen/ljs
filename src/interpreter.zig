@@ -183,6 +183,7 @@ pub const Interpreter = struct {
                 // §20.2.4.1/.2: a declaration always has a name; install `length` + `name`.
                 try setFunctionLength(obj, paramCount(f.params));
                 try self.setFunctionName(obj, f.name orelse "", "");
+                try setConstructorBackref(obj); // §10.2.4 MakeConstructor: F.prototype.constructor === F
                 if (f.name) |name| try env.declare(name, .{ .object = obj }, true, true);
                 return .{ .normal = .undefined };
             },
@@ -1676,6 +1677,23 @@ pub const Interpreter = struct {
         try obj.defineData("length", .{ .number = n }, false, false, true);
     }
 
+    /// §10.2.4 MakeConstructor — install the `constructor` back-reference on an ordinary function's
+    /// own `.prototype`: `F.prototype.constructor === F`, descriptor `{ writable:true,
+    /// enumerable:false, configurable:true }`. So `function F(){}; F.prototype.constructor === F`
+    /// and (through the chain) `new F().constructor === F`. NON-enumerable is load-bearing (a stray
+    /// enumerable `constructor` would surface in for-in / Object.keys). Only ordinary (constructible)
+    /// functions are MakeConstructor targets: arrows have no `.prototype`; a Generator/AsyncGenerator
+    /// function's `.prototype` is the (non-constructor) %Generator%-instance prototype and carries no
+    /// `constructor` (§27.x.4); an async function has no own `.prototype`. Runs at function-object
+    /// creation (outside hot loops).
+    fn setConstructorBackref(obj: *Object) std.mem.Allocator.Error!void {
+        const fd = obj.call orelse return;
+        if (fd.is_arrow or fd.is_generator or fd.is_async) return; // not a MakeConstructor target
+        const pv = obj.get("prototype") orelse return;
+        if (pv != .object) return;
+        try pv.object.defineData("constructor", .{ .object = obj }, true, false, true);
+    }
+
     /// §20.2.4.2 / §10.2.9 SetFunctionName — install the `name` own data property `{ writable:false,
     /// enumerable:false, configurable:true }`. `prefix` (when non-empty) is space-joined ahead of the
     /// name ("get"/"set"/"bound"). Names are interned in the realm arena so they outlive the call.
@@ -1735,6 +1753,7 @@ pub const Interpreter = struct {
         // "" for an anonymous expression — a NamedEvaluation site may rename it via maybeSetAnonName).
         try setFunctionLength(obj, paramCount(f.params));
         try self.setFunctionName(obj, f.name orelse "", "");
+        try setConstructorBackref(obj); // §10.2.4 MakeConstructor: F.prototype.constructor === F (no-op for arrows)
         return .{ .normal = .{ .object = obj } };
     }
 

@@ -45,6 +45,16 @@ fn defineMethod(arena: std.mem.Allocator, target: *Object, name: []const u8, id:
     try target.defineData(name, .{ .object = fn_obj }, true, false, true);
 }
 
+/// §19/§20.x.3 — install the `constructor` back-reference on a constructor's `.prototype`:
+/// `<Ctor>.prototype.constructor === <Ctor>`, descriptor `{ writable:true, enumerable:false,
+/// configurable:true }`. NON-enumerable is load-bearing (a stray enumerable `constructor` would
+/// surface in for-in / Object.keys). A no-op if the constructor has no object `.prototype`.
+fn defineConstructorBackref(ctor: *Object) std.mem.Allocator.Error!void {
+    const pv = ctor.get("prototype") orelse return;
+    if (pv != .object) return;
+    try pv.object.defineData("constructor", .{ .object = ctor }, true, false, true);
+}
+
 pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Error!void {
     // §19.1 Value properties of the global object — `undefined`/`NaN`/`Infinity`. These are
     // non-writable, non-configurable in the spec, so we declare them immutable. Many programs
@@ -72,6 +82,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         try defineMethod(arena, fp, "bind", .function_method, "bind");
     }
     function_fn.prototype = function_proto;
+    try defineConstructorBackref(function_fn); // §20.2.3.2 %Function.prototype%.constructor === Function
     try env.declare("Function", .{ .object = function_fn }, true, true);
 
     // §20.1 Object — constructor + Object.prototype reflection (§20.1.3) + Object static reflection
@@ -113,6 +124,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try defineMethod(arena, object_fn, "isSealed", .object_is_sealed, "isSealed");
     try defineMethod(arena, object_fn, "preventExtensions", .object_prevent_extensions, "preventExtensions");
     try defineMethod(arena, object_fn, "isExtensible", .object_is_extensible, "isExtensible");
+    try defineConstructorBackref(object_fn); // §20.1.2.1 Object.prototype.constructor === Object
     try env.declare("Object", .{ .object = object_fn }, true, true);
 
     // §20.5 The Error family — each a native constructor; `name` is the error name.
@@ -126,6 +138,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
                 try pv.object.set("name", .{ .string = name });
             }
         }
+        try defineConstructorBackref(ctor); // §20.5.3.1 / §20.5.6.3.1 <Error>.prototype.constructor === <Error>
         try env.declare(name, .{ .object = ctor }, true, true);
     }
 
@@ -142,6 +155,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
             for (string_methods) |m| try defineMethod(arena, pv.object, m, .string_method, m);
         }
     }
+    try defineConstructorBackref(string_fn); // §22.1.3.1 String.prototype.constructor === String
     try env.declare("String", .{ .object = string_fn }, true, true);
 
     // §23.1 Array — constructor, Array.prototype methods, Array.isArray. Array literals
@@ -156,6 +170,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         }
     }
     try defineMethod(arena, array_fn, "isArray", .array_method, "isArray");
+    try defineConstructorBackref(array_fn); // §23.1.3.1 Array.prototype.constructor === Array
     try env.declare("Array", .{ .object = array_fn }, true, true);
 
     // §20.4 Symbol — the constructor (callable, NOT a constructor: `new Symbol` throws, §20.4.1) plus
@@ -179,6 +194,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
             try defineMethod(arena, pv.object, "valueOf", .symbol_to_string, "valueOf");
         }
     }
+    try defineConstructorBackref(symbol_fn); // §20.4.3.1 Symbol.prototype.constructor === Symbol
     try env.declare("Symbol", .{ .object = symbol_fn }, true, true);
 
     // §23.1.5.1 / §22.1.5.1 install the iteration protocol on Array.prototype / String.prototype:
@@ -276,6 +292,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     }
     try defineMethod(arena, promise_fn, "resolve", .promise_resolve, "resolve"); // §27.2.4.5
     try defineMethod(arena, promise_fn, "reject", .promise_reject, "reject"); // §27.2.4.4
+    try defineConstructorBackref(promise_fn); // §27.2.5.2 Promise.prototype.constructor === Promise
     try env.declare("Promise", .{ .object = promise_fn }, true, true);
 
     // §19.2.1 eval — the global `eval` intrinsic (%eval%). A native function object so it is reachable
@@ -316,6 +333,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
                 try pv.object.set("name", .{ .string = "AggregateError" });
             }
         }
+        try defineConstructorBackref(ctor); // §20.5.7.3.1 AggregateError.prototype.constructor === AggregateError
         try env.declare("AggregateError", .{ .object = ctor }, true, true);
     }
 
