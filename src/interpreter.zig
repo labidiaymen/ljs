@@ -1984,15 +1984,19 @@ pub const Interpreter = struct {
         const call_env = try Environment.create(self.arena, fd.closure);
         for (fd.params, 0..) |param, i| {
             var v: Value = if (i < args.len) args[i] else .undefined; // missing args → undefined
+            var defaulted = false;
             if (v == .undefined) {
                 if (param.default) |dn| { // §15.1 default value applied when the arg is undefined
                     const dc = try self.evalExpr(dn, call_env);
                     if (dc.isAbrupt()) return dc;
                     v = dc.normal;
+                    defaulted = true;
                 }
             }
             // Fast path: a plain identifier parameter binds directly (no pattern matching).
             if (param.pattern.* == .identifier) {
+                // §15.1.3 step on a SingleNameBinding: name an anonymous fn/class default initializer.
+                if (defaulted) try self.maybeSetAnonName(param.default.?, v, param.pattern.identifier);
                 try call_env.declare(param.pattern.identifier, v, true, true);
             } else {
                 const bc = try self.bindPattern(param.pattern, v, call_env, true);
@@ -2100,6 +2104,10 @@ pub const Interpreter = struct {
                                 return dc;
                             }
                             v = dc.normal;
+                            // §8.6.2 SingleNameBinding step 6.d: an anonymous fn/class default initializer
+                            // bound to a single identifier takes that identifier as its `name`.
+                            if (el.target.?.* == .identifier)
+                                try self.maybeSetAnonName(dn, v, el.target.?.identifier);
                         }
                     }
                     const bc = self.bindPattern(el.target.?, v, env, mutable) catch |e| {
@@ -2141,6 +2149,10 @@ pub const Interpreter = struct {
                             const dc = try self.evalExpr(dn, env);
                             if (dc.isAbrupt()) return dc;
                             v = dc.normal;
+                            // §13.3.3.7 KeyedBindingInitialization step 6.d: name an anonymous fn/class
+                            // default initializer after a single-identifier binding target.
+                            if (prop.target.* == .identifier)
+                                try self.maybeSetAnonName(dn, v, prop.target.identifier);
                         }
                     }
                     const bc = try self.bindPattern(prop.target, v, env, mutable);
@@ -2269,6 +2281,10 @@ pub const Interpreter = struct {
                             const dc = try self.evalExpr(dn, env);
                             if (dc.isAbrupt()) return dc;
                             v = dc.normal;
+                            // §13.15.5.5 KeyedDestructuringAssignmentEvaluation: name an anonymous
+                            // fn/class default on the shorthand `{x = <anon>}` identifier target.
+                            if (p.value.* == .identifier)
+                                try self.maybeSetAnonName(dn, v, p.value.identifier);
                         }
                     }
                     const tc = try self.assignElement(p.value, v, env);
@@ -2293,6 +2309,9 @@ pub const Interpreter = struct {
             .assign => |a| {
                 const v = try self.applyDefault(value, a.value, env);
                 if (v.isAbrupt()) return v;
+                // §13.15.5.2 step 5.d: when the default was used (source undefined), an anonymous
+                // fn/class initializer on a single-identifier target takes that name.
+                if (value == .undefined) try self.maybeSetAnonName(a.value, v.normal, a.name);
                 return self.assignToTarget(&.{ .identifier = a.name }, v.normal, env);
             },
             .assign_member => |m| {
@@ -2930,14 +2949,18 @@ pub const Interpreter = struct {
         const call_env = try Environment.create(self.arena, fd.closure);
         for (fd.params, 0..) |param, i| {
             var v: Value = if (i < args.len) args[i] else .undefined;
+            var defaulted = false;
             if (v == .undefined) {
                 if (param.default) |dn| {
                     const dc = try self.evalExpr(dn, call_env);
                     if (dc.isAbrupt()) return dc;
                     v = dc.normal;
+                    defaulted = true;
                 }
             }
             if (param.pattern.* == .identifier) {
+                // §15.1.3: name an anonymous fn/class default initializer on a SingleNameBinding.
+                if (defaulted) try self.maybeSetAnonName(param.default.?, v, param.pattern.identifier);
                 try call_env.declare(param.pattern.identifier, v, true, true);
             } else {
                 const bc = try self.bindPattern(param.pattern, v, call_env, true);

@@ -2498,3 +2498,31 @@ test "M26 object-literal __proto__ sets [[Prototype]] (§B.3.1)" {
     // But mixing a proto setter with a computed `__proto__` is NOT a duplicate (different definitions).
     try expectNoSyntaxErrorStrict("var o = ({__proto__:{}, ['__proto__']:2});");
 }
+
+test "M27 NamedEvaluation on destructuring/param defaults (§8.6.2 / §13.15.5.2 / §15.1.3)" {
+    // §15.1.3: a SingleNameBinding parameter default that is an anonymous fn/arrow/class
+    // takes the parameter name.
+    try expectStr("function f(cb = function(){}){ return cb.name } f()", "cb");
+    try expectStr("function f(ar = () => {}){ return ar.name } f()", "ar");
+    try expectStr("function f(c = class{}){ return c.name } f()", "c");
+    // §13.3.3.7 object binding-pattern property default → property-target identifier name.
+    try expectStr("function f({fn = function(){}}){ return fn.name } f({})", "fn");
+    try expectStr("function f({af = () => {}}){ return af.name } f({})", "af");
+    try expectStr("function f({gn = function*(){}}){ return gn.name } f({})", "gn");
+    // `key: target = default` form names after the target binding, not the key.
+    try expectStr("function f({k: t = function(){}}){ return t.name } f({})", "t");
+    // §8.6.2 array binding-pattern element default → element-target identifier name.
+    try expectStr("function f([x = function(){}]){ return x.name } f([])", "x");
+    try expectStr("function f([y = () => {}]){ return y.name } f([])", "y");
+    // var/let binding declarations with destructuring defaults.
+    try expectStr("var {vn = function(){}} = {}; vn.name", "vn");
+    try expectStr("var [vy = function(){}] = []; vy.name", "vy");
+    // §13.15.5.2 assignment patterns (not declarations) name the same way.
+    try expectStr("var bn; ({bn = function(){}} = {}); bn.name", "bn");
+    try expectStr("var by; [by = function(){}] = []; by.name", "by");
+    // A NAMED function default keeps its own name (NOT renamed to the binding id).
+    try expectStr("function f({z = function named(){}}){ return z.name } f({})", "named");
+    // When the value IS provided (default not used), the bound value is NOT renamed.
+    // (An anonymous fn passed as an array element has name "" and stays "".)
+    try expectStr("function f({w = function(){}}){ return w.name } var a=[function(){}]; f({w:a[0]})", "");
+}
