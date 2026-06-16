@@ -15,9 +15,18 @@ performance story from day one.
 > `freeze`/`seal`/`preventExtensions`, `Object.prototype.hasOwnProperty`/`propertyIsEnumerable`/
 > `isPrototypeOf`, and `Function.prototype.call`/`apply`/`bind`), and **destructuring assignment**
 > (`[a, b] = arr`, `({x, y} = obj)`, holes / defaults / rest / nested / member-index targets, §13.15.5) —
-> enough to load the Test262 harness (both `propertyHelper.js` and `compareArray.js` now fully load) and
-> pass **39.6%** of `language/expressions` (6,718 tests, harness metric). Generators and async are later milestones. The
+> enough to load the Test262 harness (both `propertyHelper.js` and `compareArray.js` now fully load),
+> plus generators (`function*` / `yield` / `yield*`). Conformance is now tracked over the **whole
+> `language/` tree**: **40.9%** of `language/` (14,039 / 39,913, harness metric), of which
+> `language/expressions` is **46.7%** (7,922 / 19,215). Async is a later milestone. The
 > bytecode/JIT tiers are future work. A learning-grade, in-progress engine, not a drop-in Node replacement.
+
+> **Scope: 100% ECMAScript, no Node host APIs.** ljs targets full ECMAScript conformance — the JS
+> language plus the standard built-in library, i.e. exactly Test262's `test/language/` and
+> `test/built-ins/`. It deliberately does **not** implement Node/host runtime APIs (CommonJS
+> `require` / module loading, ESM host loading, `fs` / `http` / `net` / `process` / `Buffer`, host
+> timers `setTimeout` / `setInterval`). Promises and the microtask / Job queue **are** in scope —
+> they're ECMA-262, not the host.
 
 ## Why another engine?
 
@@ -86,14 +95,28 @@ ljs run <file>        # evaluate a source file
 
 ## Conformance (Test262)
 
+**Scope:** the conformance target is 100% **ECMAScript** — the JS language + standard built-in
+library, i.e. Test262's `test/language/` and `test/built-ins/`. Node/host APIs (CommonJS/ESM host
+module loading, `fs`/`http`/`net`/`process`/`Buffer`, host timers) are explicitly out of scope;
+Promises + the microtask/Job queue are in scope (they're ECMA-262). Conformance is now tracked over
+the **whole `language/` tree** (no longer just `language/expressions`).
+
 ```sh
-# vendor a slice of the official suite (fast sparse checkout), pinned via test262.pin
-./scripts/vendor-test262.sh test/language/expressions
-zig build test262 -- --path vendor/test262/test/language/expressions --harness-dir vendor/test262/harness
+# vendor the whole language/ tree (fast sparse checkout), pinned via test262.pin
+./scripts/vendor-test262.sh test/language
+zig build test262 -- --path vendor/test262/test/language --harness-dir vendor/test262/harness
+# (a narrower slice, e.g. just expressions, also works:)
+# ./scripts/vendor-test262.sh test/language/expressions
 # baseline + regression gate:
 zig build test262 -- --path <dir> --harness-dir vendor/test262/harness --update-baseline baseline/<name>.json
 zig build test262 -- --path <dir> --harness-dir vendor/test262/harness --baseline baseline/<name>.json   # exit 1 on regression
 ```
+
+**Current headline (HEAD, harness metric):** full `language/` → **14,039 passed / 39,913 total /
+5,594 skipped = 40.9%**; `language/expressions` → **7,922 / 19,215 = 46.7%**. Baselines:
+`baseline/language.json` (full tree, the milestone metric) and `baseline/language-expressions.json`
+(the expressions slice, kept for continuity). The remaining `language/statements` failures are
+dominated by `class` (≈4.8k fail-lines), then `for-of`, `function`, `for`, and `generators`.
 
 **Metric:** conformance is reported **WITH the Test262 harness prelude** (`--harness-dir
 vendor/test262/harness`, the standard Test262 way). The prior bare-gate numbers undercounted positive
@@ -163,7 +186,8 @@ lever — generators/`yield` (the language-level iterator producer), next.
 | **M6** | **reflection / property descriptors** — §6.1.7.1 attributes + `[[Extensible]]`, `Object.defineProperty`/`getOwnPropertyDescriptor(s)`/`getOwnPropertyNames`/`keys`/`values`/`entries`/`create`/`assign`/`is`/`getPrototypeOf`/`setPrototypeOf`/`freeze`/`seal`/`preventExtensions`, `Object.prototype.hasOwnProperty`/`propertyIsEnumerable`/`isPrototypeOf`, `Function.prototype.call`/`apply`/`bind`; unblocks `propertyHelper.js` + `compareArray.js` | ✅ done (35.8% → 38.4% of expressions, harness metric, +432; bench green, ljs 0.2–0.5× Node) |
 | **M7** | **destructuring assignment** — §13.15.5 cover-grammar refinement (`[a,b]=arr`, `({x,y}=obj)`) + `assignPattern` (holes / defaults / array+object rest / nested / member-index-private targets, single RHS eval) + §13.2.5.1/§13.15.5.1 early errors | ✅ done (38.4% → 39.6% of expressions, harness metric, +209; bench green, ljs 0.2–0.5× Node) |
 | **M8** | **iterator protocol + Symbol** — minimal §20.4 Symbol (the `symbol` primitive + `Symbol()` + well-known symbols + a non-enumerated symbol-keyed store) + the §7.4 protocol (`getIterator`/`iteratorStep`/`iteratorClose`) wired into for-of (IteratorClose on break/return/throw) / spread / array destructuring + native `Array`/`String` iterators | ✅ done (39.6% → 40.2% of expressions, harness metric, +107; bench green, ljs 0.2–0.5× Node) |
-| M9+ | generators / `yield` (the next lever), then `Map`/`Set` / async — climbing Test262 % | next |
+| **M9** | **generators** — `function*` / `yield` / `yield*` delegation + generator methods | ✅ done (40.2% → 46.7% of expressions, harness metric) |
+| M10+ | `Map`/`Set`, then Promise + microtask/Job queue + async/await — climbing Test262 % over the full `language/` tree (then `built-ins/`) | next |
 | Later | bytecode VM, then optimizing tiers — graduated when the benchmarks justify it | future |
 
 M3's nine cycles: operators (`**`, bitwise, shifts, `in`) · template literals · spread/rest ·

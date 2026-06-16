@@ -4,8 +4,15 @@
 #
 # Usage:
 #   scripts/vendor-test262.sh                                   # full clone (large)
-#   scripts/vendor-test262.sh test/language/expressions/addition  # sparse subset (fast)
+#   scripts/vendor-test262.sh test/language                     # the canonical scope: the whole
+#                                                               # language/ tree (statements,
+#                                                               # expressions, …) — sparse + fast
+#   scripts/vendor-test262.sh test/language/expressions/addition  # a narrower sparse subset
 #   TEST262_COMMIT=<sha> scripts/vendor-test262.sh [<paths>...]  # pin a specific commit
+#
+# Scope (see CLAUDE.md / constitution): conformance targets the whole ECMAScript language +
+# built-in library, so we vendor at least `test/language` (later, also `test/built-ins`).
+# `harness/` is always included automatically below (needed for the Test262 prelude).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

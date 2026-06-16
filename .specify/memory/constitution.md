@@ -94,6 +94,14 @@ verification is the only way to keep a from-scratch effort honest.
   subsystem, not improvised.
 - **Target spec edition:** a specific ECMA-262 edition/draft is pinned per the plan and
   recorded alongside the pinned Test262 commit.
+- **Scope — 100% ECMAScript, no host APIs:** the conformance target is the ECMAScript
+  *language* and standard built-in *library* in full — exactly Test262's `test/language/` and
+  `test/built-ins/` (conformance is tracked over the whole `language/` tree, not just
+  `language/expressions`). Node/host runtime surfaces are **out of scope**: CommonJS
+  `require` / module loading, ESM host loading, `fs` / `http` / `net` / `process` / `Buffer`,
+  and host timers (`setTimeout` / `setInterval`). Promises and the microtask / Job queue ARE
+  in scope (they are ECMA-262, not host). When the only remaining conformance work would be a
+  Node host API, stop — it is out of scope by definition.
 - **Architecture order:** tree-walk interpreter → bytecode VM → (optional) optimizing
   tier. Each tier is a separate, planned milestone, and **graduating to the next tier is
   gated by benchmark data** (Principle IV), not by a fixed schedule.

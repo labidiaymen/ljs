@@ -9,6 +9,19 @@ Active stack: Zig 0.16.0 (pinned), pure std, tree-walk interpreter, in-process T
 Constitution: `.specify/memory/constitution.md` — correctness/conformance before performance.
 <!-- SPECKIT END -->
 
+## Scope — 100% ECMAScript, NO Node host APIs
+- **Goal:** 100% **ECMAScript** conformance — the JS *language* plus the standard built-in
+  *library*, i.e. exactly what Test262 covers under `test/language/` and `test/built-ins/`.
+  Conformance is tracked over the full `language/` tree (no longer just `language/expressions`).
+- **Explicitly out of scope — Node host APIs.** ljs does **NOT** implement any Node/host
+  runtime surface: CommonJS `require` / module loading, ESM host module loading, `fs` / `http` /
+  `net` / `process` / `Buffer`, and host timers (`setTimeout` / `setInterval`). These are host
+  embeddings, not ECMA-262.
+- **In scope (it's ECMAScript):** Promises and the microtask / Job queue (`Promise`, `await`,
+  Job scheduling) — these are defined by ECMA-262, not the host. Host *timers* are not.
+- **Stop rule:** when the only remaining work to advance conformance would be implementing a
+  Node host API, **stop** — that is by definition out of scope.
+
 ## Git / commits
 - Do **not** add a `Co-Authored-By: Claude` (or any Claude/Anthropic) trailer to commit messages.
 - Do **not** set Claude/Anthropic as the commit author — commits are authored by the user.
