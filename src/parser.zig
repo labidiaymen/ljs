@@ -804,17 +804,24 @@ pub const Parser = struct {
             }
         }
 
-        // §15.7 Unsupported element prefixes parse-reject (preserve negatives): generator `* m` and
-        // `async m` (a separate future milestone). Accessors `get`/`set` (handled just below), computed
-        // names `[expr]`, and PrivateName members `#x` (handled below) land this cycle. `get`/`set`/
+        // §15.7 GeneratorMethod `* m(){…}` / `static * m(){…}` / `* [expr](){…}` — a leading `*`
+        // marks a generator method (§15.5). `async m` / `async * m` (async generators) stay
+        // parse-rejected (a separate future milestone). Accessors `get`/`set` (handled just below),
+        // computed names `[expr]`, and PrivateName members `#x` (handled below) land too. `get`/`set`/
         // `async` are only a modifier when followed by something that begins a property name (else they
         // are an ordinary element key, e.g. `get(){}` / `get = 1` / `get;`).
+        var is_generator_method = false;
         switch (self.peek().kind) {
-            .star => return ParseError.UnexpectedToken, // generator method (deferred)
+            .star => {
+                is_generator_method = true;
+                _ = self.advance(); // consume `*`
+            },
             .identifier => {
                 const w = self.peek().lexeme;
-                if (std.mem.eql(u8, w, "async") and startsAccessorName(self.tokens[self.idx + 1].kind)) {
-                    return ParseError.UnexpectedToken; // async method (deferred)
+                if (std.mem.eql(u8, w, "async") and
+                    (startsAccessorName(self.tokens[self.idx + 1].kind) or self.tokens[self.idx + 1].kind == .star))
+                {
+                    return ParseError.UnexpectedToken; // async method / async generator (deferred)
                 }
                 // §15.7 `get x(){…}` / `set x(v){…}` accessor (instance or static). A `get`/`set`
                 // followed by a PrivateIdentifier is a PRIVATE accessor `get #x(){…}`.
@@ -843,23 +850,37 @@ pub const Parser = struct {
             // `static` method may not be named `prototype`. A private method named `#constructor` is a
             // SyntaxError (handled in parsePrivateName) and a private name is never the class ctor.
             if (is_static and is_literal and !is_private and std.mem.eql(u8, pn.key, "prototype")) return ParseError.UnexpectedToken;
-            // §15.7: a non-static, non-private method named `constructor` is the class constructor.
-            const is_ctor = !is_static and is_literal and !is_private and std.mem.eql(u8, pn.key, "constructor");
+            // §15.7: a non-static, non-private method named `constructor` is the class constructor —
+            // but a GENERATOR method named `constructor` is a §15.7.1 SyntaxError (a constructor is
+            // never a generator), and a `static *prototype` was already rejected above.
+            const is_ctor = !is_generator_method and !is_static and is_literal and !is_private and std.mem.eql(u8, pn.key, "constructor");
+            if (is_generator_method and is_literal and !is_private and !is_static and std.mem.eql(u8, pn.key, "constructor")) return ParseError.UnexpectedToken;
             // §13.3.5/§13.3.7: every MethodDefinition body has a [[HomeObject]] (`super.x` allowed);
             // `super(...)` is allowed only in a DERIVED class's `constructor`. Saved/restored so the
             // flags don't leak to the next element (or, via the defers, to anything after the body).
             const saved_in_method = self.in_method;
             const saved_in_derived = self.in_derived_ctor;
+            const saved_in_generator = self.in_generator;
             defer self.in_method = saved_in_method;
             defer self.in_derived_ctor = saved_in_derived;
+            defer self.in_generator = saved_in_generator;
             self.in_method = true;
             self.in_derived_ctor = is_ctor and is_derived;
+            // §15.5: a generator method's BODY parses with `[+Yield]`; its FormalParameters do NOT
+            // (a `yield` operator in a default is a §15.5.1 SyntaxError, and `yield` may not be a
+            // param BindingIdentifier). An ordinary method un-sets `in_generator` (yield is not the
+            // operator there even when the method sits inside an enclosing generator).
+            self.in_generator = false;
             const pl = try self.parseParams();
+            if (is_generator_method and paramsHaveYield(pl)) return ParseError.UnexpectedToken;
+            self.in_generator = is_generator_method;
             const body = try self.parseMethodBody(pl);
             // §15.7 / §13.2.5.1 UniqueFormalParameters — a method's parameters have no duplicates.
             if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
+            // §14.3.1 / §15.5.1: a method's params may not collide with its body's LexicallyDeclaredNames.
+            if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
             const f = try self.arena.create(ast.Function);
-            f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body };
+            f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = is_generator_method };
             return .{
                 .kind = if (is_ctor) .constructor else .method,
                 .is_static = is_static,
@@ -869,6 +890,9 @@ pub const Parser = struct {
                 .value = .{ .func = f },
             };
         }
+        // A leading `*` with no following method body (`* x;` / `* x = 1`) is a SyntaxError — a
+        // generator element must be a method.
+        if (is_generator_method) return ParseError.UnexpectedToken;
 
         // §15.7 FieldDefinition `x = Initializer ;` or bare `x ;` (ASI). An optional `= expr`.
         // §15.7.1 Early Errors on the field's PropName: it may not be `constructor`; a `static` field
@@ -1694,9 +1718,43 @@ pub const Parser = struct {
                 break;
             }
 
+            // §13.2.5 GeneratorMethod `* m(){…}` / `* [expr](){…}` in an object literal — a leading
+            // `*` marks a generator method (§15.5). `async m` / `async * m` (async generators) stay
+            // parse-rejected (a separate future milestone).
+            if (self.peek().kind == .star) {
+                _ = self.advance(); // consume `*`
+                const name = try self.parsePropertyName();
+                if (self.peek().kind != .lparen) return ParseError.UnexpectedToken; // a `*` element must be a method
+                const saved_in_generator = self.in_generator;
+                defer self.in_generator = saved_in_generator;
+                // §15.5: the params parse `~Yield` (a `yield` there is a §15.5.1 SyntaxError), the body `+Yield`.
+                self.in_generator = false;
+                const pl = try self.parseParams();
+                if (paramsHaveYield(pl)) return ParseError.UnexpectedToken;
+                self.in_generator = true;
+                const body = try self.parseMethodBody(pl);
+                if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
+                // §14.3.1 / §15.5.1: params may not collide with the body's LexicallyDeclaredNames.
+                if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
+                const f = try self.arena.create(ast.Function);
+                f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = true };
+                const fnode = try self.alloc(.{ .function = f });
+                try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = fnode });
+                if (self.peek().kind == .comma) {
+                    _ = self.advance();
+                    continue;
+                }
+                break;
+            }
+
             // §13.2.5.6 `get`/`set` accessor — only when the next token starts a property name (so
             // `{get: 1}` and `{get(){}}` and `{get}` stay ordinary uses of the identifier `get`).
             const w = self.peek();
+            if (w.kind == .identifier and std.mem.eql(u8, w.lexeme, "async") and
+                (startsAccessorName(self.tokens[self.idx + 1].kind) or self.tokens[self.idx + 1].kind == .star))
+            {
+                return ParseError.UnexpectedToken; // async method / async generator method (deferred)
+            }
             if (w.kind == .identifier and (std.mem.eql(u8, w.lexeme, "get") or std.mem.eql(u8, w.lexeme, "set")) and
                 startsAccessorName(self.tokens[self.idx + 1].kind))
             {
@@ -1736,11 +1794,18 @@ pub const Parser = struct {
             const name = try self.parsePropertyName();
 
             if (self.peek().kind == .lparen) {
-                // §13.2.5 MethodDefinition `m(args){…}` — sugar for `m: function(args){…}`.
+                // §13.2.5 MethodDefinition `m(args){…}` — sugar for `m: function(args){…}`. An ordinary
+                // method un-sets `in_generator` (yield is not the operator there, even inside an
+                // enclosing generator); restored after the body.
+                const saved_in_generator = self.in_generator;
+                defer self.in_generator = saved_in_generator;
+                self.in_generator = false;
                 const pl = try self.parseParams();
                 const body = try self.parseMethodBody(pl);
                 // §13.2.5.1 UniqueFormalParameters — a method's parameters have no duplicates.
                 if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
+                // §14.3.1: params may not collide with the body's LexicallyDeclaredNames.
+                if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
                 const f = try self.arena.create(ast.Function);
                 f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body };
                 const fnode = try self.alloc(.{ .function = f });
@@ -2142,6 +2207,59 @@ fn hasDuplicateBoundNames(pl: Parser.ParamList) bool {
         if (collectBoundNames(r, &names, a)) return true;
     }
     return false;
+}
+
+/// §14.3.1 / §15.5.1 / §13.2.5.1 Early Error: a function/method's FormalParameters BoundNames must be
+/// disjoint from its body's LexicallyDeclaredNames (`function f(a){ let a }` / `*m(a){ const a }` are
+/// SyntaxErrors). Returns true on a conflict. Walks only the TOP-LEVEL statements of the body — a
+/// nested block's `let` is its own lexical scope. Top-level `let`/`const`/`class` are lexical; a
+/// top-level `function` declaration is VarDeclared (not Lexical) so it does NOT conflict here.
+fn paramsConflictWithBodyLexical(pl: Parser.ParamList, body: []const ast.Stmt) bool {
+    // Collect the parameter bound names into a small fixed buffer (formal lists are tiny).
+    var names: std.ArrayList([]const u8) = .empty;
+    var buf: [128][]const u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(std.mem.sliceAsBytes(buf[0..]));
+    const a = fba.allocator();
+    for (pl.params) |p| _ = collectBoundNames(p.pattern, &names, a);
+    if (pl.rest) |r| _ = collectBoundNames(r, &names, a);
+    if (names.items.len == 0) return false;
+    for (body) |stmt| {
+        switch (stmt) {
+            .declaration => |d| {
+                if (d.kind == .var_decl) continue; // var is not a LexicallyDeclaredName
+                for (d.decls) |decl| {
+                    if (patternBindsAny(decl.target, names.items)) return true;
+                }
+            },
+            .class_decl => |c| {
+                if (c.name) |nm| if (nameInList(nm, names.items)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn nameInList(name: []const u8, list: []const []const u8) bool {
+    for (list) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// Does `pattern` bind any identifier present in `list`?
+fn patternBindsAny(pattern: *const ast.Pattern, list: []const []const u8) bool {
+    switch (pattern.*) {
+        .identifier => |n| return nameInList(n, list),
+        .array => |ap| {
+            for (ap.elements) |el| if (el.target) |t| if (patternBindsAny(t, list)) return true;
+            if (ap.rest) |r| return patternBindsAny(r, list);
+            return false;
+        },
+        .object => |op| {
+            for (op.properties) |prop| if (patternBindsAny(prop.target, list)) return true;
+            if (op.rest) |r| return nameInList(r, list);
+            return false;
+        },
+    }
 }
 
 /// Append `pattern`'s bound identifiers to `names`, returning true if any was already present.

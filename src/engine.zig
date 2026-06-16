@@ -556,6 +556,49 @@ test "M9 generators: yield parse early errors (§15.5.1, US6)" {
     try expectBool("function* g(){ yield } g().next().done", false);
 }
 
+test "M9 generators: yield* delegation (§15.5.5, Cycle 2)" {
+    // delegate to another generator: the inner's values flow through the outer.
+    try expectStr("function* inner(){yield 1; yield 2} function* outer(){yield* inner(); yield 3} [...outer()].join()", "1,2,3");
+    // delegate to an array iterator, then a string iterator.
+    try expectNumber("function* g(){yield* [1,2]; yield* 'ab'} [...g()].length", 4);
+    try expectStr("function* g(){yield* [1,2]; yield* 'ab'} [...g()].join()", "1,2,a,b");
+    // §14.4.14 step 7.a.ii: `yield*` evaluates to the inner iterator's final (done) value.
+    try expectStr("function* inner(){yield 1; return 9} function* outer(){var r = yield* inner(); yield r} [...outer()].join()", "1,9");
+    // a sent value is forwarded into the inner generator's `yield`; the inner's return becomes the
+    // yield* value, which the outer then yields back — so the .next(42) that completes the inner sees it.
+    try expectNumber("function* inner(){var x = yield; return x} function* outer(){var r = yield* inner(); yield r} var it = outer(); it.next(); it.next(42).value", 42);
+    // delegating to an empty iterable yields nothing; the yield* value is the inner return.
+    try expectNumber("function* g(){var r = yield* []; yield 5} [...g()].length", 1);
+}
+
+test "M9 generators: generator methods in classes & objects (§15.5, Cycle 2)" {
+    // class instance generator method.
+    try expectNumber("class C{ *g(){yield 5} } [...new C().g()][0]", 5);
+    try expectNumber("class C{ *g(){yield 1; yield 2; yield 3} } [...new C().g()].length", 3);
+    // static generator method.
+    try expectNumber("class C{ static *g(){yield 8} } C.g().next().value", 8);
+    // computed-key generator method.
+    try expectNumber("class C{ *['g'](){yield 4} } new C().g().next().value", 4);
+    // object-literal generator method.
+    try expectNumber("var o = {*g(){yield 7}}; o.g().next().value", 7);
+    try expectStr("var o = {*g(){yield 'a'; yield 'b'}}; [...o.g()].join()", "a,b");
+    // a generator method `this` binds to the receiver.
+    try expectNumber("var o = {v: 11, *g(){yield this.v}}; o.g().next().value", 11);
+}
+
+test "M9 generators: generator-method early errors stay rejected (§15.5.1, Cycle 2)" {
+    // §15.5.1: `yield` as a generator-method param name is a SyntaxError (class + object).
+    try expectSyntaxError("class C{ *g(yield){} }");
+    try expectSyntaxError("var o = {*g(yield){}};");
+    // §15.7.1: a generator method named `constructor` is forbidden.
+    try expectSyntaxError("class C{ *constructor(){} }");
+    // async generator methods stay parse-rejected (separate async milestone).
+    try expectSyntaxError("class C{ async *g(){} }");
+    try expectSyntaxError("var o = {async *g(){}};");
+    // a `*` element with no method body is a SyntaxError.
+    try expectSyntaxError("class C{ *x = 1; }");
+}
+
 test "M3 arrow functions: bodies & param forms (US5, §15.3)" {
     // expression body (implicit return), single un-parenthesized param
     try expectNumber("var f = x => x + 1; f(41)", 42);
@@ -674,10 +717,8 @@ test "M4 classes: body is strict (Cycle 1, §15.7)" {
 }
 
 test "M4 classes: unsupported element syntax still parse-rejects (Cycle 1 scope)" {
-    // generators / async are a separate future milestone — they must still parse-reject so the
-    // negative-parse class tests that use them keep passing.
-    try expectSyntaxError("class C { *m() {} }"); // generator method (deferred)
-    try expectSyntaxError("class C { static *m() {} }"); // static generator (deferred)
+    // generator methods landed in M9 Cycle 2 (covered by the M9 generator-method tests); `async` /
+    // async generators are a separate future milestone — they must still parse-reject.
     try expectSyntaxError("class C { async m() {} }"); // async method (deferred)
     try expectSyntaxError("class C { async *m() {} }"); // async generator (deferred)
     // a ClassDeclaration requires a name

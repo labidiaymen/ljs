@@ -546,9 +546,7 @@ pub const Interpreter = struct {
             .yield_expr => |y| {
                 // §14.4 YieldExpression — legal only on a generator body thread (`current_gen` set).
                 // A `yield` reached outside a generator at runtime should not occur (the parser rejects
-                // it), but guard defensively. `yield* x` delegation is parsed but its full §15.5.5
-                // semantics are Cycle 2 — Cycle 1 yields the (already-iterable) operand value as one
-                // step rather than draining it, so it does not crash.
+                // it), but guard defensively.
                 if (self.current_gen == null) return self.throwError("SyntaxError", "yield outside a generator");
                 var arg: Value = .undefined;
                 if (y.argument) |an| {
@@ -556,6 +554,9 @@ pub const Interpreter = struct {
                     if (ac.isAbrupt()) return ac;
                     arg = ac.normal;
                 }
+                // §15.5.5 `yield* expr` delegates to the iterator of `expr`; plain `yield expr` performs
+                // a single handoff.
+                if (y.delegate) return self.doYieldDelegate(arg);
                 return self.doYield(arg);
             },
             .call => |c| return self.evalCall(c, env),
@@ -2349,28 +2350,150 @@ pub const Interpreter = struct {
         return .{ .normal = .undefined };
     }
 
-    /// §14.4.14 / §27.5.3.7 the `yield x` runtime — the body-thread side of the handoff. Posts the
-    /// yielded value to the caller, parks on `resume_gen`, and on resume returns the sent value (a
-    /// normal `.next(v)`), throws (an injected `.throw(e)`), or returns (an injected `.return(v)` →
-    /// propagated as a return completion so the body's `finally` blocks run). Only ever runs on a
-    /// generator body thread (`current_gen` non-null).
-    fn doYield(self: *Interpreter, value: Value) EvalError!Completion {
+    /// How the consumer resumed a parked `yield` — the resume kind (`.next`/`.return`/`.throw`) plus
+    /// the value it carried. `abandon` is set when realm teardown woke the body to unwind it.
+    const Resumption = struct { kind: object_mod.ResumeKind, value: Value, abandon: bool };
+
+    /// §27.5.3.7 GeneratorYield core — the body-thread side of the handoff. Posts the yielded value to
+    /// the caller, parks on `resume_gen`, and reports back HOW the consumer resumed (`.next`/`.return`/
+    /// `.throw` + the carried value). Callers translate that into a body completion (plain `yield`) or
+    /// forward it to an inner iterator (`yield*`). Only ever runs on a body thread (`current_gen` set).
+    fn doYieldRaw(self: *Interpreter, value: Value) Resumption {
         const gen = self.current_gen.?;
         // Abandonment (realm teardown): once signaled, every further `yield` immediately unwinds the
         // body with a return completion (without parking), so a `yield` reached inside a `finally`
         // during the unwind cannot re-park and deadlock the joining thread.
-        if (gen.abandon) return .{ .ret = .undefined };
+        if (gen.abandon) return .{ .kind = .ret, .value = .undefined, .abandon = true };
         gen.transfer_value = value;
         gen.transfer_kind = .yield;
         gen.to_caller.post(self.io); // hand control to the caller
         gen.resume_gen.waitUncancelable(self.io); // park until the next .next/.return/.throw
-        if (gen.abandon) return .{ .ret = .undefined }; // woken by cleanup → unwind
+        if (gen.abandon) return .{ .kind = .ret, .value = .undefined, .abandon = true }; // woken by cleanup
+        return .{ .kind = gen.resume_kind, .value = gen.sent_value, .abandon = false };
+    }
+
+    /// §14.4.14 the `yield x` runtime — perform one handoff and translate the resumption into a body
+    /// completion: a normal `.next(v)` makes the yield expression evaluate to `v`; an injected
+    /// `.throw(e)` re-throws at the yield; an injected `.return(v)` returns (so the body's `finally`
+    /// blocks run during unwind).
+    fn doYield(self: *Interpreter, value: Value) EvalError!Completion {
+        const r = self.doYieldRaw(value);
         // §27.5.3.3/.4 the resume kind decides what the yield expression "evaluates to".
-        switch (gen.resume_kind) {
-            .next => return .{ .normal = gen.sent_value }, // yield evaluates to the sent value
-            .throw => return .{ .throw = gen.sent_value }, // §27.5.3.4 inject a throw at the yield
-            .ret => return .{ .ret = gen.sent_value }, // §27.5.3.4 inject a return (runs finally blocks)
+        return switch (r.kind) {
+            .next => .{ .normal = r.value }, // yield evaluates to the sent value
+            .throw => .{ .throw = r.value }, // §27.5.3.4 inject a throw at the yield
+            .ret => .{ .ret = r.value }, // §27.5.3.4 inject a return (runs finally blocks)
+        };
+    }
+
+    /// §14.4.14 / §15.5.5 `yield* expr` delegation — drive the iterator of `expr`, forwarding each
+    /// `.next`/`.return`/`.throw` the OUTER consumer sends to the inner iterator and re-yielding the
+    /// inner's values to the outer consumer. When the inner iterator is done, the whole `yield*`
+    /// expression evaluates to that final `value`. Runs on the generator body thread.
+    ///   • outer `.next(v)`  → inner `next(v)`; `{done:false}` re-yields, `{done:true}` finishes yield*.
+    ///   • outer `.throw(e)` → inner `throw(e)` if present (§14.4.14 step 7); else IteratorClose + a
+    ///     TypeError thrown into the body (the inner has no throw handler).
+    ///   • outer `.return(v)`→ inner `return(v)` if present (§14.4.14 step 8); a `{done:true}` inner
+    ///     result returns that value from the body; absent `return` → return `v` directly.
+    fn doYieldDelegate(self: *Interpreter, source: Value) EvalError!Completion {
+        const git = try self.getIterator(source);
+        const iterator: *Object = switch (git) {
+            .abrupt => |c| return c,
+            .iterator => |it| it,
+        };
+        // §14.4.14 step 5: the first inner call is `next(undefined)`; thereafter the value forwarded
+        // is whatever the outer consumer sent. `received` carries the resume kind + value each round.
+        var received: Resumption = .{ .kind = .next, .value = .undefined, .abandon = false };
+        while (true) {
+            switch (received.kind) {
+                // §14.4.14 step 7.a.i: forward a normal resume to the inner iterator's `next`.
+                .next => {
+                    const res = try self.iteratorCall(iterator, "next", received.value, true);
+                    switch (res) {
+                        .abrupt => |c| return c,
+                        .result => |r| {
+                            if (r.done) return .{ .normal = r.value }; // §14.4.14 step 7.a.ii: yield* value
+                            received = self.doYieldRaw(r.value); // re-yield; capture the next resumption
+                            if (received.abandon) return .{ .ret = .undefined };
+                        },
+                    }
+                },
+                // §14.4.14 step 7.b: an outer `.throw(e)` forwards to the inner iterator's `throw`.
+                .throw => {
+                    const tm = try self.getProperty(.{ .object = iterator }, "throw");
+                    if (tm.isAbrupt()) return tm;
+                    if (tm.normal == .object and tm.normal.object.kind == .function) {
+                        const rc = try self.callFunction(tm.normal.object, &.{received.value}, .{ .object = iterator });
+                        if (rc.isAbrupt()) return rc;
+                        const r = try self.iterResultFromValue(rc.normal);
+                        switch (r) {
+                            .abrupt => |c| return c,
+                            .result => |ir| {
+                                if (ir.done) return .{ .normal = ir.value }; // §14.4.14 step 7.b.iii
+                                received = self.doYieldRaw(ir.value);
+                                if (received.abandon) return .{ .ret = .undefined };
+                            },
+                        }
+                    } else {
+                        // §14.4.14 step 7.b.iii: the inner iterator has no `throw` — close it and throw a
+                        // TypeError into the body (so a `try`/`catch` around the `yield*` can observe it).
+                        try self.iteratorClose(iterator);
+                        return self.throwError("TypeError", "The iterator does not provide a throw method");
+                    }
+                },
+                // §14.4.14 step 8: an outer `.return(v)` forwards to the inner iterator's `return`.
+                .ret => {
+                    const rm = try self.getProperty(.{ .object = iterator }, "return");
+                    if (rm.isAbrupt()) return rm;
+                    // §14.4.14 step 8.b: a missing `return` → return the value directly (unwind the body).
+                    if (rm.normal != .object or rm.normal.object.kind != .function) return .{ .ret = received.value };
+                    const rc = try self.callFunction(rm.normal.object, &.{received.value}, .{ .object = iterator });
+                    if (rc.isAbrupt()) return rc;
+                    const r = try self.iterResultFromValue(rc.normal);
+                    switch (r) {
+                        .abrupt => |c| return c,
+                        .result => |ir| {
+                            // §14.4.14 step 8.d.iii: a done inner `return` result completes the body with
+                            // that value; otherwise re-yield and keep delegating.
+                            if (ir.done) return .{ .ret = ir.value };
+                            received = self.doYieldRaw(ir.value);
+                            if (received.abandon) return .{ .ret = .undefined };
+                        },
+                    }
+                },
+            }
         }
+    }
+
+    const IterStep = struct { value: Value, done: bool };
+    const CallStepResult = union(enum) { result: IterStep, abrupt: Completion };
+
+    /// Call `iterator[method](arg)` and decode the IteratorResult into `{ value, done }`. `pass_arg`
+    /// false calls with no argument (parameterless `next()`); true forwards `arg`. A non-object result
+    /// is a §7.4.4 TypeError. Used by `yield*` to drive the inner iterator's next/throw/return.
+    fn iteratorCall(self: *Interpreter, iterator: *Object, method: []const u8, arg: Value, pass_arg: bool) EvalError!CallStepResult {
+        const mc = try self.getProperty(.{ .object = iterator }, method);
+        if (mc.isAbrupt()) return .{ .abrupt = mc };
+        if (mc.normal != .object or mc.normal.object.kind != .function) {
+            return .{ .abrupt = try self.throwError("TypeError", "iterator method is not a function") };
+        }
+        const args: []const Value = if (pass_arg) &.{arg} else &.{};
+        const rc = try self.callFunction(mc.normal.object, args, .{ .object = iterator });
+        if (rc.isAbrupt()) return .{ .abrupt = rc };
+        return self.iterResultFromValue(rc.normal);
+    }
+
+    /// Decode an IteratorResult object into `{ value, done }` (§7.4.4 / §7.4.5). A non-object → TypeError.
+    fn iterResultFromValue(self: *Interpreter, result: Value) EvalError!CallStepResult {
+        if (result != .object) {
+            return .{ .abrupt = try self.throwError("TypeError", "Iterator result is not an object") };
+        }
+        const obj = result.object;
+        const dc = try self.getProperty(.{ .object = obj }, "done");
+        if (dc.isAbrupt()) return .{ .abrupt = dc };
+        const vc = try self.getProperty(.{ .object = obj }, "value");
+        if (vc.isAbrupt()) return .{ .abrupt = vc };
+        return .{ .result = .{ .value = vc.normal, .done = toBoolean(dc.normal) } };
     }
 
     /// Construct an IteratorResult `{ value, done }` object (§7.4.1 CreateIterResultObject), proto =

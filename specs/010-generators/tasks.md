@@ -70,10 +70,34 @@ commit).
   `finally`), and joins it — so no OS thread lingers and the short-lived conformance runner does not hang
   (verified: 200 abandoned generators + an infinite-loop abandoned generator both exit cleanly).
 
+## Cycle 2 — `yield*` delegation (§15.5.5) + generator methods (DONE — continuity gate (`language/expressions`, harness): passed 7,138 → **7,922** (+784), **0 true regressions / 784 recoveries** by `mode+path`; conformance 42.1% → **46.7%**. The recoveries are the generator-method slice of `class`/`object` (previously parse-rejected wholesale) + `yield*` delegation tests; the broader §14.3.1 param-vs-LexicallyDeclaredNames early error added alongside also recovered the ordinary-method `name-param-redecl` variants. The only initial regressions (4 — `object/method-definition/generator-param-redecl-{const,let}` ×{strict,sloppy}) were finer-grained §14.3.1/§15.5.1 early errors that previously "passed" only because `{*m(){}}` parse-rejected wholesale; all 4 fixed by the new `paramsConflictWithBodyLexical` check, leaving 0. Bench green: `perf: ok (no ljs-vs-self regression)`, ljs 0.2–0.6× Node — generator methods reuse the C1 thread substrate, ordinary calls still spawn no thread. No hangs (the `yield*` drain forwards next/throw/return over the M8 §7.4 path; the full run completes in ~45s).)
+- [x] **`yield*` delegation (`src/interpreter.zig`)** — replaced the C1 single-step `yield*` with a real
+  §15.5.5/§14.4.14 delegation loop (`doYieldDelegate`): get the operand's iterator (M8 `getIterator`),
+  forward each outer `.next(v)`→inner `next(v)`, `.throw(e)`→inner `throw(e)` (else IteratorClose +
+  TypeError), `.return(v)`→inner `return(v)`; re-yield each `{done:false}` value to the outer consumer
+  via the new `doYieldRaw` (which surfaces the resume kind+value instead of collapsing it); a
+  `{done:true}` inner result makes the `yield*` expression evaluate to that `value`. Delegates to
+  arrays/strings/generators/any custom iterable.
+- [x] **Generator methods (`src/parser.zig`, `src/interpreter.zig`)** — un-rejected a leading `*` in
+  class bodies (`*m(){}` / `static *m(){}` / `*[expr](){}`) and object literals (`{ *m(){} }`), setting
+  `is_generator` on the method `Function`; the interpreter's existing method-creation path
+  (`evalFunctionExpr`) already propagates `is_generator` + wires `[[HomeObject]]` for class methods, so
+  no new install code was needed (object-method `super` remains the pre-existing object-literal gap).
+  §15.5.1/§14.3.1 early errors preserved: `yield` as a generator-method param BindingIdentifier or a
+  default referencing `yield` (`paramsHaveYield`), a generator method named `constructor`, a `*` element
+  with no method body, params colliding with the body's LexicallyDeclaredNames
+  (`paramsConflictWithBodyLexical`). Also fixed a latent `in_generator` leak: an ordinary method inside a
+  generator now correctly un-sets `in_generator` for its own body.
+- [x] **Async generators/methods stay parse-rejecting** — `async *m(){}` (class + object) and `async m`
+  verified still SyntaxError (separate async milestone); no regression on those negatives.
+- [x] **Tests (`src/engine.zig`, all green)** — `yield*` to a generator/array/string; `yield*` return
+  value; sent-value forwarding through `yield*`; class instance/static/computed generator methods;
+  object-literal generator method (incl. `this` binding); generator-method early-error negatives
+  (`yield` param, `*constructor`, `async *`, `*x = 1`). Updated the stale Cycle-1 negative
+  (`class C { *m() {} }` no longer parse-rejects).
+
 ## Future cycles (planned)
-- **Cycle 2 — `yield*` delegation (§15.5.5) + generator methods:** `yield* iterable` (delegate to an
-  inner iterator, forwarding next/return/throw per §27.5.3.7); generator *methods* in object literals
-  (`{ *m(){} }`) and classes (`*m(){}`, `static *m(){}`); the generator `.name`/`.length`.
+- **Cycle 3 — generator `.name`/`.length`** (deferred from Cycle 2; small, non-blocking).
 - **Cycle 3+ — async generators / `for-await-of` / `AsyncGeneratorPrototype`** on the now-real generator
   substrate; `Map`/`Set`.
 

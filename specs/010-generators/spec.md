@@ -4,7 +4,7 @@
 
 **Created**: 2026-06-16
 
-**Status**: Cycle 1 in progress
+**Status**: Cycle 1 + Cycle 2 done (`yield*` delegation + generator methods landed; conformance 46.7%)
 
 **Input**: "M9: generators. M8 landed the §7.4 iterator protocol + a minimal Symbol, but only the
 iterator *consumers* (for-of / spread / destructuring) and the native Array/String *producers*. The
@@ -138,8 +138,9 @@ SyntaxError. `yield*` (delegation) is parsed (Cycle 2 semantics) or rejected cle
 ## Assumptions
 - Tree-walk tier retained. Suspension is via a dedicated OS thread per generator (`std.Thread`) with a
   strict ping-pong handoff (one runner at a time) over `std.Io.Semaphore` (the global threaded Io's
-  raw-OS-futex). `yield*` delegation (§15.5.5), generator *methods* in classes/objects (`*m(){}`), and
-  async generators are deferred to Cycle 2.
+  raw-OS-futex). `yield*` delegation (§15.5.5) and generator *methods* in classes/objects (`*m(){}` /
+  `static *m(){}` / `{ *m(){} }`) landed in Cycle 2 (reusing this substrate); async generators
+  (`async *`) and the generator `.name`/`.length` are deferred to a later cycle.
 - A never-fully-consumed generator parks a thread (acceptable for the short-lived harness; documented).
 
 ## Dependencies
