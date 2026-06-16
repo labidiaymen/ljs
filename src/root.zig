@@ -25,6 +25,7 @@ test {
     _ = @import("builtin_array.zig");
     _ = @import("builtin_string.zig");
     _ = @import("ast.zig");
+    _ = @import("unicode_id.zig");
     _ = @import("lexer.zig");
     _ = @import("parser.zig");
     _ = @import("interpreter.zig");

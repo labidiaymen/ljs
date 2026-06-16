@@ -172,6 +172,8 @@ pub const Parser = struct {
             .lbracket => return self.parseArrayPattern(),
             .lbrace => return self.parseObjectPattern(),
             .identifier => {
+                // §12.7.1: an escaped §12.7.2 ReservedWord is not a valid BindingIdentifier.
+                if (isEscapedReservedIdent(self.peek())) return ParseError.UnexpectedToken;
                 // §15.7.11: `await` is reserved as a BindingIdentifier inside a static block.
                 if (self.in_static_block and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
                 // §15.8.1: inside an async body `await` may not be a BindingIdentifier (`var await`,
@@ -231,7 +233,10 @@ pub const Parser = struct {
         while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
             if (self.peek().kind == .ellipsis) { // §14.3.3 BindingRestProperty (must be last)
                 _ = self.advance();
-                rest = (try self.expect(.identifier)).lexeme;
+                const rt = try self.expect(.identifier);
+                // §12.7.1: a BindingRestProperty target is a BindingIdentifier — reject escaped reserved.
+                if (isEscapedReservedIdent(rt)) return ParseError.UnexpectedToken;
+                rest = rt.lexeme;
                 break;
             }
             const kt = self.advance();
@@ -241,12 +246,15 @@ pub const Parser = struct {
                 else => return ParseError.UnexpectedToken,
             };
             const target: *const ast.Pattern = if (self.peek().kind == .colon) blk: {
-                // `key: target` (renaming / nested)
+                // `key: target` (renaming / nested) — `key` is an IdentifierName (escaped reserved OK).
                 _ = self.advance();
                 break :blk try self.parsePattern();
-            } else
-                // shorthand `{x}` — key doubles as the binding identifier
-                try self.allocPattern(.{ .identifier = key });
+            } else blk: {
+                // shorthand `{x}` — key doubles as the BindingIdentifier, so an escaped §12.7.2
+                // ReservedWord (`{ with }`) is a SyntaxError (§12.7.1).
+                if (isEscapedReservedIdent(kt)) return ParseError.UnexpectedToken;
+                break :blk try self.allocPattern(.{ .identifier = key });
+            };
             var default: ?*const ast.Node = null;
             if (self.peek().kind == .assign) {
                 _ = self.advance();
@@ -409,7 +417,9 @@ pub const Parser = struct {
     /// for-header (here) as the for-of marker — everywhere else `of` is an ordinary identifier.
     fn peekIsOf(self: *Parser) bool {
         const t = self.peek();
-        return t.kind == .identifier and std.mem.eql(u8, t.lexeme, "of");
+        // §12.7.1: a contextual keyword spelled with a Unicode escape is NOT the keyword (`of`
+        // is the identifier `of`, never the for-of marker) — terminal symbols must appear verbatim.
+        return t.kind == .identifier and !t.had_escape and std.mem.eql(u8, t.lexeme, "of");
     }
 
     fn parseFor(self: *Parser) ParseError!ast.Stmt {
@@ -583,6 +593,8 @@ pub const Parser = struct {
             if (self.peek().kind == .lparen) {
                 _ = self.advance();
                 const cp = try self.expect(.identifier);
+                // §12.7.1: an escaped ReservedWord is not a valid catch-parameter BindingIdentifier.
+                if (isEscapedReservedIdent(cp)) return ParseError.UnexpectedToken;
                 // §13.1.1 Early Error: in strict, a catch parameter (a BindingIdentifier) may not be
                 // `eval`/`arguments` or a future-reserved word.
                 if (self.strict and isStrictReservedBindingName(cp.lexeme)) return ParseError.UnexpectedToken;
@@ -752,6 +764,9 @@ pub const Parser = struct {
                 // statement `async` then a separate `function` declaration). An async generator decl
                 // (`async function* g(){}`) also lands here.
                 if (self.atAsyncFunctionStart()) {
+                    // §12.7.1 Early Error: the `async` keyword of an AsyncFunctionDeclaration must not
+                    // contain a Unicode escape (`async function f(){}`).
+                    if (self.peek().had_escape) return ParseError.UnexpectedToken;
                     _ = self.advance(); // `async`
                     _ = self.advance(); // `function`
                     return .{ .func_decl = try self.parseFunction(true) };
@@ -831,6 +846,8 @@ pub const Parser = struct {
         // Collect the chain of label identifiers (`a: b: c: …`).
         var chain: std.ArrayListUnmanaged([]const u8) = .empty;
         while (self.peek().kind == .identifier and self.idx + 1 < self.tokens.len and self.tokens[self.idx + 1].kind == .colon) {
+            // §12.7.1: an escaped ReservedWord is not a valid LabelIdentifier.
+            if (isEscapedReservedIdent(self.peek())) return ParseError.UnexpectedToken;
             const name = self.advance().lexeme; // identifier
             _ = self.advance(); // `:`
             // §13.1.1 LabelIdentifier Early Errors: `yield` is not a valid label in a generator body
@@ -911,7 +928,11 @@ pub const Parser = struct {
         self.in_generator = false;
         self.in_async = false;
         var name: ?[]const u8 = null;
-        if (self.peek().kind == .identifier) name = self.advance().lexeme;
+        if (self.peek().kind == .identifier) {
+            // §12.7.1: an escaped ReservedWord is not a valid function-name BindingIdentifier.
+            if (isEscapedReservedIdent(self.peek())) return ParseError.UnexpectedToken;
+            name = self.advance().lexeme;
+        }
         // §13.1.1: a strict function's name (BindingIdentifier) may not be `eval`/`arguments`/a
         // future-reserved word. Checked against the *enclosing* strictness (the name is declared
         // in the outer scope).
@@ -980,6 +1001,8 @@ pub const Parser = struct {
         var name: ?[]const u8 = null;
         // §15.7: a class name is a BindingIdentifier. `extends`/`{` end the (optional) name.
         if (self.peek().kind == .identifier) {
+            // §12.7.1: an escaped ReservedWord is not a valid class-name BindingIdentifier.
+            if (isEscapedReservedIdent(self.peek())) return ParseError.UnexpectedToken;
             // §13.1.1: a class name may not be a strict-reserved word — and a class body is always
             // strict, so this holds in every mode.
             if (isStrictReservedBindingName(self.peek().lexeme)) return ParseError.UnexpectedToken;
@@ -1102,7 +1125,7 @@ pub const Parser = struct {
         // begins a (non-static) element name. `static(){}`/`static = 1`/`static;`/`static }` use the
         // identifier `static` as the element key instead.
         var is_static = false;
-        if (self.peek().kind == .identifier and std.mem.eql(u8, self.peek().lexeme, "static")) {
+        if (self.peek().kind == .identifier and !self.peek().had_escape and std.mem.eql(u8, self.peek().lexeme, "static")) {
             const next = self.tokens[self.idx + 1].kind;
             switch (next) {
                 // `static` as a key, not a modifier.
@@ -1134,7 +1157,7 @@ pub const Parser = struct {
         // §15.8: `async` is the modifier only when (no LineTerminator before the next token AND) the
         // next token begins a property name or is `*`. `async \n m(){}` is the field `async` then a
         // method `m` (ASI), so a LineTerminator un-sets the modifier.
-        if (self.peek().kind == .identifier and std.mem.eql(u8, self.peek().lexeme, "async") and
+        if (self.peek().kind == .identifier and !self.peek().had_escape and std.mem.eql(u8, self.peek().lexeme, "async") and
             !self.tokens[self.idx + 1].newline_before and
             (startsAccessorName(self.tokens[self.idx + 1].kind) or self.tokens[self.idx + 1].kind == .star))
         {
@@ -1150,8 +1173,9 @@ pub const Parser = struct {
                 const w = self.peek().lexeme;
                 // §15.7 `get x(){…}` / `set x(v){…}` accessor (instance or static). A `get`/`set`
                 // followed by a PrivateIdentifier is a PRIVATE accessor `get #x(){…}`. (Not reachable
-                // when `is_async_method` — `async get(){}` is an async method named `get`.)
-                if (!is_async_method and (std.mem.eql(u8, w, "get") or std.mem.eql(u8, w, "set")) and
+                // when `is_async_method` — `async get(){}` is an async method named `get`.) §12.7.1: an
+                // escaped `get`/`set` is the plain identifier, never the accessor modifier.
+                if (!is_async_method and !self.peek().had_escape and (std.mem.eql(u8, w, "get") or std.mem.eql(u8, w, "set")) and
                     startsAccessorName(self.tokens[self.idx + 1].kind))
                 {
                     return self.parseClassAccessor(is_static, std.mem.eql(u8, w, "get"));
@@ -1572,6 +1596,9 @@ pub const Parser = struct {
     /// follows on the SAME line (no intervening LineTerminator — else ASI splits it). The `function`
     /// keyword must immediately follow `async`.
     fn atAsyncFunctionStart(self: *Parser) bool {
+        // Structural recognition only — escape-ness is checked by the caller (§12.7.1: `async`
+        // [no LT] `function` IS the AsyncFunction production even when escaped; the escape is an
+        // Early Error, not a re-parse as an identifier).
         if (self.peek().kind != .identifier or !std.mem.eql(u8, self.peek().lexeme, "async")) return false;
         if (self.idx + 1 >= self.tokens.len) return false;
         const nxt = self.tokens[self.idx + 1];
@@ -1586,6 +1613,7 @@ pub const Parser = struct {
     /// matching `)` distinguishes `async (a, b) => …` from a call `async(a, b)`.
     const AsyncHead = enum { arrow_ident, arrow_paren, function_expr };
     fn atAsyncArrowOrFunction(self: *Parser) ?AsyncHead {
+        // Structural recognition only — escape-ness checked by the caller (§12.7.1 Early Error).
         if (self.peek().kind != .identifier or !std.mem.eql(u8, self.peek().lexeme, "async")) return null;
         if (self.idx + 1 >= self.tokens.len) return null;
         const nxt = self.tokens[self.idx + 1];
@@ -1644,36 +1672,43 @@ pub const Parser = struct {
         //   • `async [no LT] function …` — an async function expression.
         // `async` is the modifier ONLY with no LineTerminator before the following token (else ASI /
         // `async` is an identifier). Distinguished from a CALL `async(x)` by the trailing `=>`.
-        if (self.atAsyncArrowOrFunction()) |kind| switch (kind) {
-            .arrow_ident => {
-                _ = self.advance(); // `async`
-                // §15.8.1: `async await => …` — `await` may not be an async arrow's param BindingIdentifier.
-                if (std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
-                const pat = try self.allocPattern(.{ .identifier = self.advance().lexeme });
-                const params = try self.arena.alloc(ast.Param, 1);
-                params[0] = .{ .pattern = pat, .default = null };
-                return self.finishArrowAsync(.{ .params = params, .rest = null }, true);
-            },
-            .arrow_paren => {
-                _ = self.advance(); // `async`
-                const saved_in_async = self.in_async;
-                defer self.in_async = saved_in_async;
-                // §15.8: an AsyncArrowFunction's CoverCallExpressionAndAsyncArrowHead parses its
-                // formals with `[+Await]` — so `await` is reserved as a BindingIdentifier inside them
-                // (including in a nested arrow's params, `async(a = (await) => {}) => {}`), and an
-                // `await` operator there becomes an `await_expr`. §15.8.1 then rejects any params that
-                // bind/contain `await` (`paramsHaveAwait`, which catches both the identifier and the node).
-                self.in_async = true;
-                const pl = try self.parseParams();
-                if (paramsHaveAwait(pl)) return ParseError.UnexpectedToken;
-                return self.finishArrowAsync(pl, true);
-            },
-            .function_expr => {
-                _ = self.advance(); // `async`
-                _ = self.advance(); // `function`
-                return self.alloc(.{ .function = try self.parseFunction(true) });
-            },
-        };
+        if (self.atAsyncArrowOrFunction()) |kind| {
+            // §12.7.1 Early Error: the `async` of an async arrow / async function expression is a
+            // terminal symbol and must not contain a Unicode escape (`async function …`).
+            if (self.peek().had_escape) return ParseError.UnexpectedToken;
+            switch (kind) {
+                .arrow_ident => {
+                    _ = self.advance(); // `async`
+                    // §15.8.1: `async await => …` — `await` may not be an async arrow's param BindingIdentifier.
+                    if (std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
+                    // §12.7.1: an escaped ReservedWord is not a valid arrow-param BindingIdentifier.
+                    if (isEscapedReservedIdent(self.peek())) return ParseError.UnexpectedToken;
+                    const pat = try self.allocPattern(.{ .identifier = self.advance().lexeme });
+                    const params = try self.arena.alloc(ast.Param, 1);
+                    params[0] = .{ .pattern = pat, .default = null };
+                    return self.finishArrowAsync(.{ .params = params, .rest = null }, true);
+                },
+                .arrow_paren => {
+                    _ = self.advance(); // `async`
+                    const saved_in_async = self.in_async;
+                    defer self.in_async = saved_in_async;
+                    // §15.8: an AsyncArrowFunction's CoverCallExpressionAndAsyncArrowHead parses its
+                    // formals with `[+Await]` — so `await` is reserved as a BindingIdentifier inside them
+                    // (including in a nested arrow's params, `async(a = (await) => {}) => {}`), and an
+                    // `await` operator there becomes an `await_expr`. §15.8.1 then rejects any params that
+                    // bind/contain `await` (`paramsHaveAwait`, which catches both the identifier and the node).
+                    self.in_async = true;
+                    const pl = try self.parseParams();
+                    if (paramsHaveAwait(pl)) return ParseError.UnexpectedToken;
+                    return self.finishArrowAsync(pl, true);
+                },
+                .function_expr => {
+                    _ = self.advance(); // `async`
+                    _ = self.advance(); // `function`
+                    return self.alloc(.{ .function = try self.parseFunction(true) });
+                },
+            }
+        }
         // §15.3 ArrowFunction (cover grammar, checked before the precedence climb):
         //   • `Identifier =>` — a single un-parenthesized parameter.
         //   • `( … ) =>` — a parenthesized formal list (lookahead to the matching `)`).
@@ -1684,6 +1719,8 @@ pub const Parser = struct {
             if (self.in_static_block and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
             // §15.8.1: inside an async context `await` may not be an arrow's param BindingIdentifier.
             if (self.in_async and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
+            // §12.7.1: an escaped ReservedWord is not a valid arrow-param BindingIdentifier.
+            if (isEscapedReservedIdent(self.peek())) return ParseError.UnexpectedToken;
             const pat = try self.allocPattern(.{ .identifier = self.advance().lexeme });
             const params = try self.arena.alloc(ast.Param, 1);
             params[0] = .{ .pattern = pat, .default = null };
@@ -1839,14 +1876,17 @@ pub const Parser = struct {
     fn validateAssignmentTarget(self: *Parser, node: *const ast.Node) ParseError!void {
         switch (node.*) {
             .identifier => |n| {
-                // §13.15.1: in strict, an assignment target may not be `eval`/`arguments`.
-                if (self.strict and isEvalOrArguments(n)) return ParseError.UnexpectedToken;
+                // §13.15.1: in strict, a DestructuringAssignmentTarget IdentifierReference may not be
+                // `eval`/`arguments` NOR a strict future-reserved word (`let`/`static`/`implements`/…).
+                // Non-escaped reserved words are lexed as keyword tokens and never reach here; this fires
+                // for an escaped spelling (`{ let } = o`, §12.7.1) — IdentifierReference ≠ ReservedWord.
+                if (self.strict and isStrictReservedBindingName(n)) return ParseError.UnexpectedToken;
             },
             .member, .index, .private_member => {},
             // A `target = default` element/property (the literal parser folded the `=` into an
             // assignment node). The DEFAULT side is an ordinary expression; only the TARGET recurses.
             .assign => |a| {
-                if (self.strict and isEvalOrArguments(a.name)) return ParseError.UnexpectedToken;
+                if (self.strict and isStrictReservedBindingName(a.name)) return ParseError.UnexpectedToken;
             },
             .assign_member, .assign_index, .private_assign => {},
             // Nested pattern `[{a}, [b]] = …` — the element is itself a literal to refine.
@@ -2188,7 +2228,7 @@ pub const Parser = struct {
             // `{async(){}}` use the identifier `async`).
             {
                 var om_is_async = false;
-                if (self.peek().kind == .identifier and std.mem.eql(u8, self.peek().lexeme, "async") and
+                if (self.peek().kind == .identifier and !self.peek().had_escape and std.mem.eql(u8, self.peek().lexeme, "async") and
                     !self.tokens[self.idx + 1].newline_before and
                     (startsAccessorName(self.tokens[self.idx + 1].kind) or self.tokens[self.idx + 1].kind == .star))
                 {
@@ -2235,7 +2275,7 @@ pub const Parser = struct {
             // §13.2.5.6 `get`/`set` accessor — only when the next token starts a property name (so
             // `{get: 1}` and `{get(){}}` and `{get}` stay ordinary uses of the identifier `get`).
             const w = self.peek();
-            if (w.kind == .identifier and (std.mem.eql(u8, w.lexeme, "get") or std.mem.eql(u8, w.lexeme, "set")) and
+            if (w.kind == .identifier and !w.had_escape and (std.mem.eql(u8, w.lexeme, "get") or std.mem.eql(u8, w.lexeme, "set")) and
                 startsAccessorName(self.tokens[self.idx + 1].kind))
             {
                 const is_get = std.mem.eql(u8, w.lexeme, "get");
@@ -2304,6 +2344,11 @@ pub const Parser = struct {
                 // (non-computed, non-string-keyed) identifier name; a computed/string key with no
                 // `:`/`(` is a SyntaxError.
                 if (name.computed != null or !name.is_ident) return ParseError.UnexpectedToken;
+                // §12.7.1 / §13.2.5: a shorthand `{x}` is an IdentifierReference (`Identifier ::
+                // IdentifierName but not ReservedWord`), so an escaped §12.7.2 ReservedWord shorthand
+                // (`({ with })`) is always a SyntaxError — in BOTH modes (the word is reserved
+                // unconditionally, unlike the strict-only `let`/`static` handled at refinement).
+                if (name.had_escape and lex.isReservedWord(name.key)) return ParseError.UnexpectedToken;
                 // §13.1.1 / §15.5.1 / §15.7.11: a shorthand IdentifierReference may not be a reserved
                 // word — `yield` in strict OR inside a generator body (`({ yield })` / `({ yield } = o)`
                 // in a `function*`), `await` inside a static block.
@@ -2332,7 +2377,7 @@ pub const Parser = struct {
         return self.alloc(.{ .object_literal = props.items });
     }
 
-    const PropName = struct { key: []const u8, computed: ?*const ast.Node = null, is_ident: bool = false };
+    const PropName = struct { key: []const u8, computed: ?*const ast.Node = null, is_ident: bool = false, had_escape: bool = false };
 
     /// §13.2.5 PropertyName — a literal name (identifier / string / number) or a `[expr]`
     /// ComputedPropertyName. `is_ident` flags a bare identifier (the only shorthand-eligible form).
@@ -2347,7 +2392,7 @@ pub const Parser = struct {
             },
             .identifier => {
                 _ = self.advance();
-                return .{ .key = t.lexeme, .is_ident = true };
+                return .{ .key = t.lexeme, .is_ident = true, .had_escape = t.had_escape };
             },
             .string => {
                 // §12.9.4.1 Early Error: a legacy-octal escape in a string PropertyName is a strict-
@@ -2402,6 +2447,16 @@ pub const Parser = struct {
                 return self.alloc(.null);
             },
             .identifier => {
+                // §12.7.1: an escaped §12.7.2 ReservedWord is not a valid IdentifierReference.
+                if (isEscapedReservedIdent(t)) return ParseError.UnexpectedToken;
+                // §12.7.1 Early Error: an escaped `async` immediately followed (no LineTerminator) by
+                // `function` is the AsyncFunctionExpression production written with an escape — a
+                // SyntaxError, never `<identifier async> <function>`. (Caught here because async function
+                // expressions in unary-operand position, e.g. `void async function f(){}`, are not
+                // recognized at the assignment level.)
+                if (t.had_escape and std.mem.eql(u8, t.lexeme, "async") and
+                    self.idx + 1 < self.tokens.len and self.tokens[self.idx + 1].kind == .kw_function and
+                    !self.tokens[self.idx + 1].newline_before) return ParseError.UnexpectedToken;
                 // §13.1.1: `yield` is a reserved word in strict mode — using it as an
                 // IdentifierReference (a primary expression, e.g. a `m(x = yield)` param default
                 // inside an always-strict class body) is a SyntaxError.
@@ -2418,6 +2473,11 @@ pub const Parser = struct {
                 if (self.in_async and std.mem.eql(u8, t.lexeme, "await")) return ParseError.UnexpectedToken;
                 // §15.7.11: `await` is reserved as an IdentifierReference inside a static block body.
                 if (self.in_static_block and std.mem.eql(u8, t.lexeme, "await")) return ParseError.UnexpectedToken;
+                // §15.7.11 Early Error: ContainsArguments of a ClassStaticBlock's statement list is a
+                // SyntaxError — `arguments` may not appear as an IdentifierReference directly in a static
+                // block. `in_static_block` is cleared when entering a nested ordinary function (which
+                // rebinds `arguments`), so this only fires for the block's own references.
+                if (self.in_static_block and std.mem.eql(u8, t.lexeme, "arguments")) return ParseError.UnexpectedToken;
                 _ = self.advance();
                 return self.alloc(.{ .identifier = t.lexeme });
             },
@@ -2506,6 +2566,17 @@ pub const Parser = struct {
 /// update target in strict mode.
 fn isEvalOrArguments(name: []const u8) bool {
     return std.mem.eql(u8, name, "eval") or std.mem.eql(u8, name, "arguments");
+}
+
+/// §12.7.1 / §12.7.2: an `Identifier` is `IdentifierName but not ReservedWord`. A token that is an
+/// identifier whose IdentifierName contained a Unicode escape AND whose decoded StringValue is a
+/// §12.7.2 ReservedWord is NOT a valid Identifier (binding / reference) — a SyntaxError. (`yield`/
+/// `await` are excepted by §12.7.1 and are not in `isReservedWord`.) Non-escaped reserved words are
+/// lexed as keyword tokens and never reach an Identifier position as an `.identifier`, so this guard
+/// fires only for the escaped spelling. It does NOT apply at IdentifierName positions (property names,
+/// member access), where reserved words — escaped or not — are valid.
+fn isEscapedReservedIdent(t: lex.Token) bool {
+    return t.kind == .identifier and t.had_escape and lex.isReservedWord(t.lexeme);
 }
 
 /// §13.1.1 / Table: a name that may not be used as a BindingIdentifier in strict mode — `eval`,

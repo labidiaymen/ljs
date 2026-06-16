@@ -2,6 +2,7 @@
 //! on demand. Covers numbers, string literals, the `true`/`false`/`null` keywords, and the
 //! punctuators the M0 expression grammar needs.
 const std = @import("std");
+const unicode_id = @import("unicode_id.zig");
 
 pub const TokenKind = enum {
     number,
@@ -118,6 +119,13 @@ pub const Token = struct {
     /// before the directive prologue / RunMode is resolved), so it flags the token and the parser
     /// rejects it when `self.strict` — mirroring how other strict Early Errors are threaded.
     has_legacy_octal: bool = false,
+    /// §12.7.1: the IdentifierName contained a `\uHHHH` / `\u{H…}` UnicodeEscapeSequence. For such an
+    /// identifier `lexeme` holds the DECODED StringValue (used for keyword matching + as the name). A
+    /// keyword spelled with an escape is NOT a keyword token — it stays `.identifier`/`.private_identifier`.
+    /// The §12.7.2 ReservedWord rejection (other than `yield`/`await`) is applied by the PARSER at
+    /// Identifier / BindingIdentifier / IdentifierReference positions only (so an escaped reserved word
+    /// is still a valid IdentifierName for a property name, e.g. `o.\u{69}f`); see `isEscapedReservedIdent`.
+    had_escape: bool = false,
 };
 
 pub const LexError = error{ UnexpectedCharacter, UnterminatedString, InvalidEscape, OutOfMemory };
@@ -194,14 +202,31 @@ pub const Lexer = struct {
             while (self.pos < self.src.len and (isDigit(self.src[self.pos]) or self.src[self.pos] == '.')) {
                 self.pos += 1;
             }
+            // §12.9.3 NOTE: "The SourceCharacter immediately following a NumericLiteral must not be an
+            // IdentifierStart or DecimalDigit." A `\` here begins a `\u` IdentifierStart escape (now that
+            // §12.7.1 identifier escapes are accepted) — e.g. `0b0` — which is likewise an Early
+            // Error. (Digits were already consumed by the loop above.)
+            if (self.pos < self.src.len) {
+                const nxt = self.src[self.pos];
+                if (isIdentStart(nxt) or nxt == '\\') return LexError.UnexpectedCharacter;
+            }
             return .{ .kind = .number, .lexeme = self.src[start..self.pos] };
         }
 
-        // Identifiers / keywords (only the literals we support). §12.7 (subset).
-        if (isIdentStart(c)) {
-            self.pos += 1;
-            while (self.pos < self.src.len and isIdentPart(self.src[self.pos])) self.pos += 1;
-            const word = self.src[start..self.pos];
+        // Identifiers / keywords. §12.7. An IdentifierName starts with an ASCII IdentifierStart
+        // (`$ _ A-Za-z`) or a `\uHHHH` / `\u{H…}` escape whose code point is a valid ID_Start
+        // (§12.7.1). The escaped form is scanned by `scanIdentifier`, which decodes + validates and
+        // returns whether any escape was present.
+        if (isIdentStart(c) or c == '\\') {
+            const id = try self.scanIdentifier(start, false);
+            const word = id.value;
+            // §12.7.1: a keyword spelled with an escape is NOT a keyword token; it is an identifier
+            // whose name is the decoded text. The ReservedWord rejection (§12.7.2) is NOT applied here
+            // — it belongs to the `Identifier :: IdentifierName but not ReservedWord` production, so an
+            // escaped reserved word is still a valid IdentifierName for a *property name* (`o.\u{69}f`,
+            // `{ \u{69}f: 1 }`). The parser rejects escaped reserved words only at Identifier /
+            // BindingIdentifier / IdentifierReference positions (see `rejectEscapedReserved`).
+            if (id.had_escape) return .{ .kind = .identifier, .lexeme = word, .had_escape = true };
             if (std.mem.eql(u8, word, "true")) return .{ .kind = .kw_true, .lexeme = word };
             if (std.mem.eql(u8, word, "false")) return .{ .kind = .kw_false, .lexeme = word };
             if (std.mem.eql(u8, word, "null")) return .{ .kind = .kw_null, .lexeme = word };
@@ -244,9 +269,17 @@ pub const Lexer = struct {
         // not followed by an identifier start is an UnexpectedCharacter (the parser further restricts
         // private identifiers to class-body member contexts, §15.7).
         if (c == '#') {
-            if (!isIdentStart(self.peek2())) return LexError.UnexpectedCharacter;
+            const after = self.peek2();
+            if (!isIdentStart(after) and after != '\\') return LexError.UnexpectedCharacter;
             self.pos += 1; // '#'
-            while (self.pos < self.src.len and isIdentPart(self.src[self.pos])) self.pos += 1;
+            const id = try self.scanIdentifier(self.pos, false);
+            // §15.7 PrivateName lexeme INCLUDES the leading `#` (so `#x` and `x` never collide). The
+            // name part is the (possibly decoded) IdentifierName. An escaped reserved word is still
+            // legal as a PrivateName (`#if` is fine), so no reserved-word check here.
+            if (id.had_escape) {
+                const name = std.mem.concat(self.arena, u8, &.{ "#", id.value }) catch return LexError.OutOfMemory;
+                return .{ .kind = .private_identifier, .lexeme = name, .had_escape = true };
+            }
             return .{ .kind = .private_identifier, .lexeme = self.src[start..self.pos] };
         }
 
@@ -623,6 +656,61 @@ pub const Lexer = struct {
         }
     }
 
+    const ScannedIdent = struct { value: []const u8, had_escape: bool };
+
+    /// §12.7 / §12.7.1 — scan an IdentifierName beginning at `from`, supporting `\uHHHH` / `\u{H…}`
+    /// UnicodeEscapeSequences at the start and in parts (escapes-only: raw non-ASCII bytes are not
+    /// identifier characters here). On entry `self.pos == from`. On return `self.pos` points just past
+    /// the last identifier character. The IdentifierStart code point is validated against ID_Start and
+    /// every IdentifierPart against ID_Continue (§12.7); a violating escaped code point → SyntaxError.
+    /// When no escape is present `value` aliases the source slice (the fast path); otherwise it is the
+    /// decoded StringValue, UTF-8-encoded into the arena. `_ = is_private` is reserved for symmetry.
+    fn scanIdentifier(self: *Lexer, from: usize, is_private: bool) LexError!ScannedIdent {
+        _ = is_private;
+        self.pos = from;
+        // Fast path: a plain ASCII identifier with no escape. Scan greedily; if we hit a `\` the
+        // identifier contained an escape and we restart on the buffered path.
+        if (self.pos < self.src.len and isIdentStart(self.src[self.pos])) {
+            var p = self.pos + 1;
+            while (p < self.src.len and isIdentPart(self.src[p])) p += 1;
+            if (p >= self.src.len or self.src[p] != '\\') {
+                const slice = self.src[from..p];
+                self.pos = p;
+                return .{ .value = slice, .had_escape = false };
+            }
+        }
+        // Buffered path: at least one `\u` escape somewhere in the identifier.
+        var buf: std.ArrayList(u8) = .empty;
+        var first = true;
+        while (self.pos < self.src.len) {
+            const ch = self.src[self.pos];
+            if (ch == '\\') {
+                // §12.7.1: only `\` UnicodeEscapeSequence is permitted in an identifier.
+                if (self.pos + 1 >= self.src.len or self.src[self.pos + 1] != 'u') return LexError.InvalidEscape;
+                self.pos += 2; // consume `\u`
+                const cp = try self.scanUnicodeEscape();
+                if (first) {
+                    if (!unicode_id.isIdStart(cp)) return LexError.UnexpectedCharacter;
+                } else {
+                    if (!unicode_id.isIdContinue(cp)) return LexError.UnexpectedCharacter;
+                }
+                try self.encodeCodePoint(&buf, cp);
+                first = false;
+                continue;
+            }
+            if (isIdentStart(ch) or (!first and isDigit(ch))) {
+                // A raw ASCII identifier character (ID_Start / digit). Append as-is.
+                try buf.append(self.arena, ch);
+                self.pos += 1;
+                first = false;
+                continue;
+            }
+            break;
+        }
+        if (first) return LexError.UnexpectedCharacter; // empty (e.g. a bare `\` that was not `\u`)
+        return .{ .value = buf.items, .had_escape = true };
+    }
+
     /// §12.9.4.1 — parse a UnicodeEscapeSequence body (after the `\u`): `HHHH` (4 hex) or `{H…}`
     /// (1+ hex, code point ≤ 0x10FFFF). Returns the code point. Invalid → InvalidEscape. `self.pos`
     /// points just past the `u`; on return it points past the consumed digits / closing brace.
@@ -709,4 +797,25 @@ fn isIdentStart(c: u8) bool {
 }
 fn isIdentPart(c: u8) bool {
     return isIdentStart(c) or isDigit(c);
+}
+
+/// §12.7.2 ReservedWord — the keywords that may not be the StringValue of an IdentifierName that
+/// contained a UnicodeEscapeSequence (§12.7.1). The full set EXCLUDES `yield` and `await` (the
+/// §12.7.1 exception: they are contextual and only reserved in certain goal symbols, handled by the
+/// parser). `let`/`static`/`async`/`of`/`as`/`get`/`set`/`from`/`yield`/`await` are contextual, not
+/// ReservedWords, so they are absent. Includes `enum`, `export`, `import`, `with`, `debugger`, `super`,
+/// which the keyword table in `scanToken` does not all cover — hence this dedicated predicate.
+pub fn isReservedWord(name: []const u8) bool {
+    const words = [_][]const u8{
+        "break",    "case",    "catch",  "class",      "const", "continue",
+        "debugger", "default", "delete", "do",         "else",  "enum",
+        "export",   "extends", "false",  "finally",    "for",   "function",
+        "if",       "import",  "in",     "instanceof", "new",   "null",
+        "return",   "super",   "switch", "this",       "throw", "true",
+        "try",      "typeof",  "var",    "void",       "while", "with",
+    };
+    for (words) |w| {
+        if (std.mem.eql(u8, name, w)) return true;
+    }
+    return false;
 }

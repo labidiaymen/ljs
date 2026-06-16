@@ -2351,3 +2351,64 @@ test "M16 prototype.constructor back-reference (§19/§20/§22/§23)" {
         \\throwsRightCtor(TypeError, function(){ null.x })
     , true);
 }
+
+test "M23 IdentifierName unicode escapes — basic decode + binding (§12.7.1)" {
+    // `\uHHHH` / `\u{H…}` at identifier start and parts; decoded StringValue is the name.
+    try expectNumber("var \\u{62}=9; b", 9);
+    try expectNumber("var \\u0062 = 7; b", 7);
+    try expectNumber("var b = 7; \\u{62}", 7); // an escaped USE resolves to the same binding
+    try expectNumber("var a\\u{62}c = 4; abc", 4); // escape in a PART
+    try expectNumber("var $\\u{30} = 8; $0", 8); // §12.7 ID_Continue digit via escape (`$0`)
+    // Member access with an escaped IdentifierName (`a.if` — reserved words OK as property names).
+    try expectNumber("var o = { a: 5 }; o.\\u{61}", 5);
+    try expectNumber("var o = { if: 3 }; o.\\u{69}f", 3);
+}
+
+test "M23 IdentifierName escapes in class fields + private names (§12.7.1 / §15.7)" {
+    try expectNumber("class C { \\u{6F} = 5; m(){ return this.o; } } new C().m()", 5);
+    try expectNumber("class C { #\\u{78} = 6; g(){ return this.#x; } } new C().g()", 6);
+}
+
+test "M23 escaped ReservedWord → SyntaxError (§12.7.1 / §12.7.2)" {
+    // §12.7.2 ReservedWord spelled with an escape is a SyntaxError (keyword-table + dedicated set).
+    try expectSyntaxError("var \\u{69}f = 1;"); // if
+    try expectSyntaxError("var \\u{76}ar = 1;"); // var
+    try expectSyntaxError("\\u0066or (;;) {}"); // for
+    try expectSyntaxError("var \\u0065xport = 1;"); // export (absent from the keyword table)
+    try expectSyntaxError("var \\u{65}num = 1;"); // enum
+    try expectSyntaxError("\\u0077ith (o) {}"); // with
+    try expectSyntaxError("d\\u0065bugger;"); // debugger
+}
+
+test "M23 escaped yield/await are identifiers in sloppy (§12.7.1 exception)" {
+    // §12.7.1: `yield`/`await` are NOT ReservedWords for this rule — an escaped spelling is OK as an
+    // identifier in sloppy mode.
+    try expectNumber("var \\u{79}ield = 5; yield", 5);
+    try expectNumber("var \\u{61}wait = 4; await", 4);
+}
+
+test "M23 ID_Start / ID_Continue validation of escaped code points (§12.7)" {
+    // Invalid IdentifierStart / IdentifierPart code points reached via escape → SyntaxError.
+    try expectSyntaxError("var \\u2E2F;"); // VERTICAL TILDE (U+2E2F): Lm but Pattern_Syntax — not ID_Start
+    try expectSyntaxError("var a\\u2E2F;"); // …nor ID_Continue
+    try expectSyntaxError("var \\u200C;"); // ZWNJ (U+200C): not ID_Start
+    try expectSyntaxError("var \\u200D;"); // ZWJ (U+200D): not ID_Start
+    // Accepted: grandfathered Other_ID_Start, Kelvin, ZWNJ/ZWJ as PARTS, astral letter.
+    try expectNumber("var \\u2118 = 3; \\u2118", 3); // SCRIPT CAPITAL P
+    try expectNumber("var \\u212A = 1; \\u212A", 1); // KELVIN SIGN
+    try expectNumber("var a\\u200C = 2; a\\u200C", 2); // ZWNJ valid as ID_Continue
+    try expectNoSyntaxErrorStrict("var \\u{10840};"); // astral IMPERIAL ARAMAIC ALEPH
+}
+
+test "M23 escaped contextual keywords are not the keyword (§12.7.1)" {
+    // A contextual keyword spelled with an escape is the plain identifier — these grammar positions
+    // then become SyntaxErrors (the keyword form is required verbatim).
+    try expectSyntaxError("for (var x o\\u0066 []) ;"); // escaped `of`
+    try expectSyntaxError("({ \\u0067\\u0065\\u0074 m() {} });"); // escaped `get`
+    try expectSyntaxError("\\u0061sync function f(){}"); // escaped `async` function decl
+    try expectSyntaxError("void \\u0061sync function f(){}"); // escaped `async` function expr
+    // §13.15.1: escaped strict-reserved word as an IdentifierReference dstr target (strict) → error.
+    try expectSyntaxErrorStrict("var x = { l\\u0065t } = { let: 42 };");
+    // §12.9.3: a NumericLiteral may not be immediately followed by an IdentifierStart (incl. `\\u`).
+    try expectSyntaxError("0\\u00620;");
+}
