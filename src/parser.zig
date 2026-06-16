@@ -272,14 +272,14 @@ pub const Parser = struct {
         var i: usize = 0;
         while (i < raw.len) {
             if (raw[i] == '\\' and i + 1 < raw.len) {
-                const d: u8 = switch (raw[i + 1]) {
-                    'n' => '\n',
-                    't' => '\t',
-                    'r' => '\r',
-                    else => raw[i + 1], // \\, \`, \$, \", \' → literal
-                };
-                try cooked.append(self.arena, d);
-                i += 2;
+                // §12.9.6 TemplateCharacter escape: shares §12.9.4.1 Character/Hex/Unicode escapes with
+                // string literals (UTF-8-encoded), plus `\0` NUL and LineContinuation; templates FORBID
+                // legacy octal / `\8` / `\9` (handled leniently — see spec). Find the end of this one
+                // escape (up to the next backslash / `${` / end) and decode the slice via the lexer.
+                var j = i + 2;
+                while (j < raw.len and raw[j] != '\\' and !(raw[j] == '$' and j + 1 < raw.len and raw[j + 1] == '{')) j += 1;
+                try lex.Lexer.decodeEscapesInto(self.arena, &cooked, raw[i..j], true);
+                i = j;
                 continue;
             }
             if (raw[i] == '$' and i + 1 < raw.len and raw[i + 1] == '{') {
@@ -2315,6 +2315,9 @@ pub const Parser = struct {
                 return .{ .key = t.lexeme, .is_ident = true };
             },
             .string => {
+                // §12.9.4.1 Early Error: a legacy-octal escape in a string PropertyName is a strict-
+                // mode SyntaxError too (e.g. `"use strict"; ({"\1": 1})`).
+                if (self.strict and t.has_legacy_octal) return ParseError.UnexpectedToken;
                 _ = self.advance();
                 return .{ .key = t.string_value };
             },
@@ -2344,6 +2347,10 @@ pub const Parser = struct {
                 return self.alloc(.{ .number = n });
             },
             .string => {
+                // §12.9.4.1 / Annex B.1.2 Early Error: a LegacyOctalEscapeSequence /
+                // NonOctalDecimalEscape / `\0`-before-a-digit in a StringLiteral is a SyntaxError in
+                // strict mode (the lexer flagged the token; strict-ness is only known here).
+                if (self.strict and t.has_legacy_octal) return ParseError.UnexpectedToken;
                 _ = self.advance();
                 return self.alloc(.{ .string = t.string_value });
             },

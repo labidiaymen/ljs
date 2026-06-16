@@ -405,6 +405,52 @@ test "M2 strings: length, index, methods (US2)" {
     try expectStr("\"a,b,c\".split(\",\")[2]", "c");
 }
 
+test "M12 string escapes: hex / unicode / octal / line-continuation (§12.9.4.1)" {
+    // §12.9.4.1 HexEscapeSequence `\xHH`
+    try expectBool("\"\\x41\" === \"A\"", true);
+    try expectBool("\"\\x4A\" === \"J\"", true);
+    try expectBool("\"B\" === \"B\"", true);
+    // §12.9.4.1 UnicodeEscapeSequence `\uHHHH` and braced `\u{H…}`
+    try expectBool("\"\\u0041\" === \"A\"", true);
+    try expectBool("\"\\u{41}\" === \"A\"", true);
+    // A supplementary-plane code point is UTF-8-encoded; ljs `String.length` is the BYTE count
+    // (U+1F600 GRINNING FACE = 4 UTF-8 bytes: F0 9F 98 80). Documented byte-length semantics.
+    try expectNumber("\"\\u{1F600}\".length", 4);
+    // §12.9.4.1 single-char escapes: `\b`=0x08, `\f`=0x0C, `\v`=0x0B, `\0`=NUL
+    try expectNumber("\"\\b\".charCodeAt(0)", 8);
+    try expectNumber("\"\\f\".charCodeAt(0)", 12);
+    try expectNumber("\"\\v\".charCodeAt(0)", 11);
+    try expectNumber("\"\\0\".charCodeAt(0)", 0);
+    // IdentityEscape: `\q` → `q`
+    try expectBool("\"\\q\" === \"q\"", true);
+    // §12.9.4.1 LineContinuation: `\` + LineTerminator produces nothing (LF and CRLF)
+    try expectBool("\"a\\\nb\" === \"ab\"", true);
+    try expectBool("\"a\\\r\nb\" === \"ab\"", true);
+    // Annex B.1.2 LegacyOctalEscapeSequence (sloppy): `\101` (octal 101 = 0x41 = 'A'), `\7` = 0x07
+    try expectBool("\"\\101\" === \"A\"", true);
+    try expectNumber("\"\\7\".charCodeAt(0)", 7);
+    // NonOctalDecimalEscape (sloppy): `\8` → `8`
+    try expectBool("\"\\8\" === \"8\"", true);
+    // computed PropertyName decoded via a hex escape
+    try expectNumber("var o = {}; o[\"\\x41\"] = 5; o.A", 5);
+    // template literals share the §12.9.4.1 Hex/Unicode escapes
+    try expectBool("`\\x41` === \"A\"", true);
+    try expectBool("`\\u{41}` === \"A\"", true);
+    // §12.9.4.1 invalid hex / unicode escapes → SyntaxError
+    try expectSyntaxError("\"\\xZZ\"");
+    try expectSyntaxError("\"\\x4\"");
+    try expectSyntaxError("\"\\u{110000}\"");
+    try expectSyntaxError("\"\\u123\"");
+    try expectSyntaxError("\"\\u{}\"");
+    // Annex B.1.2 / §12.9.4.1 Early Error: a legacy octal escape in STRICT mode is a SyntaxError;
+    // the same string in sloppy mode is fine (verified above).
+    try expectSyntaxErrorStrict("\"\\101\"");
+    try expectSyntaxErrorStrict("\"\\1\"");
+    try expectSyntaxErrorStrict("'\\8'");
+    // a NUL escape `\0` (not followed by a digit) is legal in BOTH modes
+    try expectNoSyntaxErrorStrict("\"\\0\"");
+}
+
 test "M3 operators: **, bitwise, shifts, in (US1)" {
     try expectNumber("2 ** 10", 1024);
     try expectNumber("2 ** 3 ** 2", 512); // right-assoc: 2**(3**2)=2**9

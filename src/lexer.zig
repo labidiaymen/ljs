@@ -111,9 +111,15 @@ pub const Token = struct {
     /// §12.3: a LineTerminator appeared in the trivia immediately before this token. Needed for
     /// the restricted productions (ASI, and the `[no LineTerminator here]` arrow `=>`, §15.3.1).
     newline_before: bool = false,
+    /// §12.9.4.1 / Annex B.1.2: the string literal contained a LegacyOctalEscapeSequence,
+    /// NonOctalDecimalEscapeSequence (`\8`/`\9`), or a `\0` immediately followed by a decimal digit.
+    /// Legal in sloppy mode; a strict-mode Early Error. The lexer cannot know strict-ness (it runs
+    /// before the directive prologue / RunMode is resolved), so it flags the token and the parser
+    /// rejects it when `self.strict` — mirroring how other strict Early Errors are threaded.
+    has_legacy_octal: bool = false,
 };
 
-pub const LexError = error{ UnexpectedCharacter, UnterminatedString, OutOfMemory };
+pub const LexError = error{ UnexpectedCharacter, UnterminatedString, InvalidEscape, OutOfMemory };
 
 pub const Lexer = struct {
     src: []const u8,
@@ -464,32 +470,219 @@ pub const Lexer = struct {
         const start = self.pos;
         self.pos += 1; // opening quote
         var buf: std.ArrayList(u8) = .empty;
+        var has_octal = false;
         while (self.pos < self.src.len) {
             const ch = self.src[self.pos];
             if (ch == quote) {
                 self.pos += 1;
-                return .{ .kind = .string, .lexeme = self.src[start..self.pos], .string_value = buf.items };
+                return .{ .kind = .string, .lexeme = self.src[start..self.pos], .string_value = buf.items, .has_legacy_octal = has_octal };
             }
-            if (ch == '\\' and self.pos + 1 < self.src.len) {
-                self.pos += 1;
-                const esc = self.src[self.pos];
-                const decoded: u8 = switch (esc) {
-                    'n' => '\n',
-                    't' => '\t',
-                    'r' => '\r',
-                    '\\' => '\\',
-                    '"' => '"',
-                    '\'' => '\'',
-                    else => esc,
-                };
-                try buf.append(self.arena, decoded);
-                self.pos += 1;
+            // §12.9.4 a raw LineTerminator may not appear in a StringLiteral (a LineContinuation needs
+            // the leading `\`). LF/CR (and U+2028/U+2029) terminate the literal → unterminated.
+            if (ch == '\n' or ch == '\r') return LexError.UnterminatedString;
+            if (ch == '\\') {
+                try self.decodeEscapeInto(&buf, false, &has_octal);
                 continue;
             }
             try buf.append(self.arena, ch);
             self.pos += 1;
         }
         return LexError.UnterminatedString;
+    }
+
+    /// §12.9.4.1 / §12.9.6 — decode the single EscapeSequence at `self.pos` (which points at the `\`)
+    /// into `buf`, advancing `self.pos` past it. `is_template` selects template semantics (no legacy
+    /// octal / `\8` / `\9`; `\0` is the NUL escape). For string literals a LegacyOctalEscapeSequence /
+    /// NonOctalDecimalEscape / `\0`-before-a-digit sets `has_octal.*` (a strict-mode Early Error the
+    /// parser rejects). Invalid hex / unicode escapes are an `InvalidEscape` LexError (→ SyntaxError).
+    fn decodeEscapeInto(self: *Lexer, buf: *std.ArrayList(u8), is_template: bool, has_octal: *bool) LexError!void {
+        // self.src[self.pos] == '\\'
+        self.pos += 1; // consume the backslash
+        if (self.pos >= self.src.len) return LexError.UnterminatedString;
+        const esc = self.src[self.pos];
+        switch (esc) {
+            // §12.9.4.1 LineContinuation — `\` + LineTerminatorSequence produces nothing.
+            '\n' => {
+                self.pos += 1;
+                return;
+            },
+            '\r' => {
+                self.pos += 1;
+                if (self.pos < self.src.len and self.src[self.pos] == '\n') self.pos += 1; // CRLF = one LineTerminatorSequence
+                return;
+            },
+            // U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR (UTF-8: E2 80 A8 / E2 80 A9) as a
+            // LineContinuation. Detect the 3-byte sequence after the backslash.
+            0xE2 => {
+                if (self.pos + 2 < self.src.len and self.src[self.pos + 1] == 0x80 and
+                    (self.src[self.pos + 2] == 0xA8 or self.src[self.pos + 2] == 0xA9))
+                {
+                    self.pos += 3;
+                    return;
+                }
+                // otherwise an IdentityEscape of the (multi-byte) character — copy the lead byte and
+                // let the loop copy the continuation bytes verbatim.
+                try buf.append(self.arena, esc);
+                self.pos += 1;
+                return;
+            },
+            // §12.9.4.1 CharacterEscapeSequence (single-char).
+            'n' => {
+                try buf.append(self.arena, '\n');
+                self.pos += 1;
+            },
+            't' => {
+                try buf.append(self.arena, '\t');
+                self.pos += 1;
+            },
+            'r' => {
+                try buf.append(self.arena, '\r');
+                self.pos += 1;
+            },
+            'b' => {
+                try buf.append(self.arena, 0x08); // BACKSPACE
+                self.pos += 1;
+            },
+            'f' => {
+                try buf.append(self.arena, 0x0C); // FORM FEED
+                self.pos += 1;
+            },
+            'v' => {
+                try buf.append(self.arena, 0x0B); // LINE TABULATION (vertical tab)
+                self.pos += 1;
+            },
+            // §12.9.4.1 HexEscapeSequence `\xHH` — exactly 2 hex digits. An invalid hex escape is a
+            // SyntaxError — in a StringLiteral AND in a TemplateLiteral (§12.9.6: an UNtagged template
+            // with an invalid escape IS a SyntaxError; only a TAGGED template would have `cooked =
+            // undefined`. ljs does not model per-quasi cooked-undefined for tagged templates, so the
+            // rare tagged-template-invalid-escape case is deferred — see spec Out of scope.)
+            'x' => {
+                self.pos += 1; // past 'x'
+                if (self.pos + 1 >= self.src.len) return LexError.InvalidEscape;
+                const hi = hexDigit(self.src[self.pos]) orelse return LexError.InvalidEscape;
+                const lo = hexDigit(self.src[self.pos + 1]) orelse return LexError.InvalidEscape;
+                self.pos += 2;
+                try self.encodeCodePoint(buf, @as(u21, hi) * 16 + lo);
+            },
+            // §12.9.4.1 UnicodeEscapeSequence `\uHHHH` or `\u{H…}` — invalid → SyntaxError (string + template).
+            'u' => {
+                self.pos += 1; // past 'u'
+                const cp = try self.scanUnicodeEscape();
+                try self.encodeCodePoint(buf, cp);
+            },
+            // §12.9.4.1 `\0` (and, Annex B, LegacyOctalEscapeSequence) + NonOctalDecimalEscape.
+            '0'...'9' => {
+                if (is_template) {
+                    // §12.9.6: templates forbid legacy octal / `\8` / `\9`; only `\0` (not followed by a
+                    // digit) is the NUL escape. We decode `\0`→NUL leniently and copy others as identity
+                    // (the strict `cooked = undefined` refinement is deferred — see spec Out of scope).
+                    if (esc == '0' and !(self.pos + 1 < self.src.len and isDigit(self.src[self.pos + 1]))) {
+                        try buf.append(self.arena, 0);
+                        self.pos += 1;
+                        return;
+                    }
+                    try buf.append(self.arena, esc);
+                    self.pos += 1;
+                    return;
+                }
+                // NonOctalDecimalEscapeSequence (Annex B.1.2): `\8` / `\9` → the digit char `8`/`9`.
+                if (esc == '8' or esc == '9') {
+                    has_octal.* = true;
+                    try buf.append(self.arena, esc);
+                    self.pos += 1;
+                    return;
+                }
+                // `\0` not followed by a decimal digit → NUL (legal in both modes, no octal flag).
+                if (esc == '0' and !(self.pos + 1 < self.src.len and isDigit(self.src[self.pos + 1]))) {
+                    try buf.append(self.arena, 0);
+                    self.pos += 1;
+                    return;
+                }
+                // LegacyOctalEscapeSequence (Annex B.1.2): 1–3 octal digits, value ≤ 255. The first
+                // digit being 0–3 permits 3 digits; 4–7 permits 2. `\0`-before-a-digit lands here too.
+                has_octal.* = true;
+                var value: u16 = @intCast(esc - '0');
+                self.pos += 1;
+                const max_more: usize = if (esc <= '3') 2 else 1;
+                var count: usize = 0;
+                while (count < max_more and self.pos < self.src.len) : (count += 1) {
+                    const d = self.src[self.pos];
+                    if (d < '0' or d > '7') break;
+                    value = value * 8 + (d - '0');
+                    self.pos += 1;
+                }
+                try self.encodeCodePoint(buf, value); // ≤ 0o377 = 255, a single code unit
+            },
+            // §12.9.4.1 NonEscapeCharacter → IdentityEscape (`\\ \' \" \` \$` and any other char `\c`→`c`).
+            else => {
+                try buf.append(self.arena, esc);
+                self.pos += 1;
+            },
+        }
+    }
+
+    /// §12.9.4.1 — parse a UnicodeEscapeSequence body (after the `\u`): `HHHH` (4 hex) or `{H…}`
+    /// (1+ hex, code point ≤ 0x10FFFF). Returns the code point. Invalid → InvalidEscape. `self.pos`
+    /// points just past the `u`; on return it points past the consumed digits / closing brace.
+    fn scanUnicodeEscape(self: *Lexer) LexError!u21 {
+        if (self.pos < self.src.len and self.src[self.pos] == '{') {
+            self.pos += 1; // '{'
+            var value: u32 = 0;
+            var any = false;
+            while (self.pos < self.src.len and self.src[self.pos] != '}') {
+                const d = hexDigit(self.src[self.pos]) orelse return LexError.InvalidEscape;
+                value = value * 16 + d;
+                if (value > 0x10FFFF) return LexError.InvalidEscape; // CodePoint > 0x10FFFF
+                any = true;
+                self.pos += 1;
+            }
+            if (!any) return LexError.InvalidEscape; // `\u{}` empty
+            if (self.pos >= self.src.len or self.src[self.pos] != '}') return LexError.InvalidEscape;
+            self.pos += 1; // '}'
+            return @intCast(value);
+        }
+        // `\uHHHH` — exactly 4 hex digits.
+        if (self.pos + 3 >= self.src.len) return LexError.InvalidEscape;
+        var value: u21 = 0;
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            const d = hexDigit(self.src[self.pos + i]) orelse return LexError.InvalidEscape;
+            value = value * 16 + d;
+        }
+        self.pos += 4;
+        return value;
+    }
+
+    /// UTF-8-encode a code point into `buf`. ljs strings are `[]const u8` (UTF-8). Lone surrogates
+    /// (0xD800–0xDFFF) — reachable via `\uHHHH` / `\u{D800}` — are not valid UTF-8, so they are
+    /// hand-encoded in the 3-byte WTF-8 form (ljs keeps byte strings; see spec Edge Cases).
+    fn encodeCodePoint(self: *Lexer, buf: *std.ArrayList(u8), cp: u21) LexError!void {
+        if (cp >= 0xD800 and cp <= 0xDFFF) {
+            try buf.append(self.arena, @intCast(0xE0 | (cp >> 12)));
+            try buf.append(self.arena, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+            try buf.append(self.arena, @intCast(0x80 | (cp & 0x3F)));
+            return;
+        }
+        var tmp: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(cp, &tmp) catch return LexError.InvalidEscape;
+        try buf.appendSlice(self.arena, tmp[0..len]);
+    }
+
+    /// Decode every EscapeSequence in `raw` into `buf` (no quotes / backticks). Used by the template
+    /// decoder (`is_template = true`). String literals decode inline in `lexString`. Code points are
+    /// UTF-8-encoded. (`raw` is the literal text between delimiters; `${…}` is handled by the caller.)
+    pub fn decodeEscapesInto(arena: std.mem.Allocator, buf: *std.ArrayList(u8), raw: []const u8, is_template: bool) LexError!void {
+        var lx = Lexer.init(arena, raw);
+        var ignored_octal = false;
+        while (lx.pos < raw.len) {
+            const ch = raw[lx.pos];
+            if (ch == '\\') {
+                try lx.decodeEscapeInto(buf, is_template, &ignored_octal);
+                continue;
+            }
+            try buf.append(arena, ch);
+            lx.pos += 1;
+        }
     }
 };
 
@@ -499,6 +692,15 @@ fn tok(kind: TokenKind, lexeme: []const u8) Token {
 
 fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
+}
+/// A single hex digit's value, or null if `c` is not `[0-9A-Fa-f]` (§12.9.4.1 HexDigit).
+fn hexDigit(c: u8) ?u4 {
+    return switch (c) {
+        '0'...'9' => @intCast(c - '0'),
+        'a'...'f' => @intCast(c - 'a' + 10),
+        'A'...'F' => @intCast(c - 'A' + 10),
+        else => null,
+    };
 }
 fn isIdentStart(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$';
