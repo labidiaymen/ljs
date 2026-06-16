@@ -306,6 +306,11 @@ pub const NativeId = enum {
     /// Runner-injected `$DONE` (Test262 async completion callback). Not part of ECMA-262 — installed
     /// only by the conformance runner to drive [async] tests; ordinary evals never see it.
     test_done,
+    /// §19.2.1 the global `eval` intrinsic (%eval%). A native function object so it is reachable both
+    /// as the `eval` global binding and as `globalThis.eval`. When invoked through `callNative` this is
+    /// the INDIRECT path (global env, global `this`); the interpreter's `evalCall` intercepts the DIRECT
+    /// case (callee is the IdentifierReference `eval` resolving to this intrinsic) before dispatch.
+    eval_fn,
 };
 
 /// §10.4.1 A Bound Function Exotic Object's internal slots: the wrapped target, the bound `this`, and

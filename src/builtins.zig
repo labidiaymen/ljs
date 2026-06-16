@@ -278,6 +278,14 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try defineMethod(arena, promise_fn, "reject", .promise_reject, "reject"); // §27.2.4.4
     try env.declare("Promise", .{ .object = promise_fn }, true, true);
 
+    // §19.2.1 eval — the global `eval` intrinsic (%eval%). A native function object so it is reachable
+    // both as the `eval` global binding and (mirrored below) as `globalThis.eval`. Its behavior lives in
+    // the interpreter: `callNative(.eval_fn)` is INDIRECT eval (global env, global this); the
+    // interpreter's `evalCall` intercepts the DIRECT case (callee is the IdentifierReference `eval`).
+    const eval_fn = try Object.createNative(arena, .eval_fn, "eval");
+    eval_fn.prototype = function_proto; // §20.2.3 every function object → %Function.prototype%
+    try env.declare("eval", .{ .object = eval_fn }, true, true);
+
     // §21.3 Math — a namespace object (not a constructor): non-enumerable function-valued methods
     // (proto = %Object.prototype%). The minimal subset the harness needs: propertyHelper.js's
     // `Math.pow(2, 32)` (§21.3.2.26); the common companions round out a usable surface for tests.

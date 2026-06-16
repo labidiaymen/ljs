@@ -14,6 +14,7 @@ const ops = @import("abstract_ops.zig");
 const builtin_array = @import("builtin_array.zig");
 const builtin_string = @import("builtin_string.zig");
 const builtins = @import("builtins.zig");
+const Parser = @import("parser.zig").Parser;
 
 // ECMA-262 abstract operations live in abstract_ops.zig; alias them so call sites read naturally.
 const toNumber = ops.toNumber;
@@ -1764,6 +1765,10 @@ pub const Interpreter = struct {
     fn evalCall(self: *Interpreter, c: anytype, env: *Environment) EvalError!Completion {
         var this_for_call: Value = .undefined;
         var callee: Value = .undefined;
+        // §19.2.1.1 / §13.3.6: a DIRECT eval is a CallExpression whose callee is *exactly* the
+        // IdentifierReference `eval` resolving to the %eval% intrinsic. Detect it here (before the
+        // generic dispatch) so the eval body runs in the CALLER's running execution context.
+        var is_direct_eval = false;
         switch (c.callee.*) {
             .member => |m| {
                 const oc = try self.evalExpr(m.object, env);
@@ -1811,12 +1816,29 @@ pub const Interpreter = struct {
                 const cc = try self.evalExpr(c.callee, env);
                 if (cc.isAbrupt()) return cc;
                 callee = cc.normal;
+                // §19.2.1.1: the callee is the bare IdentifierReference `eval`, and it resolved to the
+                // %eval% intrinsic (NOT a shadowing user binding named `eval`). This is a DIRECT eval.
+                if (c.callee.* == .identifier and std.mem.eql(u8, c.callee.identifier, "eval")) {
+                    if (cc.normal == .object and cc.normal.object.native == .eval_fn) is_direct_eval = true;
+                }
             },
         }
 
         var args: std.ArrayListUnmanaged(Value) = .empty;
         const alc = try self.evalSpreadList(c.args, env, &args);
         if (alc.isAbrupt()) return alc;
+
+        // §19.2.1.1 DIRECT eval: run in the CALLER's running execution context. A non-string argument
+        // is returned unchanged (§19.2.1 step 2). Otherwise the eval body runs in a fresh CHILD of the
+        // caller's current `env` — reads/writes of surrounding bindings work, and `let`/`const`/`class`
+        // (and, in this slice, `var`) declared by the eval are eval-local. `this_val`/`home_object` are
+        // inherited (left at the interpreter's current values). Counters carry through.
+        if (is_direct_eval) {
+            const arg: Value = if (args.items.len > 0) args.items[0] else .undefined;
+            if (arg != .string) return .{ .normal = arg };
+            const eval_env = try Environment.create(self.arena, env);
+            return self.performEval(arg.string, eval_env);
+        }
 
         if (callee != .object or callee.object.kind != .function) {
             return self.throwError("TypeError", "value is not a function");
@@ -4090,6 +4112,25 @@ pub const Interpreter = struct {
 
     /// §20.5: throw a real Error object carrying `name`/`message`, proto-linked to the realm's
     /// matching Error constructor (so `e instanceof TypeError` and name-based classification work).
+    /// §19.2.1.1 PerformEval — parse `source` as a Script and run it in `target_env` on THIS
+    /// interpreter (so the live step/depth counters carry through; runaway eval code still terminates
+    /// and recursion through eval stays bounded). A parse error → a real `SyntaxError` (§19.2.1 step
+    /// 7). The script's completion VALUE is the result (the engine's `run` already returns the last
+    /// statement's value). `target_env` is a fresh child of the caller's env for DIRECT eval (reads/
+    /// writes of surrounding bindings work; `let`/`const`/`class` are eval-local) or the GLOBAL env for
+    /// INDIRECT eval. `this_val`/`home_object` are left at the interpreter's current values (inherited
+    /// for direct; the caller resets them for indirect). Non-string `source` is handled by the caller.
+    fn performEval(self: *Interpreter, source: []const u8, target_env: *Environment) EvalError!Completion {
+        const program = Parser.parse(self.arena, source) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // §19.2.1 step 7: a parse failure throws a SyntaxError (a real, catchable error object).
+            else => return self.throwError("SyntaxError", "eval: invalid source"),
+        };
+        // Reuse `run` (ReturnIfAbrupt over the statement list); the completion value is the last
+        // statement's value. Counters are the interpreter's own — not reset, so limits still apply.
+        return self.run(program, target_env);
+    }
+
     pub fn throwError(self: *Interpreter, kind: []const u8, msg: []const u8) EvalError!Completion {
         const err = try Object.create(self.arena, self.errorProto(kind));
         try err.set("name", .{ .string = kind });
@@ -4755,6 +4796,26 @@ pub const Interpreter = struct {
             .promise_resolve_fn, .promise_reject_fn => return self.promiseResolvingFn(func, args),
             .promise_finally_thunk => return self.promiseFinallyThunk(func, args),
             .test_done => return self.testDone(args),
+            .eval_fn => {
+                // §19.2.1: reaching `callNative` means INDIRECT eval (`(0,eval)(s)`, `var e=eval; e(s)`,
+                // `globalThis.eval(s)`) — the direct case is intercepted in `evalCall` before dispatch.
+                // Non-string argument → returned unchanged (§19.2.1 step 2). Otherwise run in the GLOBAL
+                // environment with global `this` (§19.2.1.1 with direct=false).
+                const arg: Value = if (args.len > 0) args[0] else .undefined;
+                if (arg != .string) return .{ .normal = arg };
+                const genv = self.globals orelse return self.throwError("EvalError", "eval: no realm");
+                // §19.2.1.1: indirect eval's `this` is the global object; save/restore the running
+                // `this_val`/`home_object` around the eval so the caller's frame is unperturbed.
+                const saved_this = self.this_val;
+                const saved_home = self.home_object;
+                defer {
+                    self.this_val = saved_this;
+                    self.home_object = saved_home;
+                }
+                self.this_val = if (genv.lookup("%GlobalThis%")) |b| b.value else .undefined;
+                self.home_object = null;
+                return self.performEval(arg.string, genv);
+            },
             else => {},
         }
         switch (func.native) {
@@ -4843,6 +4904,7 @@ pub const Interpreter = struct {
             .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch
             .promise_all, .promise_all_settled, .promise_any, .promise_race, .promise_combinator_element => unreachable, // handled in the first switch
             .promise_resolve_fn, .promise_reject_fn, .promise_finally_thunk, .test_done => unreachable, // handled in the first switch
+            .eval_fn => unreachable, // §19.2.1 handled in the first switch (indirect eval path)
             .none => unreachable,
         }
     }

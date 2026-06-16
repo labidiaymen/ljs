@@ -2182,3 +2182,24 @@ test "M14 class member attributes: methods non-enumerable, fields enumerable (§
     try expectBool("class C{f=1} Object.getOwnPropertyDescriptor(new C(),'f').enumerable", true);
     try expectBool("class C{} Object.getOwnPropertyDescriptor(C.prototype,'constructor').enumerable", false);
 }
+
+test "M15 eval: core + direct + indirect (§19.2.1 / §19.2.1.1)" {
+    // §19.2.1: the completion value of the parsed Script is eval's result.
+    try expectNumber("eval(\"1+2\")", 3);
+    try expectNumber("eval(\"var x=10; x*2\")", 20);
+    try expectNumber("eval(\"1;2;3\")", 3);
+    try expectNumber("eval(\"if(true) 7\")", 7);
+    try expectUndefined("eval(\"var x=5\")"); // a `var` declaration completes with undefined
+    try expectNumber("eval(\"({x:1}).x\")", 1); // object-literal parse (a leading `{` is an expr here)
+    // §19.2.1 step 2: a non-string argument is returned unchanged.
+    try expectNumber("eval(42)", 42);
+    // §19.2.1.1 DIRECT eval reads + writes the caller's locals.
+    try expectNumber("function f(){ var a=5; return eval(\"a+1\") } f()", 6);
+    try expectNumber("function f(){ var a=1; eval(\"a=9\"); return a } f()", 9);
+    // §19.2.1.1 INDIRECT eval runs in the global env — it cannot see a caller's local `a`.
+    try expectStr("var e=eval; function f(){ var a=1; try{ e(\"a\"); return \"no\" }catch(x){ return \"ref\" } } f()", "ref");
+    // §19.2.1 step 7: a parse error throws a real, catchable SyntaxError.
+    try expectStr("try{ eval(\"var\") }catch(e){ e.name }", "SyntaxError");
+    // globalThis.eval is the same intrinsic (indirect when called off globalThis).
+    try expectNumber("globalThis.eval(\"2+3\")", 5);
+}
