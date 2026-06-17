@@ -6,6 +6,7 @@
 //! alternation `|`, and backreferences `\1` / `\k<name>`. Lookaround, Unicode property escapes, and
 //! full u/v-mode strictness are deferred. `compile` throws SyntaxError on malformed syntax.
 const std = @import("std");
+const unicode_id = @import("unicode_id.zig");
 
 pub const CompileError = error{ SyntaxError, OutOfMemory };
 
@@ -69,6 +70,12 @@ const Parser = struct {
     pos: usize = 0,
     group_count: usize = 0, // capturing groups seen
     names: std.ArrayListUnmanaged(NamedGroup) = .empty,
+    /// §22.2.1 `\k<name>` references, resolved to group indices after the whole pattern is parsed (so
+    /// forward references work); a name with no matching group is a dangling-reference SyntaxError.
+    named_refs: std.ArrayListUnmanaged(struct { name: []const u8, node: *Node }) = .empty,
+    /// Highest `\N` numeric backreference seen. In UnicodeMode a reference past the last group is a
+    /// SyntaxError (§22.2.1 — non-UnicodeMode treats it as a legacy octal/literal escape instead).
+    max_backref: usize = 0,
     unicode: bool,
 
     fn mk(self: *Parser, n: Node) CompileError!*Node {
@@ -216,6 +223,24 @@ const Parser = struct {
             '\\' => return self.parseAtomEscape(),
             '*', '+', '?' => return CompileError.SyntaxError, // nothing to repeat
             ')' => return CompileError.SyntaxError,
+            '{' => {
+                // §22.2.1: in UnicodeMode `{` is never a PatternCharacter — always a SyntaxError here.
+                // In non-UnicodeMode (Annex B) a `{` that forms a valid quantifier at this position has
+                // nothing to repeat (→ SyntaxError); otherwise it is a literal `{`.
+                if (self.unicode) return CompileError.SyntaxError;
+                const save = self.pos;
+                var mn: usize = 0;
+                var mx: usize = 0;
+                if (try self.parseBraceQuantifier(&mn, &mx)) return CompileError.SyntaxError;
+                self.pos = save + 1;
+                return self.mk(.{ .tag = .char, .ch = c });
+            },
+            '}', ']' => {
+                // §22.2.1: a lone `}`/`]` is a SyntaxError in UnicodeMode; Annex B allows it as a literal.
+                if (self.unicode) return CompileError.SyntaxError;
+                self.pos += 1;
+                return self.mk(.{ .tag = .char, .ch = c });
+            },
             else => {
                 self.pos += 1;
                 return self.mk(.{ .tag = .char, .ch = c });
@@ -236,14 +261,12 @@ const Parser = struct {
                 capturing = false;
             } else if (k == '<' and self.pos + 1 < self.src.len and self.src[self.pos + 1] != '=' and self.src[self.pos + 1] != '!') {
                 self.pos += 1; // '<'
-                const ns = self.pos;
-                while (self.peek()) |nc| {
-                    if (nc == '>') break;
-                    self.pos += 1;
+                // §22.2.1 GroupSpecifier: `<` RegExpIdentifierName `>` — validated (non-empty, valid
+                // identifier code points) and unique within the pattern (duplicate name → SyntaxError).
+                const name = try self.parseGroupName();
+                for (self.names.items) |ng| {
+                    if (std.mem.eql(u8, ng.name, name)) return CompileError.SyntaxError;
                 }
-                if (self.peek() != '>') return CompileError.SyntaxError;
-                const name = self.src[ns..self.pos];
-                self.pos += 1; // '>'
                 self.group_count += 1;
                 gi = self.group_count;
                 try self.names.append(self.arena, .{ .name = name, .index = gi });
@@ -271,18 +294,24 @@ const Parser = struct {
         var ranges: std.ArrayListUnmanaged(Range) = .empty;
         while (self.peek()) |c| {
             if (c == ']') break;
+            // `parseClassAtom` returns the byte for a single-char atom, or null when it appended a
+            // CharacterClassEscape (\d\w\s…) directly to `ranges`.
             const lo = try self.parseClassAtom(&ranges);
-            // a range `a-z` (only when not at the end and the next is not `]`)
-            if (lo != null and self.peek() == '-' and self.pos + 1 < self.src.len and self.src[self.pos + 1] != ']') {
+            // a range `X-Y` (only when a `-` follows and it is not the closing `]`)
+            if (self.peek() == '-' and self.pos + 1 < self.src.len and self.src[self.pos + 1] != ']') {
                 self.pos += 1; // '-'
                 const hi = try self.parseClassAtom(&ranges);
-                if (hi) |h| {
-                    if (lo.? > h) return CompileError.SyntaxError; // z-a
-                    try ranges.append(self.arena, .{ .lo = lo.?, .hi = h });
+                if (lo != null and hi != null) {
+                    if (lo.? > hi.?) return CompileError.SyntaxError; // z-a
+                    try ranges.append(self.arena, .{ .lo = lo.?, .hi = hi.? });
                 } else {
-                    // hi was a class-escape (e.g. a-\d) → treat `-` as literal
-                    try ranges.append(self.arena, .{ .lo = lo.?, .hi = lo.? });
+                    // §22.2.1 NonemptyClassRanges: a range endpoint that is a CharacterClassEscape
+                    // (e.g. `\d-a`, `a-\d`, `\s-\d`) is a SyntaxError in UnicodeMode; Annex B treats the
+                    // `-` (and any single-char side) as literals (the escape side is already appended).
+                    if (self.unicode) return CompileError.SyntaxError;
+                    if (lo) |l| try ranges.append(self.arena, .{ .lo = l, .hi = l });
                     try ranges.append(self.arena, .{ .lo = '-', .hi = '-' });
+                    if (hi) |h| try ranges.append(self.arena, .{ .lo = h, .hi = h });
                 }
             } else if (lo) |l| {
                 try ranges.append(self.arena, .{ .lo = l, .hi = l });
@@ -356,26 +385,33 @@ const Parser = struct {
                     self.pos += 1;
                 }
                 const idx = std.fmt.parseInt(usize, self.src[n0..self.pos], 10) catch return CompileError.SyntaxError;
+                if (idx > self.max_backref) self.max_backref = idx; // checked vs group_count after parse (UnicodeMode)
                 return self.mk(.{ .tag = .backref, .backref_index = idx });
+            },
+            'c' => {
+                // §22.2.1 ControlEscape `\cX` (X a control letter A–Za–z) → the control character X mod 32.
+                self.pos += 1; // 'c'
+                if (self.peek()) |letter| {
+                    if ((letter >= 'A' and letter <= 'Z') or (letter >= 'a' and letter <= 'z')) {
+                        self.pos += 1;
+                        return self.mk(.{ .tag = .char, .ch = letter % 32 });
+                    }
+                }
+                // `\c` not followed by a control letter: SyntaxError in UnicodeMode; Annex B treats the
+                // `\` as a literal backslash (the `c` is then an ordinary PatternCharacter).
+                if (self.unicode) return CompileError.SyntaxError;
+                return self.mk(.{ .tag = .char, .ch = '\\' });
             },
             'k' => {
                 self.pos += 1;
                 if (self.peek() != '<') return CompileError.SyntaxError;
-                self.pos += 1;
-                const ns = self.pos;
-                while (self.peek()) |nc| {
-                    if (nc == '>') break;
-                    self.pos += 1;
-                }
-                if (self.peek() != '>') return CompileError.SyntaxError;
-                const name = self.src[ns..self.pos];
-                self.pos += 1;
-                // resolved to an index at compile end; store name via a sentinel backref (resolved later)
-                for (self.names.items) |ng| {
-                    if (std.mem.eql(u8, ng.name, name)) return self.mk(.{ .tag = .backref, .backref_index = ng.index });
-                }
-                // forward named backref — resolve after full parse; store 0 (matches empty) as fallback
-                return self.mk(.{ .tag = .backref, .backref_index = 0 });
+                self.pos += 1; // '<'
+                // §22.2.1 `\k<RegExpIdentifierName>` — validated like a GroupSpecifier; the index is
+                // resolved after the whole pattern is parsed so forward references work.
+                const name = try self.parseGroupName();
+                const node = try self.mk(.{ .tag = .backref, .backref_index = 0 });
+                try self.named_refs.append(self.arena, .{ .name = name, .node = node });
+                return node;
             },
             else => {
                 const b = try self.singleCharEscape();
@@ -396,10 +432,107 @@ const Parser = struct {
             '0' => 0,
             'x' => self.parseHex(2),
             'u' => self.parseHex(4),
-            else => e, // identity escape (Annex B lenient)
+            // §22.2.1 IdentityEscape: in UnicodeMode only SyntaxCharacters and `/` may be escaped — any
+            // other `\c` (e.g. `\a`, `\M`, `\8`) is a SyntaxError. Non-UnicodeMode is Annex-B lenient.
+            else => {
+                if (self.unicode and !isSyntaxChar(e) and e != '/') return CompileError.SyntaxError;
+                return e;
+            },
         };
     }
+
+    /// §22.2.1 RegExpIdentifierName for a `(?<name>…)` GroupSpecifier or `\k<name>` — entered with
+    /// `self.pos` just past the `<`. Validates a non-empty run of RegExpIdentifierStart/Part code
+    /// points (decoding raw UTF-8 and `\u`/`\u{}` escapes), consumes the closing `>`, and returns the
+    /// raw name slice. An empty name, an invalid code point, or a missing `>` is a SyntaxError.
+    fn parseGroupName(self: *Parser) CompileError![]const u8 {
+        const start = self.pos;
+        var count: usize = 0;
+        while (true) {
+            const b = self.peek() orelse return CompileError.SyntaxError; // unterminated `<…`
+            if (b == '>') {
+                if (count == 0) return CompileError.SyntaxError; // empty GroupSpecifier
+                const name = self.src[start..self.pos];
+                self.pos += 1; // '>'
+                return name;
+            }
+            const cp = if (b == '\\') blk: {
+                if (self.pos + 1 >= self.src.len or self.src[self.pos + 1] != 'u') return CompileError.SyntaxError;
+                self.pos += 2; // `\u`
+                break :blk try self.parseUnicodeEscapeCp();
+            } else if (b < 0x80) blk: {
+                self.pos += 1;
+                break :blk @as(u21, b);
+            } else blk: {
+                const len = std.unicode.utf8ByteSequenceLength(b) catch return CompileError.SyntaxError;
+                if (self.pos + len > self.src.len) return CompileError.SyntaxError;
+                const cp = std.unicode.utf8Decode(self.src[self.pos .. self.pos + len]) catch return CompileError.SyntaxError;
+                self.pos += len;
+                break :blk cp;
+            };
+            const ok = if (count == 0) isRegExpIdStart(cp) else isRegExpIdPart(cp);
+            if (!ok) return CompileError.SyntaxError;
+            count += 1;
+        }
+    }
+
+    /// A `\uHHHH` or `\u{H…}` escape (entered just past the `\u`), returning the code point. Used by
+    /// RegExpIdentifierName; a malformed escape or an out-of-range `\u{}` value is a SyntaxError.
+    fn parseUnicodeEscapeCp(self: *Parser) CompileError!u21 {
+        if (self.peek() == '{') {
+            self.pos += 1;
+            var v: u32 = 0;
+            var n: usize = 0;
+            while (self.peek()) |d| {
+                const nib = hexVal(d) orelse break;
+                v = v * 16 + nib;
+                if (v > 0x10FFFF) return CompileError.SyntaxError;
+                self.pos += 1;
+                n += 1;
+            }
+            if (n == 0 or self.peek() != '}') return CompileError.SyntaxError;
+            self.pos += 1; // '}'
+            return @intCast(v);
+        }
+        var v: u32 = 0;
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            const d = self.peek() orelse return CompileError.SyntaxError;
+            const nib = hexVal(d) orelse return CompileError.SyntaxError;
+            v = v * 16 + nib;
+            self.pos += 1;
+        }
+        return @intCast(v);
+    }
 };
+
+/// §12.9.5 SyntaxCharacter :: one of `^ $ \ . * + ? ( ) [ ] { } |`.
+fn isSyntaxChar(c: u8) bool {
+    return switch (c) {
+        '^', '$', '\\', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|' => true,
+        else => false,
+    };
+}
+
+fn hexVal(c: u8) ?u32 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+/// §22.2.1 RegExpIdentifierStart — UnicodeIDStart, `$`, or `_` (surrogate pairs fold into the decoded
+/// code point under the byte model).
+fn isRegExpIdStart(cp: u21) bool {
+    return cp == '$' or cp == '_' or unicode_id.isIdStart(cp);
+}
+
+/// §22.2.1 RegExpIdentifierPart — UnicodeIDContinue, `$`, `_`, ZWNJ (U+200C), or ZWJ (U+200D).
+fn isRegExpIdPart(cp: u21) bool {
+    return cp == '$' or cp == '_' or cp == 0x200C or cp == 0x200D or unicode_id.isIdContinue(cp);
+}
 
 fn appendClassEscape(arena: std.mem.Allocator, ranges: *std.ArrayListUnmanaged(Range), e: u8) CompileError!void {
     switch (e) {
@@ -567,6 +700,21 @@ pub fn compile(arena: std.mem.Allocator, source: []const u8, ignore_case: bool, 
     var p = Parser{ .arena = arena, .src = source, .unicode = unicode };
     const ast = try p.parseDisjunction();
     if (p.pos != source.len) return CompileError.SyntaxError; // trailing `)` etc.
+    // §22.2.1 post-parse Static Semantics. Resolve `\k<name>` against the group names now that the
+    // whole pattern (including forward references) is known; an unmatched name is a SyntaxError.
+    for (p.named_refs.items) |ref| {
+        var found = false;
+        for (p.names.items) |ng| {
+            if (std.mem.eql(u8, ng.name, ref.name)) {
+                ref.node.backref_index = ng.index;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return CompileError.SyntaxError; // dangling \k<name>
+    }
+    // §22.2.1: in UnicodeMode a `\N` numeric reference past the last capturing group is a SyntaxError.
+    if (unicode and p.max_backref > p.group_count) return CompileError.SyntaxError;
     var c = Compiler{ .arena = arena };
     _ = try c.emit(.{ .save = 0 }); // whole-match start
     try c.compileNode(ast);
@@ -581,6 +729,41 @@ pub fn compile(arena: std.mem.Allocator, source: []const u8, ignore_case: bool, 
         .multiline = multiline,
         .dot_all = dot_all,
     };
+}
+
+/// §12.9.5 Static Semantics: Early Errors for a RegularExpressionLiteral — the FlagText must be a set
+/// of the recognized flags `dgimsuvy` with no code point repeated and not both `u` and `v`, and the
+/// BodyText must parse as a Pattern (in UnicodeMode iff `u`/`v` is present). Pure (arena-only) so the
+/// PARSER can enforce it at parse time: an invalid literal is a parse-phase SyntaxError, not a deferred
+/// runtime one. `error.SyntaxError` covers both an invalid flag set and an unparsable pattern.
+pub fn validateLiteral(arena: std.mem.Allocator, pattern: []const u8, flags: []const u8) CompileError!void {
+    var seen = [_]bool{false} ** 8; // d g i m s u v y
+    var unicode = false;
+    var unicode_sets = false;
+    for (flags) |f| {
+        const idx: usize = switch (f) {
+            'd' => 0,
+            'g' => 1,
+            'i' => 2,
+            'm' => 3,
+            's' => 4,
+            'u' => blk: {
+                unicode = true;
+                break :blk 5;
+            },
+            'v' => blk: {
+                unicode_sets = true;
+                break :blk 6;
+            },
+            'y' => 7,
+            else => return CompileError.SyntaxError, // unrecognized flag code point
+        };
+        if (seen[idx]) return CompileError.SyntaxError; // duplicate flag
+        seen[idx] = true;
+    }
+    if (unicode and unicode_sets) return CompileError.SyntaxError; // `u` and `v` are mutually exclusive
+    // ignore_case/multiline/dot_all do not affect parse validity; only UnicodeMode (u/v) does.
+    _ = try compile(arena, pattern, false, false, false, unicode or unicode_sets);
 }
 
 // ─── Backtracking VM ─────────────────────────────────────────────────────────────────────────────

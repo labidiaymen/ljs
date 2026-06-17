@@ -139,6 +139,13 @@ pub const Lexer = struct {
     src: []const u8,
     pos: usize = 0,
     arena: std.mem.Allocator,
+    /// §12.9.1: the two lexical goal symbols (InputElementDiv vs InputElementRegExp) are selected by
+    /// the syntactic grammar, which a separate-pass lexer cannot consult. We approximate that choice
+    /// with the previous significant token's kind: a `/` begins a RegularExpressionLiteral unless the
+    /// previous token can end an operand (a literal, identifier, `this`/`super`, `)`/`]`/`}`, or a
+    /// postfix `++`/`--`), in which case it is the division operator. `.eof` (the initial value) means
+    /// start-of-input, where a regex is allowed. See `regexAllowed`.
+    prev_kind: TokenKind = .eof,
 
     pub fn init(arena: std.mem.Allocator, src: []const u8) Lexer {
         var self = Lexer{ .src = src, .arena = arena };
@@ -230,7 +237,40 @@ pub const Lexer = struct {
         const nl = self.skipTrivia();
         var t = try self.scanToken();
         t.newline_before = nl;
+        // §12.9.1: remember this token's kind so the next `/` can pick the InputElementDiv vs
+        // InputElementRegExp goal (see `prev_kind` / `regexAllowed`). `scanToken` reads `prev_kind`
+        // (the PREVIOUS token) before we overwrite it here.
+        self.prev_kind = t.kind;
         return t;
+    }
+
+    /// §12.9.1: should a `/` at the current position begin a RegularExpressionLiteral (true) rather
+    /// than be the division `/` / `/=` operator (false)? Approximated from the previous significant
+    /// token: division is expected only after a token that can terminate an operand.
+    fn regexAllowed(self: *Lexer) bool {
+        return switch (self.prev_kind) {
+            // Operand-terminating tokens → the `/` is division.
+            .number,
+            .string,
+            .template,
+            .regex,
+            .identifier,
+            .private_identifier,
+            .kw_this,
+            .kw_super,
+            .kw_true,
+            .kw_false,
+            .kw_null,
+            .rparen,
+            .rbracket,
+            .rbrace,
+            .plus_plus,
+            .minus_minus,
+            => false,
+            // Everything else (operators, `(`/`[`/`{`/`,`/`;`, keywords like `return`/`typeof`/`case`,
+            // and `.eof` = start-of-input) → a regex is allowed.
+            else => true,
+        };
     }
 
     fn scanToken(self: *Lexer) LexError!Token {
@@ -396,7 +436,14 @@ pub const Lexer = struct {
                 }
                 return self.maybeCompound(.star, .star_assign, start);
             },
-            '/' => return self.maybeCompound(.slash, .slash_assign, start), // (regex literals: M2, with the pattern validator)
+            '/' => {
+                // §12.9.1 / §12.9.5: in InputElementRegExp context a `/` begins a
+                // RegularExpressionLiteral; otherwise it is the division operator `/` / `/=`. (A `//`
+                // or `/*` comment was already consumed by `skipTrivia`, so the `/` here is never a
+                // comment — and a RegularExpressionFirstChar cannot be `*`, §12.9.5.)
+                if (self.regexAllowed()) return self.lexRegex();
+                return self.maybeCompound(.slash, .slash_assign, start);
+            },
             '%' => return self.maybeCompound(.percent, .percent_assign, start),
             '?' => {
                 // §13.13 nullish coalescing `??` / §13.15.2 logical assignment `??=`
@@ -526,6 +573,71 @@ pub const Lexer = struct {
             return tok(with_eq, self.src[start..self.pos]);
         }
         return tok(base, self.src[start..self.pos]);
+    }
+
+    /// §12.9.5 RegularExpressionLiteral `/ RegularExpressionBody / RegularExpressionFlags`. On entry
+    /// `self.pos` sits just past the opening `/` and `start` points at it. Scans the body (honoring
+    /// `\` escapes and `[...]` classes, where `/` does not terminate) up to the closing `/`, then the
+    /// flags (IdentifierPart chars). A LineTerminator inside the body/escape or an unterminated literal
+    /// is a Syntax Error (§12.9.5: RegularExpressionChar excludes LineTerminator). The pattern syntax
+    /// itself and the legality of flags are validated later, when the RegExp is constructed
+    /// (`builtin_regexp.makeRegExp`, §22.2.3.1). Returns `lexeme` = pattern text, `string_value` = flags.
+    fn lexRegex(self: *Lexer) LexError!Token {
+        const body_start = self.pos;
+        var in_class = false; // §12.9.5: inside a `[ ... ]` RegularExpressionClass, `/` is a literal char
+        while (true) {
+            if (self.pos >= self.src.len) return LexError.UnexpectedCharacter; // unterminated `/…`
+            const c = self.src[self.pos];
+            // §12.9.5: RegularExpressionChar / RegularExpressionClassChar exclude LineTerminator
+            // (ASCII CR/LF and U+2028/U+2029) — an unterminated literal, never spanning a line.
+            if (self.lineTerminatorLen(self.pos) != 0) return LexError.UnexpectedCharacter;
+            if (c == '\\') {
+                // §12.9.5 RegularExpressionBackslashSequence :: \ RegularExpressionNonTerminator.
+                self.pos += 1;
+                if (self.pos >= self.src.len or self.lineTerminatorLen(self.pos) != 0) return LexError.UnexpectedCharacter;
+                self.pos += 1; // consume the escaped (non-LineTerminator) char
+                continue;
+            }
+            if (c == '[') {
+                in_class = true;
+            } else if (c == ']') {
+                in_class = false;
+            } else if (c == '/' and !in_class) {
+                break; // closing delimiter
+            }
+            self.pos += 1;
+        }
+        const body_end = self.pos;
+        self.pos += 1; // consume closing '/'
+        // §12.9.5 RegularExpressionFlags :: [empty] | RegularExpressionFlags IdentifierPartChar. Consume
+        // the maximal ASCII IdentifierPart run, plus a `\` that begins a UnicodeEscapeSequence — which
+        // IS an IdentifierPart but illegal as a flag ("It is a Syntax Error if IdentifierPart contains a
+        // Unicode escape sequence"). Capturing the `\u…` here lets the parser's `validateLiteral` reject
+        // the literal at parse time instead of mis-lexing it as a separate identifier token. Raw non-ASCII
+        // bytes are NOT consumed: a Unicode whitespace/line-terminator after the literal (e.g. NBSP, EM
+        // SPACE) must terminate the flags, not be eaten as one. The flag *set* is validated by the parser.
+        const flags_start = self.pos;
+        while (self.pos < self.src.len and (isIdentPart(self.src[self.pos]) or self.src[self.pos] == '\\')) self.pos += 1;
+        return .{
+            .kind = .regex,
+            .lexeme = self.src[body_start..body_end],
+            .string_value = self.src[flags_start..self.pos],
+        };
+    }
+
+    /// §12.3: the UTF-8 byte length of a LineTerminator at `at` (CR, LF, or U+2028/U+2029), or 0 if
+    /// the byte there is not a LineTerminator. Used by `lexRegex` to reject line-spanning literals.
+    fn lineTerminatorLen(self: *Lexer, at: usize) usize {
+        if (at >= self.src.len) return 0;
+        const c = self.src[at];
+        if (c == '\n' or c == '\r') return 1;
+        if (c >= 0x80) {
+            const len = std.unicode.utf8ByteSequenceLength(c) catch return 0;
+            if (at + len > self.src.len) return 0;
+            const cp = std.unicode.utf8Decode(self.src[at .. at + len]) catch return 0;
+            if (cp == 0x2028 or cp == 0x2029) return len;
+        }
+        return 0;
     }
 
     fn lexEqEq(self: *Lexer, start: usize) Token {

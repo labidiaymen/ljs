@@ -5,6 +5,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const lex = @import("lexer.zig");
 const bigint = @import("bigint.zig");
+const regex_engine = @import("builtin_regexp_engine.zig");
 
 pub const ParseError = error{ UnexpectedToken, UnexpectedEof } || lex.LexError;
 
@@ -2822,6 +2823,13 @@ pub const Parser = struct {
                 return self.alloc(.null);
             },
             .regex => { // §13.2.7 RegularExpressionLiteral — lexeme = pattern, string_value = flags
+                // §12.9.5 Static Semantics (Early Errors): an invalid pattern or flag set is a
+                // parse-phase SyntaxError (Test262 `literals/regexp` negatives use `phase: parse`),
+                // not a deferred runtime error — so validate here rather than at RegExp construction.
+                regex_engine.validateLiteral(self.arena, t.lexeme, t.string_value) catch |e| switch (e) {
+                    error.OutOfMemory => return ParseError.OutOfMemory,
+                    error.SyntaxError => return ParseError.UnexpectedToken,
+                };
                 _ = self.advance();
                 return self.alloc(.{ .regex_literal = .{ .pattern = t.lexeme, .flags = t.string_value } });
             },
