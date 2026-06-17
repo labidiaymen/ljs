@@ -459,6 +459,10 @@ pub const NativeId = enum {
     /// `encodeURI`/`encodeURIComponent`/`decodeURI`/`decodeURIComponent` (§19.2.6). Installed on the
     /// global env (and thus mirrored onto globalThis as non-enumerable own properties).
     global_fn,
+    /// §10.4.4.6 %ThrowTypeError% — the unique per-realm function that unconditionally throws a
+    /// TypeError. Used as the poison `get`/`set` for `callee` (and historically `caller`) on a
+    /// strict / unmapped arguments object. Never returns normally.
+    throw_type_error,
 };
 
 /// §10.4.1 A Bound Function Exotic Object's internal slots: the wrapped target, the bound `this`, and

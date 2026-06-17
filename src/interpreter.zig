@@ -2451,6 +2451,12 @@ pub const Interpreter = struct {
         return null;
     }
 
+    /// §10.4.4.6 the realm's unique %ThrowTypeError% intrinsic, or null in a realm-less context.
+    fn throwTypeErrorIntrinsic(self: *Interpreter) ?*Object {
+        if (self.globals) |g| if (g.lookup("%ThrowTypeError%")) |b| if (b.value == .object) return b.value.object;
+        return null;
+    }
+
     pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
         // §13.3.12: consume the one-shot [[NewTarget]] hand-off from a preceding `construct` (else
         // `undefined`) and clear the slot immediately — so it cannot leak past this [[Call]] into a
@@ -6831,6 +6837,9 @@ pub const Interpreter = struct {
             },
             .function_ctor => return self.functionConstructor(args),
             .function_proto_noop => return .{ .normal = .undefined }, // §20.2.3 %Function.prototype%() → undefined
+            // §10.4.4.6 %ThrowTypeError% — always throws, regardless of args/this. Backs the poison
+            // `callee` accessor on a strict/unmapped arguments object.
+            .throw_type_error => return self.throwError("TypeError", "'callee', 'caller', and 'arguments' properties may not be accessed on strict mode functions"),
             .object_define_property => return builtin_object.objectDefineProperty(self, args),
             .object_define_properties => return builtin_object.objectDefineProperties(self, args),
             .object_get_own_property_descriptor => return builtin_object.objectGetOwnPropertyDescriptor(self, args),
@@ -6915,7 +6924,7 @@ pub const Interpreter = struct {
         }
         if (!fd.strict) {
             // §10.4.4 CreateMappedArgumentsObject: `callee` is the function (writable, non-enumerable,
-            // configurable). (A strict/unmapped `callee` is the %ThrowTypeError% poison — deferred.)
+            // configurable).
             try ao.defineData("callee", .{ .object = func }, true, false, true);
             // The [[ParameterMap]] exists only for a SIMPLE parameter list (no defaults / rest /
             // destructuring). Indices [0, min(argc, paramcount)) alias their parameter binding.
@@ -6935,6 +6944,16 @@ pub const Interpreter = struct {
                     }
                     ao.mapped_params = .{ .env = call_env, .names = names };
                 }
+            }
+        } else {
+            // §10.4.4.6 CreateUnmappedArgumentsObject: `callee` is an accessor whose get AND set are
+            // both the realm's %ThrowTypeError% poison, with { enumerable: false, configurable: false }.
+            if (self.throwTypeErrorIntrinsic()) |poison| {
+                try ao.properties.put(self.arena, "callee", .{
+                    .payload = .{ .accessor = .{ .get = poison, .set = poison } },
+                    .enumerable = false,
+                    .configurable = false,
+                });
             }
         }
         return ao;

@@ -784,4 +784,14 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try env.declare("globalThis", .{ .object = global_obj }, true, true);
     // Stash under a sentinel so the engine (and the async runner) can reach the global object.
     try env.declare("%GlobalThis%", .{ .object = global_obj }, false, true);
+    // §10.4.4.6 %ThrowTypeError% — the unique per-realm poison function (frozen, non-extensible per
+    // spec; the M-subset stores the shared instance so a strict arguments object's `callee` accessor
+    // can reference it). Stashed under a sentinel; reached via Interpreter.throwTypeErrorIntrinsic.
+    {
+        const tte = try Object.createNative(arena, .throw_type_error, "");
+        tte.prototype = function_proto;
+        try tte.defineData("length", .{ .number = 0 }, false, false, false);
+        try tte.defineData("name", .{ .string = "" }, false, false, false);
+        try env.declare("%ThrowTypeError%", .{ .object = tte }, false, true);
+    }
 }
