@@ -3062,3 +3062,69 @@ test "M36: §21.2.1.1 BigInt(x) + §21.2.3 ToString" {
     try expectBool("BigInt.asUintN(8, 256n) === 0n", true);
     try expectBool("BigInt.asIntN(8, 255n) === -1n", true);
 }
+
+test "M39: §22.1.3 String.prototype methods — index/search family" {
+    // §22.1.3.1 at — relative index (negative from end)
+    try expectStr("\"abc\".at(-1)", "c");
+    try expectStr("\"abc\".at(0)", "a");
+    try expectUndefined("\"abc\".at(3)");
+    // §22.1.3.4 codePointAt — ASCII byte
+    try expectNumber("\"abc\".codePointAt(0)", 97);
+    try expectUndefined("\"abc\".codePointAt(5)");
+    // §22.1.3.24/.7 startsWith / endsWith
+    try expectBool("\"abc\".startsWith(\"ab\")", true);
+    try expectBool("\"abc\".startsWith(\"bc\", 1)", true);
+    try expectBool("\"abc\".endsWith(\"bc\")", true);
+    try expectBool("\"abc\".endsWith(\"ab\", 2)", true);
+    // §22.1.3.9/.11 indexOf(pos) / lastIndexOf
+    try expectNumber("\"abcabc\".indexOf(\"b\", 2)", 4);
+    try expectNumber("\"abcabc\".lastIndexOf(\"a\")", 3);
+    // §22.1.3.8 includes(pos)
+    try expectBool("\"abc\".includes(\"a\", 1)", false);
+}
+
+test "M39: §22.1.3 String.prototype methods — build/transform family" {
+    // §22.1.3.5 concat
+    try expectStr("\"a\".concat(\"b\", \"c\")", "abc");
+    // §22.1.3.18 repeat (+ RangeError on negative / Infinity)
+    try expectStr("\"ab\".repeat(3)", "ababab");
+    try expectStr("\"x\".repeat(0)", "");
+    try expectThrows("\"x\".repeat(-1)");
+    try expectThrows("\"x\".repeat(Infinity)");
+    // §22.1.3.16/.15 padStart / padEnd
+    try expectStr("\"ab\".padStart(4, \"x\")", "xxab");
+    try expectStr("\"ab\".padEnd(4, \"x\")", "abxx");
+    try expectStr("\"ab\".padStart(5)", "   ab");
+    // §22.1.3.32/.34/.33 trim / trimStart / trimEnd
+    try expectStr("\"  x  \".trim()", "x");
+    try expectStr("\"  x  \".trimStart()", "x  ");
+    try expectStr("\"  x  \".trimEnd()", "  x");
+    // Annex B substr
+    try expectStr("\"abcde\".substr(1, 2)", "bc");
+    try expectStr("\"abcde\".substr(-2)", "de");
+    // §22.1.3.10 localeCompare (code-unit compare in the M-subset)
+    try expectNumber("\"a\".localeCompare(\"a\")", 0);
+    try expectNumber("\"a\".localeCompare(\"b\")", -1);
+    // string-arg replace / replaceAll (§22.1.3.20/.21 string path)
+    try expectStr("\"a-b\".replace(\"-\", \"+\")", "a+b");
+    try expectStr("\"a-b-c\".replace(\"-\", \"+\")", "a+b-c");
+    try expectStr("\"a-b-c\".replaceAll(\"-\", \"+\")", "a+b+c");
+    try expectStr("\"a-b\".replace(\"-\", \"$&$&\")", "a--b");
+}
+
+test "M39: §22.1.2 String statics + RequireObjectCoercible" {
+    // §22.1.2.1 fromCharCode
+    try expectStr("String.fromCharCode(97, 98)", "ab");
+    // §22.1.2.2 fromCodePoint (+ RangeError on out-of-range)
+    try expectStr("String.fromCodePoint(97, 98)", "ab");
+    try expectThrows("String.fromCodePoint(-1)");
+    try expectThrows("String.fromCodePoint(0x110000)");
+    // §22.1.2.4 String.raw — direct call on a template object
+    try expectStr("String.raw({ raw: [\"a\", \"b\", \"c\"] }, 1, 2)", "a1b2c");
+    try expectStr("String.raw({ raw: [\"x\"] })", "x");
+    // §22.1.3 RequireObjectCoercible — null/undefined this → TypeError
+    try expectThrows("String.prototype.at.call(undefined, 0)");
+    try expectThrows("String.prototype.charAt.call(null, 0)");
+    // unboxing a String wrapper
+    try expectStr("new String(\"hi\").at(0)", "h");
+}

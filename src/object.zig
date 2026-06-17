@@ -245,6 +245,7 @@ pub const NativeId = enum {
     array_method, // Array.prototype.<native_name> / Array.isArray
     array_static, // §23.1.2 Array.from / Array.of
     string_method, // String.prototype.<native_name>
+    string_static, // §22.1.2 String.fromCharCode / String.fromCodePoint / String.raw
     function_ctor, // Function(...) — minimal (the `.prototype` carrier for call/apply/bind)
     // §20.1.2 Object static reflection
     object_define_property, // Object.defineProperty

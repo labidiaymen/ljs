@@ -1348,6 +1348,17 @@ pub const Interpreter = struct {
         if (ctor.native == .symbol_ctor) return self.throwError("TypeError", "Symbol is not a constructor");
         // §21.2.1: the `BigInt` constructor has no [[Construct]] — `new BigInt()` is a TypeError.
         if (ctor.native == .bigint_ctor) return self.throwError("TypeError", "BigInt is not a constructor");
+        // §17 / §10.3: a built-in *method* or *static* (e.g. `String.prototype.concat`, `String.fromCharCode`,
+        // `Math.max`) has NO [[Construct]] — only the genuine built-in *constructors* below do. A native
+        // with no AST body (`call == null`) that is not one of those throws "not a constructor". Ordinary
+        // functions / bound functions / classes have `native == .none` and a `call` body, so they pass.
+        if (ctor.call == null and ctor.native != .none) {
+            const constructible = switch (ctor.native) {
+                .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor => true,
+                else => false,
+            };
+            if (!constructible) return self.throwError("TypeError", "value is not a constructor");
+        }
         var proto: ?*Object = null;
         if (ctor.get("prototype")) |pv| {
             if (pv == .object) proto = pv.object;
@@ -2676,6 +2687,17 @@ pub const Interpreter = struct {
                     }
                     // else fall through to the prototype chain (Array.prototype methods)
                 }
+                // §22.1.4.1/§10.4.3: a `new String(s)` wrapper is a String exotic — `.length` and the
+                // canonical integer indices [0, len) read the boxed [[StringData]] (own, ahead of the
+                // ordinary chain) so wrapper.length / wrapper[i] mirror the primitive (M-subset: byte
+                // model). A defined own data property still wins (none clobbers these read-only slots).
+                if (o.primitive != null and o.primitive.? == .string and o.getProp(key) == null) {
+                    const sv = o.primitive.?.string;
+                    if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(sv.len) } };
+                    if (parseIndex(key)) |i| {
+                        if (i < sv.len) return .{ .normal = .{ .string = sv[i .. i + 1] } };
+                    }
+                }
                 // §10.1.8.1 OrdinaryGet — locate the property (data or accessor) on the chain.
                 // Data-property fast path: a single descriptor read, no accessor branch.
                 const loc = o.getProp(key) orelse return .{ .normal = .undefined };
@@ -3060,6 +3082,8 @@ pub const Interpreter = struct {
             else => v,
         };
         if (prim == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a number");
+        // §7.1.4 step 2: ToNumber(BigInt) throws a TypeError (it does NOT silently become NaN).
+        if (prim == .bigint) return self.throwError("TypeError", "Cannot convert a BigInt value to a number");
         return .{ .normal = .{ .number = toNumber(prim) } };
     }
 
@@ -5933,6 +5957,7 @@ pub const Interpreter = struct {
             .array_method => return builtin_array.call(self, func.native_name, this_val, args),
             .array_static => return builtin_array.staticCall(self, func.native_name, args),
             .string_method => return builtin_string.call(self, func.native_name, this_val, args),
+            .string_static => return builtin_string.staticCall(self, func.native_name, args),
             .math_method => return self.mathMethod(func.native_name, args),
             .array_values => return self.makeArrayIterator(this_val, .value), // §23.1.3.34 / Array.prototype[Symbol.iterator]
             .array_keys => return self.makeArrayIterator(this_val, .key), // §23.1.3.18 Array.prototype.keys
@@ -6165,7 +6190,7 @@ pub const Interpreter = struct {
             .bigint_method => return self.bigintMethod(func.native_name, this_val, args), // §21.2.3 toString/valueOf
             .symbol_ctor => return self.symbolConstructor(args), // §20.4.1.1 Symbol([description])
             .promise_ctor => return self.promiseConstructor(args), // §27.2.3.1 Promise(executor) called w/o new
-            .array_ctor, .array_method, .array_static, .string_method, .math_method => unreachable, // handled in the first switch
+            .array_ctor, .array_method, .array_static, .string_method, .string_static, .math_method => unreachable, // handled in the first switch
             .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
             .generator_method, .generator_iterator => unreachable, // handled in the first switch
             .async_generator_method, .async_generator_iterator, .async_from_sync_method, .async_from_sync_wrap => unreachable, // handled in the first switch
@@ -6381,6 +6406,17 @@ pub const Interpreter = struct {
     /// `toStringCoerce`, which throws on a Symbol per spec.
     pub fn toString(self: *Interpreter, v: Value) EvalError![]const u8 {
         return ops.toString(self.arena, v);
+    }
+
+    /// §7.1.17 ToString — the FULL throwing form (ToPrimitive(string) on an object, TypeError on a
+    /// Symbol). Public so the string library (§22.1.3) can coerce `this`/arguments with the observable
+    /// abrupt completions the spec mandates (e.g. `"".endsWith(Symbol())` → TypeError). Returns the
+    /// string, or the abrupt completion when coercion throws.
+    pub fn toStringThrowing(self: *Interpreter, v: Value) EvalError!Completion {
+        return switch (try self.toStringCoerceV(v)) {
+            .string => |s| .{ .normal = .{ .string = s } },
+            .abrupt => |c| c,
+        };
     }
 
     const CoerceResult = union(enum) { string: []const u8, abrupt: Completion };

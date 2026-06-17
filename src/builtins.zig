@@ -150,16 +150,22 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         if (pv == .object) {
             pv.object.prototype = object_proto; // §22.1.3 String.prototype inherits %Object.prototype%
             const string_methods = [_][]const u8{
-                "charAt",    "charCodeAt",  "indexOf",     "includes", "slice",
-                "substring", "toUpperCase", "toLowerCase", "split",
+                "charAt",      "charCodeAt", "codePointAt", "at",         "indexOf",
+                "lastIndexOf", "includes",   "startsWith",  "endsWith",   "slice",
+                "substring",   "substr",     "concat",      "repeat",     "padStart",
+                "padEnd",      "trim",       "trimStart",   "trimEnd",    "toUpperCase",
+                "toLowerCase", "split",      "replace",     "replaceAll", "localeCompare",
                 // §22.1.3.28/.32: toString/valueOf return the [[StringData]] (so a `new String(x)` wrapper
                 // and ToPrimitive recover the string primitive).
-                   "toString",
-                "valueOf",
+                "toString",    "valueOf",
             };
             for (string_methods) |m| try defineMethod(arena, pv.object, m, .string_method, m);
         }
     }
+    // §22.1.2 String statics — fromCharCode / fromCodePoint / raw. (raw works on a direct call's
+    // template object; tagged-template syntax is not wired, see specs/039 spec.md.)
+    const string_statics = [_][]const u8{ "fromCharCode", "fromCodePoint", "raw" };
+    for (string_statics) |m| try defineMethod(arena, string_fn, m, .string_static, m);
     try defineConstructorBackref(string_fn); // §22.1.3.1 String.prototype.constructor === String
     try env.declare("String", .{ .object = string_fn }, true, true);
 
