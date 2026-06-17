@@ -845,6 +845,90 @@ pub const Object = struct {
         return obj;
     }
 
+    /// §20.2.4.1 the `length` of a built-in function (count of expected args). For a family dispatched
+    /// by `native_name` (array/string/math/… methods) the length keys off the spec method name; for a
+    /// single-purpose native it is fixed by `id`. Returns null for an unknown/internal native (→ no
+    /// `length` property, exactly as before — purely additive, so no test can regress).
+    fn nativeLength(id: NativeId, name: []const u8) ?f64 {
+        const L = struct {
+            fn pick(n: []const u8, comptime pairs: anytype) ?f64 {
+                inline for (pairs) |p| if (std.mem.eql(u8, n, p[0])) return p[1];
+                return null;
+            }
+        };
+        return switch (id) {
+            // ── constructors ──
+            .object_ctor, .array_ctor, .string_ctor, .number_ctor, .boolean_ctor, .function_ctor, .bigint_ctor, .promise_ctor, .error_ctor => 1,
+            .aggregate_error_ctor => 2,
+            .suppressed_error_ctor => 3,
+            .symbol_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor => 0,
+            // ── Object statics / prototype (each its own id) ──
+            .object_define_property => 3,
+            .object_assign, .object_create, .object_define_properties, .object_get_own_property_descriptor, .object_is, .object_set_prototype_of, .object_has_own, .object_group_by => 2,
+            .object_entries, .object_values, .object_keys, .object_freeze, .object_from_entries, .object_get_own_property_descriptors, .object_get_own_property_names, .object_get_own_property_symbols, .object_get_prototype_of, .object_is_extensible, .object_is_frozen, .object_is_sealed, .object_prevent_extensions, .object_seal => 1,
+            .object_has_own_property, .object_property_is_enumerable, .object_is_prototype_of, .object_proto_setter => 1,
+            .object_to_string, .object_value_of, .object_proto_getter => 0,
+            // ── eval / globals ──
+            .eval_fn => 1,
+            .global_fn => L.pick(name, .{ .{ "isNaN", 1 }, .{ "isFinite", 1 }, .{ "parseFloat", 1 }, .{ "parseInt", 2 }, .{ "decodeURI", 1 }, .{ "decodeURIComponent", 1 }, .{ "encodeURI", 1 }, .{ "encodeURIComponent", 1 } }),
+            // ── Function.prototype ──
+            .function_method => L.pick(name, .{ .{ "apply", 2 }, .{ "bind", 1 }, .{ "call", 1 } }),
+            .function_proto_noop => 0,
+            // ── Math / Reflect ──
+            .math_method => L.pick(name, .{ .{ "atan2", 2 }, .{ "pow", 2 }, .{ "max", 2 }, .{ "min", 2 }, .{ "hypot", 2 }, .{ "imul", 2 } }) orelse 1,
+            .reflect_method => L.pick(name, .{ .{ "apply", 3 }, .{ "construct", 2 }, .{ "defineProperty", 3 }, .{ "deleteProperty", 2 }, .{ "get", 2 }, .{ "getOwnPropertyDescriptor", 2 }, .{ "getPrototypeOf", 1 }, .{ "has", 2 }, .{ "isExtensible", 1 }, .{ "ownKeys", 1 }, .{ "preventExtensions", 1 }, .{ "set", 3 }, .{ "setPrototypeOf", 2 } }),
+            // ── Number / Boolean / BigInt ──
+            .number_static => L.pick(name, .{ .{ "isNaN", 1 }, .{ "isFinite", 1 }, .{ "isInteger", 1 }, .{ "isSafeInteger", 1 }, .{ "parseFloat", 1 }, .{ "parseInt", 2 } }),
+            .number_method => L.pick(name, .{ .{ "toExponential", 1 }, .{ "toFixed", 1 }, .{ "toPrecision", 1 }, .{ "toString", 1 }, .{ "toLocaleString", 0 }, .{ "valueOf", 0 } }),
+            .boolean_method => 0,
+            .bigint_static => 2, // asIntN / asUintN
+            .bigint_method => 0, // toString / valueOf / toLocaleString
+            // ── Symbol ──
+            .symbol_static => 1, // for / keyFor
+            .symbol_to_string => L.pick(name, .{.{ "[Symbol.toPrimitive]", 1 }}) orelse 0,
+            .symbol_description => 0,
+            // ── Promise ──
+            .promise_then => 2,
+            .promise_catch, .promise_finally, .promise_resolve, .promise_reject, .promise_all, .promise_all_settled, .promise_any, .promise_race => 1,
+            // ── iterators / generators ──
+            .generator_method, .async_generator_method, .async_from_sync_method => 1, // next/return/throw
+            .iterator_next => 0,
+            .array_values, .array_keys, .array_entries, .string_iterator, .generator_iterator, .async_generator_iterator, .species_getter => 0,
+            // ── collections ──
+            .collection_size, .collection_iterator => 0,
+            .map_method => L.pick(name, .{ .{ "get", 1 }, .{ "set", 2 }, .{ "has", 1 }, .{ "delete", 1 }, .{ "clear", 0 }, .{ "forEach", 1 } }),
+            .set_method => L.pick(name, .{ .{ "add", 1 }, .{ "has", 1 }, .{ "delete", 1 }, .{ "clear", 0 }, .{ "forEach", 1 }, .{ "union", 1 }, .{ "intersection", 1 }, .{ "difference", 1 }, .{ "symmetricDifference", 1 }, .{ "isSubsetOf", 1 }, .{ "isSupersetOf", 1 }, .{ "isDisjointFrom", 1 } }),
+            .weakmap_method => L.pick(name, .{ .{ "get", 1 }, .{ "set", 2 }, .{ "has", 1 }, .{ "delete", 1 } }),
+            .weakset_method => L.pick(name, .{ .{ "add", 1 }, .{ "has", 1 }, .{ "delete", 1 } }),
+            // ── JSON ──
+            .json_parse => 2,
+            .json_stringify => 3,
+            // ── Array / String (dispatched by method name) ──
+            .array_static => L.pick(name, .{ .{ "from", 1 }, .{ "of", 0 }, .{ "fromAsync", 1 } }),
+            .array_method => L.pick(name, .{
+                .{ "isArray", 1 },  .{ "at", 1 },             .{ "concat", 1 },     .{ "copyWithin", 2 }, .{ "entries", 0 },
+                .{ "every", 1 },    .{ "fill", 1 },           .{ "filter", 1 },     .{ "find", 1 },       .{ "findIndex", 1 },
+                .{ "findLast", 1 }, .{ "findLastIndex", 1 },  .{ "flat", 0 },       .{ "flatMap", 1 },    .{ "forEach", 1 },
+                .{ "includes", 1 }, .{ "indexOf", 1 },        .{ "join", 1 },       .{ "keys", 0 },       .{ "lastIndexOf", 1 },
+                .{ "map", 1 },      .{ "pop", 0 },            .{ "push", 1 },       .{ "reduce", 1 },     .{ "reduceRight", 1 },
+                .{ "reverse", 0 },  .{ "shift", 0 },          .{ "slice", 2 },      .{ "some", 1 },       .{ "sort", 1 },
+                .{ "splice", 2 },   .{ "toLocaleString", 0 }, .{ "toReversed", 0 }, .{ "toSorted", 1 },   .{ "toSpliced", 2 },
+                .{ "toString", 0 }, .{ "unshift", 1 },        .{ "values", 0 },     .{ "with", 2 },
+            }),
+            .string_static => L.pick(name, .{ .{ "fromCharCode", 1 }, .{ "fromCodePoint", 1 }, .{ "raw", 1 } }),
+            .string_method => L.pick(name, .{
+                .{ "at", 1 },          .{ "charAt", 1 },            .{ "charCodeAt", 1 },        .{ "codePointAt", 1 },  .{ "concat", 1 },
+                .{ "endsWith", 1 },    .{ "includes", 1 },          .{ "indexOf", 1 },           .{ "lastIndexOf", 1 },  .{ "localeCompare", 1 },
+                .{ "match", 1 },       .{ "matchAll", 1 },          .{ "normalize", 0 },         .{ "padEnd", 1 },       .{ "padStart", 1 },
+                .{ "repeat", 1 },      .{ "replace", 2 },           .{ "replaceAll", 2 },        .{ "search", 1 },       .{ "slice", 2 },
+                .{ "split", 2 },       .{ "startsWith", 1 },        .{ "substr", 2 },            .{ "substring", 2 },    .{ "toLowerCase", 0 },
+                .{ "toUpperCase", 0 }, .{ "toLocaleLowerCase", 0 }, .{ "toLocaleUpperCase", 0 }, .{ "trim", 0 },         .{ "trimEnd", 0 },
+                .{ "trimStart", 0 },   .{ "toString", 0 },          .{ "valueOf", 0 },           .{ "isWellFormed", 0 }, .{ "toWellFormed", 0 },
+            }),
+            else => null, // internal natives (resolving functions, combinator elements, test hooks)
+        };
+    }
+
     /// A built-in function object (kind=function, dispatched by `native` id).
     pub fn createNative(arena: std.mem.Allocator, id: NativeId, name: []const u8) std.mem.Allocator.Error!*Object {
         const obj = try create(arena, null);
@@ -853,10 +937,16 @@ pub const Object = struct {
         obj.native_name = name;
         const proto = try create(arena, null);
         try obj.set("prototype", .{ .object = proto });
+        // §20.2.4.1: a built-in function's `length` own property (the count of expected arguments) —
+        // non-enumerable, non-writable, configurable. Defined BEFORE `name` so OrdinaryOwnPropertyKeys
+        // lists `length` first (matching the spec's property order). `null` ⇒ unknown native ⇒ omit it
+        // (no regression — the property was simply absent before). `defineMethod` may pass a more
+        // specific `native_name` (e.g. "map:keys") so the per-name lookup keys off the spec method name.
+        if (nativeLength(id, name)) |len| try obj.defineData("length", .{ .number = len }, false, false, true);
         // §20.2.4.2: a built-in function's `name` own property (non-enumerable, non-writable,
         // configurable). For a method installed via `defineMethod` this is overwritten with the
         // property key; for a constructor / standalone native this name (the passed identifier) is
-        // already the spec name. (Per-native `length` is deferred — see specs/015.)
+        // already the spec name.
         try obj.defineData("name", .{ .string = name }, false, false, true);
         return obj;
     }
