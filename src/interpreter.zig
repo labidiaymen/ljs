@@ -2179,9 +2179,14 @@ pub const Interpreter = struct {
                     // §15.7.14: the superclass must be a constructor with an object/null `.prototype`.
                     if (so.kind != .function) return self.throwError("TypeError", "Class extends value is not a constructor or null");
                     super_ctor = so;
-                    if (so.get("prototype")) |pv| {
-                        if (pv == .object) super_proto = pv.object;
-                    }
+                    // §15.7.14: protoParent = Get(superclass, "prototype"); it must be an Object or
+                    // null — a present primitive (number/string/undefined/…) is a TypeError. An object
+                    // links the derived prototype; null links to null (no parent prototype).
+                    if (so.get("prototype")) |pv| switch (pv) {
+                        .object => |po| super_proto = po,
+                        .null => {},
+                        else => return self.throwError("TypeError", "Class extends value does not have a valid prototype property"),
+                    };
                 },
                 else => return self.throwError("TypeError", "Class extends value is not a constructor or null"),
             }
