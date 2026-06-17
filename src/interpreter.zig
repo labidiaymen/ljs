@@ -12,6 +12,7 @@ const object_mod = @import("object.zig");
 const Object = object_mod.Object;
 const ops = @import("abstract_ops.zig");
 const builtin_array = @import("builtin_array.zig");
+const builtin_array_static = @import("builtin_array_static.zig");
 const builtin_string = @import("builtin_string.zig");
 const builtin_collection = @import("builtin_collection.zig");
 const builtin_json = @import("builtin_json.zig");
@@ -6405,7 +6406,7 @@ pub const Interpreter = struct {
                 return .{ .normal = .{ .object = arr } };
             },
             .array_method => return builtin_array.call(self, func.native_name, this_val, args),
-            .array_static => return builtin_array.staticCall(self, func.native_name, this_val, args),
+            .array_static => return builtin_array_static.staticCall(self, func.native_name, this_val, args),
             .string_method => return builtin_string.call(self, func.native_name, this_val, args),
             .string_static => return builtin_string.staticCall(self, func.native_name, args),
             .map_method => return builtin_collection.mapMethod(self, func.native_name, this_val, args),
