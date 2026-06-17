@@ -22,6 +22,21 @@ Constitution: `.specify/memory/constitution.md` — correctness/conformance befo
 - **Stop rule:** when the only remaining work to advance conformance would be implementing a
   Node host API, **stop** — that is by definition out of scope.
 
+### Scope expansion (2026-06-17, user-authorized — to break past the ~92-93% ceiling)
+- **UTF-16 string semantics — IN SCOPE (always was; a documented deviation being corrected).**
+  ECMA-262 strings are sequences of UTF-16 code units. ljs stores `[]const u8` and currently
+  reports `length`/`charCodeAt`/indexing over BYTES (`"é".length === 2`). The fix is a phased epic
+  (`specs/068-utf16-strings/`): treat the storage as WTF-8 (lone surrogates representable) with an
+  ASCII fast path, and compute code-unit `length`/indexing/methods/escapes/iteration/regex on
+  demand. No charter conflict — pure language conformance.
+- **Module LANGUAGE part — IN SCOPE (ECMA-262 §16.2).** The ESM grammar (`import`/`export`
+  declarations, early errors), module linking/evaluation semantics, and the `import()` dynamic
+  ImportCall expression ARE ECMAScript. A **minimal test-harness module loader** (resolve a
+  specifier to source by reading the referenced file relative to the test) is permitted to drive
+  the Test262 module corpus — it is a test harness, NOT a general Node host API. General Node host
+  APIs (`require`, `fs`/`http`/`net`/`process`/`Buffer`, host timers) remain OUT of scope.
+  Sequencing: tackle UTF-16 first (no loader nuance, biggest scattered payoff), modules second.
+
 ## Git / commits
 - Do **not** add a `Co-Authored-By: Claude` (or any Claude/Anthropic) trailer to commit messages.
 - Do **not** set Claude/Anthropic as the commit author — commits are authored by the user.

@@ -5,6 +5,7 @@
 //! `string_static`); this file is the string library, the interpreter stays the evaluator.
 const std = @import("std");
 const interp = @import("interpreter.zig");
+const sutf16 = @import("string_utf16.zig");
 const Interpreter = interp.Interpreter;
 const EvalError = interp.EvalError;
 const Object = @import("object.zig").Object;
@@ -41,52 +42,61 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
     };
 
     if (eql(u8, name, "charAt")) {
+        // §22.1.3.1: the 1-code-unit substring at code-unit index `n` (§6.1.4); out of range → "".
         const ir = try intArg(it, args, 0, 0);
         const n = switch (ir) {
             .abrupt => |c| return c,
             .value => |v| v,
         };
-        if (n >= 0 and n < @as(f64, @floatFromInt(s.len))) {
-            const i: usize = @intFromFloat(n);
-            return str(s[i .. i + 1]);
+        if (n >= 0 and n < @as(f64, @floatFromInt(sutf16.utf16Length(s)))) {
+            return str(try sutf16.charAtAlloc(it.arena, s, @intFromFloat(n)));
         }
         return str("");
     }
     if (eql(u8, name, "charCodeAt")) {
+        // §22.1.3.2: the UTF-16 code unit at code-unit index `n`; out of range → NaN.
         const ir = try intArg(it, args, 0, 0);
         const n = switch (ir) {
             .abrupt => |c| return c,
             .value => |v| v,
         };
-        if (n >= 0 and n < @as(f64, @floatFromInt(s.len))) {
-            const i: usize = @intFromFloat(n);
-            return num(@floatFromInt(s[i]));
+        if (n >= 0 and n < @as(f64, @floatFromInt(sutf16.utf16Length(s)))) {
+            if (sutf16.codeUnitAt(s, @intFromFloat(n))) |cu| return num(@floatFromInt(cu));
         }
         return num(std.math.nan(f64));
     }
     if (eql(u8, name, "codePointAt")) {
-        // §22.1.3.4: UTF-8 decode the code point starting at byte `pos`; out of range → undefined.
+        // §22.1.3.4: the code POINT at code-unit index `pos` — a lead surrogate followed by a trail
+        // combines into the astral scalar; out of range → undefined.
         const ir = try intArg(it, args, 0, 0);
         const n = switch (ir) {
             .abrupt => |c| return c,
             .value => |v| v,
         };
-        if (n < 0 or n >= @as(f64, @floatFromInt(s.len))) return .{ .normal = .undefined };
-        const i: usize = @intFromFloat(n);
-        return num(@floatFromInt(decodeCp(s, i).cp));
+        if (n < 0 or n >= @as(f64, @floatFromInt(sutf16.utf16Length(s)))) return .{ .normal = .undefined };
+        const pos: usize = @intFromFloat(n);
+        const first = sutf16.codeUnitAt(s, pos) orelse return .{ .normal = .undefined };
+        if (first >= 0xD800 and first <= 0xDBFF) {
+            if (sutf16.codeUnitAt(s, pos + 1)) |second| {
+                if (second >= 0xDC00 and second <= 0xDFFF) {
+                    const cp = 0x10000 + ((@as(u32, first - 0xD800)) << 10) + (second - 0xDC00);
+                    return num(@floatFromInt(cp));
+                }
+            }
+        }
+        return num(@floatFromInt(first));
     }
     if (eql(u8, name, "at")) {
-        // §22.1.3.1: relative index (negative from the end), byte-based; out of range → undefined.
+        // §22.1.3.1: relative code-unit index (negative from the end); out of range → undefined.
         const ir = try intArg(it, args, 0, 0);
         const rel = switch (ir) {
             .abrupt => |c| return c,
             .value => |v| v,
         };
-        const len_f: f64 = @floatFromInt(s.len);
+        const len_f: f64 = @floatFromInt(sutf16.utf16Length(s));
         const k = if (rel >= 0) rel else len_f + rel;
         if (k < 0 or k >= len_f) return .{ .normal = .undefined };
-        const i: usize = @intFromFloat(k);
-        return str(s[i .. i + 1]);
+        return str(try sutf16.charAtAlloc(it.arena, s, @intFromFloat(k)));
     }
     if (eql(u8, name, "indexOf")) {
         const needle = switch (try argStr(it, args, 0)) {

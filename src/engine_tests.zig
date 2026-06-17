@@ -348,9 +348,11 @@ test "M12 string escapes: hex / unicode / octal / line-continuation (§12.9.4.1)
     // §12.9.4.1 UnicodeEscapeSequence `\uHHHH` and braced `\u{H…}`
     try expectBool("\"\\u0041\" === \"A\"", true);
     try expectBool("\"\\u{41}\" === \"A\"", true);
-    // A supplementary-plane code point is UTF-8-encoded; ljs `String.length` is the BYTE count
-    // (U+1F600 GRINNING FACE = 4 UTF-8 bytes: F0 9F 98 80). Documented byte-length semantics.
-    try expectNumber("\"\\u{1F600}\".length", 4);
+    // §6.1.4: a supplementary-plane scalar is TWO UTF-16 code units (a surrogate pair), so
+    // `String.length` is 2 (M80 UTF-16 string semantics; was the byte count under the old model).
+    try expectNumber("\"\\u{1F600}\".length", 2);
+    try expectNumber("\"\\u{1F600}\".charCodeAt(0)", 0xD83D);
+    try expectNumber("\"\\u{1F600}\".charCodeAt(1)", 0xDE00);
     // §12.9.4.1 single-char escapes: `\b`=0x08, `\f`=0x0C, `\v`=0x0B, `\0`=NUL
     try expectNumber("\"\\b\".charCodeAt(0)", 8);
     try expectNumber("\"\\f\".charCodeAt(0)", 12);

@@ -14,6 +14,7 @@ const ops = @import("abstract_ops.zig");
 const builtin_array = @import("builtin_array.zig");
 const builtin_array_static = @import("builtin_array_static.zig");
 const builtin_string = @import("builtin_string.zig");
+const sutf16 = @import("string_utf16.zig");
 const builtin_collection = @import("builtin_collection.zig");
 const builtin_json = @import("builtin_json.zig");
 const builtin_math = @import("builtin_math.zig");
@@ -1009,8 +1010,9 @@ pub const Interpreter = struct {
                 }
             },
             .string => |s| {
-                // §22.1: a primitive String boxes to character-index own properties (enumerable).
-                for (0..s.len) |i| {
+                // §22.1: a primitive String boxes to character-index own properties (enumerable) —
+                // one per UTF-16 code unit (§6.1.4).
+                for (0..sutf16.utf16Length(s)) |i| {
                     const key = try numberToString(self.arena, @floatFromInt(i));
                     try out.append(self.arena, .{ .string = key });
                 }
@@ -3248,9 +3250,13 @@ pub const Interpreter = struct {
                 // model). A defined own data property still wins (none clobbers these read-only slots).
                 if (o.primitive != null and o.primitive.? == .string and o.getProp(key) == null) {
                     const sv = o.primitive.?.string;
-                    if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(sv.len) } };
+                    if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(sutf16.utf16Length(sv)) } };
                     if (parseIndex(key)) |i| {
-                        if (i < sv.len) return .{ .normal = .{ .string = sv[i .. i + 1] } };
+                        if (sutf16.isAscii(sv)) {
+                            if (i < sv.len) return .{ .normal = .{ .string = sv[i .. i + 1] } };
+                        } else if (sutf16.codeUnitAt(sv, i) != null) {
+                            return .{ .normal = .{ .string = try sutf16.charAtAlloc(self.arena, sv, i) } };
+                        }
                     }
                 }
                 // §10.4.4.3: a MAPPED arguments index reads the LIVE parameter binding (the map takes
@@ -3276,9 +3282,13 @@ pub const Interpreter = struct {
             },
             .string => |s| {
                 // §22.1: transparent boxing — `.length`, integer index, or a String.prototype method.
-                if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(s.len) } };
+                // §6.1.4: `.length` and integer indices are UTF-16 code-unit quantities (ASCII fast path).
+                if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(sutf16.utf16Length(s)) } };
                 if (parseIndex(key)) |i| {
-                    return .{ .normal = if (i < s.len) .{ .string = s[i .. i + 1] } else .undefined };
+                    if (sutf16.isAscii(s)) {
+                        return .{ .normal = if (i < s.len) .{ .string = s[i .. i + 1] } else .undefined };
+                    }
+                    return .{ .normal = if (sutf16.codeUnitAt(s, i) != null) .{ .string = try sutf16.charAtAlloc(self.arena, s, i) } else .undefined };
                 }
                 if (self.stringProto()) |proto| {
                     if (proto.get(key)) |m| return .{ .normal = m };
