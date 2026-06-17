@@ -500,6 +500,36 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try defineConstructorBackref(set_fn); // §24.2.3.3 Set.prototype.constructor === Set
     try env.declare("Set", .{ .object = set_fn }, true, true);
 
+    // §24.3 WeakMap / §24.4 WeakSet — keys held weakly (object or non-registered symbol). They reuse the
+    // same backing store but are NOT enumerable: no size, no iterators, no forEach, no clear. New-only
+    // (callNative throws on plain call); construction + AddEntriesFromIterable run in constructNT.
+    const weakmap_fn = try Object.createNative(arena, .weakmap_ctor, "WeakMap");
+    weakmap_fn.prototype = function_proto;
+    if (weakmap_fn.get("prototype")) |pv| if (pv == .object) {
+        const wp = pv.object;
+        wp.prototype = object_proto; // §24.3.3 WeakMap.prototype inherits %Object.prototype%
+        try defineMethod(arena, wp, "get", .weakmap_method, "get"); // §24.3.3.3
+        try defineMethod(arena, wp, "set", .weakmap_method, "set"); // §24.3.3.5
+        try defineMethod(arena, wp, "has", .weakmap_method, "has"); // §24.3.3.4
+        try defineMethod(arena, wp, "delete", .weakmap_method, "delete"); // §24.3.3.2
+        if (tag_sym) |s| try wp.defineSymbolData(s, .{ .string = "WeakMap" }, false, false, true); // §24.3.3.6
+    };
+    try defineConstructorBackref(weakmap_fn); // §24.3.3.1 WeakMap.prototype.constructor === WeakMap
+    try env.declare("WeakMap", .{ .object = weakmap_fn }, true, true);
+
+    const weakset_fn = try Object.createNative(arena, .weakset_ctor, "WeakSet");
+    weakset_fn.prototype = function_proto;
+    if (weakset_fn.get("prototype")) |pv| if (pv == .object) {
+        const wp = pv.object;
+        wp.prototype = object_proto; // §24.4.3 WeakSet.prototype inherits %Object.prototype%
+        try defineMethod(arena, wp, "add", .weakset_method, "add"); // §24.4.3.1
+        try defineMethod(arena, wp, "has", .weakset_method, "has"); // §24.4.3.4
+        try defineMethod(arena, wp, "delete", .weakset_method, "delete"); // §24.4.3.3
+        if (tag_sym) |s| try wp.defineSymbolData(s, .{ .string = "WeakSet" }, false, false, true); // §24.4.3.5
+    };
+    try defineConstructorBackref(weakset_fn); // §24.4.3.2 WeakSet.prototype.constructor === WeakSet
+    try env.declare("WeakSet", .{ .object = weakset_fn }, true, true);
+
     // §19.2.1 eval — the global `eval` intrinsic (%eval%). A native function object so it is reachable
     // both as the `eval` global binding and (mirrored below) as `globalThis.eval`. Its behavior lives in
     // the interpreter: `callNative(.eval_fn)` is INDIRECT eval (global env, global this); the

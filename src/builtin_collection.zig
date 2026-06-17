@@ -124,6 +124,57 @@ pub fn mapMethod(it: *Interpreter, name: []const u8, this_val: Value, args: []co
     unreachable;
 }
 
+/// §7.3.x CanBeHeldWeakly ( v ) — a WeakMap/WeakSet key must be an Object or a Symbol that is not in
+/// the GlobalSymbolRegistry. The engine has no `Symbol.for` registry, so every Symbol qualifies.
+fn canBeHeldWeakly(v: Value) bool {
+    return v == .object or v == .symbol;
+}
+
+/// §24.3.3 WeakMap.prototype dispatch (get/set/has/delete). No iteration / size / clear / forEach: a
+/// WeakMap is not enumerable. A non-weak-holdable key throws on `set` but is a silent miss elsewhere.
+pub fn weakMapMethod(it: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
+    const eql = std.mem.eql;
+    const coll = switch (try requireColl(it, this_val, .weakmap)) {
+        .coll => |c| c,
+        .abrupt => |c| return c,
+    };
+    const a0: Value = if (args.len > 0) args[0] else .undefined;
+    const a1: Value = if (args.len > 1) args[1] else .undefined;
+    if (eql(u8, name, "set")) {
+        if (!canBeHeldWeakly(a0)) return it.throwError("TypeError", "Invalid value used as weak map key");
+        try put(it, coll, a0, a1);
+        return .{ .normal = this_val }; // §24.3.3.5 returns the WeakMap
+    }
+    if (eql(u8, name, "get")) {
+        if (canBeHeldWeakly(a0)) if (findIndex(coll, a0)) |i| return .{ .normal = coll.entries.items[i].value };
+        return .{ .normal = .undefined };
+    }
+    if (eql(u8, name, "has")) return .{ .normal = .{ .boolean = canBeHeldWeakly(a0) and findIndex(coll, a0) != null } };
+    if (eql(u8, name, "delete")) return .{ .normal = .{ .boolean = canBeHeldWeakly(a0) and remove(coll, a0) } };
+    unreachable;
+}
+
+/// §24.4.3 WeakSet.prototype dispatch (add/has/delete).
+pub fn weakSetMethod(it: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
+    const eql = std.mem.eql;
+    const coll = switch (try requireColl(it, this_val, .weakset)) {
+        .coll => |c| c,
+        .abrupt => |c| return c,
+    };
+    const a0: Value = if (args.len > 0) args[0] else .undefined;
+    if (eql(u8, name, "add")) {
+        if (!canBeHeldWeakly(a0)) return it.throwError("TypeError", "Invalid value used in weak set");
+        if (findIndex(coll, a0) == null) {
+            try coll.entries.append(it.arena, .{ .key = a0, .value = a0 });
+            coll.size += 1;
+        }
+        return .{ .normal = this_val }; // §24.4.3.1 returns the WeakSet
+    }
+    if (eql(u8, name, "has")) return .{ .normal = .{ .boolean = canBeHeldWeakly(a0) and findIndex(coll, a0) != null } };
+    if (eql(u8, name, "delete")) return .{ .normal = .{ .boolean = canBeHeldWeakly(a0) and remove(coll, a0) } };
+    unreachable;
+}
+
 /// §24.2.3 Set.prototype dispatch (add/has/delete/clear/forEach). For a Set the stored value mirrors
 /// the key, so forEach / iteration yield the element for both the value and key positions.
 pub fn setMethod(it: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {

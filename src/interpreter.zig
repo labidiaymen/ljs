@@ -7315,6 +7315,8 @@ pub const Interpreter = struct {
             .string_static => return builtin_string.staticCall(self, func.native_name, args),
             .map_method => return builtin_collection.mapMethod(self, func.native_name, this_val, args),
             .set_method => return builtin_collection.setMethod(self, func.native_name, this_val, args),
+            .weakmap_method => return builtin_collection.weakMapMethod(self, func.native_name, this_val, args),
+            .weakset_method => return builtin_collection.weakSetMethod(self, func.native_name, this_val, args),
             // §24.1.1.1 / §24.2.1.1: a collection constructor reached via plain [[Call]] (no `new`) is a
             // TypeError; the actual construction happens in `constructNT` (where new_target.prototype is
             // in hand). WeakMap/WeakSet ctors share this guard (their construct path arrives in M46).
@@ -7574,7 +7576,8 @@ pub const Interpreter = struct {
             .species_getter, .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
             .generator_method, .generator_iterator => unreachable, // handled in the first switch
             .async_generator_method, .async_generator_iterator, .async_from_sync_method, .async_from_sync_wrap => unreachable, // handled in the first switch
-            .map_method, .set_method, .weakmap_method, .weakset_method, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .collection_size, .collection_iterator => unreachable, // handled in the first switch
+            .map_method, .set_method, .weakmap_method, .weakset_method => unreachable, // handled in the first switch
+            .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .collection_size, .collection_iterator => unreachable, // handled in the first switch
             .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch
             .promise_all, .promise_all_settled, .promise_any, .promise_race, .promise_combinator_element => unreachable, // handled in the first switch
             .promise_resolve_fn, .promise_reject_fn, .promise_finally_thunk, .test_done => unreachable, // handled in the first switch
