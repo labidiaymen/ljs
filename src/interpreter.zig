@@ -168,8 +168,9 @@ pub const Interpreter = struct {
                 // §14.3 declarations. Deliberate, documented M1 cuts (no hoisting pass yet):
                 //   (a) `var` is block-scoped here, NOT function/global-hoisted (§14.3.2/§10.2.11);
                 //   (b) the let/const temporal dead zone is not enforced — bindings are created
-                //       initialized, so the `!initialized` check below is staged, not yet live;
-                //   (c) duplicate lexical declarations are not yet a SyntaxError (§14.3.1).
+                //       initialized, so the `!initialized` check below is staged, not yet live.
+                // (M33: duplicate lexical declarations ARE now a parse-phase SyntaxError —
+                //  §14.2.1/§14.12.1/§14.15.1/§16.1.1, enforced by the static pass in parser.zig.)
                 // Tightened in later M1 cycles. None of these affect the US1 acceptance scenarios.
                 // §14.3.1 `using`/`await using` are immutable (const-like) block-scoped bindings that
                 // additionally register a DisposableResource on the enclosing scope's dispose stack.

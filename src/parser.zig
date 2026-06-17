@@ -709,6 +709,10 @@ pub const Parser = struct {
         while (self.peek().kind != .eof) {
             try stmts.append(self.arena, try self.parseStmt());
         }
+        // §16.1.1 / §14.2.1 / §14.12.1 / §14.15.1: duplicate-declaration Early Errors. A single
+        // post-parse static pass validates the Script scope and recurses into every nested lexical
+        // scope (blocks, function/method/arrow bodies, switch CaseBlocks, catch). Parse-time only.
+        try validateScope(stmts.items, .script_or_body, self.strict);
         return .{ .statements = stmts.items };
     }
 
@@ -3399,6 +3403,389 @@ fn bodyHasUseStrict(body: []const ast.Stmt) bool {
         }
     }
     return false;
+}
+
+// ── §14.2.1 / §14.12.1 / §14.15.1 / §16.1.1 duplicate-declaration Early Errors ────────────────
+// A post-parse static pass over each lexical scope. For every Block, Script/FunctionBody, switch
+// CaseBlock, and catch, it checks (1) LexicallyDeclaredNames are unique and (2) they are disjoint
+// from the scope's VarDeclaredNames. Parse-time only — no runtime/hot-path impact.
+
+/// The kind of the scope whose StatementList we are validating, which selects how a top-level
+/// FunctionDeclaration is classified: in a Block / switch CaseBlock it is a *LexicallyDeclaredName*
+/// (so a duplicate is an Early Error, strict-only between two functions per Annex B B.3.3); in a
+/// Script / FunctionBody it is a *VarDeclaredName* (so `function f(){} function f(){}` at top level
+/// is legal, but it still conflicts with a top-level `let f`).
+const ScopeKind = enum { script_or_body, block };
+
+/// A bounded name set backed by a fixed buffer — lexical/var name lists per scope are small. On
+/// overflow it stops recording (conservatively under-reporting a duplicate rather than misfiring);
+/// real programs never approach the cap.
+const NameSet = struct {
+    buf: [256][]const u8,
+    len: usize = 0,
+    fn init() NameSet {
+        // SAFETY: `len` starts at 0; `buf` slots are written by `add` before any read (`has`/`addPattern`
+        // only ever scan `buf[0..len]`), so the `undefined` backing storage is never observed.
+        return .{ .buf = undefined };
+    }
+    fn has(self: *const NameSet, name: []const u8) bool {
+        for (self.buf[0..self.len]) |n| if (std.mem.eql(u8, n, name)) return true;
+        return false;
+    }
+    /// Append `name`; returns true if it was already present (a duplicate).
+    fn add(self: *NameSet, name: []const u8) bool {
+        if (self.has(name)) return true;
+        if (self.len < self.buf.len) {
+            self.buf[self.len] = name;
+            self.len += 1;
+        }
+        return false;
+    }
+    fn addPatternDup(self: *NameSet, pattern: *const ast.Pattern) bool {
+        switch (pattern.*) {
+            .identifier => |n| return self.add(n),
+            .array => |ap| {
+                for (ap.elements) |el| if (el.target) |t| if (self.addPatternDup(t)) return true;
+                if (ap.rest) |r| return self.addPatternDup(r);
+                return false;
+            },
+            .object => |op| {
+                for (op.properties) |prop| if (self.addPatternDup(prop.target)) return true;
+                if (op.rest) |r| return self.add(r);
+                return false;
+            },
+        }
+    }
+    fn addPattern(self: *NameSet, pattern: *const ast.Pattern) void {
+        _ = self.addPatternDup(pattern);
+    }
+};
+
+fn declIsLexical(kind: ast.DeclKind) bool {
+    return kind != .var_decl; // let / const / using / await using
+}
+
+/// Append the VarDeclaredNames reachable from `stmt` into `set`, bubbling up through nested
+/// non-function statements (inner blocks, if/for/while/do/try/with/labeled bodies, switch cases)
+/// but STOPPING at any function/class boundary (a nested function body has its own var scope).
+/// Only `var` declarations contribute (a FunctionDeclaration is a *Declaration* → empty
+/// VarDeclaredNames, §14.2.2). We collect a `for`-head `var` (it hoists out of the loop) but not a
+/// `let`/`const` (a `for`'s lexical head is its own per-iteration scope).
+fn collectVarNames(stmt: ast.Stmt, set: *NameSet) void {
+    switch (stmt) {
+        .declaration => |d| {
+            if (d.kind == .var_decl) for (d.decls) |dec| set.addPattern(dec.target);
+        },
+        // §14.2.2 VarDeclaredNames: `StatementListItem : Declaration` → empty. A FunctionDeclaration
+        // is a *Declaration*, so it is NOT a VarDeclaredName of a Block (it is a LexicallyDeclaredName
+        // there, §14.2.9). It becomes a VarDeclaredName only at a Script/FunctionBody top level
+        // (TopLevelVarDeclaredNames) — added separately in `collectScopeVarNames`. So bubbling a
+        // FunctionDeclaration contributes nothing to VarDeclaredNames.
+        .func_decl => {},
+        .block => |stmts| for (stmts) |s| collectVarNames(s, set),
+        .if_stmt => |s| {
+            collectVarNames(s.then.*, set);
+            if (s.otherwise) |e| collectVarNames(e.*, set);
+        },
+        .while_stmt => |s| collectVarNames(s.body.*, set),
+        .do_while_stmt => |s| collectVarNames(s.body.*, set),
+        .for_stmt => |s| {
+            if (s.init) |i| if (i.* == .declaration and i.declaration.kind == .var_decl)
+                for (i.declaration.decls) |dec| set.addPattern(dec.target);
+            collectVarNames(s.body.*, set);
+        },
+        .for_in_stmt => |s| {
+            if (s.head == .decl and s.head.decl.kind == .var_decl) set.addPattern(s.head.decl.target);
+            collectVarNames(s.body.*, set);
+        },
+        .for_of_stmt => |s| {
+            if (s.head == .decl and s.head.decl.kind == .var_decl) set.addPattern(s.head.decl.target);
+            collectVarNames(s.body.*, set);
+        },
+        .try_stmt => |s| {
+            for (s.block) |b| collectVarNames(b, set);
+            if (s.catch_block) |cb| for (cb) |b| collectVarNames(b, set);
+            if (s.finally_block) |fb| for (fb) |b| collectVarNames(b, set);
+        },
+        .with_stmt => |s| collectVarNames(s.body.*, set),
+        .switch_stmt => |s| for (s.cases) |cs| for (cs.body) |b| collectVarNames(b, set),
+        .labeled_stmt => |s| collectVarNames(s.body.*, set),
+        else => {},
+    }
+}
+
+/// Collect, into `lex_set`, the top-level LexicallyDeclaredNames of `stmts` for a scope of `kind`,
+/// returning true on a duplicate (rule 1). In a Block / switch CaseBlock, a FunctionDeclaration is a
+/// LexicallyDeclaredName. Annex B B.3.3.6 relaxes the duplicate-entries Early Error ONLY for
+/// *plain* (non-async, non-generator) FunctionDeclarations in SLOPPY mode: two such functions in one
+/// block do not collide with each other. The relaxation does NOT extend to a function colliding with
+/// a `let`/`const`/`class`/generator/async-function of the same name, nor to the §14.2.1
+/// LexicallyDeclaredNames∩VarDeclaredNames rule (`{ var f; function f(){} }` is still an error) — so
+/// the de-duplicated plain-function names are folded into `lex_set` (for those checks) only once. In
+/// a Script/FunctionBody, top-level FunctionDeclarations are var-declared, not collected here.
+fn collectScopeLexicalNames(stmts: []const ast.Stmt, kind: ScopeKind, strict: bool, lex_set: *NameSet) bool {
+    // Plain sloppy block functions: collected once (deduped) so two of them don't collide, but still
+    // folded into `lex_set` below so they participate in every other conflict.
+    var sloppy_fns: NameSet = .init();
+    for (stmts) |stmt| {
+        switch (stmt) {
+            .declaration => |d| {
+                if (declIsLexical(d.kind)) {
+                    for (d.decls) |dec| if (lex_set.addPatternDup(dec.target)) return true;
+                }
+            },
+            .class_decl => |c| {
+                if (c.name) |nm| if (lex_set.add(nm)) return true;
+            },
+            .func_decl => |f| {
+                if (kind != .block) continue; // Script/FunctionBody: functions are var-declared
+                const nm = f.name orelse continue;
+                // Annex B applies only to a plain function in sloppy mode; async/generator/strict
+                // function declarations are ordinary LexicallyDeclaredNames (a duplicate is an error).
+                const annexb = !strict and !f.is_async and !f.is_generator;
+                if (annexb) {
+                    _ = sloppy_fns.add(nm); // dedupe; folded into lex_set after the loop
+                } else {
+                    if (lex_set.add(nm)) return true;
+                }
+            },
+            else => {},
+        }
+    }
+    // Fold the deduped plain-function names into the lexical set: a clash with an already-collected
+    // lexical name (let/const/class/generator/async/strict-fn) is the §14.2.1 duplicate Early Error;
+    // otherwise they join `lex_set` so the ∩-VarDeclaredNames check still sees them.
+    for (sloppy_fns.buf[0..sloppy_fns.len]) |nm| if (lex_set.add(nm)) return true;
+    return false;
+}
+
+/// Validate one scope's StatementList (rules 1 + 2). `catch_param`, when set, is the simple-identifier
+/// CatchParameter binding the Block is the body of: §14.15.1 makes it a Syntax Error if the parameter
+/// also occurs in the Block's LexicallyDeclaredNames (`catch(e){ let e }` / `catch(e){ function e(){} }`).
+/// It does NOT participate in the §14.2.1 LexicallyDeclaredNames∩VarDeclaredNames check — Annex B B.3.4
+/// permits a simple-identifier catch param to be re-declared as a `var` in the Block (`catch(e){var e}`).
+fn checkScopeNames(stmts: []const ast.Stmt, kind: ScopeKind, strict: bool, catch_param: ?[]const u8) ParseError!void {
+    var lex_set: NameSet = .init();
+    if (collectScopeLexicalNames(stmts, kind, strict, &lex_set)) return ParseError.UnexpectedToken;
+    // §14.15.1: the CatchParameter may not also be a LexicallyDeclaredName of the Catch Block.
+    if (catch_param) |cp| if (lex_set.has(cp)) return ParseError.UnexpectedToken;
+    if (lex_set.len == 0) return;
+    // §14.2.1 rule 2: LexicallyDeclaredNames ∩ VarDeclaredNames = ∅.
+    var var_set: NameSet = .init();
+    collectScopeVarNames(stmts, kind, &var_set);
+    for (lex_set.buf[0..lex_set.len]) |nm| if (var_set.has(nm)) return ParseError.UnexpectedToken;
+}
+
+/// VarDeclaredNames of a whole scope: every statement's bubbled-up `var` names (functions never
+/// bubble — see `collectVarNames`). At a Script/FunctionBody (`kind == .script_or_body`), a
+/// TOP-LEVEL FunctionDeclaration is additionally a VarDeclaredName (TopLevelVarDeclaredNames,
+/// §16.1.2 / §15.2.2), so `let f; function f(){}` at script/body level is an Early Error while
+/// `function f(){} function f(){}` (var∩var) is legal. In a Block, top-level functions are lexical
+/// (handled by `collectScopeLexicalNames`) and contribute nothing here.
+fn collectScopeVarNames(stmts: []const ast.Stmt, kind: ScopeKind, set: *NameSet) void {
+    if (kind == .script_or_body) {
+        for (stmts) |stmt| switch (stmt) {
+            .func_decl => |f| {
+                if (f.name) |nm| _ = set.add(nm);
+            },
+            else => {},
+        };
+    }
+    for (stmts) |stmt| collectVarNames(stmt, set);
+}
+
+/// Recursively validate `stmts` as a scope of `kind`, then descend into every nested scope
+/// (blocks, function/method/arrow bodies, switch CaseBlocks, catch). `strict` is the strictness in
+/// effect for `stmts`; it tightens going into a function body carrying its own `"use strict"`.
+fn validateScope(stmts: []const ast.Stmt, kind: ScopeKind, strict: bool) ParseError!void {
+    try checkScopeNames(stmts, kind, strict, @as(?[]const u8, null));
+    for (stmts) |stmt| try descendStmt(stmt, strict);
+}
+
+fn validateFunction(f: *const ast.Function, strict: bool) ParseError!void {
+    const inner = strict or bodyHasUseStrict(f.body);
+    // Parameter default initializers may carry nested function/class expressions (`(a = ()=>{}) =>`).
+    for (f.params) |p| if (p.default) |d| try descendNode(d, inner);
+    try validateScope(f.body, .script_or_body, inner);
+}
+
+fn validateClass(c: *const ast.Class, strict: bool) ParseError!void {
+    _ = strict;
+    // Class bodies are always strict; each method/getter/setter/field-initializer/static-block is
+    // its own FunctionBody-like scope. A ClassHeritage `extends LHS` is an outer expression.
+    if (c.superclass) |sc| try descendNode(sc, true);
+    for (c.elements) |el| {
+        if (el.computed_key) |ck| try descendNode(ck, true);
+        switch (el.value) {
+            .func => |fn_| try validateFunction(fn_, true),
+            .field_init => |maybe| if (maybe) |e| try descendNode(e, true),
+            .block => |blk| try validateScope(blk, .script_or_body, true),
+        }
+    }
+}
+
+/// Descend into the nested scopes of a single statement (and any function/class expressions inside
+/// its expressions), validating each. Does NOT re-check `stmt`'s own enclosing scope.
+fn descendStmt(stmt: ast.Stmt, strict: bool) ParseError!void {
+    switch (stmt) {
+        .block => |stmts| try validateScope(stmts, .block, strict),
+        .func_decl => |f| try validateFunction(f, strict),
+        .class_decl => |c| try validateClass(c, strict),
+        .declaration => |d| for (d.decls) |dec| if (dec.init) |ie| try descendNode(ie, strict),
+        .expr => |e| try descendNode(e, strict),
+        .ret => |maybe| if (maybe) |e| try descendNode(e, strict),
+        .throw_stmt => |e| try descendNode(e, strict),
+        .if_stmt => |s| {
+            try descendNode(s.cond, strict);
+            try descendStmt(s.then.*, strict);
+            if (s.otherwise) |e| try descendStmt(e.*, strict);
+        },
+        .while_stmt => |s| {
+            try descendNode(s.cond, strict);
+            try descendStmt(s.body.*, strict);
+        },
+        .do_while_stmt => |s| {
+            try descendNode(s.cond, strict);
+            try descendStmt(s.body.*, strict);
+        },
+        .for_stmt => |s| {
+            if (s.init) |i| try descendStmt(i.*, strict);
+            if (s.cond) |c| try descendNode(c, strict);
+            if (s.update) |u| try descendNode(u, strict);
+            try descendStmt(s.body.*, strict);
+        },
+        .for_in_stmt => |s| {
+            try descendNode(s.right, strict);
+            try descendStmt(s.body.*, strict);
+        },
+        .for_of_stmt => |s| {
+            try descendNode(s.right, strict);
+            try descendStmt(s.body.*, strict);
+        },
+        .try_stmt => |s| {
+            try validateScope(s.block, .block, strict);
+            if (s.catch_block) |cb| {
+                // §14.15.1: the Catch Block is validated as a Block, with the (simple-identifier)
+                // CatchParameter additionally barred from the Block's LexicallyDeclaredNames. A
+                // pattern catch param's own dup BoundNames are rejected at parse time (§14.15.1).
+                try checkScopeNames(cb, .block, strict, s.catch_param);
+                for (cb) |b| try descendStmt(b, strict);
+            }
+            if (s.finally_block) |fb| try validateScope(fb, .block, strict);
+        },
+        .with_stmt => |s| {
+            try descendNode(s.object, strict);
+            try descendStmt(s.body.*, strict);
+        },
+        .switch_stmt => |s| {
+            try descendNode(s.discriminant, strict);
+            // §14.12.1: the CaseBlock is ONE lexical scope merging all clause StatementLists.
+            var merged: std.ArrayList(ast.Stmt) = .empty;
+            var fba_buf: [64 * @sizeOf(ast.Stmt)]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+            const a = fba.allocator();
+            var overflow = false;
+            for (s.cases) |cs| for (cs.body) |b| {
+                merged.append(a, b) catch {
+                    overflow = true;
+                };
+            };
+            if (!overflow) try checkScopeNames(merged.items, .block, strict, @as(?[]const u8, null));
+            // Descend into each clause's nested scopes regardless.
+            for (s.cases) |cs| {
+                if (cs.test_expr) |t| try descendNode(t, strict);
+                for (cs.body) |b| try descendStmt(b, strict);
+            }
+        },
+        .labeled_stmt => |s| try descendStmt(s.body.*, strict),
+        else => {},
+    }
+}
+
+/// Descend into function/class *expressions* nested in an expression node, validating their bodies.
+/// Most expression shapes can carry a function/arrow/class literal; we recurse structurally.
+fn descendNode(node: *const ast.Node, strict: bool) ParseError!void {
+    switch (node.*) {
+        .function => |f| try validateFunction(f, strict),
+        .class_expr => |c| try validateClass(c, strict),
+        .unary => |u| try descendNode(u.operand, strict),
+        .await_expr => |e| try descendNode(e, strict),
+        .spread => |e| try descendNode(e, strict),
+        .comma => |b| {
+            try descendNode(b.left, strict);
+            try descendNode(b.right, strict);
+        },
+        .binary => |b| {
+            try descendNode(b.left, strict);
+            try descendNode(b.right, strict);
+        },
+        .logical => |b| {
+            try descendNode(b.left, strict);
+            try descendNode(b.right, strict);
+        },
+        .assign => |a| try descendNode(a.value, strict),
+        .assign_pattern => |a| {
+            try descendNode(a.target, strict);
+            try descendNode(a.value, strict);
+        },
+        .assign_member => |a| {
+            try descendNode(a.object, strict);
+            try descendNode(a.value, strict);
+        },
+        .assign_index => |a| {
+            try descendNode(a.object, strict);
+            try descendNode(a.key, strict);
+            try descendNode(a.value, strict);
+        },
+        .logical_assign => |a| {
+            try descendNode(a.target, strict);
+            try descendNode(a.value, strict);
+        },
+        .conditional => |c| {
+            try descendNode(c.cond, strict);
+            try descendNode(c.then, strict);
+            try descendNode(c.otherwise, strict);
+        },
+        .update => |u| try descendNode(u.target, strict),
+        .member => |m| try descendNode(m.object, strict),
+        .index => |ix| {
+            try descendNode(ix.object, strict);
+            try descendNode(ix.key, strict);
+        },
+        .call => |c| {
+            try descendNode(c.callee, strict);
+            for (c.args) |arg| try descendNode(arg, strict);
+        },
+        .new_expr => |c| {
+            try descendNode(c.callee, strict);
+            for (c.args) |arg| try descendNode(arg, strict);
+        },
+        .array_literal => |els| for (els) |e| try descendNode(e, strict),
+        .object_literal => |props| for (props) |p| {
+            if (p.computed_key) |ck| try descendNode(ck, strict);
+            if (p.default) |df| try descendNode(df, strict);
+            try descendNode(p.value, strict);
+        },
+        .template => |t| for (t.exprs) |e| try descendNode(e, strict),
+        .yield_expr => |y| if (y.argument) |e| try descendNode(e, strict),
+        .optional => |o| {
+            try descendNode(o.base, strict);
+            switch (o.link) {
+                .member => {},
+                .index => |k| try descendNode(k, strict),
+                .call => |args| for (args) |arg| try descendNode(arg, strict),
+            }
+        },
+        .super_call => |args| for (args) |arg| try descendNode(arg, strict),
+        .super_member => |sm| if (sm.key) |k| try descendNode(k, strict),
+        .private_member => |pm| try descendNode(pm.object, strict),
+        .private_assign => |pa| {
+            try descendNode(pa.object, strict);
+            try descendNode(pa.value, strict);
+        },
+        .private_in => |pi| try descendNode(pi.object, strict),
+        else => {},
+    }
 }
 
 /// §11.2.1 Directive Prologue → §11.2.2 strict: scan a leading token run (a Script or FunctionBody)

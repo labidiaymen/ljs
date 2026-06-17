@@ -609,6 +609,44 @@ test "M7 destructuring assignment: cover-grammar early errors (§13.2.5.1 / §13
     try expectNumber("var x = [1, , 3]; x.length", 3);
 }
 
+test "M33 duplicate-declaration Early Errors (§14.2.1/§14.12.1/§14.15.1/§16.1.1)" {
+    // ── §14.2.1 Block: LexicallyDeclaredNames unique ──
+    try expectSyntaxError("{ let x; let x; }");
+    try expectSyntaxError("{ let x; const x = 1; }");
+    try expectSyntaxError("{ const x = 1; class x {} }");
+    try expectSyntaxError("{ let x; class x {} }");
+    // ── §14.2.1 Block: LexicallyDeclaredNames ∩ VarDeclaredNames = ∅ ──
+    try expectSyntaxError("{ let x; var x; }");
+    try expectSyntaxError("{ var x; let x; }");
+    try expectSyntaxError("{ { var f; } let f; }"); // nested var bubbles up to the enclosing block
+    try expectSyntaxError("function g() { { let f; var f; } }");
+    // ── §14.12.1 SwitchStatement CaseBlock merges all clauses into one lexical scope ──
+    try expectSyntaxError("switch (0) { case 1: let x; case 2: let x; }");
+    try expectSyntaxError("switch (0) { case 1: let x; default: let x; }");
+    try expectSyntaxError("switch (0) { case 1: let x; case 2: var x; }");
+    // ── §14.15.1 Catch: CatchParameter vs Catch Block lexical names ──
+    try expectSyntaxError("try {} catch (e) { let e; }");
+    try expectSyntaxError("try {} catch (e) { const e = 1; }");
+    try expectSyntaxError("try {} catch ([x, x]) {}"); // dup catch-pattern bound names
+    // ── §16.1.1 Script top level ──
+    try expectSyntaxError("let x; let x;");
+    try expectSyntaxError("let x; var x;");
+    try expectSyntaxError("const x = 1; function x() {}");
+    // ── Strict-only: two FunctionDeclarations in a Block (Annex B B.3.3 allows it sloppy) ──
+    try expectSyntaxErrorStrict("{ function f() {} function f() {} }");
+    try expectNoSyntaxErrorStrict("{ function f() {} let g; }"); // sloppy-vs-strict sanity (parses)
+
+    // ── Positives that MUST still parse ──
+    try expectNumber("{ var x; var x; } 1", 1); // var redeclaration is legal
+    try expectNumber("{ let x; } { let x; } 1", 1); // different blocks
+    try expectNumber("let y = 0; { let y = 1; } y", 0); // nested shadow
+    try expectNumber("function f() {} function f() {} 1", 1); // top-level fn redeclaration (var-scoped)
+    try expectNumber("switch (0) { case 1: let x; case 2: { let x; } } 1", 1); // dup let in NESTED blocks
+    try expectNumber("try {} catch (e) { var e; } 1", 1); // Annex B: catch-param vs body var, simple param
+    try expectNumber("{ function g() {} function g() {} } 1", 1); // sloppy block fn redeclaration OK
+    try expectNumber("for (let i = 0; i < 1; i++) { let i; } 1", 1); // loop head vs body are separate scopes
+}
+
 test "M8 Symbol primitive: typeof, description, identity (§20.4)" {
     try expectStr("typeof Symbol()", "symbol");
     try expectStr("typeof Symbol('d')", "symbol");
