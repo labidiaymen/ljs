@@ -506,6 +506,12 @@ pub const Parser = struct {
                 // `for (var/let/const ForBinding in/of …)` — a for-in / for-of head (no initializer).
                 if (self.peek().kind == .kw_in or self.peekIsOf()) {
                     const is_of = self.peekIsOf();
+                    // §14.7.5.1 Early Error: a lexical ForDeclaration's BoundNames must contain no
+                    // duplicates (e.g. `for (const [x, x] of …)`). `var` permits duplicate bound names.
+                    if (kind != .var_decl) {
+                        var fb_names: NameSet = .init();
+                        if (fb_names.addPatternDup(target)) return ParseError.UnexpectedToken;
+                    }
                     // §14.7.5: `for await` requires the `of` form (`for await (… in …)` is a SyntaxError).
                     if (is_await and !is_of) return ParseError.UnexpectedToken;
                     _ = self.advance(); // `in` / `of`
