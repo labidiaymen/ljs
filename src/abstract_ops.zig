@@ -74,13 +74,56 @@ pub fn numberToString(arena: std.mem.Allocator, n: f64) error{OutOfMemory}![]con
     if (std.math.isNan(n)) return "NaN";
     if (std.math.isPositiveInf(n)) return "Infinity";
     if (std.math.isNegativeInf(n)) return "-Infinity";
+    if (n == 0) return "0"; // §6.1.6.1.20: both +0 and -0 → "0"
+    const a = @abs(n);
+    // §6.1.6.1.20 steps 8–9: a magnitude ≥ 1e21 (decimal exponent of the leading digit ≥ 21) or
+    // < 1e-6 (≤ -7) renders in EXPONENTIAL form ("1e+21", "1e-7") — exactly where Zig's `{d}` fixed
+    // formatting diverges from the spec. The non-exponential range below is left to `{d}` (shortest
+    // fixed), which already matches the spec, so common-case stringification is byte-for-byte unchanged.
+    if (a >= 1e21 or a < 1e-6) return ecmaExponential(arena, n);
     // Integral values that fit in i64 format cleanly as an integer (no exponent). Numbers in
     // [2^63, 1e21) are still integral per `@floor` but exceed i64 → `@intFromFloat` would panic, so
     // fall through to float formatting (which renders them without a spurious decimal point).
-    if (n == @floor(n) and @abs(n) < 9.2e18) {
+    if (n == @floor(n) and a < 9.2e18) {
         return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
     }
     return std.fmt.allocPrint(arena, "{d}", .{n});
+}
+
+/// §6.1.6.1.20 exponential rendering (`s[.ddd]e±E`): take Zig's shortest scientific form, extract the
+/// significand digits (trailing zeros trimmed) and the leading-digit exponent E, then format per spec —
+/// `d` or `d.ddd`, then `e`, the sign, and |E|. Only invoked for magnitudes that the spec renders
+/// exponentially, so the leading digit is always present and nonzero.
+fn ecmaExponential(arena: std.mem.Allocator, n: f64) error{OutOfMemory}![]const u8 {
+    const sci = try std.fmt.allocPrint(arena, "{e}", .{@abs(n)});
+    const e_idx = std.mem.indexOfScalar(u8, sci, 'e') orelse return sci; // defensive; always present
+    const mant = sci[0..e_idx];
+    const e_val = std.fmt.parseInt(i64, sci[e_idx + 1 ..], 10) catch 0;
+    // Significand digits with the '.' removed, then trailing zeros trimmed (keep ≥ 1) → canonical `s`.
+    var digbuf = try arena.alloc(u8, mant.len);
+    var k: usize = 0;
+    for (mant) |c| {
+        if (c != '.') {
+            digbuf[k] = c;
+            k += 1;
+        }
+    }
+    while (k > 1 and digbuf[k - 1] == '0') k -= 1;
+    const digits = digbuf[0..k];
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    if (n < 0) try out.append(arena, '-');
+    if (k == 1) {
+        try out.append(arena, digits[0]);
+    } else {
+        try out.append(arena, digits[0]);
+        try out.append(arena, '.');
+        try out.appendSlice(arena, digits[1..]);
+    }
+    try out.append(arena, 'e');
+    try out.append(arena, if (e_val >= 0) '+' else '-');
+    try out.appendSlice(arena, try std.fmt.allocPrint(arena, "{d}", .{@abs(e_val)}));
+    return out.items;
 }
 
 /// §7.1.6 ToInt32 from an already-computed Number — truncate, modulo 2^32, interpret as signed.
