@@ -159,6 +159,12 @@ clause + test delta. Each line = one commit, all gates green (build/test/lint/co
   gets its own `specs/NNN-<slug>/` spec folder; this ledger remains a compact index.)
 - [x] **M72** SuperProperty as assignment/update target (§13.3.5/§6.2.5.6/§10.1.9.2) — 89.3%→89.4%
   (+12). `specs/060-super-property-write/`.
+- [x] **M73** class constructor [[Call]] guard on every entry path (call/apply/bind) (§15.7.14) —
+  89.4% (+4). `specs/061-class-ctor-call-guard/`.
+- [x] **M74** class heritage `prototype` validation (§15.7.14) — 89.4% (+6).
+  `specs/062-class-heritage-prototype-validation/`.
+- [ ] **M75 (next, bigger):** built-in subclassing exotic instances (`class S extends Array{}` →
+  `new S(3).length`) — construct-model rework: super() must create the exotic `this`. Array first.
 - [ ] Async/Promise/microtask family (~325 tests; also the Node bridge)
 - [ ] Class runtime-semantics long-tail (private methods/#x-in, static blocks, field-init order)
 - [ ] **Target: language 93%** (currently 89.4%, need ~+1590)
