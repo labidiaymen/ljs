@@ -7278,7 +7278,10 @@ pub const Interpreter = struct {
                 radix = ops.numberToInt32(rc.normal.number);
             }
             if (radix < 2 or radix > 36) return self.throwError("RangeError", "toString() radix must be between 2 and 36");
-            if (radix == 10) return .{ .normal = .{ .string = try self.toString(.{ .number = n }) } };
+            // §21.1.3.6: NaN → "NaN", ±Infinity → "Infinity"/"-Infinity" REGARDLESS of radix (the radix
+            // digit-conversion only applies to finite values; routing non-finite to the base-10 path
+            // produces the spec strings — `numberToRadixString` would otherwise emit garbage for them).
+            if (radix == 10 or std.math.isNan(n) or std.math.isInf(n)) return .{ .normal = .{ .string = try self.toString(.{ .number = n }) } };
             return .{ .normal = .{ .string = try numberToRadixString(self.arena, n, @intCast(radix)) } };
         }
         if (std.mem.eql(u8, name, "toFixed")) return self.numberToFixed(n, args); // §21.1.3.3
