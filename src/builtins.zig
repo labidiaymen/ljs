@@ -104,6 +104,13 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         try defineMethod(arena, op, "hasOwnProperty", .object_has_own_property, "hasOwnProperty");
         try defineMethod(arena, op, "propertyIsEnumerable", .object_property_is_enumerable, "propertyIsEnumerable");
         try defineMethod(arena, op, "isPrototypeOf", .object_is_prototype_of, "isPrototypeOf");
+        // §B.2.2.1 the `__proto__` accessor — a configurable, NON-enumerable get/set pair on
+        // %Object.prototype% (so `o.__proto__` reads/writes [[Prototype]] through inheritance).
+        const proto_get = try Object.createNative(arena, .object_proto_getter, "get __proto__");
+        const proto_set = try Object.createNative(arena, .object_proto_setter, "set __proto__");
+        proto_get.prototype = function_proto;
+        proto_set.prototype = function_proto;
+        try op.defineAccessorEx("__proto__", proto_get, proto_set, false);
     }
     try defineMethod(arena, object_fn, "defineProperty", .object_define_property, "defineProperty");
     try defineMethod(arena, object_fn, "defineProperties", .object_define_properties, "defineProperties");
@@ -116,6 +123,10 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try defineMethod(arena, object_fn, "entries", .object_entries, "entries");
     try defineMethod(arena, object_fn, "create", .object_create, "create");
     try defineMethod(arena, object_fn, "assign", .object_assign, "assign");
+    try defineMethod(arena, object_fn, "fromEntries", .object_from_entries, "fromEntries"); // §20.1.2.7
+    try defineMethod(arena, object_fn, "hasOwn", .object_has_own, "hasOwn"); // §20.1.2.13
+    try defineMethod(arena, object_fn, "getOwnPropertySymbols", .object_get_own_property_symbols, "getOwnPropertySymbols"); // §20.1.2.10
+    try defineMethod(arena, object_fn, "groupBy", .object_group_by, "groupBy"); // §20.1.2.11
     try defineMethod(arena, object_fn, "getPrototypeOf", .object_get_prototype_of, "getPrototypeOf");
     try defineMethod(arena, object_fn, "setPrototypeOf", .object_set_prototype_of, "setPrototypeOf");
     try defineMethod(arena, object_fn, "is", .object_is, "is");

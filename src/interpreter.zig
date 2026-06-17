@@ -1032,6 +1032,7 @@ pub const Interpreter = struct {
                 return self.evalExpr(l.right, env);
             },
             .logical_assign => |la| return self.evalLogicalAssign(la, env),
+            .compound_assign => |ca| return self.evalCompoundAssign(ca, env),
             .optional => return self.evalOptionalChain(node, env),
             .conditional => |c| {
                 // §13.14 cond ? then : otherwise
@@ -1069,12 +1070,17 @@ pub const Interpreter = struct {
                         if (oc.isAbrupt()) return oc;
                         const kc = try self.evalExpr(ix.key, env);
                         if (kc.isAbrupt()) return kc;
-                        const cur = try self.getPropertyV(oc.normal, kc.normal);
+                        // §6.2.5.5/.6 + §7.1.19: RequireObjectCoercible(base) precedes the SINGLE
+                        // ToPropertyKey; the coerced primitive feeds both the read and the write-back.
+                        if (oc.normal == .undefined or oc.normal == .null) return self.throwError("TypeError", "Cannot read properties of null or undefined");
+                        const keyc = try self.coercePropertyKey(kc.normal);
+                        if (keyc.isAbrupt()) return keyc;
+                        const cur = try self.getPropertyV(oc.normal, keyc.normal);
                         if (cur.isAbrupt()) return cur;
                         const oldc = try self.toNumberV(cur.normal);
                         if (oldc.isAbrupt()) return oldc;
                         const old = oldc.normal.number;
-                        const sc = try self.setPropertyV(oc.normal, kc.normal, .{ .number = old + delta });
+                        const sc = try self.setPropertyV(oc.normal, keyc.normal, .{ .number = old + delta });
                         if (sc.isAbrupt()) return sc;
                         return .{ .normal = .{ .number = if (u.prefix) old + delta else old } };
                     },
@@ -1304,6 +1310,103 @@ pub const Interpreter = struct {
                 const rc = try self.evalExpr(la.value, env);
                 if (rc.isAbrupt()) return rc;
                 return self.setPrivate(oc.normal, pm.name, rc.normal);
+            },
+            else => return self.throwError("SyntaxError", "Invalid assignment target"),
+        }
+    }
+
+    /// §13.15.2 compound AssignmentExpression `target op= value` (`+= -= *= …`). The reference is
+    /// evaluated ONCE (base + key coerced a single time), its current value read, combined with `value`
+    /// via the §13.15.3 operator, and written back. Keeping the node intact (rather than the
+    /// `target = target op value` desugar) is what makes a side-effecting base/key run exactly once.
+    fn evalCompoundAssign(self: *Interpreter, ca: anytype, env: *Environment) EvalError!Completion {
+        switch (ca.target.*) {
+            .identifier => |name| {
+                // §13.15.2: read the current value, evaluate the RHS, combine, then PutValue. With a
+                // `with` in scope the reference is re-resolved at write time (matching §9.1.1.2.5: a
+                // getter that deletes its own binding makes the strict-mode PutValue a ReferenceError).
+                if (self.with_depth > 0) {
+                    const cur: Value = switch (self.resolveIdRef(env, name)) {
+                        .with_object => |o| blk: {
+                            const c = try self.getProperty(.{ .object = o }, name);
+                            if (c.isAbrupt()) return c;
+                            break :blk c.normal;
+                        },
+                        .binding => |b| blk: {
+                            if (!b.initialized) return self.throwError("ReferenceError", name);
+                            break :blk b.value;
+                        },
+                        .unresolved => return self.throwError("ReferenceError", name),
+                    };
+                    const rc = try self.evalExpr(ca.value, env);
+                    if (rc.isAbrupt()) return rc;
+                    const res = try self.applyNumericOrStringOp(ca.op, cur, rc.normal);
+                    if (res.isAbrupt()) return res;
+                    switch (self.resolveIdRef(env, name)) { // §6.2.5.6 PutValue: re-resolve the reference
+                        .with_object => |o| {
+                            const sc = try self.setProperty(.{ .object = o }, name, res.normal);
+                            if (sc.isAbrupt()) return sc;
+                        },
+                        .binding => |b| {
+                            if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
+                            b.value = res.normal;
+                        },
+                        .unresolved => return self.assignUnresolved(name, res.normal),
+                    }
+                    return res;
+                }
+                const b = env.lookup(name) orelse return self.throwError("ReferenceError", name);
+                if (!b.initialized) return self.throwError("ReferenceError", name); // §13.x TDZ
+                const rc = try self.evalExpr(ca.value, env);
+                if (rc.isAbrupt()) return rc;
+                const res = try self.applyNumericOrStringOp(ca.op, b.value, rc.normal);
+                if (res.isAbrupt()) return res;
+                if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
+                b.value = res.normal;
+                return res;
+            },
+            .member => |m| {
+                const oc = try self.evalExpr(m.object, env); // base evaluated once
+                if (oc.isAbrupt()) return oc;
+                const cur = try self.getProperty(oc.normal, m.name);
+                if (cur.isAbrupt()) return cur;
+                const rc = try self.evalExpr(ca.value, env);
+                if (rc.isAbrupt()) return rc;
+                const res = try self.applyNumericOrStringOp(ca.op, cur.normal, rc.normal);
+                if (res.isAbrupt()) return res;
+                const sc = try self.setProperty(oc.normal, m.name, res.normal);
+                if (sc.isAbrupt()) return sc;
+                return res;
+            },
+            .index => |ix| {
+                const oc = try self.evalExpr(ix.object, env); // base evaluated once
+                if (oc.isAbrupt()) return oc;
+                const kc = try self.evalExpr(ix.key, env); // key expression evaluated once
+                if (kc.isAbrupt()) return kc;
+                // §6.2.5.5/.6: RequireObjectCoercible(base) precedes the SINGLE §7.1.19 ToPropertyKey.
+                if (oc.normal == .undefined or oc.normal == .null) return self.throwError("TypeError", "Cannot read properties of null or undefined");
+                const keyc = try self.coercePropertyKey(kc.normal);
+                if (keyc.isAbrupt()) return keyc;
+                const cur = try self.getPropertyV(oc.normal, keyc.normal);
+                if (cur.isAbrupt()) return cur;
+                const rc = try self.evalExpr(ca.value, env);
+                if (rc.isAbrupt()) return rc;
+                const res = try self.applyNumericOrStringOp(ca.op, cur.normal, rc.normal);
+                if (res.isAbrupt()) return res;
+                const sc = try self.setPropertyV(oc.normal, keyc.normal, res.normal);
+                if (sc.isAbrupt()) return sc;
+                return res;
+            },
+            .private_member => |pm| {
+                const oc = try self.evalExpr(pm.object, env);
+                if (oc.isAbrupt()) return oc;
+                const cur = try self.getPrivate(oc.normal, pm.name);
+                if (cur.isAbrupt()) return cur;
+                const rc = try self.evalExpr(ca.value, env);
+                if (rc.isAbrupt()) return rc;
+                const res = try self.applyNumericOrStringOp(ca.op, cur.normal, rc.normal);
+                if (res.isAbrupt()) return res;
+                return self.setPrivate(oc.normal, pm.name, res.normal);
             },
             else => return self.throwError("SyntaxError", "Invalid assignment target"),
         }
@@ -1618,10 +1721,23 @@ pub const Interpreter = struct {
         if (p.computed_key) |ck| {
             const c = try self.evalExpr(ck, env);
             if (c.isAbrupt()) return .{ .completion = c };
-            if (c.normal == .symbol) return .{ .symbol = c.normal.symbol };
-            return .{ .key = try self.toString(c.normal) };
+            return self.toPropertyKey(c.normal);
         }
         return .{ .key = p.key };
+    }
+
+    /// §7.1.19 ToPropertyKey ( argument ) — a Symbol stays a Symbol; an object is ToPrimitive(string)'d
+    /// (which may itself yield a Symbol), then any non-symbol primitive is ToString'd. So a computed
+    /// `[fn]` key uses the function's `toString` (consistent with `String(fn)`), not a raw fallback.
+    fn toPropertyKey(self: *Interpreter, v: Value) EvalError!KeyResult {
+        if (v == .symbol) return .{ .symbol = v.symbol }; // §7.1.19 step 2
+        if (v == .object) {
+            const pc = try self.toPrimitive(v, .string);
+            if (pc.isAbrupt()) return .{ .completion = pc };
+            if (pc.normal == .symbol) return .{ .symbol = pc.normal.symbol };
+            return .{ .key = try self.toString(pc.normal) };
+        }
+        return .{ .key = try self.toString(v) };
     }
 
     /// §15.7.14 resolve a ClassElement's PropertyName: a computed `[expr]` (evaluated in the class
@@ -1631,8 +1747,7 @@ pub const Interpreter = struct {
         if (el.computed_key) |ck| {
             const c = try self.evalExpr(ck, env);
             if (c.isAbrupt()) return .{ .completion = c };
-            if (c.normal == .symbol) return .{ .symbol = c.normal.symbol }; // §7.1.19 ToPropertyKey: Symbol stays
-            return .{ .key = try self.toString(c.normal) };
+            return self.toPropertyKey(c.normal); // §7.1.19 ToPropertyKey (Symbol stays; object → ToPrimitive)
         }
         return .{ .key = el.key };
     }
@@ -2848,6 +2963,17 @@ pub const Interpreter = struct {
     /// the key actually IS a Symbol.
     fn getPropertyV(self: *Interpreter, base: Value, key: Value) EvalError!Completion {
         if (key == .symbol) return self.getSymbolProperty(base, key.symbol);
+        // §6.2.5.5 GetValue: RequireObjectCoercible(base) precedes ToPropertyKey — a null/undefined base
+        // throws a TypeError *before* the key is coerced (so a throwing `key.toString` never runs).
+        if (base == .undefined or base == .null) return self.throwError("TypeError", "Cannot read properties of null or undefined");
+        // §7.1.19 ToPropertyKey: an object key is ToPrimitive(string)'d first (so `o[fn]` uses the
+        // function's `toString`, matching `String(fn)`); the result may itself be a Symbol.
+        if (key == .object) {
+            const pc = try self.toPrimitive(key, .string);
+            if (pc.isAbrupt()) return pc;
+            if (pc.normal == .symbol) return self.getSymbolProperty(base, pc.normal.symbol);
+            return self.getProperty(base, try self.toString(pc.normal));
+        }
         return self.getProperty(base, try self.toString(key));
     }
 
@@ -2855,7 +2981,30 @@ pub const Interpreter = struct {
     /// ToString + the ordinary string path.
     fn setPropertyV(self: *Interpreter, base: Value, key: Value, value: Value) EvalError!Completion {
         if (key == .symbol) return self.setSymbolProperty(base, key.symbol, value);
+        // §6.2.5.6 PutValue: RequireObjectCoercible(base) precedes ToPropertyKey — a null/undefined base
+        // throws a TypeError *before* the key is coerced (so a throwing `key.toString` never runs).
+        if (base == .undefined or base == .null) return self.throwError("TypeError", "Cannot set properties of null or undefined");
+        // §7.1.19 ToPropertyKey: ToPrimitive(string) an object key first (so `o[fn] = v` keys by the
+        // function's `toString`, matching `String(fn)`); the primitive may be a Symbol.
+        if (key == .object) {
+            const pc = try self.toPrimitive(key, .string);
+            if (pc.isAbrupt()) return pc;
+            if (pc.normal == .symbol) return self.setSymbolProperty(base, pc.normal.symbol, value);
+            return self.setProperty(base, try self.toString(pc.normal), value);
+        }
         return self.setProperty(base, try self.toString(key), value);
+    }
+
+    /// §7.1.19 ToPropertyKey, returning the coerced key as a primitive Value (a String, or a Symbol
+    /// when the key is/ToPrimitive's to a Symbol). Used by read-then-write member operations (compound
+    /// assignment, `++`/`--`) so a side-effecting `key.toString` runs EXACTLY ONCE — the resulting
+    /// primitive is then passed to both `getPropertyV` and `setPropertyV` (which no-op on a primitive).
+    fn coercePropertyKey(self: *Interpreter, key: Value) EvalError!Completion {
+        if (key != .object) return .{ .normal = key };
+        const pc = try self.toPrimitive(key, .string);
+        if (pc.isAbrupt()) return pc;
+        if (pc.normal == .symbol) return .{ .normal = pc.normal };
+        return .{ .normal = .{ .string = try self.toString(pc.normal) } };
     }
 
     /// §10.1.8 [[Get]] for a Symbol key — own/inherited symbol property (data or accessor). A primitive
@@ -5167,41 +5316,10 @@ pub const Interpreter = struct {
         const r = rc.normal;
 
         switch (op) {
-            .add => { // §13.15.3 ApplyStringOrNumericBinaryOperator: ToPrimitive(default) both operands FIRST (left then
-                // right), then concat if either prim is a String, else numeric. An object's @@toPrimitive/valueOf/
-                // toString runs here; primitives pass through ToPrimitive untouched.
-                const lpc = try self.toPrimitive(l, .default);
-                if (lpc.isAbrupt()) return lpc;
-                const rpc = try self.toPrimitive(r, .default);
-                if (rpc.isAbrupt()) return rpc;
-                const lp = lpc.normal;
-                const rp = rpc.normal;
-                if (lp == .string or rp == .string) {
-                    // §13.8.1: a Symbol operand makes ToString throw a TypeError.
-                    if (lp == .symbol or rp == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a string");
-                    const ls = try self.toString(lp);
-                    const rs = try self.toString(rp);
-                    return .{ .normal = .{ .string = try std.mem.concat(self.arena, u8, &.{ ls, rs }) } };
-                }
-                // §13.15.3 step 4: neither is a String. BigInt + BigInt adds; a BigInt mixed with a
-                // non-BigInt numeric operand → TypeError (§6.1.6.2 — no implicit conversion).
-                if (lp == .bigint or rp == .bigint) return self.bigintBinary(lp, rp, .add);
-                // numeric: §13.8.1 a Symbol operand throws on ToNumber.
-                if (lp == .symbol or rp == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a number");
-                return .{ .normal = .{ .number = toNumber(lp) + toNumber(rp) } };
-            },
-            // §13.7/§13.6/§13.12/§13.9 numeric binary operators: ToNumber (via ToPrimitive number-hint) both operands.
-            .sub => return self.numericBinary(l, r, .sub),
-            .mul => return self.numericBinary(l, r, .mul),
-            .div => return self.numericBinary(l, r, .div),
-            .mod => return self.numericBinary(l, r, .mod),
-            .exp => return self.numericBinary(l, r, .exp),
-            .bit_and => return self.numericBinary(l, r, .bit_and),
-            .bit_or => return self.numericBinary(l, r, .bit_or),
-            .bit_xor => return self.numericBinary(l, r, .bit_xor),
-            .shl => return self.numericBinary(l, r, .shl),
-            .shr => return self.numericBinary(l, r, .shr),
-            .shr_un => return self.numericBinary(l, r, .shr_un),
+            .add, .sub, .mul, .div, .mod, .exp, .bit_and, .bit_or, .bit_xor, .shl, .shr, .shr_un =>
+            // §13.15.3 the string-or-numeric / numeric binary operators — shared with compound
+            // assignment (`+=`, `*=`, …) via `applyNumericOrStringOp`.
+            return self.applyNumericOrStringOp(op, l, r),
             .in_op => { // §13.10.2 `key in obj`
                 if (r != .object) return self.throwError("TypeError", "Cannot use 'in' operator to search in a non-object");
                 const key = try self.toString(l);
@@ -5233,6 +5351,32 @@ pub const Interpreter = struct {
             .seq => return .{ .normal = .{ .boolean = strictEquals(l, r) } },
             .sne => return .{ .normal = .{ .boolean = !strictEquals(l, r) } },
         }
+    }
+
+    /// §13.15.3 ApplyStringOrNumericBinaryOperator for the value-level operators shared by binary
+    /// expressions and compound assignment (`+ - * / % ** & | ^ << >> >>>`). `+` is string-or-numeric
+    /// (ToPrimitive default, concat if either is a String); the rest are purely numeric.
+    fn applyNumericOrStringOp(self: *Interpreter, op: ast.BinaryOp, l: Value, r: Value) EvalError!Completion {
+        if (op == .add) {
+            // §13.15.3: ToPrimitive(default) both operands (left then right), then concat if either is a
+            // String, else numeric. An object's @@toPrimitive/valueOf/toString runs here.
+            const lpc = try self.toPrimitive(l, .default);
+            if (lpc.isAbrupt()) return lpc;
+            const rpc = try self.toPrimitive(r, .default);
+            if (rpc.isAbrupt()) return rpc;
+            const lp = lpc.normal;
+            const rp = rpc.normal;
+            if (lp == .string or rp == .string) {
+                if (lp == .symbol or rp == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a string");
+                const ls = try self.toString(lp);
+                const rs = try self.toString(rp);
+                return .{ .normal = .{ .string = try std.mem.concat(self.arena, u8, &.{ ls, rs }) } };
+            }
+            if (lp == .bigint or rp == .bigint) return self.bigintBinary(lp, rp, .add);
+            if (lp == .symbol or rp == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a number");
+            return .{ .normal = .{ .number = toNumber(lp) + toNumber(rp) } };
+        }
+        return self.numericBinary(l, r, op);
     }
 
     /// §13.15.3 ApplyStringOrNumericBinaryOperator for the purely numeric operators (everything but
@@ -5389,6 +5533,7 @@ pub const Interpreter = struct {
 
     pub fn throwError(self: *Interpreter, kind: []const u8, msg: []const u8) EvalError!Completion {
         const err = try Object.create(self.arena, self.errorProto(kind));
+        err.error_data = true; // §20.5 [[ErrorData]] → §20.1.3.6 "Error" tag
         try err.set("name", .{ .string = kind });
         try err.set("message", .{ .string = msg });
         return .{ .throw = .{ .object = err } };
@@ -5732,6 +5877,170 @@ pub const Interpreter = struct {
             }
         };
         return .{ .normal = target };
+    }
+
+    /// §20.1.3.6 Object.prototype.toString ( ) — the brand/tag algorithm. Returns `"[object <Tag>]"`
+    /// where Tag is `Get(O, @@toStringTag)` (when a String) else the builtin tag from O's internal-slot
+    /// brand. undefined/null short-circuit to "Undefined"/"Null"; a primitive `this` boxes to its
+    /// wrapper brand (Number/String/Boolean) — symbol/bigint box to "Object".
+    fn objectToString(self: *Interpreter, this_val: Value) EvalError!Completion {
+        // §20.1.3.6 steps 1-2.
+        switch (this_val) {
+            .undefined => return .{ .normal = .{ .string = "[object Undefined]" } },
+            .null => return .{ .normal = .{ .string = "[object Null]" } },
+            else => {},
+        }
+        // §20.1.3.6 steps 4-14: builtinTag from the ordered internal-slot probe.
+        const builtin_tag: []const u8 = switch (this_val) {
+            .object => |o| blk: {
+                if (o.kind == .array) break :blk "Array"; // IsArray
+                if (o.is_arguments) break :blk "Arguments"; // [[ParameterMap]]
+                if (o.kind == .function) break :blk "Function"; // [[Call]]
+                if (o.error_data) break :blk "Error"; // [[ErrorData]]
+                if (o.primitive) |p| switch (p) {
+                    .boolean => break :blk "Boolean", // [[BooleanData]]
+                    .number => break :blk "Number", // [[NumberData]]
+                    .string => break :blk "String", // [[StringData]]
+                    else => {},
+                };
+                break :blk "Object";
+            },
+            // A primitive receiver via `.call(prim)`: ToObject → the matching wrapper brand.
+            .boolean => "Boolean",
+            .number => "Number",
+            .string => "String",
+            else => "Object", // symbol / bigint box to an ordinary Object
+        };
+        // §20.1.3.6 step 15: tag = Get(O, @@toStringTag); use it only when it is a String.
+        var tag = builtin_tag;
+        if (self.wellKnownSymbol("toStringTag")) |sym| {
+            const tc = try self.getSymbolProperty(this_val, sym);
+            if (tc.isAbrupt()) return tc;
+            if (tc.normal == .string) tag = tc.normal.string;
+        }
+        // §20.1.3.6 step 16: "[object " + tag + "]".
+        const out = try std.fmt.allocPrint(self.arena, "[object {s}]", .{tag});
+        return .{ .normal = .{ .string = out } };
+    }
+
+    /// §20.1.2.7 Object.fromEntries ( iterable ) — a fresh ordinary object whose own enumerable data
+    /// properties come from the `[key, value]` entries of the iterable. Each entry must be an Object.
+    fn objectFromEntries(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const iterable = if (args.len > 0) args[0] else .undefined;
+        // §20.1.2.7 step 1: RequireObjectCoercible (GetIterator throws on undefined/null anyway).
+        if (iterable == .undefined or iterable == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
+        const obj = try Object.create(self.arena, self.objectProto());
+        var entries: std.ArrayListUnmanaged(Value) = .empty;
+        const lc = try self.iterateToList(iterable, &entries);
+        if (lc.isAbrupt()) return lc;
+        for (entries.items) |entry| {
+            // §20.1.2.7 / §7.4 step: each entry must be an Object.
+            if (entry != .object) return self.throwError("TypeError", "Iterator value is not an entry object");
+            const kc = try self.getProperty(entry, "0");
+            if (kc.isAbrupt()) return kc;
+            const vc = try self.getProperty(entry, "1");
+            if (vc.isAbrupt()) return vc;
+            // §7.3.5 CreateDataPropertyOnObject: an own enumerable, writable, configurable data property.
+            if (kc.normal == .symbol) {
+                try obj.defineSymbolData(kc.normal.symbol, vc.normal, true, true, true);
+            } else {
+                const key = try self.toPropertyKeyString(kc.normal);
+                try obj.defineData(key, vc.normal, true, true, true);
+            }
+        }
+        return .{ .normal = .{ .object = obj } };
+    }
+
+    /// §20.1.2.13 Object.hasOwn ( O, P ) — HasOwnProperty(ToObject(O), ToPropertyKey(P)). Own string OR
+    /// symbol key, regardless of enumerability; no prototype walk.
+    fn objectHasOwn2(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const o = if (args.len > 0) args[0] else .undefined;
+        if (o == .undefined or o == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
+        const p = if (args.len > 1) args[1] else .undefined;
+        if (p == .symbol) {
+            const has = if (o == .object) blk: {
+                for (o.object.symbol_props.items) |sp| if (sp.key == p.symbol) break :blk true;
+                break :blk false;
+            } else false;
+            return .{ .normal = .{ .boolean = has } };
+        }
+        const key = try self.toPropertyKeyString(p);
+        return .{ .normal = .{ .boolean = try self.hasOwnProp(o, key) } };
+    }
+
+    /// §20.1.2.10 Object.getOwnPropertySymbols ( O ) — a fresh Array of the own Symbol keys of
+    /// ToObject(O), in insertion order. (Strings/primitives box to objects with no symbol keys.)
+    fn objectGetOwnPropertySymbols(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const o = if (args.len > 0) args[0] else .undefined;
+        if (o == .undefined or o == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
+        const arr = try Object.createArray(self.arena, self.arrayProto());
+        if (o == .object) {
+            for (o.object.symbol_props.items) |sp| {
+                try arr.elements.append(self.arena, .{ .symbol = sp.key });
+            }
+        }
+        return .{ .normal = .{ .object = arr } };
+    }
+
+    /// §20.1.2.11 Object.groupBy ( items, callback ) — §7.3.35 GroupBy (property coercion): iterate
+    /// `items`, key each by ToPropertyKey(callback(item, index)), collect items into per-key arrays,
+    /// and return an object with a NULL prototype whose own enumerable data properties are those arrays.
+    fn objectGroupBy(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const items = if (args.len > 0) args[0] else .undefined;
+        const callback = if (args.len > 1) args[1] else .undefined;
+        // §7.3.35 step 2: callback must be callable.
+        if (callback != .object or callback.object.kind != .function) return self.throwError("TypeError", "Object.groupBy callback is not a function");
+        if (items == .undefined or items == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
+        var list: std.ArrayListUnmanaged(Value) = .empty;
+        const lc = try self.iterateToList(items, &list);
+        if (lc.isAbrupt()) return lc;
+        // The result object has a null [[Prototype]] (§7.3.35 step 5: OrdinaryObjectCreate(null)).
+        const obj = try Object.create(self.arena, null);
+        for (list.items, 0..) |item, i| {
+            const kc = try self.callFunction(callback.object, &.{ item, .{ .number = @floatFromInt(i) } }, .undefined);
+            if (kc.isAbrupt()) return kc;
+            // §7.3.35: a Symbol key is allowed (PROPERTY coercion → ToPropertyKey).
+            if (kc.normal == .symbol) {
+                const sym = kc.normal.symbol;
+                const group: *Object = blk: {
+                    if (obj.getSymbolProp(sym)) |loc| if (loc.pv.payload == .data and loc.pv.payload.data == .object) break :blk loc.pv.payload.data.object;
+                    const fresh = try Object.createArray(self.arena, self.arrayProto());
+                    try obj.defineSymbolData(sym, .{ .object = fresh }, true, true, true);
+                    break :blk fresh;
+                };
+                try group.elements.append(self.arena, item);
+            } else {
+                const key = try self.toPropertyKeyString(kc.normal);
+                const group: *Object = blk: {
+                    if (obj.properties.get(key)) |pv| if (pv.payload == .data and pv.payload.data == .object) break :blk pv.payload.data.object;
+                    const fresh = try Object.createArray(self.arena, self.arrayProto());
+                    try obj.defineData(key, .{ .object = fresh }, true, true, true);
+                    break :blk fresh;
+                };
+                try group.elements.append(self.arena, item);
+            }
+        }
+        return .{ .normal = .{ .object = obj } };
+    }
+
+    /// §B.2.2.1.1 get Object.prototype.__proto__ — O = ToObject(this); return O.[[GetPrototypeOf]]().
+    /// Delegates to the §20.1.2.12 op (so a primitive `this` boxes to its wrapper proto's prototype).
+    fn objectProtoGet(self: *Interpreter, this_val: Value) EvalError!Completion {
+        return self.objectGetPrototypeOf(&.{this_val});
+    }
+
+    /// §B.2.2.1.2 set Object.prototype.__proto__ — O = RequireObjectCoercible(this). A value that is
+    /// neither Object nor null is a no-op (NOT a throw). A non-Object `this` is a no-op. Otherwise
+    /// O.[[SetPrototypeOf]](value) (may throw on a non-extensible/cyclic change). Returns undefined.
+    fn objectProtoSet(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
+        if (this_val == .undefined or this_val == .null) return self.throwError("TypeError", "Cannot set property '__proto__' of null or undefined");
+        const value = if (args.len > 0) args[0] else .undefined;
+        // §B.2.2.1.2 steps 2-3: only Object/null values are applied; everything else is a silent no-op.
+        if (value != .object and value != .null) return .{ .normal = .undefined };
+        if (this_val != .object) return .{ .normal = .undefined }; // boxed primitive — no slot to set
+        const sc = try self.objectSetPrototypeOf(&.{ this_val, value });
+        if (sc.isAbrupt()) return sc;
+        return .{ .normal = .undefined };
     }
 
     /// §20.1.2.12 Object.getPrototypeOf ( O ) — the [[Prototype]] of ToObject(O) (an object or null).
@@ -6686,6 +6995,7 @@ pub const Interpreter = struct {
                     break :blk if (pv == .object) pv.object else null;
                 };
                 const err = try Object.create(self.arena, proto);
+                err.error_data = true; // §20.5 [[ErrorData]] → §20.1.3.6 "Error" tag
                 try err.set("name", .{ .string = func.native_name });
                 const msg: Value = if (args.len > 0 and args[0] != .undefined)
                     .{ .string = try self.toString(args[0]) }
@@ -6702,6 +7012,7 @@ pub const Interpreter = struct {
                     break :blk if (pv == .object) pv.object else null;
                 };
                 const err = try Object.create(self.arena, proto);
+                err.error_data = true; // §20.5 [[ErrorData]] → §20.1.3.6 "Error" tag
                 try err.set("name", .{ .string = "AggregateError" });
                 const msg: Value = if (args.len > 1 and args[1] != .undefined)
                     .{ .string = try self.toString(args[1]) }
@@ -6727,6 +7038,7 @@ pub const Interpreter = struct {
                     break :blk if (pv == .object) pv.object else null;
                 };
                 const err = try Object.create(self.arena, proto);
+                err.error_data = true; // §20.5 [[ErrorData]] → §20.1.3.6 "Error" tag
                 if (args.len > 2 and args[2] != .undefined) {
                     try err.set("message", .{ .string = try self.toString(args[2]) });
                 }
@@ -6788,7 +7100,7 @@ pub const Interpreter = struct {
                 if (args.len > 0 and args[0] == .object) return .{ .normal = args[0] };
                 return .{ .normal = .{ .object = try Object.create(self.arena, self.objectProto()) } };
             },
-            .object_to_string => return .{ .normal = .{ .string = "[object Object]" } },
+            .object_to_string => return self.objectToString(this_val),
             // §20.1.3.7 Object.prototype.valueOf returns ToObject(this). For an object receiver that is
             // the receiver itself (so OrdinaryToPrimitive's valueOf step yields a non-primitive and falls
             // through to toString — the default object→"[object Object]" behavior). undefined/null throw.
@@ -6808,6 +7120,12 @@ pub const Interpreter = struct {
             .object_entries => return self.objectKeysValuesEntries(args, .entries),
             .object_create => return self.objectCreate(args),
             .object_assign => return self.objectAssign(args),
+            .object_from_entries => return self.objectFromEntries(args),
+            .object_has_own => return self.objectHasOwn2(args),
+            .object_get_own_property_symbols => return self.objectGetOwnPropertySymbols(args),
+            .object_group_by => return self.objectGroupBy(args),
+            .object_proto_getter => return self.objectProtoGet(this_val),
+            .object_proto_setter => return self.objectProtoSet(this_val, args),
             .object_get_prototype_of => return self.objectGetPrototypeOf(args),
             .object_set_prototype_of => return self.objectSetPrototypeOf(args),
             .object_is => return .{ .normal = .{ .boolean = ops.sameValue(if (args.len > 0) args[0] else .undefined, if (args.len > 1) args[1] else .undefined) } },
@@ -6943,6 +7261,7 @@ pub const Interpreter = struct {
     /// `kind` stays `.ordinary`, so indexed [[Get]]/`length` still read the `properties` map).
     fn makeArgumentsObject(self: *Interpreter, args: []const Value) EvalError!*Object {
         const ao = try Object.create(self.arena, self.objectProto());
+        ao.is_arguments = true; // §10.4.4 [[ParameterMap]] presence → §20.1.3.6 "Arguments" tag
         for (args, 0..) |a, i| {
             const key = try numberToString(self.arena, @floatFromInt(i));
             try ao.set(key, a);

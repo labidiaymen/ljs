@@ -3267,3 +3267,48 @@ test "M41: §21.1.3 Number.prototype methods" {
     // §21.1.3.5 toLocaleString ≈ toString for the M-subset.
     try expectStr("(255).toLocaleString()", "255");
 }
+
+test "M42: §20.1.3.6 Object.prototype.toString — builtin tags + @@toStringTag" {
+    try expectStr("Object.prototype.toString.call([])", "[object Array]");
+    try expectStr("Object.prototype.toString.call(null)", "[object Null]");
+    try expectStr("Object.prototype.toString.call(undefined)", "[object Undefined]");
+    try expectStr("Object.prototype.toString.call(function(){})", "[object Function]");
+    try expectStr("Object.prototype.toString.call(new Error('x'))", "[object Error]");
+    try expectStr("Object.prototype.toString.call(new Number(5))", "[object Number]");
+    try expectStr("Object.prototype.toString.call(new String('s'))", "[object String]");
+    try expectStr("Object.prototype.toString.call(new Boolean(true))", "[object Boolean]");
+    try expectStr("Object.prototype.toString.call({})", "[object Object]");
+    try expectStr("(function(){return Object.prototype.toString.call(arguments);})()", "[object Arguments]");
+    // §20.1.3.6 step 15: a String @@toStringTag overrides the builtin tag.
+    try expectStr("Object.prototype.toString.call({[Symbol.toStringTag]:'Foo'})", "[object Foo]");
+    // A non-String @@toStringTag is ignored → the builtin tag is used.
+    try expectStr("Object.prototype.toString.call({[Symbol.toStringTag]:42})", "[object Object]");
+    // Primitive receivers via .call box to their wrapper brand.
+    try expectStr("Object.prototype.toString.call(5)", "[object Number]");
+    try expectStr("Object.prototype.toString.call('s')", "[object String]");
+}
+
+test "M42: §20.1.2 new statics — fromEntries / hasOwn / getOwnPropertySymbols / groupBy" {
+    // §20.1.2.7 Object.fromEntries.
+    try expectNumber("Object.fromEntries([['a',1],['b',2]]).b", 2);
+    try expectBool("Object.getPrototypeOf(Object.fromEntries([])) === Object.prototype", true);
+    // §20.1.2.13 Object.hasOwn — own string + symbol, regardless of enumerability; no chain walk.
+    try expectBool("Object.hasOwn({a:1},'a')", true);
+    try expectBool("Object.hasOwn({},'toString')", false); // inherited, not own
+    try expectBool("(function(){var s=Symbol(); var o={}; o[s]=1; return Object.hasOwn(o,s);})()", true);
+    // §20.1.2.10 Object.getOwnPropertySymbols.
+    try expectNumber("Object.getOwnPropertySymbols({[Symbol.iterator]:1}).length", 1);
+    try expectNumber("Object.getOwnPropertySymbols({a:1}).length", 0);
+    // §20.1.2.11 Object.groupBy — null-proto result, per-key arrays.
+    try expectStr("Object.groupBy([1,2,3,4],function(n){return n%2?'odd':'even';}).odd.join(',')", "1,3");
+    try expectBool("Object.getPrototypeOf(Object.groupBy([1],function(){return 'k';})) === null", true);
+}
+
+test "M42: §B.2.2.1 Object.prototype.__proto__ accessor" {
+    try expectBool("({}).__proto__ === Object.prototype", true);
+    try expectNumber("(function(){var o={}; o.__proto__={x:5}; return o.x;})()", 5);
+    // Setting __proto__ to a non-object/non-null value is a silent no-op (proto unchanged).
+    try expectBool("(function(){var o={}; o.__proto__=5; return o.__proto__===Object.prototype;})()", true);
+    // get on a null-proto object returns null.
+    try expectBool("Object.create(null).__proto__ === undefined", true);
+}

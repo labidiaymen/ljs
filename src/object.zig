@@ -258,6 +258,12 @@ pub const NativeId = enum {
     object_entries, // Object.entries (§20.1.2.6)
     object_create, // Object.create (§20.1.2.2)
     object_assign, // Object.assign (§20.1.2.1)
+    object_from_entries, // Object.fromEntries (§20.1.2.7)
+    object_has_own, // Object.hasOwn (§20.1.2.13)
+    object_get_own_property_symbols, // Object.getOwnPropertySymbols (§20.1.2.10)
+    object_group_by, // Object.groupBy (§20.1.2.11)
+    object_proto_getter, // §B.2.2.1.1 get Object.prototype.__proto__
+    object_proto_setter, // §B.2.2.1.2 set Object.prototype.__proto__
     object_get_prototype_of, // Object.getPrototypeOf (§20.1.2.12)
     object_set_prototype_of, // Object.setPrototypeOf (§20.1.2.22)
     object_is, // Object.is (§20.1.2.14)
@@ -581,6 +587,14 @@ pub const Object = struct {
     /// ordinary object. `Number.prototype.valueOf` etc. (and thus ToPrimitive's valueOf) read it, so a
     /// wrapper object coerces back to its primitive in operator/coercion contexts.
     primitive: ?Value = null,
+    /// §20.5 [[ErrorData]] — set iff this object is an Error instance (one of the Error-family
+    /// constructors, or the engine's internal `throwError`). Read ONLY by §20.1.3.6
+    /// Object.prototype.toString to yield the `"Error"` builtin tag. Null/false for every other object.
+    error_data: bool = false,
+    /// §10.4.4 [[ParameterMap]] presence — set iff this object is an `arguments` exotic. The M-subset
+    /// arguments object is otherwise ordinary; this flag exists only so §20.1.3.6 Object.prototype.toString
+    /// yields the `"Arguments"` builtin tag.
+    is_arguments: bool = false,
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);

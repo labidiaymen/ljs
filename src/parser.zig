@@ -1994,21 +1994,25 @@ pub const Parser = struct {
                 .identifier => |n| if (isEvalOrArguments(n)) return ParseError.UnexpectedToken,
                 else => {},
             };
+            // §13.15.1: the target of a (compound or plain) assignment must be a simple
+            // LeftHandSideExpression — identifier / member / index / private member.
+            switch (left.*) {
+                .identifier, .member, .index, .private_member => {},
+                else => if (compoundBinOp(op) != null) return ParseError.UnexpectedToken,
+            }
             _ = self.advance();
             const rhs = try self.parseAssignment();
-            // Compound assignment `x op= v` desugars to `x = x op v` (§13.15).
-            const value = if (compoundBinOp(op)) |bop|
-                try self.alloc(.{ .binary = .{ .op = bop, .left = left, .right = rhs } })
-            else
-                rhs;
+            // §13.15.2 compound assignment `target op= v` is kept INTACT as `compound_assign` (the
+            // reference is evaluated once at runtime — see ast.compound_assign), NOT desugared to
+            // `target = target op v` (which would re-evaluate a side-effecting base/key).
+            if (compoundBinOp(op)) |bop| {
+                return self.alloc(.{ .compound_assign = .{ .op = bop, .target = left, .value = rhs } });
+            }
             switch (left.*) {
-                .identifier => |n| return self.alloc(.{ .assign = .{ .name = n, .value = value } }),
-                .member => |m| return self.alloc(.{ .assign_member = .{ .object = m.object, .name = m.name, .value = value } }),
-                .index => |ix| return self.alloc(.{ .assign_index = .{ .object = ix.object, .key = ix.key, .value = value } }),
-                // §13.3.2 `obj.#x = v` — assignment to a private member (TypeError at runtime if `obj`
-                // lacks the brand). Compound `obj.#x op= v` desugars with the private member as both
-                // sides; the desugared `value` already references `left` (the private_member node).
-                .private_member => |pm| return self.alloc(.{ .private_assign = .{ .object = pm.object, .name = pm.name, .value = value } }),
+                .identifier => |n| return self.alloc(.{ .assign = .{ .name = n, .value = rhs } }),
+                .member => |m| return self.alloc(.{ .assign_member = .{ .object = m.object, .name = m.name, .value = rhs } }),
+                .index => |ix| return self.alloc(.{ .assign_index = .{ .object = ix.object, .key = ix.key, .value = rhs } }),
+                .private_member => |pm| return self.alloc(.{ .private_assign = .{ .object = pm.object, .name = pm.name, .value = rhs } }),
                 else => return ParseError.UnexpectedToken, // invalid assignment target
             }
         }
@@ -3377,6 +3381,7 @@ fn containsArguments(node: *const ast.Node) bool {
         .assign_member => |a| return containsArguments(a.object) or containsArguments(a.value),
         .assign_index => |a| return containsArguments(a.object) or containsArguments(a.key) or containsArguments(a.value),
         .logical_assign => |a| return containsArguments(a.target) or containsArguments(a.value),
+        .compound_assign => |a| return containsArguments(a.target) or containsArguments(a.value),
         .member => |m| return containsArguments(m.object),
         .index => |ix| return containsArguments(ix.object) or containsArguments(ix.key),
         .spread => |s| return containsArguments(s),
@@ -3841,6 +3846,10 @@ fn descendNode(node: *const ast.Node, strict: bool) ParseError!void {
             try descendNode(a.value, strict);
         },
         .logical_assign => |a| {
+            try descendNode(a.target, strict);
+            try descendNode(a.value, strict);
+        },
+        .compound_assign => |a| {
             try descendNode(a.target, strict);
             try descendNode(a.value, strict);
         },

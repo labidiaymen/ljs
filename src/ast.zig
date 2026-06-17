@@ -68,6 +68,12 @@ pub const Node = union(enum) {
     /// written. `target` is the assignment target (identifier / member `a.b` / index `a[k]`); the
     /// interpreter destructures it to read-once / write-once without re-evaluating the base.
     logical_assign: struct { op: LogicalOp, target: *const Node, value: *const Node },
+    /// §13.15.2 compound AssignmentExpression `target op= value` (arithmetic/bitwise/string `op`, NOT
+    /// the logical forms). Like `logical_assign`, the reference (`target`: identifier / member `a.b` /
+    /// index `a[k]` / private `a.#x`) is evaluated ONCE — base + key coerced a single time — then the
+    /// current value is read, combined with `value` via `op`, and written back. Kept intact (rather than
+    /// desugared to `t = t op v`) so a side-effecting base/key expression runs exactly once (§13.15.2).
+    compound_assign: struct { op: BinaryOp, target: *const Node, value: *const Node },
     function: *const Function, // §15.2 function expression
     call: struct { callee: *const Node, args: []const *const Node }, // §13.3.6 call
     new_expr: struct { callee: *const Node, args: []const *const Node }, // §13.3.5 new
