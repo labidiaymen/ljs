@@ -746,17 +746,30 @@ pub const Interpreter = struct {
                 .normal => {},
                 .cont => |l| {
                     // A `continue` for our loop steps to the next value; a labelled one for an outer
-                    // loop is an abrupt exit of THIS loop — close the iterator and propagate (§7.4.11).
+                    // loop is an abrupt exit of THIS loop — a NORMAL completion close (§7.4.11): a
+                    // throwing `return()` propagates.
                     if (!loopHandles(l, my_labels)) {
-                        try self.iteratorClose(iterator);
+                        const cc = try self.iteratorCloseChecked(iterator);
+                        if (cc.isAbrupt()) return cc;
                         return bc;
                     }
                 },
                 .brk => |l| {
-                    try self.iteratorClose(iterator); // §14.7.5.7 step 11.b.iii: break closes the iterator
+                    // §14.7.5.7 step 11.b.iii: break closes the iterator on a NORMAL completion — a
+                    // throwing `return()` (or non-object result) propagates (§7.4.11 steps 5–6).
+                    const cc = try self.iteratorCloseChecked(iterator);
+                    if (cc.isAbrupt()) return cc;
                     if (loopHandles(l, my_labels)) break else return bc; // outer-targeted break still propagates
                 },
-                .ret, .throw => {
+                .ret => {
+                    // §7.4.11: a `return` completion is NOT a throw → propagate a throwing `return()`.
+                    const cc = try self.iteratorCloseChecked(iterator);
+                    if (cc.isAbrupt()) return cc;
+                    return bc;
+                },
+                .throw => {
+                    // §7.4.11 step 4: on a throw completion the original error wins — `return()`'s
+                    // own error is swallowed.
                     try self.iteratorClose(iterator);
                     return bc;
                 },
@@ -4120,9 +4133,27 @@ pub const Interpreter = struct {
         const rc = try self.getProperty(.{ .object = iterator }, "return");
         if (rc.isAbrupt()) return; // swallow — don't mask the original completion
         if (rc.normal != .object or rc.normal.object.kind != .function) return;
-        // A throwing `return()` is swallowed (the original completion wins, §7.4.11 step 6); but an
+        // A throwing `return()` is swallowed (the original completion wins, §7.4.11 step 4); but an
         // engine error (OOM / step-limit) still propagates via `try`.
         _ = try self.callFunction(rc.normal.object, &.{}, .{ .object = iterator });
+    }
+
+    /// §7.4.11 IteratorClose for a NORMAL (non-throw) incoming completion — the iterator is being
+    /// closed early on `break` / loop-exiting `continue` / `return`, so a thrown `return()` (or a
+    /// non-Object `return()` result) MUST propagate (steps 5–6), unlike the throw-completion case
+    /// (`iteratorClose`, step 4, which swallows). Returns `.normal` on a clean close, else the abrupt
+    /// completion to propagate. GetMethod semantics: undefined/null `return` → no-op; non-callable →
+    /// TypeError (§7.3.10).
+    fn iteratorCloseChecked(self: *Interpreter, iterator: *Object) EvalError!Completion {
+        const rc = try self.getProperty(.{ .object = iterator }, "return");
+        if (rc.isAbrupt()) return rc; // a throwing `return` getter propagates
+        if (rc.normal == .undefined or rc.normal == .null) return .{ .normal = .undefined };
+        if (rc.normal != .object or rc.normal.object.kind != .function)
+            return self.throwError("TypeError", "iterator 'return' is not a function");
+        const res = try self.callFunction(rc.normal.object, &.{}, .{ .object = iterator });
+        if (res.isAbrupt()) return res; // §7.4.11 step 5: a thrown `return()` propagates
+        if (res.normal != .object) return self.throwError("TypeError", "iterator 'return' result is not an object"); // step 6
+        return .{ .normal = .undefined };
     }
 
     /// §7.4.1 GetIterator + drain — materialize an iterable `value` into a slice of its yielded values
