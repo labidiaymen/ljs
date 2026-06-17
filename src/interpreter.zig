@@ -1215,6 +1215,7 @@ pub const Interpreter = struct {
             },
             .call => |c| return self.evalCall(c, env),
             .new_expr => |n| return self.evalNew(n, env),
+            .import_call => |ic| return self.evalImportCall(ic, env),
             .logical => |l| {
                 // §13.13 short-circuit: `||` returns left if truthy, `&&` returns left if falsy,
                 // `??` returns left unless it is null/undefined (then the right operand).
@@ -4832,6 +4833,37 @@ pub const Interpreter = struct {
         const g = self.globals orelse return null;
         const b = g.lookup("%PromisePrototype%") orelse return null;
         return if (b.value == .object) b.value.object else null;
+    }
+
+    /// §13.3.10 ImportCall Runtime Semantics: Evaluation. Evaluate the specifier (and, if present,
+    /// the import-options second argument) for their GetValue side effects, then ToString the
+    /// specifier and return a Promise. With no module loader, a successful ToString yields a Promise
+    /// REJECTED with a TypeError ("module loading is not supported"); an abrupt ToString (a Symbol
+    /// specifier, or a throwing `toString`/`valueOf`) rejects the Promise with that error
+    /// (IfAbruptRejectPromise, step 7). The result is always a genuine Promise object, so `.then`/
+    /// `.catch` and synchronous `assert.throws` on the call site behave per spec.
+    fn evalImportCall(self: *Interpreter, ic: anytype, env: *Environment) EvalError!Completion {
+        // Step 3–4: evaluate the AssignmentExpression specifier and GetValue.
+        const sc = try self.evalExpr(ic.specifier, env);
+        if (sc.isAbrupt()) return sc;
+        // The optional second argument (import options) — evaluate left-to-right for side effects.
+        if (ic.options) |opt| {
+            const oc = try self.evalExpr(opt, env);
+            if (oc.isAbrupt()) return oc;
+        }
+        // Step 5: NewPromiseCapability(%Promise%).
+        const promise = try self.newPromise();
+        // Step 6–7: specifierString = ToString(specifier); IfAbruptRejectPromise.
+        switch (try self.toStringCoerceV(sc.normal)) {
+            .abrupt => |a| try self.rejectPromise(promise, a.throw),
+            .string => {
+                // Step 8: HostLoadImportedModule — no loader in scope, so reject with a TypeError.
+                const tc = try self.throwError("TypeError", "module loading is not supported");
+                try self.rejectPromise(promise, tc.throw);
+            },
+        }
+        // Step 9: return the Promise.
+        return .{ .normal = .{ .object = promise } };
     }
 
     /// §27.2.3.1 CreatePromise / NewPromiseCapability — a fresh pending Promise object (proto =

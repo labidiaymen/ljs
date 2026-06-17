@@ -78,6 +78,13 @@ pub const Node = union(enum) {
     compound_assign: struct { op: BinaryOp, target: *const Node, value: *const Node },
     function: *const Function, // §15.2 function expression
     call: struct { callee: *const Node, args: []const *const Node }, // §13.3.6 call
+    /// §13.3.10 ImportCall — the dynamic `import( specifier [, options] )` expression. `specifier`
+    /// is the AssignmentExpression first argument; `options` (non-null) is the optional second
+    /// argument (import options / attributes object). ImportCall is a CallExpression but NOT a
+    /// NewExpression target and NOT a simple assignment target (the parser enforces both). With no
+    /// module loader, the interpreter ToString-es the specifier and returns a Promise rejected with
+    /// a TypeError (a throwing ToString rejects the promise instead).
+    import_call: struct { specifier: *const Node, options: ?*const Node },
     new_expr: struct { callee: *const Node, args: []const *const Node }, // §13.3.5 new
     logical: struct { op: LogicalOp, left: *const Node, right: *const Node }, // §13.13
     conditional: struct { cond: *const Node, then: *const Node, otherwise: *const Node }, // §13.14 ?:

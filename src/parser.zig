@@ -367,6 +367,12 @@ pub const Parser = struct {
             return self.alloc(.new_target);
         }
         var callee = try self.parsePrimary();
+        // §13.3.10: ImportCall is a CallExpression, not a MemberExpression — a BARE ImportCall is
+        // NOT a valid NewExpression target (`new import('x')`, `new import('x').prop` are
+        // SyntaxErrors). A PARENTHESIZED `new (import(''))` IS valid (the parens make it a
+        // CoverParenthesizedExpression → PrimaryExpression → MemberExpression); `last_was_paren`
+        // (set by the `.lparen` primary, cleared by the bare-ImportCall primary) distinguishes them.
+        if (callee.* == .import_call and !self.last_was_paren) return ParseError.UnexpectedToken;
         while (true) {
             switch (self.peek().kind) {
                 .dot => {
@@ -399,6 +405,33 @@ pub const Parser = struct {
             args = list.items;
         }
         return self.alloc(.{ .new_expr = .{ .callee = callee, .args = args } });
+    }
+
+    /// §13.3.10 ImportCall — current token is `import`, next is `(`. Parses
+    /// `import ( AssignmentExpression[+In] [ , AssignmentExpression[+In] ] [ , ] )`. The arguments
+    /// use `parseAssignment` (NOT the spread-capable element parser): §13.3.10 forbids `...spread`
+    /// (a Forbidden Extension), an empty `import()` (AssignmentExpression is not optional), and a
+    /// third argument (at most two). A trailing comma after either argument is allowed.
+    fn parseImportCall(self: *Parser) ParseError!*const ast.Node {
+        _ = self.advance(); // import
+        _ = try self.expect(.lparen);
+        // §13.3.10: no argument is a SyntaxError; a leading spread is a Forbidden Extension.
+        if (self.peek().kind == .rparen or self.peek().kind == .ellipsis) return ParseError.UnexpectedToken;
+        const specifier = try self.parseAssignment();
+        var options: ?*const ast.Node = null;
+        if (self.peek().kind == .comma) {
+            _ = self.advance(); // first comma
+            if (self.peek().kind != .rparen) {
+                // A second argument (import options). A spread here is also forbidden.
+                if (self.peek().kind == .ellipsis) return ParseError.UnexpectedToken;
+                options = try self.parseAssignment();
+                // An optional trailing comma after the second argument.
+                if (self.peek().kind == .comma) _ = self.advance();
+            }
+        }
+        // At most two arguments: anything other than `)` now (e.g. a third `,`) is a SyntaxError.
+        _ = try self.expect(.rparen);
+        return self.alloc(.{ .import_call = .{ .specifier = specifier, .options = options } });
     }
 
     fn parseIf(self: *Parser) ParseError!ast.Stmt {
@@ -2272,6 +2305,9 @@ pub const Parser = struct {
             // §13.3.12.1 / §13.4.1.1: NewTarget has AssignmentTargetType `invalid` — `++new.target`
             // (and the covered `++(new.target)`, parens already collapsed) is a SyntaxError.
             if (target.* == .new_target) return ParseError.UnexpectedToken;
+            // §13.3.10 / §13.4.1.1: ImportCall has AssignmentTargetType `invalid` — `++import('')`
+            // (and `--import('')`) is a SyntaxError.
+            if (target.* == .import_call) return ParseError.UnexpectedToken;
             // §13.4.1.1 Early Error: in strict, the operand of a prefix update may not be the
             // reference `eval`/`arguments`.
             if (self.strict) switch (target.*) {
@@ -2443,6 +2479,9 @@ pub const Parser = struct {
             // §13.3.12.1 / §13.4.1.1: NewTarget has AssignmentTargetType `invalid` — `new.target++`
             // (and the covered `(new.target)++`) is a SyntaxError.
             if (expr.* == .new_target) return ParseError.UnexpectedToken;
+            // §13.3.10 / §13.4.1.1: ImportCall has AssignmentTargetType `invalid` — `import('')++`
+            // (and `import('')--`) is a SyntaxError.
+            if (expr.* == .import_call) return ParseError.UnexpectedToken;
             const op: ast.UpdateOp = if (self.peek().kind == .plus_plus) .inc else .dec;
             _ = self.advance();
             expr = try self.alloc(.{ .update = .{ .op = op, .prefix = false, .target = expr } });
@@ -2938,11 +2977,21 @@ pub const Parser = struct {
                 return self.parseTemplate(t.string_value);
             },
             .kw_new => return self.parseNew(),
-            // §13.3.10 ImportCall / §16.2 modules are unsupported — `import` is a reserved word, so
-            // any expression form (`import(x)`, `import.meta`, …) is a parse-phase SyntaxError. This
-            // also keeps spread support honest: ImportCall forbids `...` (a Forbidden Extension), so
-            // `import(...x)` must not parse as an ordinary spread call.
-            .kw_import => return ParseError.UnexpectedToken,
+            // §13.3.10 ImportCall `import ( AssignmentExpression [, AssignmentExpression] [,] )`.
+            // Only the call form is supported: a bare `import`, a static `import`/`export`
+            // declaration, and every MetaProperty form (`import.meta`, `import.source`,
+            // `import.defer`, `import.UNKNOWN`) remain parse-phase SyntaxErrors (the `else` below).
+            .kw_import => {
+                if (self.idx + 1 < self.tokens.len and self.tokens[self.idx + 1].kind == .lparen) {
+                    const ic = try self.parseImportCall();
+                    // A bare (unparenthesized) ImportCall is not a NewExpression target — clear any
+                    // stale `last_was_paren` so `parseNew`'s guard reads it correctly (a PARENTHESIZED
+                    // `new (import(''))` is valid and is handled by the `.lparen` arm, which sets it).
+                    self.last_was_paren = false;
+                    return ic;
+                }
+                return ParseError.UnexpectedToken;
+            },
             // §15.7 ClassExpression (primary position). The name is optional (`class { … }`).
             .kw_class => return self.alloc(.{ .class_expr = try self.parseClass(false) }),
             // §13.3.5/§13.3.7: `super` is handled in `parsePostfix` (it must be the base of a
@@ -3104,6 +3153,7 @@ fn nodeReferencesYield(node: *const ast.Node) bool {
         .assign => |a| nodeReferencesYield(a.value),
         .comma => |c| nodeReferencesYield(c.left) or nodeReferencesYield(c.right),
         .call => |c| nodeReferencesYield(c.callee),
+        .import_call => |ic| nodeReferencesYield(ic.specifier) or (if (ic.options) |o| nodeReferencesYield(o) else false),
         else => false,
     };
 }
@@ -3157,6 +3207,7 @@ fn nodeReferencesAwait(node: *const ast.Node) bool {
         .assign => |a| nodeReferencesAwait(a.value),
         .comma => |c| nodeReferencesAwait(c.left) or nodeReferencesAwait(c.right),
         .call => |c| nodeReferencesAwait(c.callee),
+        .import_call => |ic| nodeReferencesAwait(ic.specifier) or (if (ic.options) |o| nodeReferencesAwait(o) else false),
         else => false,
     };
 }
@@ -3422,6 +3473,11 @@ fn containsArguments(node: *const ast.Node) bool {
         .new_expr => |n| {
             if (containsArguments(n.callee)) return true;
             for (n.args) |a| if (containsArguments(a)) return true;
+            return false;
+        },
+        .import_call => |ic| {
+            if (containsArguments(ic.specifier)) return true;
+            if (ic.options) |o| if (containsArguments(o)) return true;
             return false;
         },
         .array_literal => |elems| {
@@ -3934,6 +3990,10 @@ fn descendNode(node: *const ast.Node, strict: bool) ParseError!void {
         .new_expr => |c| {
             try descendNode(c.callee, strict);
             for (c.args) |arg| try descendNode(arg, strict);
+        },
+        .import_call => |ic| {
+            try descendNode(ic.specifier, strict);
+            if (ic.options) |o| try descendNode(o, strict);
         },
         .array_literal => |els| for (els) |e| try descendNode(e, strict),
         .object_literal => |props| for (props) |p| {
