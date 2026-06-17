@@ -198,9 +198,10 @@ pub fn build(b: *std.Build) void {
     t262_step.dependOn(&run_t262.step);
 
     // `zig build vendor` — fetch the pinned Test262 corpus (gitignored) into vendor/test262.
-    // Sparse checkout of test/language at the commit in test262.pin; run once after cloning.
-    const vendor = b.addSystemCommand(&.{ "scripts/vendor-test262.sh", "test/language" });
-    const vendor_step = b.step("vendor", "Fetch the pinned Test262 corpus (sparse: test/language)");
+    // Sparse checkout of test/language + test/built-ins at the commit in test262.pin; run once
+    // after cloning. Both trees are in scope (100% ECMAScript = language + built-in library).
+    const vendor = b.addSystemCommand(&.{ "scripts/vendor-test262.sh", "test/language", "test/built-ins" });
+    const vendor_step = b.step("vendor", "Fetch the pinned Test262 corpus (sparse: test/language + test/built-ins)");
     vendor_step.dependOn(&vendor.step);
 
     // Harness unit tests (metadata parsing, classification) run as part of `zig build test`.

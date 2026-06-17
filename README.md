@@ -103,10 +103,11 @@ zig build                 # compile the engine + CLI + harness
 zig build test            # run the engine unit tests (in src/engine.zig) — no Test262 needed
 
 # Test262 conformance corpus is gitignored (it's TC39's ~50k-file suite); fetch the pinned commit:
-zig build vendor          # sparse-checkout test/language at test262.pin → vendor/test262/
+zig build vendor          # sparse-checkout test/language + test/built-ins at test262.pin → vendor/test262/
 
 # run conformance (with the regression gate against the committed baseline):
-zig build test262 -- --path vendor/test262/test/language --harness-dir vendor/test262/harness --baseline baseline/language.json
+zig build test262 -- --path vendor/test262/test/language  --harness-dir vendor/test262/harness --baseline baseline/language.json
+zig build test262 -- --path vendor/test262/test/built-ins --harness-dir vendor/test262/harness --baseline baseline/builtins.json
 zig build lint            # zig fmt --check + ZLint
 zig build bench           # ljs (ReleaseFast) vs Node, gated on no ljs-vs-self perf regression
 ```
@@ -122,12 +123,14 @@ snapshots, and the SDD docs in `specs/` are in git.
 library, i.e. Test262's `test/language/` and `test/built-ins/`. Node/host APIs (CommonJS/ESM host
 module loading, `fs`/`http`/`net`/`process`/`Buffer`, host timers) are explicitly out of scope;
 Promises + the microtask/Job queue are in scope (they're ECMA-262). Conformance is now tracked over
-the **whole `language/` tree** (no longer just `language/expressions`).
+**both** the whole `language/` tree **and** the `built-ins/` tree (the standard library — the bulk of
+the remaining work toward 100% ECMAScript).
 
 ```sh
-# vendor the whole language/ tree (fast sparse checkout), pinned via test262.pin
-./scripts/vendor-test262.sh test/language
-zig build test262 -- --path vendor/test262/test/language --harness-dir vendor/test262/harness
+# vendor BOTH trees (fast sparse checkout), pinned via test262.pin
+./scripts/vendor-test262.sh test/language test/built-ins
+zig build test262 -- --path vendor/test262/test/language  --harness-dir vendor/test262/harness
+zig build test262 -- --path vendor/test262/test/built-ins --harness-dir vendor/test262/harness
 # (a narrower slice, e.g. just expressions, also works:)
 # ./scripts/vendor-test262.sh test/language/expressions
 # baseline + regression gate:
@@ -140,6 +143,21 @@ zig build test262 -- --path <dir> --harness-dir vendor/test262/harness --baselin
 `baseline/language-expressions.json` (the expressions slice, kept for continuity). The remaining
 `language/` failures are now mostly runtime edge cases (`class` long tail, iterator/async details)
 plus the not-yet-implemented `dynamic-import` (host), regex literals, and `BigInt`.
+
+**Built-ins baseline (M37, harness metric):** the `built-ins/` tree (the standard library, 23,646
+test files) measures **≈7,690 passed / ≈45,500 mode-runs = ≈16.9%** at this milestone. `built-ins/`
+is now vendored, measured, and gated via `baseline/builtins.json` (7,744 passing test ids). M37 is an
+**infrastructure + measurement** cycle — no engine feature changed; it opens the standard library up
+for the subsequent stdlib milestones. The failure split is overwhelmingly `unexpected_error` (~82% —
+positive tests that throw `TypeError: … is not a function` because a built-in method is missing), so
+the recoverable clusters are whole method families. The largest failing top-level objects are
+`Temporal`, `RegExp`, `TypedArray`/`DataView`/`ArrayBuffer`/`Atomics` (the binary/typed-array engine)
+and `Date` — these are big *separate* engines; the realistic near-term stdlib wins are the
+prototype/static method gaps in **`Object`** (2,501 fails, already 63%), **`Array`** (≈5,200 fails),
+**`String`** (1,953 fails) and **`Iterator`** helpers (1,014 fails). Note: a handful of `Array`
+partitions (`length`, `prototype/{indexOf,lastIndexOf,slice}` and the top-level `Array` files) trip an
+engine memory blowup when a test sets a very large `array.length` (eager backing-store
+materialization), so they are excluded from the measured numbers and the baseline until that is fixed.
 
 **Metric:** conformance is reported **WITH the Test262 harness prelude** (`--harness-dir
 vendor/test262/harness`, the standard Test262 way). The prior bare-gate numbers undercounted positive
