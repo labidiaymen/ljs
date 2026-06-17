@@ -713,7 +713,7 @@ pub const Parser = struct {
         // post-parse static pass validates the Script scope and recurses into every nested lexical
         // scope (blocks, function/method/arrow bodies, switch CaseBlocks, catch). Parse-time only.
         try validateScope(stmts.items, .script_or_body, self.strict);
-        return .{ .statements = stmts.items };
+        return .{ .statements = stmts.items, .strict = self.strict };
     }
 
     fn parseStmt(self: *Parser) ParseError!ast.Stmt {
@@ -1094,7 +1094,7 @@ pub const Parser = struct {
         // are tracked separately as pre-existing cuts; methods already enforce it.)
         if (is_async and paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
         const f = try self.arena.create(ast.Function);
-        f.* = .{ .name = name, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = is_generator, .is_async = is_async };
+        f.* = .{ .name = name, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = is_generator, .is_async = is_async, .strict = body_strict };
         return f;
     }
 
@@ -1336,13 +1336,14 @@ pub const Parser = struct {
             if (is_async_method and paramsHaveAwait(pl)) return ParseError.UnexpectedToken;
             self.in_generator = is_generator_method;
             self.in_async = is_async_method;
-            const body = try self.parseMethodBody(pl);
+            var body_strict: bool = false;
+            const body = try self.parseMethodBody(pl, &body_strict);
             // §15.7 / §13.2.5.1 UniqueFormalParameters — a method's parameters have no duplicates.
             if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
             // §14.3.1 / §15.5.1: a method's params may not collide with its body's LexicallyDeclaredNames.
             if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
             const f = try self.arena.create(ast.Function);
-            f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = is_generator_method, .is_async = is_async_method, .is_method = true };
+            f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = is_generator_method, .is_async = is_async_method, .is_method = true, .strict = body_strict };
             return .{
                 .kind = if (is_ctor) .constructor else .method,
                 .is_static = is_static,
@@ -1462,10 +1463,11 @@ pub const Parser = struct {
         } else {
             if (pl.params.len != 1 or pl.rest != null) return ParseError.UnexpectedToken;
         }
-        const body = try self.parseMethodBody(pl);
+        var body_strict: bool = false;
+        const body = try self.parseMethodBody(pl, &body_strict);
         if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
         const f = try self.arena.create(ast.Function);
-        f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_method = true };
+        f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_method = true, .strict = body_strict };
         return .{
             .kind = if (is_get) .get else .set,
             .is_static = is_static,
@@ -1711,7 +1713,7 @@ pub const Parser = struct {
         // body's LexicallyDeclaredNames (`async (bar) => { let bar; }`).
         if (is_async and paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
         const f = try self.arena.create(ast.Function);
-        f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_arrow = true, .is_async = is_async };
+        f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_arrow = true, .is_async = is_async, .strict = body_strict };
         return self.alloc(.{ .function = f });
     }
 
@@ -2396,11 +2398,16 @@ pub const Parser = struct {
     /// context the same way `parseFunction` does: the body inherits the enclosing strictness OR its
     /// own "use strict" prologue (§11.2.2), strict params may not be reserved/`eval`/`arguments`
     /// (§13.1.1), and a "use strict" directive is forbidden with a non-simple param list (§15.1.1).
-    fn parseMethodBody(self: *Parser, pl: ParamList) ParseError![]const ast.Stmt {
+    /// `strict_out` (when non-null) receives this method body's §11.2.2 strict-mode flag (inherited
+    /// strict, an own `"use strict"`, or — for a class member — the always-strict class body), so the
+    /// caller can record it on the `ast.Function` for runtime strict gating. (`self.strict` is restored
+    /// to the enclosing value on the way out, so it can't be read back at the creation site.)
+    fn parseMethodBody(self: *Parser, pl: ParamList, strict_out: ?*bool) ParseError![]const ast.Stmt {
         const enclosing_strict = self.strict;
         defer self.strict = enclosing_strict;
         const body_strict = enclosing_strict or
             (self.peek().kind == .lbrace and directivePrologueIsStrict(self.tokens[self.idx + 1 ..]));
+        if (strict_out) |p| p.* = body_strict;
         if (body_strict and paramsHaveStrictReserved(pl)) return ParseError.UnexpectedToken;
         self.strict = body_strict;
         const ctrl = self.enterControlScope(); // §14.13: a method body starts a fresh label scope
@@ -2468,12 +2475,13 @@ pub const Parser = struct {
                     if (om_is_async and paramsHaveAwait(pl)) return ParseError.UnexpectedToken;
                     self.in_generator = om_is_gen;
                     self.in_async = om_is_async;
-                    const body = try self.parseMethodBody(pl);
+                    var body_strict: bool = false;
+                    const body = try self.parseMethodBody(pl, &body_strict);
                     if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
                     // §14.3.1 / §15.5.1: params may not collide with the body's LexicallyDeclaredNames.
                     if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
                     const f = try self.arena.create(ast.Function);
-                    f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = om_is_gen, .is_async = om_is_async, .is_method = true };
+                    f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = om_is_gen, .is_async = om_is_async, .is_method = true, .strict = body_strict };
                     const fnode = try self.alloc(.{ .function = f });
                     try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = fnode });
                     if (self.peek().kind == .comma) {
@@ -2503,11 +2511,12 @@ pub const Parser = struct {
                 } else {
                     if (pl.params.len != 1 or pl.rest != null) return ParseError.UnexpectedToken;
                 }
-                const body = try self.parseMethodBody(pl);
+                var body_strict: bool = false;
+                const body = try self.parseMethodBody(pl, &body_strict);
                 // §13.2.5.1 UniqueFormalParameters — a method/accessor's params have no duplicates.
                 if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
                 const f = try self.arena.create(ast.Function);
-                f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_method = true };
+                f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_method = true, .strict = body_strict };
                 const fnode = try self.alloc(.{ .function = f });
                 try props.append(self.arena, .{
                     .kind = if (is_get) .get else .set,
@@ -2533,13 +2542,14 @@ pub const Parser = struct {
                 defer self.in_generator = saved_in_generator;
                 self.in_generator = false;
                 const pl = try self.parseParams();
-                const body = try self.parseMethodBody(pl);
+                var body_strict: bool = false;
+                const body = try self.parseMethodBody(pl, &body_strict);
                 // §13.2.5.1 UniqueFormalParameters — a method's parameters have no duplicates.
                 if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
                 // §14.3.1: params may not collide with the body's LexicallyDeclaredNames.
                 if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
                 const f = try self.arena.create(ast.Function);
-                f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_method = true };
+                f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_method = true, .strict = body_strict };
                 const fnode = try self.alloc(.{ .function = f });
                 try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = fnode });
             } else if (self.peek().kind == .colon) {

@@ -647,6 +647,70 @@ test "M33 duplicate-declaration Early Errors (§14.2.1/§14.12.1/§14.15.1/§16.
     try expectNumber("for (let i = 0; i < 1; i++) { let i; } 1", 1); // loop head vs body are separate scopes
 }
 
+test "M34 sloppy assignment to an unresolved name creates a global (§9.1.1.4.16 / §6.2.5.6 PutValue)" {
+    // §6.2.5.6 step 6.a / §9.1.1.4.16: in SLOPPY mode, `x = v` where `x` is unresolved succeeds and
+    // creates a property on the global object (and a global binding) — it does NOT throw.
+    try expectNumber("x = 5; x", 5);
+    try expectNumber("x = 5; globalThis.x", 5); // the reified global object reflects the new global
+    try expectNumber("r = 8; globalThis.r", 8); // bare-assignment → globalThis property
+    // A sloppy function body that assigns to an unresolved name also creates the global.
+    try expectNumber("function f(){ w = 3; } f(); globalThis.w", 3);
+    try expectNumber("function f(){ w = 3; } f(); w", 3); // bare read sees the same value
+    // §10.1.9.2: the created global property is enumerable/writable/configurable (Set, not var-create).
+    try expectBool("aa = 1; Object.getOwnPropertyDescriptor(globalThis, 'aa').enumerable", true);
+    // The created global is a normal mutable binding — a subsequent bare read sees the latest value.
+    try expectNumber("b = 1; b = 2; b", 2);
+
+    // §13.15.2: STRICT mode keeps throwing ReferenceError for an assignment to an unresolved name.
+    // (A `"use strict"` Script body, and a strict function body, both gate this.)
+    try expectThrows("'use strict'; y = 5;");
+    try expectThrows("'use strict'; (function(){ z = 1; })();");
+    try expectBool("'use strict'; try { y2 = 1; false } catch (e) { e instanceof ReferenceError }", true);
+    try expectBool(
+        "var f = function(){ 'use strict'; z2 = 1; }; try { f(); false } catch (e) { e instanceof ReferenceError }",
+        true,
+    );
+    // A strict function nested in a sloppy script is strict at runtime; a sloppy function nested in a
+    // strict script is sloppy at runtime — runtime strictness is per-function (lexical), not per-caller.
+    try expectBool("function s(){ 'use strict'; u = 1; } try { s(); false } catch (e) { e instanceof ReferenceError }", true);
+
+    // A class body is always strict — an assignment to an unresolved name in a method throws.
+    try expectBool(
+        "class C { m(){ cc = 1; } } try { new C().m(); false } catch (e) { e instanceof ReferenceError }",
+        true,
+    );
+    // Reading an unresolved identifier ALWAYS throws ReferenceError (sloppy or strict) — only the
+    // assignment target is special; compound/update (`+= `/`++`) read first, so they still throw.
+    try expectThrows("missingReadOnly + 1");
+    try expectThrows("undeclaredCompound += 1;"); // reads `undeclaredCompound` first → ReferenceError
+
+    // §13.x TDZ: a lexical (`let`/`const`/`class`) name is hoisted into its scope as UNINITIALIZED, so
+    // a reference BEFORE the declaration line is a ReferenceError — NOT a stray global / outer binding.
+    // This is what gates the sloppy-global change from swallowing a before-init `let` assignment.
+    try expectBool(
+        "(function(){ function set(){ p = 1; } try { set(); return false } catch (e) { return e instanceof ReferenceError } let p; })()",
+        true,
+    ); // assign to a block-scoped `let` before its declaration → TDZ, not a global
+    try expectBool(
+        "(function(){ try { 0, [q] = []; return false } catch (e) { return e instanceof ReferenceError } let q; })()",
+        true,
+    ); // destructuring-assign to a `let` before its declaration → TDZ
+    try expectBool(
+        "(function(){ try { return rr } catch (e) { return e instanceof ReferenceError } let rr; })()",
+        true,
+    ); // READ of a `let` before its declaration → TDZ
+    try expectBool(
+        "(function(){ try { tt++; return false } catch (e) { return e instanceof ReferenceError } let tt; })()",
+        true,
+    ); // `++` of a `let` before its declaration → TDZ (the GetValue throws)
+    // A normal `let`/`const`/`class`, declared then used, is unaffected by the TDZ hoist.
+    try expectNumber("let aok = 3; aok + 1", 4);
+    try expectNumber("const cok = 7; cok", 7);
+    try expectNumber("let z1 = 1; { let z1 = 2; } z1", 1); // nested-block shadow still works
+    // §9.1.1.4.18: `delete x` of a sloppy-created global removes it (configurable), so a later read throws.
+    try expectBool("dx = 1; delete dx; try { dx; false } catch (e) { e instanceof ReferenceError }", true);
+}
+
 test "M8 Symbol primitive: typeof, description, identity (§20.4)" {
     try expectStr("typeof Symbol()", "symbol");
     try expectStr("typeof Symbol('d')", "symbol");

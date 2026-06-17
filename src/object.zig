@@ -393,6 +393,12 @@ pub const FunctionData = struct {
     /// derived constructor (no explicit `constructor`) forwards its args to `super(...)`.
     is_derived_ctor: bool = false,
     super_ctor: ?*Object = null,
+    /// §11.2.2 strict-mode flag of this function's body (from `ast.Function.strict`): inherited strict,
+    /// an own `"use strict"` prologue, or a class member (always strict). The interpreter restores its
+    /// runtime strict state to this around the body, so §6.2.5.6 PutValue to an unresolved name throws
+    /// ReferenceError (strict) instead of creating a global property (sloppy). Class constructors are
+    /// always strict (§15.7) — set true when synthesizing the constructor's FunctionData.
+    strict: bool = false,
 };
 
 /// §15.7.14 one resolved instance FieldDefinition: the property key (computed keys are evaluated at

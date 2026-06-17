@@ -219,6 +219,12 @@ pub const Function = struct {
     /// *async-generator* method, which (being a GeneratorFunction) still receives its generator
     /// `prototype`. Plain function declarations/expressions and class constructors leave this false.
     is_method: bool = false,
+    /// §11.2.2 strict-mode flag for THIS function's body: true if the body inherits strictness from an
+    /// enclosing strict scope, carries its own `"use strict"` directive prologue, or is a class member
+    /// (class bodies are always strict). Computed at parse time. The interpreter restores its runtime
+    /// strict state to this value around the body so §6.2.5.6 PutValue to an unresolved name throws
+    /// ReferenceError (strict) versus creating a global property (sloppy).
+    strict: bool = false,
 };
 
 /// §15.7 Class Definitions. A `Class` is the shared shape of a ClassDeclaration (statement) and a
@@ -324,4 +330,8 @@ pub const Stmt = union(enum) {
 /// A `switch` case; `test_expr == null` for `default`.
 pub const Case = struct { test_expr: ?*const Node, body: []const Stmt };
 
-pub const Program = struct { statements: []const Stmt };
+/// §11.2.2: a Script is strict if it carries a `"use strict"` directive prologue (or the runner runs
+/// it in strict `RunMode`). The interpreter reads this to gate runtime strict-mode semantics — most
+/// notably §9.1.1.4.16 SetMutableBinding / §6.2.5.6 PutValue: an assignment to an unresolved name
+/// CREATES a global property in sloppy code but throws ReferenceError in strict code.
+pub const Program = struct { statements: []const Stmt, strict: bool = false };

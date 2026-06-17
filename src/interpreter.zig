@@ -72,6 +72,13 @@ pub const Interpreter = struct {
     /// The realm's global environment — used to resolve the Error family for engine-thrown
     /// errors (so they carry the right prototype + name). Set by the engine after setup.
     globals: ?*Environment = null,
+    /// §11.2.2 the running execution context's strict-mode flag. Set from the Script's strictness on
+    /// `run`, and saved/restored to the active function's `FunctionData.strict` around each body
+    /// (`callFunction`). Gates §6.2.5.6 PutValue to an UNRESOLVED IdentifierReference: in sloppy mode
+    /// it creates a property on the global object (§9.1.1.4.16 step "global, var-create"); in strict
+    /// mode it throws ReferenceError. Only the slow (unresolved) assignment path reads it — a resolved
+    /// binding's mutation never consults it, so the hot assignment path is unchanged.
+    strict: bool = false,
     /// §14.11 count of `with` statements currently on the scope chain. When 0 (the overwhelming
     /// common case) identifier resolution takes the fast declarative path unchanged; when >0,
     /// resolution consults object Environment Records (the `with` binding objects) first.
@@ -140,6 +147,17 @@ pub const Interpreter = struct {
     }
 
     pub fn run(self: *Interpreter, program: ast.Program, env: *Environment) EvalError!Completion {
+        // §11.2.2: the Script (or eval) body runs in its declared strict context (a `"use strict"`
+        // prologue, a strict `RunMode`, or — for a direct eval — strictness inherited from the caller,
+        // already folded into `program.strict` by the parser). Gates §6.2.5.6 PutValue to an unresolved
+        // name. Saved/restored so an eval's body strictness does not leak back into the caller's frame.
+        const saved_strict = self.strict;
+        self.strict = program.strict;
+        defer self.strict = saved_strict;
+        // §16.1.7 / §19.2.1.3 Global/EvalDeclarationInstantiation (lexical step): hoist this Script/eval
+        // body's top-level `let`/`const`/`class` names into the env as TDZ bindings before any statement
+        // runs, so a forward reference is a §13.x ReferenceError (not a stray global / outer resolution).
+        try self.hoistLexicalNames(program.statements, env);
         var last: Completion = .{ .normal = .undefined };
         for (program.statements) |stmt| {
             last = try self.evalStmt(stmt, env);
@@ -216,7 +234,7 @@ pub const Interpreter = struct {
             },
             .func_decl => |f| {
                 // §15.2 — bind a function object to its name in the current scope.
-                const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env, .is_generator = f.is_generator, .is_async = f.is_async });
+                const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env, .is_generator = f.is_generator, .is_async = f.is_async, .strict = f.strict });
                 obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
                 // §20.2.4.1/.2: a declaration always has a name; install `length` + `name`.
                 try setFunctionLength(obj, paramCount(f.params));
@@ -414,6 +432,47 @@ pub const Interpreter = struct {
         return .unresolved;
     }
 
+    /// §8.2.6 / §14.2.3 / §10.2.11 lexical pre-declaration (the §10/§14 *DeclarationInstantiation*
+    /// step for lexical names): create each top-level `let`/`const`/`class` BoundName of `stmts` in
+    /// `env` as an UNINITIALIZED binding (its Temporal Dead Zone). When the declaration statement later
+    /// runs it initializes the binding (`declare` with `initialized = true`). This makes a *reference*
+    /// to a lexical name BEFORE its declaration line a §13.x TDZ ReferenceError (read AND PutValue),
+    /// rather than resolving to an outer scope or — for an assignment — wrongly creating a global. Only
+    /// the scope's OWN top-level declarations are hoisted (nested blocks/loops/functions have their own
+    /// scope + pass); `var`/`function` are not lexical (function declarations are separately created
+    /// initialized). Names already present in `env` (the rare re-entry) are left untouched.
+    fn hoistLexicalNames(self: *Interpreter, stmts: []const ast.Stmt, env: *Environment) EvalError!void {
+        for (stmts) |s| switch (s) {
+            .declaration => |d| {
+                if (d.kind == .var_decl) continue; // §13.3.2 `var` is not a lexical (no TDZ here)
+                for (d.decls) |dec| try self.hoistPatternNames(dec.target, env);
+            },
+            .class_decl => |c| {
+                // §15.7: a ClassDeclaration introduces a lexical (let-like) binding for its name.
+                if (c.name) |nm| if (env.lookupLocal(nm) == null)
+                    try env.declare(nm, .undefined, true, false); // uninitialized → TDZ
+            },
+            else => {},
+        };
+    }
+
+    /// Pre-declare every BindingIdentifier in a lexical-declaration pattern as uninitialized (TDZ).
+    fn hoistPatternNames(self: *Interpreter, pattern: *const ast.Pattern, env: *Environment) EvalError!void {
+        switch (pattern.*) {
+            .identifier => |n| {
+                if (env.lookupLocal(n) == null) try env.declare(n, .undefined, true, false);
+            },
+            .array => |ap| {
+                for (ap.elements) |el| if (el.target) |t| try self.hoistPatternNames(t, env);
+                if (ap.rest) |r| try self.hoistPatternNames(r, env);
+            },
+            .object => |op| {
+                for (op.properties) |prop| try self.hoistPatternNames(prop.target, env);
+                if (op.rest) |r| if (env.lookupLocal(r) == null) try env.declare(r, .undefined, true, false);
+            },
+        }
+    }
+
     fn runBlock(self: *Interpreter, stmts: []const ast.Stmt, env: *Environment) EvalError!Completion {
         var last: Completion = .{ .normal = .undefined };
         for (stmts) |s| {
@@ -428,6 +487,11 @@ pub const Interpreter = struct {
     /// using`. Gated on `blockHasUsing` so an ordinary scope is identical to a bare `runBlock` (perf:
     /// no dispose-stack traffic for ordinary scope exit).
     fn runScope(self: *Interpreter, stmts: []const ast.Stmt, env: *Environment) EvalError!Completion {
+        // §14.2.3 BlockDeclarationInstantiation (lexical step): hoist this block's top-level
+        // `let`/`const`/`class` names as TDZ bindings before running it. `runScope` is entered only for a
+        // block that actually has lexical declarations (or a try/catch/finally body), so the hot path
+        // (declaration-free blocks via `runBlock`) never reaches here.
+        try self.hoistLexicalNames(stmts, env);
         if (!blockHasUsing(stmts)) return self.runBlock(stmts, env);
         const marker = self.disposables.items.len;
         const c = try self.runBlock(stmts, env);
@@ -653,6 +717,31 @@ pub const Interpreter = struct {
         }
     }
 
+    /// §6.2.5.6 PutValue step 6.a / §9.1.1.4.16 + §9.1.1.1.3: an assignment to an UNRESOLVED
+    /// IdentifierReference. In STRICT mode this is a ReferenceError; in SLOPPY mode it performs
+    /// `Set(globalObject, name, value, false)`, which — when the property is absent — creates an
+    /// ordinary {writable, enumerable, configurable} own property on the global object. We keep the
+    /// engine's two views of the global namespace consistent: the property is written on BOTH the
+    /// reified global object (so `globalThis.x` sees it) AND the global declarative Environment (so a
+    /// bare `x` resolves to it). Returns the assigned value. SLOW path only — a resolved binding never
+    /// reaches here, so the hot assignment path is unchanged.
+    fn assignUnresolved(self: *Interpreter, name: []const u8, value: Value) EvalError!Completion {
+        if (self.strict) return self.throwError("ReferenceError", name);
+        const g = self.globals orelse return self.throwError("ReferenceError", name);
+        // Mirror onto the reified global object (`globalThis`). `set` honors an existing non-writable
+        // property (a no-op write, per Set(..., false)); otherwise it creates a default data property.
+        if (g.lookup("%GlobalThis%")) |gb| if (gb.value == .object) {
+            try gb.value.object.set(name, value);
+        };
+        // Reflect in the global Environment so bare-identifier resolution sees the same value.
+        if (g.lookup(name)) |b| {
+            if (b.mutable) b.value = value;
+        } else {
+            try g.declare(name, value, true, true);
+        }
+        return .{ .normal = value };
+    }
+
     /// §6.2.5.6 PutValue — write `value` through the AssignmentTarget `node` (identifier / `a.b` /
     /// `a[k]`). Mirrors the `assign`/`assign_member`/`assign_index` evaluation paths.
     fn assignToTarget(self: *Interpreter, node: *const ast.Node, value: Value, env: *Environment) EvalError!Completion {
@@ -661,13 +750,15 @@ pub const Interpreter = struct {
                 if (self.with_depth > 0) switch (self.resolveIdRef(env, name)) {
                     .with_object => |o| return self.setProperty(.{ .object = o }, name, value),
                     .binding => |b| {
+                        if (!b.initialized) return self.throwError("ReferenceError", name); // §13.x TDZ
                         if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
                         b.value = value;
                         return .{ .normal = value };
                     },
-                    .unresolved => return self.throwError("ReferenceError", name),
+                    .unresolved => return self.assignUnresolved(name, value),
                 };
-                const b = env.lookup(name) orelse return self.throwError("ReferenceError", name);
+                const b = env.lookup(name) orelse return self.assignUnresolved(name, value);
+                if (!b.initialized) return self.throwError("ReferenceError", name); // §13.x PutValue to a TDZ binding
                 if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
                 b.value = value;
                 return .{ .normal = value };
@@ -797,13 +888,15 @@ pub const Interpreter = struct {
                 if (self.with_depth > 0) switch (self.resolveIdRef(env, a.name)) {
                     .with_object => |o| return self.setProperty(.{ .object = o }, a.name, c.normal),
                     .binding => |b| {
+                        if (!b.initialized) return self.throwError("ReferenceError", a.name); // §13.x TDZ
                         if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
                         b.value = c.normal;
                         return .{ .normal = c.normal };
                     },
-                    .unresolved => return self.throwError("ReferenceError", a.name),
+                    .unresolved => return self.assignUnresolved(a.name, c.normal),
                 };
-                const b = env.lookup(a.name) orelse return self.throwError("ReferenceError", a.name);
+                const b = env.lookup(a.name) orelse return self.assignUnresolved(a.name, c.normal);
+                if (!b.initialized) return self.throwError("ReferenceError", a.name); // §13.x PutValue to a TDZ binding
                 if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
                 b.value = c.normal;
                 return .{ .normal = c.normal };
@@ -936,6 +1029,7 @@ pub const Interpreter = struct {
                 switch (u.target.*) {
                     .identifier => |name| {
                         const b = env.lookup(name) orelse return self.throwError("ReferenceError", name);
+                        if (!b.initialized) return self.throwError("ReferenceError", name); // §13.4 TDZ on the GetValue
                         const oldc = try self.toNumberV(b.value);
                         if (oldc.isAbrupt()) return oldc;
                         const old = oldc.normal.number;
@@ -1631,6 +1725,7 @@ pub const Interpreter = struct {
             .is_class_ctor = true,
             .is_derived_ctor = is_derived,
             .super_ctor = super_ctor,
+            .strict = true, // §15.7: a class body (and thus its constructor) is always strict
         });
         ctor.prototype = self.functionProto(); // §20.2.3 default; a derived class overrides to Super below
         // The constructor's `.prototype` object holds the instance methods.
@@ -1934,6 +2029,7 @@ pub const Interpreter = struct {
             .is_async = f.is_async,
             .is_method = f.is_method,
             .captured_this = if (f.is_arrow) self.this_val else .undefined,
+            .strict = f.strict,
         });
         obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
         // §20.2.4.1/.2: install `length` (ExpectedArgumentCount) and `name` (the declared name, or
@@ -2043,7 +2139,8 @@ pub const Interpreter = struct {
             const arg: Value = if (args.items.len > 0) args.items[0] else .undefined;
             if (arg != .string) return .{ .normal = arg };
             const eval_env = try Environment.create(self.arena, env);
-            return self.performEval(arg.string, eval_env);
+            // §19.2.1.1: a DIRECT eval inherits the caller's strictness.
+            return self.performEval(arg.string, eval_env, self.strict);
         }
 
         if (callee != .object or callee.object.kind != .function) {
@@ -2148,7 +2245,17 @@ pub const Interpreter = struct {
         const saved_labels = self.pending_labels;
         self.pending_labels = .empty;
         defer self.pending_labels = saved_labels;
+        // §11.2.2: the body runs in its own strict context (`fd.strict`, computed at parse time —
+        // inherited strict, an own `"use strict"`, a class member, or a class constructor). Restored on
+        // return so the caller's strictness is unaffected. A sloppy callee called from strict code (and
+        // vice-versa) is gated correctly for §6.2.5.6 PutValue to an unresolved name.
+        const saved_strict = self.strict;
+        self.strict = fd.strict;
+        defer self.strict = saved_strict;
 
+        // §10.2.11 FunctionDeclarationInstantiation (lexical step): hoist the body's top-level
+        // `let`/`const`/`class` names as TDZ bindings before it runs (so a forward reference throws).
+        try self.hoistLexicalNames(fd.body, call_env);
         // §ER: a FunctionBody lexically containing a `using`/`await using` disposes its resources on
         // exit (normal return OR throw). Gated on `blockHasUsing` so an ordinary body pays nothing.
         if (blockHasUsing(fd.body)) {
@@ -3393,6 +3500,11 @@ pub const Interpreter = struct {
         if (abrupt) |c| return c;
         self.this_val = gen.this_val;
         self.home_object = gen.home_object;
+        // §11.2.2: the generator/async body runs in its own strict context (this fresh body interpreter
+        // started sloppy). A strict body's §6.2.5.6 PutValue to an unresolved name must throw.
+        self.strict = fd.strict;
+        // §10.2.11 (lexical step): hoist the body's top-level `let`/`const`/`class` names as TDZ bindings.
+        try self.hoistLexicalNames(fd.body, call_env);
         // §ER: a GeneratorBody / AsyncFunctionBody / AsyncGeneratorBody lexically containing a
         // `using`/`await using` disposes its resources on body exit (return OR throw). Gated on
         // `blockHasUsing` so an ordinary body pays nothing.
@@ -4729,11 +4841,26 @@ pub const Interpreter = struct {
                 if (kc.isAbrupt()) return kc;
                 return self.deleteProperty(oc.normal, try self.toString(kc.normal));
             },
-            // §13.5.1.2 step 3: `delete` of an unqualified IdentifierReference. In sloppy mode the
-            // binding would be deleted only if configurable; our bindings aren't deletable, so we
-            // return true without removing (a benign M-subset deviation). Strict mode is a
-            // SyntaxError (§13.5.1.1) — not yet enforced (no strict-mode context; see gap note).
-            .identifier => return .{ .normal = .{ .boolean = true } },
+            // §13.5.1.2 step 3 / §9.1.1.4.18 DeleteBinding: `delete` of an unqualified
+            // IdentifierReference. A binding created by a sloppy assignment to an unresolved name
+            // (§9.1.1.4.16) is a CONFIGURABLE global property — `delete` removes it (from both the
+            // reified global object and the global Environment, keeping the two views consistent), so a
+            // later read throws ReferenceError. Lexical/var/function bindings are non-deletable: those
+            // (no configurable global-object property) keep the M-subset deviation of returning true
+            // without removing. Strict `delete x` is a §13.5.1.1 SyntaxError (parse-rejected upstream).
+            .identifier => |name| {
+                if (self.globals) |g| {
+                    if (g.lookup("%GlobalThis%")) |gb| if (gb.value == .object) {
+                        const o = gb.value.object;
+                        if (o.properties.get(name)) |pv| {
+                            if (!pv.configurable) return .{ .normal = .{ .boolean = false } };
+                            _ = o.properties.orderedRemove(name);
+                            _ = g.vars.remove(name); // remove the mirrored global Environment binding
+                        }
+                    };
+                }
+                return .{ .normal = .{ .boolean = true } };
+            },
             // §13.5.1.2 step 2: the operand is not a Reference — evaluate it for side effects and
             // return true (`delete 5`, `delete f()`, `delete (x + 1)`).
             else => {
@@ -4931,8 +5058,11 @@ pub const Interpreter = struct {
     /// writes of surrounding bindings work; `let`/`const`/`class` are eval-local) or the GLOBAL env for
     /// INDIRECT eval. `this_val`/`home_object` are left at the interpreter's current values (inherited
     /// for direct; the caller resets them for indirect). Non-string `source` is handled by the caller.
-    fn performEval(self: *Interpreter, source: []const u8, target_env: *Environment) EvalError!Completion {
-        const program = Parser.parse(self.arena, source) catch |e| switch (e) {
+    fn performEval(self: *Interpreter, source: []const u8, target_env: *Environment, inherit_strict: bool) EvalError!Completion {
+        // §19.2.1.1: the eval code is strict iff it carries its own `"use strict"` prologue OR (DIRECT
+        // eval only) the calling context is strict (`inherit_strict`). Parsing with the inherited flag
+        // folds both into `program.strict`, which `run` installs as the eval body's runtime strictness.
+        const program = Parser.parseMode(self.arena, source, inherit_strict) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             // §19.2.1 step 7: a parse failure throws a SyntaxError (a real, catchable error object).
             else => return self.throwError("SyntaxError", "eval: invalid source"),
@@ -5627,7 +5757,8 @@ pub const Interpreter = struct {
                 }
                 self.this_val = if (genv.lookup("%GlobalThis%")) |b| b.value else .undefined;
                 self.home_object = null;
-                return self.performEval(arg.string, genv);
+                // §19.2.1.1: INDIRECT eval runs in the global context — sloppy unless its own prologue.
+                return self.performEval(arg.string, genv, false);
             },
             else => {},
         }
