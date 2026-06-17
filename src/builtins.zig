@@ -772,7 +772,10 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         while (it.next()) |entry| {
             const name = entry.key_ptr.*;
             if (name.len > 0 and name[0] == '%') continue; // skip %...% sentinels
-            try global_obj.defineData(name, entry.value_ptr.value, true, false, true);
+            // §19.1.1/.2/.4: the value properties NaN / Infinity / undefined are non-writable AND
+            // non-configurable on the global object (others — constructors etc. — are writable+configurable).
+            const immutable = std.mem.eql(u8, name, "undefined") or std.mem.eql(u8, name, "NaN") or std.mem.eql(u8, name, "Infinity");
+            try global_obj.defineData(name, entry.value_ptr.value, !immutable, false, !immutable);
         }
     }
     // §19.3.1 globalThis is a writable, non-enumerable, configurable own property of the global object

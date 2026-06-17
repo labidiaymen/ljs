@@ -75,6 +75,9 @@ pub fn evaluateAsyncTest(arena: std.mem.Allocator, source: []const u8, mode: Run
     var gen_registry: std.ArrayListUnmanaged(*obj_mod.Generator) = .empty;
     var job_queue: std.ArrayListUnmanaged(obj_mod.Job) = .empty;
     var interp = Interpreter{ .arena = arena, .step_limit = step_limit, .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue, .async_done = done_sink };
+    // §9.4.2 GetThisBinding: the global environment's `this` is the global object (in both strict and
+    // sloppy mode), so the top-level Script body runs with `this` = globalThis.
+    interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
     const completion = interp.run(program, global) catch |e| {
         interp.cleanupGenerators();
         return switch (e) {
@@ -124,6 +127,8 @@ pub fn evaluateWithLimit(arena: std.mem.Allocator, source: []const u8, mode: Run
     // reactions / async-function continuations run here). Empty for a script with no promises (no-op).
     var job_queue: std.ArrayListUnmanaged(@import("object.zig").Job) = .empty;
     var interp = Interpreter{ .arena = arena, .step_limit = step_limit, .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
+    // §9.4.2 GetThisBinding: the global environment's `this` is the global object (both modes).
+    interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
     const completion = interp.run(program, global) catch |e| {
         interp.cleanupGenerators(); // join/abandon any parked generator threads before unwinding
         return switch (e) {

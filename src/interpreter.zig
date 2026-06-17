@@ -2413,6 +2413,13 @@ pub const Interpreter = struct {
     }
 
     /// §10.2.1 [[Call]] — native built-in, else an ordinary AST-closure function.
+    /// The global object as a Value (the realm's `%GlobalThis%`), or null in a realm-less context.
+    /// Used for §10.2.1.2 sloppy `this` substitution and §9.4.2 global `this`.
+    fn globalThisValue(self: *Interpreter) ?Value {
+        if (self.globals) |g| if (g.lookup("%GlobalThis%")) |b| return b.value;
+        return null;
+    }
+
     pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
         // §13.3.12: consume the one-shot [[NewTarget]] hand-off from a preceding `construct` (else
         // `undefined`) and clear the slot immediately — so it cannot leak past this [[Call]] into a
@@ -2437,14 +2444,22 @@ pub const Interpreter = struct {
         // Generator object in `suspended_start` (the body runs on its own thread later, on `.next`).
         // Checked before the depth bump so it pays no recursion budget; ordinary functions skip it.
         if (func.call) |fd0| {
+            // §10.2.1.2 OrdinaryCallBindThis: generator / async functions snapshot `this` here (off the
+            // ordinary-body path below), so apply the non-strict global-`this` substitution before they
+            // capture it — otherwise a sloppy `function* g(){}` / `async function f(){}` called with
+            // undefined `this` would see undefined instead of the global object. Arrows: captured_this.
+            const gen_this = if (!fd0.is_arrow and !fd0.strict and (this_val == .undefined or this_val == .null))
+                (self.globalThisValue() orelse this_val)
+            else
+                this_val;
             // §27.6.2 an async generator (`async function*`) [[Call]] returns an AsyncGenerator object
             // (lazy — the body runs on its own thread when first driven). Checked before the plain
             // generator / async branches (it is both is_async AND is_generator).
-            if (fd0.is_generator and fd0.is_async) return self.createAsyncGenerator(func, args, this_val);
-            if (fd0.is_generator) return self.createGenerator(func, args, this_val);
+            if (fd0.is_generator and fd0.is_async) return self.createAsyncGenerator(func, args, gen_this);
+            if (fd0.is_generator) return self.createGenerator(func, args, gen_this);
             // §27.7.5.1 an async function's [[Call]] returns a Promise immediately and runs the body on
             // a generator-style thread, suspending at each `await`.
-            if (fd0.is_async) return self.callAsyncFunction(func, args, this_val);
+            if (fd0.is_async) return self.callAsyncFunction(func, args, gen_this);
         }
         // Each call stacks several heavy native frames — count call depth too so the guard
         // fires before the native stack overflows (these frames are bigger than expr frames).
@@ -2460,7 +2475,14 @@ pub const Interpreter = struct {
         // §15.3: an arrow has no own `this` binding — it uses the `this` captured at creation,
         // ignoring however it was called. Ordinary functions take the call-site `this`.
         const saved_this = self.this_val;
-        self.this_val = if (fd.is_arrow) fd.captured_this else this_val;
+        self.this_val = if (fd.is_arrow) fd.captured_this else blk: {
+            // §10.2.1.2 OrdinaryCallBindThis (this-mode = global): a NON-STRICT ordinary function called
+            // with a `this` of undefined/null uses the global object instead. Strict functions keep the
+            // value as-is; arrows use their captured `this`. (Primitive-`this` boxing in sloppy mode is a
+            // separate refinement, not handled here.)
+            if (!fd.strict and (this_val == .undefined or this_val == .null)) break :blk (self.globalThisValue() orelse this_val);
+            break :blk this_val;
+        };
         defer self.this_val = saved_this;
         // §9.2.5/§13.3.5: a method invocation installs its [[HomeObject]] for `super` resolution.
         // An arrow has no own home object — it lexically keeps the enclosing one (like `this`), so
@@ -3048,9 +3070,20 @@ pub const Interpreter = struct {
                 // property. The common case (absent or own data) stays a single `set`.
                 if (o.getProp(key)) |loc| {
                     if (loc.pv.payload == .accessor) {
-                        const setter = loc.pv.payload.accessor.set orelse return .{ .normal = value };
+                        const setter = loc.pv.payload.accessor.set orelse {
+                            // §10.1.9.2: a getter-only accessor (own or inherited) → [[Set]] returns false;
+                            // §6.2.5.6 PutValue throws in strict, silent no-op in sloppy.
+                            if (self.strict) return self.throwError("TypeError", "Cannot set property that has only a getter");
+                            return .{ .normal = value };
+                        };
                         const sc = try self.callFunction(setter, &.{value}, base);
                         if (sc.isAbrupt()) return sc;
+                        return .{ .normal = value };
+                    }
+                    // §10.1.9.2: a non-writable data property (own or inherited — an inherited non-writable
+                    // data property blocks creating a shadowing own property) → [[Set]] returns false.
+                    if (!loc.pv.writable) {
+                        if (self.strict) return self.throwError("TypeError", "Cannot assign to read only property");
                         return .{ .normal = value };
                     }
                 }
@@ -5509,12 +5542,21 @@ pub const Interpreter = struct {
     /// resolves the base object, removes the own property `key`, and returns `true`. For an array
     /// integer index we leave a hole by setting the element to `undefined` (M-subset; a true sparse
     /// array model is deferred). A non-Reference operand evaluates for side effects and returns true.
+    /// §13.5.1.2 step 6: in strict mode a `delete` of a property reference whose [[Delete]] returned
+    /// false (a non-configurable own property) is a TypeError; sloppy mode yields the `false`.
+    fn finishStrictDelete(self: *Interpreter, dc: Completion) EvalError!Completion {
+        if (dc.isAbrupt()) return dc;
+        if (self.strict and dc.normal == .boolean and !dc.normal.boolean) return self.throwError("TypeError", "Cannot delete property of an object in strict mode");
+        return dc;
+    }
+
     fn evalDelete(self: *Interpreter, operand: *const ast.Node, env: *Environment) EvalError!Completion {
         switch (operand.*) {
             .member => |m| {
                 const oc = try self.evalExpr(m.object, env);
                 if (oc.isAbrupt()) return oc;
-                return self.deleteProperty(oc.normal, m.name);
+                const dc = try self.deleteProperty(oc.normal, m.name);
+                return self.finishStrictDelete(dc);
             },
             .index => |ix| {
                 const oc = try self.evalExpr(ix.object, env);
@@ -5526,11 +5568,11 @@ pub const Interpreter = struct {
                 const pk = try self.toPropertyKey(kc.normal);
                 if (pk.isAbrupt()) return pk.completion;
                 if (pk.symbol) |sym| {
-                    if (oc.normal == .object) return .{ .normal = .{ .boolean = oc.normal.object.deleteSymbol(sym) } };
+                    if (oc.normal == .object) return self.finishStrictDelete(.{ .normal = .{ .boolean = oc.normal.object.deleteSymbol(sym) } });
                     if (oc.normal == .undefined or oc.normal == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
                     return .{ .normal = .{ .boolean = true } };
                 }
-                return self.deleteProperty(oc.normal, pk.key);
+                return self.finishStrictDelete(try self.deleteProperty(oc.normal, pk.key));
             },
             // §13.5.1.2 step 3 / §9.1.1.4.18 DeleteBinding: `delete` of an unqualified
             // IdentifierReference. A binding created by a sloppy assignment to an unresolved name
