@@ -12,4 +12,8 @@ description: "Task list for the UTF-16 strings EPIC (068) — phased; M80 = Phas
 - [x] T050 Local repros: SC-003 cases pass; ASCII strings unchanged.
 - [x] T060 FULL gate: build/test/lint green; language 39116 = 89.6%, +8, 0 regressions; bench ok. (engine_tests astral-length updated; charCodeAt/codePointAt NaN/Inf guards added.)
 
-## Later phases (M81+): see spec.md — escapes, index-methods, iteration/misc, regex.
+## Phase 2 (M81) — escapes + fromCharCode/fromCodePoint — DONE (+0 language, +2 built-ins/String, 0 regr)
+- [x] canonicalizeSurrogates helper (combine adjacent surrogate-pair WTF-8 → astral 4-byte).
+- [x] String.fromCharCode / fromCodePoint apply it; lexer string-literal escapes apply it.
+
+## Later phases (M82+): see spec.md — index-methods (slice/indexOf/split/...), iteration/misc, regex.

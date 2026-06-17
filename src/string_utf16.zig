@@ -108,6 +108,50 @@ pub fn charAtAlloc(arena: std.mem.Allocator, s: []const u8, idx: usize) std.mem.
     return arena.dupe(u8, enc);
 }
 
+/// Combine adjacent WTF-8 surrogate-pair encodings — a 3-byte high surrogate (ED A0..AF xx)
+/// immediately followed by a 3-byte low surrogate (ED B0..BF xx) — into the canonical 4-byte UTF-8
+/// astral scalar. Applied where a string is built from CODE UNITS (lexer `\u` escapes,
+/// `String.fromCharCode`/`fromCodePoint`) so it byte-equals the same astral literal. Lone surrogates
+/// are left as their 3-byte form. Fast path: a string with no 0xED byte is returned unchanged.
+pub fn canonicalizeSurrogates(arena: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]const u8 {
+    if (std.mem.indexOfScalar(u8, s, 0xED) == null) return s; // no surrogate-lead byte → nothing to do
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (i + 6 <= s.len and s[i] == 0xED and s[i + 1] >= 0xA0 and s[i + 1] <= 0xAF and
+            s[i + 3] == 0xED and s[i + 4] >= 0xB0 and s[i + 4] <= 0xBF)
+        {
+            const hi: u21 = (@as(u21, s[i] & 0x0F) << 12) | (@as(u21, s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F);
+            const lo: u21 = (@as(u21, s[i + 3] & 0x0F) << 12) | (@as(u21, s[i + 4] & 0x3F) << 6) | (s[i + 5] & 0x3F);
+            const cp: u21 = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+            // cp is in [0x10000, 0x10FFFF] → the canonical 4-byte UTF-8 form (no fallible encode).
+            try out.append(arena, @intCast(0xF0 | (cp >> 18)));
+            try out.append(arena, @intCast(0x80 | ((cp >> 12) & 0x3F)));
+            try out.append(arena, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+            try out.append(arena, @intCast(0x80 | (cp & 0x3F)));
+            i += 6;
+        } else {
+            try out.append(arena, s[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+test "canonicalize surrogate pairs" {
+    const a = std.testing.allocator;
+    // 😀 in WTF-8 (6 bytes) → 😀 (4-byte UTF-8 F0 9F 98 80)
+    const wtf8 = [_]u8{ 0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80 };
+    const got = try canonicalizeSurrogates(a, &wtf8);
+    defer a.free(got);
+    try std.testing.expectEqualSlices(u8, "\u{1F600}", got);
+    // a lone high surrogate is left unchanged (code-unit-identical)
+    const lone = [_]u8{ 0xED, 0xA0, 0xBD };
+    const lone_out = try canonicalizeSurrogates(a, &lone);
+    defer a.free(lone_out);
+    try std.testing.expectEqualSlices(u8, &lone, lone_out);
+}
+
 test "utf16 length and code units" {
     try std.testing.expectEqual(@as(usize, 5), utf16Length("hello"));
     try std.testing.expectEqual(@as(usize, 1), utf16Length("é")); // U+00E9, 2 bytes, 1 unit

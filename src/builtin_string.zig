@@ -295,7 +295,9 @@ pub fn staticCall(it: *Interpreter, name: []const u8, args: []const Value) EvalE
             const u16v = toUint16(nc.normal.number);
             try encodeCp(it.arena, &buf, u16v);
         }
-        return str(buf.items);
+        // §6.1.4: adjacent surrogate code units form an astral scalar — canonicalize so the result
+        // byte-equals the same astral literal.
+        return str(try sutf16.canonicalizeSurrogates(it.arena, buf.items));
     }
     if (eql(u8, name, "fromCodePoint")) {
         // §22.1.2.2: each arg must be an integer code point in [0, 0x10FFFF] (else RangeError).
@@ -309,7 +311,7 @@ pub fn staticCall(it: *Interpreter, name: []const u8, args: []const Value) EvalE
             }
             try encodeCp(it.arena, &buf, @intFromFloat(n));
         }
-        return str(buf.items);
+        return str(try sutf16.canonicalizeSurrogates(it.arena, buf.items));
     }
     if (eql(u8, name, "raw")) {
         return stringRaw(it, args);

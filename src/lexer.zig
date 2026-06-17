@@ -3,6 +3,7 @@
 //! punctuators the M0 expression grammar needs.
 const std = @import("std");
 const unicode_id = @import("unicode_id.zig");
+const sutf16 = @import("string_utf16.zig");
 
 pub const TokenKind = enum {
     number,
@@ -700,7 +701,10 @@ pub const Lexer = struct {
             const ch = self.src[self.pos];
             if (ch == quote) {
                 self.pos += 1;
-                return .{ .kind = .string, .lexeme = self.src[start..self.pos], .string_value = buf.items, .has_legacy_octal = has_octal };
+                // §6.1.4: combine adjacent `\uXXXX` surrogate-pair escapes into the canonical astral
+                // scalar so `"😀" === "😀"` (a no-op fast path for surrogate-free strings).
+                const sv = try sutf16.canonicalizeSurrogates(self.arena, buf.items);
+                return .{ .kind = .string, .lexeme = self.src[start..self.pos], .string_value = sv, .has_legacy_octal = has_octal };
             }
             // §12.9.4 a raw LineTerminator may not appear in a StringLiteral (a LineContinuation needs
             // the leading `\`). LF/CR (and U+2028/U+2029) terminate the literal → unterminated.
