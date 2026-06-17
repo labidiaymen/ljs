@@ -12,6 +12,9 @@ pub const Symbol = struct {
     /// A process-unique id, purely for cheap display/debugging; identity is by pointer (`*Symbol`).
     id: u64,
     description: ?[]const u8 = null,
+    /// §20.4.2.2 the GlobalSymbolRegistry key this symbol was registered under via `Symbol.for`, else
+    /// null. `Symbol.keyFor` returns it; §7.3 CanBeHeldWeakly excludes a registered symbol (non-null).
+    registry_key: ?[]const u8 = null,
 };
 
 pub const Value = union(enum) {

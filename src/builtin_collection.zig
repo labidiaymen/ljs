@@ -146,7 +146,8 @@ pub fn mapMethod(it: *Interpreter, name: []const u8, this_val: Value, args: []co
 /// §7.3.x CanBeHeldWeakly ( v ) — a WeakMap/WeakSet key must be an Object or a Symbol that is not in
 /// the GlobalSymbolRegistry. The engine has no `Symbol.for` registry, so every Symbol qualifies.
 fn canBeHeldWeakly(v: Value) bool {
-    return v == .object or v == .symbol;
+    // §7.3: an Object, or a Symbol NOT in the GlobalSymbolRegistry (a `Symbol.for` result is excluded).
+    return v == .object or (v == .symbol and v.symbol.registry_key == null);
 }
 
 /// §24.3.3 WeakMap.prototype dispatch (get/set/has/delete). No iteration / size / clear / forEach: a

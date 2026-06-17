@@ -286,20 +286,38 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     const symbol_fn = try Object.createNative(arena, .symbol_ctor, "Symbol");
     symbol_fn.prototype = function_proto; // §20.2.3 the Symbol constructor → %Function.prototype%
     // §20.4.2 well-known symbols — installed non-writable/non-enumerable/non-configurable per spec.
-    const well_known = [_][]const u8{ "iterator", "asyncIterator", "toStringTag", "hasInstance", "toPrimitive", "species", "dispose", "asyncDispose", "unscopables" };
+    const well_known = [_][]const u8{ "iterator", "asyncIterator", "toStringTag", "hasInstance", "toPrimitive", "species", "dispose", "asyncDispose", "unscopables", "match", "matchAll", "replace", "search", "split", "isConcatSpreadable" };
     for (well_known) |name| {
         const desc = try std.fmt.allocPrint(arena, "Symbol.{s}", .{name});
         const sym = try newSymbol(arena, desc);
         try symbol_fn.defineData(name, .{ .symbol = sym }, false, false, false);
     }
-    // §20.4.3 Symbol.prototype — `toString`/`valueOf` (the only Symbol→string conversions allowed).
+    // §20.4.3 Symbol.prototype — toString/valueOf, the `description` getter, and [Symbol.toPrimitive].
     if (symbol_fn.get("prototype")) |pv| {
         if (pv == .object) {
-            pv.object.prototype = object_proto; // §20.4.3 Symbol.prototype inherits %Object.prototype%
-            try defineMethod(arena, pv.object, "toString", .symbol_to_string, "toString");
-            try defineMethod(arena, pv.object, "valueOf", .symbol_to_string, "valueOf");
+            const sp = pv.object;
+            sp.prototype = object_proto; // §20.4.3 Symbol.prototype inherits %Object.prototype%
+            try defineMethod(arena, sp, "toString", .symbol_to_string, "toString");
+            try defineMethod(arena, sp, "valueOf", .symbol_to_string, "valueOf");
+            // §20.4.3.2 get Symbol.prototype.description — an accessor (no setter), non-enumerable.
+            const desc_get = try Object.createNative(arena, .symbol_description, "get description");
+            desc_get.prototype = function_proto;
+            try sp.defineAccessorEx("description", desc_get, null, false);
+            // §20.4.3.5 Symbol.prototype[Symbol.toPrimitive] ( hint ) — returns the Symbol; non-writable,
+            // non-enumerable, configurable. §20.4.3.6 [Symbol.toStringTag] = "Symbol".
+            if (symbol_fn.get("toPrimitive")) |tp| if (tp == .symbol) {
+                const tpf = try Object.createNative(arena, .symbol_to_string, "[Symbol.toPrimitive]");
+                tpf.prototype = function_proto;
+                try tpf.defineData("name", .{ .string = "[Symbol.toPrimitive]" }, false, false, true);
+                try sp.defineSymbolData(tp.symbol, .{ .object = tpf }, false, false, true);
+            };
+            if (symbol_fn.get("toStringTag")) |tag| if (tag == .symbol)
+                try sp.defineSymbolData(tag.symbol, .{ .string = "Symbol" }, false, false, true);
         }
     }
+    // §20.4.2.2 Symbol.for / §20.4.2.6 Symbol.keyFor — the GlobalSymbolRegistry statics.
+    try defineMethod(arena, symbol_fn, "for", .symbol_static, "for");
+    try defineMethod(arena, symbol_fn, "keyFor", .symbol_static, "keyFor");
     try defineConstructorBackref(symbol_fn); // §20.4.3.1 Symbol.prototype.constructor === Symbol
     try env.declare("Symbol", .{ .object = symbol_fn }, true, true);
 

@@ -320,7 +320,9 @@ pub const NativeId = enum {
     bigint_static, // BigInt.<native_name> (asIntN/asUintN)
     // §20.4 Symbol (M8) — the constructor + Symbol.prototype.toString + the iterator natives.
     symbol_ctor, // Symbol([description]) — callable, not a constructor
-    symbol_to_string, // Symbol.prototype.toString / Symbol.prototype.valueOf (native_name selects)
+    symbol_to_string, // Symbol.prototype.toString / valueOf / [Symbol.toPrimitive] (native_name selects)
+    symbol_static, // §20.4.2 Symbol.for(key) / Symbol.keyFor(sym) (native_name selects)
+    symbol_description, // §20.4.3.2 get Symbol.prototype.description
     species_getter, // §23.1.2.5 get Array[Symbol.species] — returns `this` (the receiver constructor)
     array_values, // Array.prototype[Symbol.iterator] / .values — returns an Array Iterator
     array_keys, // Array.prototype.keys — Array Iterator over indices (§23.1.3.18)

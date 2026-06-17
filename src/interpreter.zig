@@ -95,6 +95,9 @@ pub const Interpreter = struct {
     /// The realm's global environment — used to resolve the Error family for engine-thrown
     /// errors (so they carry the right prototype + name). Set by the engine after setup.
     globals: ?*Environment = null,
+    /// §20.4.2.2 the GlobalSymbolRegistry — `Symbol.for(key)` returns the same Symbol for a given key
+    /// string (creating it on first use). Lives for the realm's lifetime (arena-allocated).
+    symbol_registry: std.StringHashMapUnmanaged(*Symbol) = .{},
     /// §11.2.2 the running execution context's strict-mode flag. Set from the Script's strictness on
     /// `run`, and saved/restored to the active function's `FunctionData.strict` around each body
     /// (`callFunction`). Gates §6.2.5.6 PutValue to an UNRESOLVED IdentifierReference: in sloppy mode
@@ -7378,7 +7381,9 @@ pub const Interpreter = struct {
             .array_entries => return self.makeArrayIterator(this_val, .entry), // §23.1.3.7 Array.prototype.entries
             .string_iterator => return self.makeStringIterator(this_val), // §22.1.3.36 String.prototype[Symbol.iterator]
             .iterator_next => return self.iteratorNext(this_val), // §23.1.5.2.1 / §22.1.5.2.1 %…IteratorPrototype%.next
-            .symbol_to_string => return self.symbolToString(this_val), // §20.4.3.3 / §20.4.3.4
+            .symbol_to_string => return self.symbolToString(func.native_name, this_val), // §20.4.3.3/.4/.5
+            .symbol_static => return self.symbolStatic(func.native_name, args), // §20.4.2 for/keyFor
+            .symbol_description => return self.symbolDescription(this_val), // §20.4.3.2 get description
             .generator_method => { // §27.5.1.2/.4/.5 %GeneratorPrototype%.next/return/throw
                 const arg: Value = if (args.len > 0) args[0] else .undefined;
                 const kind: object_mod.ResumeKind = if (std.mem.eql(u8, func.native_name, "return"))
@@ -7607,6 +7612,7 @@ pub const Interpreter = struct {
             .promise_ctor => return self.promiseConstructor(args), // §27.2.3.1 Promise(executor) called w/o new
             .array_ctor, .array_method, .array_static, .string_method, .string_static, .math_method, .reflect_method => unreachable, // handled in the first switch
             .species_getter, .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
+            .symbol_static, .symbol_description => unreachable, // handled in the first switch
             .generator_method, .generator_iterator => unreachable, // handled in the first switch
             .async_generator_method, .async_generator_iterator, .async_from_sync_method, .async_from_sync_wrap => unreachable, // handled in the first switch
             .map_method, .set_method, .weakmap_method, .weakset_method => unreachable, // handled in the first switch
@@ -7638,9 +7644,46 @@ pub const Interpreter = struct {
     /// §20.4.3.3 Symbol.prototype.toString / §20.4.3.4 Symbol.prototype.valueOf — `this` must be a
     /// Symbol; `toString` returns its SymbolDescriptiveString, `valueOf` the Symbol itself. (The
     /// native_name selection is implicit: both share this handler, distinguished by the return.)
-    fn symbolToString(self: *Interpreter, this_val: Value) EvalError!Completion {
-        if (this_val != .symbol) return self.throwError("TypeError", "Symbol.prototype.toString requires that 'this' be a Symbol");
-        return .{ .normal = .{ .string = try self.toString(this_val) } };
+    fn symbolToString(self: *Interpreter, native_name: []const u8, this_val: Value) EvalError!Completion {
+        // §20.4.3 ThisSymbolValue: `this` is a Symbol primitive OR a Symbol wrapper object (unwrap it).
+        const sym: Value = switch (this_val) {
+            .symbol => this_val,
+            .object => |o| if (o.primitive) |p| (if (p == .symbol) p else return self.throwError("TypeError", "not a Symbol")) else return self.throwError("TypeError", "not a Symbol"),
+            else => return self.throwError("TypeError", "Symbol.prototype method requires that 'this' be a Symbol"),
+        };
+        // §20.4.3.4 valueOf / §20.4.3.5 [Symbol.toPrimitive] return the Symbol itself; toString stringifies.
+        if (std.mem.eql(u8, native_name, "valueOf") or std.mem.eql(u8, native_name, "[Symbol.toPrimitive]")) {
+            return .{ .normal = sym };
+        }
+        return .{ .normal = .{ .string = try self.toString(sym) } };
+    }
+
+    /// §20.4.3.2 get Symbol.prototype.description — the [[Description]] (a string, or undefined).
+    fn symbolDescription(self: *Interpreter, this_val: Value) EvalError!Completion {
+        const sym: *Symbol = switch (this_val) {
+            .symbol => |s| s,
+            .object => |o| if (o.primitive) |p| (if (p == .symbol) p.symbol else return self.throwError("TypeError", "not a Symbol")) else return self.throwError("TypeError", "not a Symbol"),
+            else => return self.throwError("TypeError", "get description requires that 'this' be a Symbol"),
+        };
+        return .{ .normal = if (sym.description) |d| .{ .string = d } else .undefined };
+    }
+
+    /// §20.4.2.2 Symbol.for ( key ) / §20.4.2.6 Symbol.keyFor ( sym ).
+    fn symbolStatic(self: *Interpreter, native_name: []const u8, args: []const Value) EvalError!Completion {
+        const arg0: Value = if (args.len > 0) args[0] else .undefined;
+        if (std.mem.eql(u8, native_name, "for")) {
+            const sc = try self.toStringValuePub(arg0); // §20.4.2.2 step 1: stringKey = ToString(key)
+            if (sc.isAbrupt()) return sc;
+            const k = sc.normal.string;
+            if (self.symbol_registry.get(k)) |existing| return .{ .normal = .{ .symbol = existing } };
+            const sym = try builtins.newSymbol(self.arena, k);
+            sym.registry_key = k;
+            try self.symbol_registry.put(self.arena, k, sym);
+            return .{ .normal = .{ .symbol = sym } };
+        }
+        // §20.4.2.6 Symbol.keyFor ( sym ) — sym MUST be a Symbol; returns its registry key or undefined.
+        if (arg0 != .symbol) return self.throwError("TypeError", "Symbol.keyFor requires a Symbol argument");
+        return .{ .normal = if (arg0.symbol.registry_key) |rk| .{ .string = rk } else .undefined };
     }
 
     /// §7.1.13 ToBigInt — a primitive `prim` (after ToPrimitive) to a BigInt, or an abrupt completion
