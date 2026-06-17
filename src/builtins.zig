@@ -389,12 +389,19 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         try defineMethod(arena, ip, "some", .iterator_helper, "some");
         try defineMethod(arena, ip, "every", .iterator_helper, "every");
         try defineMethod(arena, ip, "find", .iterator_helper, "find");
+        // §27.1.4 lazy helpers (M56) — return a new Iterator Helper object.
+        try defineMethod(arena, ip, "map", .iterator_helper, "map");
+        try defineMethod(arena, ip, "filter", .iterator_helper, "filter");
+        try defineMethod(arena, ip, "take", .iterator_helper, "take");
+        try defineMethod(arena, ip, "drop", .iterator_helper, "drop");
+        try defineMethod(arena, ip, "flatMap", .iterator_helper, "flatMap");
         // §27.1.4.1 %Iterator.prototype%[Symbol.iterator]() returns `this` (reuse the return-this native).
         const self_fn = try Object.createNative(arena, .generator_iterator, "[Symbol.iterator]");
         self_fn.prototype = function_proto;
         try ip.defineSymbolData(iter_sym, .{ .object = self_fn }, true, false, true);
         try env.declare("%IteratorPrototype%", .{ .object = ip }, false, true);
     }
+    try defineMethod(arena, iterator_fn, "from", .iterator_from, "from"); // §27.1.3.1.1 Iterator.from
     try defineConstructorBackref(iterator_fn); // §27.1.4.2 Iterator.prototype.constructor === Iterator
     try env.declare("Iterator", .{ .object = iterator_fn }, true, true);
 

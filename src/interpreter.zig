@@ -7427,8 +7427,14 @@ pub const Interpreter = struct {
             .array_entries => return self.makeArrayIterator(this_val, .entry), // §23.1.3.7 Array.prototype.entries
             .string_iterator => return self.makeStringIterator(this_val), // §22.1.3.36 String.prototype[Symbol.iterator]
             .iterator_next => return self.iteratorNext(this_val), // §23.1.5.2.1 / §22.1.5.2.1 %…IteratorPrototype%.next
-            .iterator_helper => return self.iteratorHelper(func.native_name, this_val, args), // §27.1.4 helpers
-            .iterator_from => return self.throwError("TypeError", "Iterator.from is not yet supported"), // M56
+            .iterator_helper => {
+                // take/drop take a numeric limit (not a callback) → a distinct validation path.
+                if (std.mem.eql(u8, func.native_name, "take")) return self.iteratorLimitHelper(.take, this_val, args);
+                if (std.mem.eql(u8, func.native_name, "drop")) return self.iteratorLimitHelper(.drop, this_val, args);
+                return self.iteratorHelper(func.native_name, this_val, args);
+            },
+            .iterator_helper_next => return self.helperNext(func.native_name, this_val, args), // §27.1.4.x lazy next/return
+            .iterator_from => return self.iteratorFrom(args), // §27.1.3.1.1
             .iterator_ctor => {
                 // §27.1.3.1: the abstract `Iterator` constructor — a direct call (no new_target) or
                 // `new Iterator()` (new_target === %Iterator% itself) throws; only a subclass `super()`
@@ -7677,7 +7683,7 @@ pub const Interpreter = struct {
             .map_method, .set_method, .weakmap_method, .weakset_method => unreachable, // handled in the first switch
             .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .collection_size, .collection_iterator => unreachable, // handled in the first switch
             .json_parse, .json_stringify => unreachable, // handled in the first switch
-            .iterator_helper, .iterator_from, .iterator_ctor => unreachable, // handled in the first switch
+            .iterator_helper, .iterator_helper_next, .iterator_from, .iterator_ctor => unreachable, // handled in the first switch
             .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch
             .promise_all, .promise_all_settled, .promise_any, .promise_race, .promise_combinator_element => unreachable, // handled in the first switch
             .promise_resolve_fn, .promise_reject_fn, .promise_finally_thunk, .test_done => unreachable, // handled in the first switch
@@ -8327,7 +8333,269 @@ pub const Interpreter = struct {
             return .{ .normal = acc };
         }
 
+        // ── §27.1.4 LAZY helpers: return a new Iterator Helper object (cb already validated above) ──
+        if (eql(u8, name, "map")) return .{ .normal = .{ .object = try self.makeHelper(.map, o, next_fn, cb, 0) } };
+        if (eql(u8, name, "filter")) return .{ .normal = .{ .object = try self.makeHelper(.filter, o, next_fn, cb, 0) } };
+        if (eql(u8, name, "flatMap")) return .{ .normal = .{ .object = try self.makeHelper(.flat_map, o, next_fn, cb, 0) } };
+
         unreachable;
+    }
+
+    /// §27.1.4 take/drop — separate from `iteratorHelper` because their argument is a numeric limit
+    /// (not a callback): ToNumber(limit) → NaN throws RangeError, negative throws RangeError; both close
+    /// the underlying iterator on the abrupt path. Returns a lazy helper that yields the first / skips
+    /// the first `limit` values.
+    fn iteratorLimitHelper(self: *Interpreter, kind: object_mod.HelperKind, this_val: Value, args: []const Value) EvalError!Completion {
+        if (this_val != .object) return self.throwError("TypeError", "Iterator.prototype method called on a non-object");
+        const o = this_val.object;
+        const nc = try self.getProperty2(this_val, "next");
+        if (nc.isAbrupt()) return nc;
+        const next_fn = nc.normal;
+        const arg0: Value = if (args.len > 0) args[0] else .undefined;
+        const numc = try self.toNumberV(arg0);
+        if (numc.isAbrupt()) {
+            try self.iteratorClose(o);
+            return numc;
+        }
+        if (std.math.isNan(numc.normal.number)) {
+            try self.iteratorClose(o);
+            return self.throwError("RangeError", "limit must not be NaN");
+        }
+        const ic = try self.toIntegerOrInfinityPub(numc.normal);
+        if (ic.isAbrupt()) return ic;
+        const lim = ic.normal.number;
+        if (lim < 0) {
+            try self.iteratorClose(o);
+            return self.throwError("RangeError", "limit must be non-negative");
+        }
+        return .{ .normal = .{ .object = try self.makeHelper(kind, o, next_fn, .undefined, lim) } };
+    }
+
+    /// Create a lazy Iterator Helper object (proto = %Iterator.prototype%) wrapping `underlying`, with
+    /// its own `next` / `return` natives (`iterator_helper_next`).
+    fn makeHelper(self: *Interpreter, kind: object_mod.HelperKind, underlying: *Object, next_fn: Value, callback: Value, remaining: f64) EvalError!*Object {
+        const st = try self.arena.create(object_mod.HelperState);
+        st.* = .{ .kind = kind, .underlying = underlying, .next_fn = next_fn, .callback = callback, .remaining = remaining };
+        const h = try Object.create(self.arena, self.iteratorProto());
+        h.iter_helper = st;
+        const next_native = try Object.createNative(self.arena, .iterator_helper_next, "next");
+        next_native.prototype = self.functionProto();
+        try h.defineData("next", .{ .object = next_native }, true, false, true);
+        const ret_native = try Object.createNative(self.arena, .iterator_helper_next, "return");
+        ret_native.prototype = self.functionProto();
+        try h.defineData("return", .{ .object = ret_native }, true, false, true);
+        return h;
+    }
+
+    /// §7.4.x GetIteratorFlattenable ( obj, primitiveHandling ) — used by `Iterator.from` (strings
+    /// allowed) and `flatMap` (primitives rejected). Returns the iterator object + its cached `next`.
+    fn getIteratorFlattenable(self: *Interpreter, obj: Value, allow_string: bool) EvalError!union(enum) { it: struct { obj: *Object, next_fn: Value }, abrupt: Completion } {
+        if (obj != .object) {
+            if (!(allow_string and obj == .string)) {
+                return .{ .abrupt = try self.throwError("TypeError", "value is not iterable / not an object") };
+            }
+        }
+        // method = Get(obj, @@iterator); if undefined/null and obj is an Object → use obj directly.
+        const iter_sym = self.wellKnownIterator() orelse return .{ .abrupt = try self.throwError("TypeError", "no Symbol.iterator") };
+        const mc = try self.getSymbolProperty(obj, iter_sym);
+        if (mc.isAbrupt()) return .{ .abrupt = mc };
+        const iterator: Value = if (mc.normal == .undefined or mc.normal == .null)
+            obj // an absent @@iterator → obj is itself the iterator record's [[Iterator]]
+        else blk: {
+            if (mc.normal != .object or !isCallable(mc.normal.object)) {
+                return .{ .abrupt = try self.throwError("TypeError", "Symbol.iterator is not callable") };
+            }
+            const rc = try self.callFunction(mc.normal.object, &.{}, obj);
+            if (rc.isAbrupt()) return .{ .abrupt = rc };
+            break :blk rc.normal;
+        };
+        if (iterator != .object) return .{ .abrupt = try self.throwError("TypeError", "iterator is not an object") };
+        const nc = try self.getProperty2(iterator, "next");
+        if (nc.isAbrupt()) return .{ .abrupt = nc };
+        return .{ .it = .{ .obj = iterator.object, .next_fn = nc.normal } };
+    }
+
+    /// §27.1.3.1.1 Iterator.from ( O ) — wrap O's iterator so it inherits %Iterator.prototype%. If the
+    /// iterator already does, it is returned as-is; otherwise a `wrap` helper delegates to it.
+    fn iteratorFrom(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const obj: Value = if (args.len > 0) args[0] else .undefined;
+        const flat = switch (try self.getIteratorFlattenable(obj, true)) {
+            .it => |x| x,
+            .abrupt => |c| return c,
+        };
+        // If the iterator already inherits %Iterator.prototype%, return it directly (no wrapper).
+        const iproto = self.iteratorProto();
+        var p: ?*Object = flat.obj.prototype;
+        while (p) |pp| : (p = pp.prototype) {
+            if (pp == iproto) return .{ .normal = .{ .object = flat.obj } };
+        }
+        return .{ .normal = .{ .object = try self.makeHelper(.wrap, flat.obj, flat.next_fn, .undefined, 0) } };
+    }
+
+    /// §27.1.4.x an Iterator Helper's own `next` / `return` — drives the lazy transform, pulling from
+    /// the underlying iterator (via the cached next) and applying the per-kind logic. `return` closes
+    /// the underlying (and any in-flight inner iterator) and marks the helper done.
+    fn helperNext(self: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
+        if (this_val != .object or this_val.object.iter_helper == null) {
+            return self.throwError("TypeError", "not an Iterator Helper");
+        }
+        const st = this_val.object.iter_helper.?;
+
+        if (std.mem.eql(u8, name, "return")) {
+            if (!st.done) {
+                st.done = true;
+                if (st.inner) |inner| try self.iteratorClose(inner);
+                try self.iteratorClose(st.underlying);
+            }
+            const v: Value = if (args.len > 0) args[0] else .undefined;
+            return self.iterResultObjectC(v, true);
+        }
+
+        if (st.done) return self.iterResultObjectC(.undefined, true);
+        const under: Value = .{ .object = st.underlying };
+
+        switch (st.kind) {
+            .wrap => {
+                switch (try self.iterNextDirect(under, st.next_fn)) {
+                    .done => {
+                        st.done = true;
+                        return self.iterResultObjectC(.undefined, true);
+                    },
+                    .abrupt => |c| return c,
+                    .value => |v| return self.iterResultObjectC(v, false),
+                }
+            },
+            .map => {
+                switch (try self.iterNextDirect(under, st.next_fn)) {
+                    .done => {
+                        st.done = true;
+                        return self.iterResultObjectC(.undefined, true);
+                    },
+                    .abrupt => |c| return c,
+                    .value => |v| {
+                        const r = try self.callFunction(st.callback.object, &.{ v, .{ .number = st.counter } }, .undefined);
+                        st.counter += 1;
+                        if (r.isAbrupt()) {
+                            st.done = true;
+                            try self.iteratorClose(st.underlying);
+                            return r;
+                        }
+                        return self.iterResultObjectC(r.normal, false);
+                    },
+                }
+            },
+            .filter => {
+                while (true) {
+                    switch (try self.iterNextDirect(under, st.next_fn)) {
+                        .done => {
+                            st.done = true;
+                            return self.iterResultObjectC(.undefined, true);
+                        },
+                        .abrupt => |c| return c,
+                        .value => |v| {
+                            const r = try self.callFunction(st.callback.object, &.{ v, .{ .number = st.counter } }, .undefined);
+                            st.counter += 1;
+                            if (r.isAbrupt()) {
+                                st.done = true;
+                                try self.iteratorClose(st.underlying);
+                                return r;
+                            }
+                            if (toBoolean(r.normal)) return self.iterResultObjectC(v, false);
+                        },
+                    }
+                }
+            },
+            .take => {
+                if (st.remaining <= 0) {
+                    st.done = true;
+                    try self.iteratorClose(st.underlying);
+                    return self.iterResultObjectC(.undefined, true);
+                }
+                st.remaining -= 1;
+                switch (try self.iterNextDirect(under, st.next_fn)) {
+                    .done => {
+                        st.done = true;
+                        return self.iterResultObjectC(.undefined, true);
+                    },
+                    .abrupt => |c| return c,
+                    .value => |v| return self.iterResultObjectC(v, false),
+                }
+            },
+            .drop => {
+                if (!st.started) {
+                    st.started = true;
+                    while (st.remaining > 0) : (st.remaining -= 1) {
+                        switch (try self.iterNextDirect(under, st.next_fn)) {
+                            .done => {
+                                st.done = true;
+                                return self.iterResultObjectC(.undefined, true);
+                            },
+                            .abrupt => |c| return c,
+                            .value => {},
+                        }
+                    }
+                }
+                switch (try self.iterNextDirect(under, st.next_fn)) {
+                    .done => {
+                        st.done = true;
+                        return self.iterResultObjectC(.undefined, true);
+                    },
+                    .abrupt => |c| return c,
+                    .value => |v| return self.iterResultObjectC(v, false),
+                }
+            },
+            .flat_map => {
+                while (true) {
+                    if (st.inner) |inner| {
+                        switch (try self.iterNextDirect(.{ .object = inner }, st.inner_next)) {
+                            .done => st.inner = null,
+                            .abrupt => |c| {
+                                st.done = true;
+                                try self.iteratorClose(st.underlying);
+                                return c;
+                            },
+                            .value => |v| return self.iterResultObjectC(v, false),
+                        }
+                    } else {
+                        switch (try self.iterNextDirect(under, st.next_fn)) {
+                            .done => {
+                                st.done = true;
+                                return self.iterResultObjectC(.undefined, true);
+                            },
+                            .abrupt => |c| return c,
+                            .value => |v| {
+                                const mapped = try self.callFunction(st.callback.object, &.{ v, .{ .number = st.counter } }, .undefined);
+                                st.counter += 1;
+                                if (mapped.isAbrupt()) {
+                                    st.done = true;
+                                    try self.iteratorClose(st.underlying);
+                                    return mapped;
+                                }
+                                switch (try self.getIteratorFlattenable(mapped.normal, false)) {
+                                    .abrupt => |c| {
+                                        st.done = true;
+                                        try self.iteratorClose(st.underlying);
+                                        return c;
+                                    },
+                                    .it => |x| {
+                                        st.inner = x.obj;
+                                        st.inner_next = x.next_fn;
+                                    },
+                                }
+                            },
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    /// Build a fresh `{ value, done }` IteratorResult as a Completion (helper-result convenience).
+    fn iterResultObjectC(self: *Interpreter, value: Value, done: bool) EvalError!Completion {
+        const r = try Object.create(self.arena, self.objectProto());
+        try r.set("value", value);
+        try r.set("done", .{ .boolean = done });
+        return .{ .normal = .{ .object = r } };
     }
 
     /// §22.1.5.1 CreateStringIterator — a fresh String Iterator object over the primitive string's

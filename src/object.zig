@@ -28,6 +28,26 @@ pub const IterState = struct {
 
 pub const IterKind = enum { value, key, entry };
 
+/// §27.1.4 Iterator Helper kind — the lazy transform a helper object applies as it pulls from its
+/// underlying iterator. `wrap` is the identity passthrough used by `Iterator.from` (§27.1.3.1.1).
+pub const HelperKind = enum { map, filter, take, drop, flat_map, wrap };
+
+/// §27.1.4 Iterator Helper state — present iff this object is a lazy helper (map/filter/…/from wrapper).
+/// Its `next` native (`iterator_helper_next`) pulls from `underlying` (via the cached `next_fn`),
+/// applies the transform, and tracks per-kind state. Created by the %Iterator.prototype% lazy methods.
+pub const HelperState = struct {
+    kind: HelperKind,
+    underlying: *Object,
+    next_fn: Value,
+    callback: Value = .undefined, // map / filter / flatMap mapper
+    counter: f64 = 0, // index argument passed to the callback
+    remaining: f64 = 0, // take / drop limit (counts down)
+    inner: ?*Object = null, // flatMap: the current inner iterator being flattened
+    inner_next: Value = .undefined,
+    started: bool = false, // drop: whether the initial skip has run
+    done: bool = false, // latched once the helper is exhausted/closed
+};
+
 /// §24.1 / §24.2 / §24.3 / §24.4 the keyed-collection backing store, attached to an ordinary object
 /// via `Object.collection` (null for every non-collection object → zero cost). Entries are kept in
 /// INSERTION ORDER; a delete leaves a tombstone (`present=false`) so an iterator created earlier still
@@ -334,6 +354,7 @@ pub const NativeId = enum {
     iterator_ctor, // §27.1.3.1 new Iterator() — abstract (direct construction throws)
     iterator_from, // §27.1.3.1.1 Iterator.from(O)
     iterator_helper, // %Iterator.prototype%.<native_name>
+    iterator_helper_next, // §27.1.4.x an Iterator Helper object's own `next` (drives the lazy transform)
     // §27.5 Generator — %GeneratorPrototype% methods + [Symbol.iterator].
     generator_method, // %GeneratorPrototype%.next / .return / .throw (native_name selects)
     generator_iterator, // %GeneratorPrototype%[Symbol.iterator] — returns `this`
@@ -608,6 +629,9 @@ pub const Object = struct {
     /// §24.1/§24.2/§24.3/§24.4 keyed-collection backing store — present iff this object is a
     /// Map/Set/WeakMap/WeakSet instance. Null for every other object (zero cost).
     collection: ?*Collection = null,
+    /// §27.1.4 Iterator Helper state — present iff this object is a lazy iterator helper (a result of
+    /// `map`/`filter`/`take`/`drop`/`flatMap` or `Iterator.from`'s wrapper). Null otherwise (zero cost).
+    iter_helper: ?*HelperState = null,
     /// §27.5 Generator state — present iff this object is a Generator (made by calling a `function*`).
     /// Holds the suspendable-execution machinery (body thread + ping-pong semaphores). Null for every
     /// other object (zero cost). The %GeneratorPrototype% `next`/`return`/`throw` natives drive it.
