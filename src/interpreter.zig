@@ -5907,7 +5907,7 @@ pub const Interpreter = struct {
     /// §10.4.2.2 ArrayCreate(length): a fresh plain Array exotic of [[Length]] `length` (no eager fill —
     /// a length-only grow is sparse), proto-linked to %Array.prototype%. The default ArraySpeciesCreate
     /// result. A length above 2^32-1 → RangeError (step 1).
-    fn newArray(self: *Interpreter, length: usize) EvalError!Completion {
+    pub fn newArray(self: *Interpreter, length: usize) EvalError!Completion {
         if (length > 4294967295) return self.throwError("RangeError", "Invalid array length");
         const a = try Object.createArray(self.arena, self.arrayProto());
         a.array_length = length;
@@ -6442,6 +6442,8 @@ pub const Interpreter = struct {
             .regexp_ctor => return builtin_regexp.construct(self, args), // §22.2.4.1 RegExp(...) without new
             .regexp_proto_getter => return builtin_regexp.getter(self, func.native_name, this_val), // §22.2.6
             .regexp_to_string => return builtin_regexp.toString(self, this_val), // §22.2.6.17
+            .regexp_exec => return builtin_regexp.exec(self, this_val, args), // §22.2.6.2
+            .regexp_test => return builtin_regexp.test_(self, this_val, args), // §22.2.6.16
             .collection_size => return self.collectionSize(func.native_name, this_val),
             .collection_iterator => {
                 // `native_name` is "<home>:<which>" — <home> ("map"/"set") brands the receiver, <which>
@@ -6723,7 +6725,7 @@ pub const Interpreter = struct {
             .map_method, .set_method, .weakmap_method, .weakset_method => unreachable, // handled in the first switch
             .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .collection_size, .collection_iterator => unreachable, // handled in the first switch
             .proxy_ctor, .proxy_revocable, .proxy_revoke => unreachable, // handled in the first switch
-            .regexp_ctor, .regexp_proto_getter, .regexp_to_string => unreachable, // handled in the first switch
+            .regexp_ctor, .regexp_proto_getter, .regexp_to_string, .regexp_exec, .regexp_test => unreachable, // handled in the first switch
             .json_parse, .json_stringify => unreachable, // handled in the first switch
             .iterator_helper, .iterator_helper_next, .iterator_from, .iterator_ctor => unreachable, // handled in the first switch
             .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch

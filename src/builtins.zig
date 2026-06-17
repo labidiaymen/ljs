@@ -622,6 +622,8 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
             try rp.defineAccessorEx(gn, gf, null, false);
         }
         try defineMethod(arena, rp, "toString", .regexp_to_string, "toString"); // §22.2.6.17
+        try defineMethod(arena, rp, "exec", .regexp_exec, "exec"); // §22.2.6.2
+        try defineMethod(arena, rp, "test", .regexp_test, "test"); // §22.2.6.16
     };
     try defineConstructorBackref(regexp_fn); // §22.2.6.1 RegExp.prototype.constructor === RegExp
     try env.declare("RegExp", .{ .object = regexp_fn }, true, true);

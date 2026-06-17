@@ -11,6 +11,7 @@ const Completion = @import("completion.zig").Completion;
 const object_mod = @import("object.zig");
 const Object = object_mod.Object;
 const RegExpData = object_mod.RegExpData;
+const engine = @import("builtin_regexp_engine.zig");
 
 /// %RegExp.prototype% — the [[Prototype]] of every RegExp instance. Null in a realm-less eval.
 fn regexpProto(it: *Interpreter) ?*Object {
@@ -78,6 +79,15 @@ pub fn makeRegExp(it: *Interpreter, pattern: []const u8, flags: []const u8) Eval
     rd.flags = fbuf.items;
     rd.source = if (pattern.len == 0) "(?:)" else pattern;
 
+    // §22.2.3.1 step: parse the pattern (validates syntax → SyntaxError) and keep the compiled program.
+    const prog = engine.compile(it.arena, pattern, rd.ignore_case, rd.multiline, rd.dot_all, rd.unicode or rd.unicode_sets) catch |e| switch (e) {
+        error.SyntaxError => return it.throwError("SyntaxError", "Invalid regular expression"),
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    const prog_ptr = try it.arena.create(engine.Program);
+    prog_ptr.* = prog;
+    rd.program = prog_ptr;
+
     const rd_ptr = try it.arena.create(RegExpData);
     rd_ptr.* = rd;
     const o = try Object.create(it.arena, regexpProto(it));
@@ -144,6 +154,96 @@ pub fn getter(it: *Interpreter, name: []const u8, this_val: Value) EvalError!Com
     }
     if (is_proto) return .{ .normal = .undefined };
     return it.throwError("TypeError", "RegExp flag getter called on incompatible receiver");
+}
+
+/// §22.2.7.2 RegExpBuiltinExec — the core match: read `lastIndex` (for global/sticky), run the
+/// compiled program from there, then either build the match result array (`[whole, ...groups]` with
+/// `index`/`input`/`groups`) and advance `lastIndex`, or return null and reset `lastIndex` to 0.
+fn builtinExec(it: *Interpreter, this_val: Value, input: []const u8) EvalError!Completion {
+    const o = this_val.object;
+    const rd = o.regexp.?;
+    const prog = rd.program orelse return it.throwError("TypeError", "RegExp has no compiled pattern");
+    const global_or_sticky = rd.global or rd.sticky;
+
+    var last_index: usize = 0;
+    if (global_or_sticky) {
+        const lic = try it.getProperty2(this_val, "lastIndex");
+        if (lic.isAbrupt()) return lic;
+        const nic = try it.toIntegerOrInfinity(lic.normal);
+        if (nic.isAbrupt()) return nic;
+        const n = nic.normal.number;
+        if (n < 0 or n > @as(f64, @floatFromInt(input.len))) {
+            const sc = try it.setProperty(this_val, "lastIndex", .{ .number = 0 });
+            if (sc.isAbrupt()) return sc;
+            return .{ .normal = .null };
+        }
+        last_index = @intFromFloat(n);
+    }
+
+    const m = (try engine.exec(it.arena, prog, input, last_index, rd.sticky)) orelse {
+        if (global_or_sticky) {
+            const sc = try it.setProperty(this_val, "lastIndex", .{ .number = 0 });
+            if (sc.isAbrupt()) return sc;
+        }
+        return .{ .normal = .null };
+    };
+
+    const start = m.saves[0].?;
+    const end = m.saves[1].?;
+    if (global_or_sticky) {
+        const sc = try it.setProperty(this_val, "lastIndex", .{ .number = @floatFromInt(end) });
+        if (sc.isAbrupt()) return sc;
+    }
+
+    const arr = (try it.newArray(prog.num_groups + 1)).normal.object;
+    try arr.arraySet(it.arena, 0, .{ .string = input[start..end] });
+    var gi: usize = 1;
+    while (gi <= prog.num_groups) : (gi += 1) {
+        const a = m.saves[2 * gi];
+        const b = m.saves[2 * gi + 1];
+        const v: Value = if (a != null and b != null) .{ .string = input[a.?..b.?] } else .undefined;
+        try arr.arraySet(it.arena, gi, v);
+    }
+    try arr.defineData("index", .{ .number = @floatFromInt(start) }, true, true, true);
+    try arr.defineData("input", .{ .string = input }, true, true, true);
+    // §22.2.7.2: `groups` is a null-prototype object of named captures, or undefined when there are none.
+    if (prog.names.len > 0) {
+        const groups = try Object.create(it.arena, null);
+        for (prog.names) |ng| {
+            const a = m.saves[2 * ng.index];
+            const b = m.saves[2 * ng.index + 1];
+            const v: Value = if (a != null and b != null) .{ .string = input[a.?..b.?] } else .undefined;
+            try groups.defineData(ng.name, v, true, true, true);
+        }
+        try arr.defineData("groups", .{ .object = groups }, true, true, true);
+    } else {
+        try arr.defineData("groups", .undefined, true, true, true);
+    }
+    return .{ .normal = .{ .object = arr } };
+}
+
+/// §22.2.6.2 RegExp.prototype.exec ( string ) — coerce `string`, then run the builtin exec.
+pub fn exec(it: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
+    if (this_val != .object or this_val.object.regexp == null) {
+        return it.throwError("TypeError", "RegExp.prototype.exec called on incompatible receiver");
+    }
+    const arg: Value = if (args.len > 0) args[0] else .undefined;
+    const sc = try it.toStringValuePub(arg);
+    if (sc.isAbrupt()) return sc;
+    return builtinExec(it, this_val, sc.normal.string);
+}
+
+/// §22.2.6.16 RegExp.prototype.test ( string ) — exec and report whether a match was found.
+pub fn test_(it: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
+    if (this_val != .object or this_val.object.regexp == null) {
+        return it.throwError("TypeError", "RegExp.prototype.test called on incompatible receiver");
+    }
+    const arg: Value = if (args.len > 0) args[0] else .undefined;
+    const sc = try it.toStringValuePub(arg);
+    if (sc.isAbrupt()) return sc;
+    const r = try builtinExec(it, this_val, sc.normal.string);
+    if (r.isAbrupt()) return r;
+    return .{ .normal = .{ .boolean = r.normal != .null } };
 }
 
 /// §22.2.6.17 RegExp.prototype.toString → `/source/flags` (reads the `source`/`flags` properties).

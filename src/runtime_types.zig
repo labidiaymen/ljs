@@ -9,6 +9,7 @@ const Value = @import("value.zig").Value;
 const Symbol = @import("value.zig").Symbol;
 const Environment = @import("environment.zig").Environment;
 const Object = @import("object.zig").Object;
+const regexp_engine = @import("builtin_regexp_engine.zig");
 
 pub const IterState = struct {
     /// The array being iterated (its `elements`), or null for a string iterator.
@@ -56,6 +57,9 @@ pub const RegExpData = struct {
     unicode_sets: bool = false,
     sticky: bool = false,
     has_indices: bool = false,
+    /// The compiled pattern (parser → bytecode), built by `makeRegExp` via `regexp_engine.compile`.
+    /// Null only on the bare %RegExp.prototype% (no [[RegExpMatcher]]); every real instance has one.
+    program: ?*const regexp_engine.Program = null,
 };
 
 pub const HelperState = struct {
@@ -415,6 +419,8 @@ pub const NativeId = enum {
     regexp_ctor, // new RegExp(pattern, flags) / RegExp(...)
     regexp_proto_getter, // get RegExp.prototype.<source|flags|global|ignoreCase|...> (native_name selects)
     regexp_to_string, // RegExp.prototype.toString
+    regexp_exec, // RegExp.prototype.exec
+    regexp_test, // RegExp.prototype.test
     promise_ctor, // new Promise(executor)
     promise_then, // Promise.prototype.then
     promise_catch, // Promise.prototype.catch
