@@ -17,6 +17,7 @@ const builtin_collection = @import("builtin_collection.zig");
 const builtin_json = @import("builtin_json.zig");
 const builtin_math = @import("builtin_math.zig");
 const builtin_number = @import("builtin_number.zig");
+const builtin_symbol = @import("builtin_symbol.zig");
 const builtins = @import("builtins.zig");
 const bigint = @import("bigint.zig");
 const Parser = @import("parser.zig").Parser;
@@ -7332,9 +7333,9 @@ pub const Interpreter = struct {
                 }
                 return .{ .normal = this_val };
             },
-            .symbol_to_string => return self.symbolToString(func.native_name, this_val), // §20.4.3.3/.4/.5
-            .symbol_static => return self.symbolStatic(func.native_name, args), // §20.4.2 for/keyFor
-            .symbol_description => return self.symbolDescription(this_val), // §20.4.3.2 get description
+            .symbol_to_string => return builtin_symbol.toStringMethod(self, func.native_name, this_val), // §20.4.3.3/.4/.5
+            .symbol_static => return builtin_symbol.static(self, func.native_name, args), // §20.4.2 for/keyFor
+            .symbol_description => return builtin_symbol.description(self, this_val), // §20.4.3.2 get description
             .generator_method => { // §27.5.1.2/.4/.5 %GeneratorPrototype%.next/return/throw
                 const arg: Value = if (args.len > 0) args[0] else .undefined;
                 const kind: object_mod.ResumeKind = if (std.mem.eql(u8, func.native_name, "return"))
@@ -7560,7 +7561,7 @@ pub const Interpreter = struct {
             .bigint_ctor => return self.bigintConstructor(args), // §21.2.1.1 BigInt(value)
             .bigint_static => return self.bigintStatic(func.native_name, args), // §21.2.2 asIntN/asUintN
             .bigint_method => return self.bigintMethod(func.native_name, this_val, args), // §21.2.3 toString/valueOf
-            .symbol_ctor => return self.symbolConstructor(args), // §20.4.1.1 Symbol([description])
+            .symbol_ctor => return builtin_symbol.constructor(self, args), // §20.4.1.1 Symbol([description])
             .promise_ctor => return self.promiseConstructor(args), // §27.2.3.1 Promise(executor) called w/o new
             .array_ctor, .array_method, .array_static, .string_method, .string_static, .math_method, .reflect_method => unreachable, // handled in the first switch
             .species_getter, .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
@@ -7578,65 +7579,6 @@ pub const Interpreter = struct {
             .global_fn => unreachable, // §19.2 handled in the first switch
             .none => unreachable,
         }
-    }
-
-    // ── §20.4 Symbol + §22.1.5/§23.1.5 native iterators ─────────────────────────
-
-    /// §20.4.1.1 Symbol ( [ description ] ) — mint a fresh unique Symbol whose [[Description]] is
-    /// ToString(description) (or undefined when omitted). Called only as a function (`new Symbol()` is
-    /// rejected in `construct`).
-    fn symbolConstructor(self: *Interpreter, args: []const Value) EvalError!Completion {
-        const desc: ?[]const u8 = if (args.len > 0 and args[0] != .undefined)
-            try self.toString(args[0]) // §20.4.1.1 step 2: ToString(description)
-        else
-            null;
-        const sym = try builtins.newSymbol(self.arena, desc);
-        return .{ .normal = .{ .symbol = sym } };
-    }
-
-    /// §20.4.3.3 Symbol.prototype.toString / §20.4.3.4 Symbol.prototype.valueOf — `this` must be a
-    /// Symbol; `toString` returns its SymbolDescriptiveString, `valueOf` the Symbol itself. (The
-    /// native_name selection is implicit: both share this handler, distinguished by the return.)
-    fn symbolToString(self: *Interpreter, native_name: []const u8, this_val: Value) EvalError!Completion {
-        // §20.4.3 ThisSymbolValue: `this` is a Symbol primitive OR a Symbol wrapper object (unwrap it).
-        const sym: Value = switch (this_val) {
-            .symbol => this_val,
-            .object => |o| if (o.primitive) |p| (if (p == .symbol) p else return self.throwError("TypeError", "not a Symbol")) else return self.throwError("TypeError", "not a Symbol"),
-            else => return self.throwError("TypeError", "Symbol.prototype method requires that 'this' be a Symbol"),
-        };
-        // §20.4.3.4 valueOf / §20.4.3.5 [Symbol.toPrimitive] return the Symbol itself; toString stringifies.
-        if (std.mem.eql(u8, native_name, "valueOf") or std.mem.eql(u8, native_name, "[Symbol.toPrimitive]")) {
-            return .{ .normal = sym };
-        }
-        return .{ .normal = .{ .string = try self.toString(sym) } };
-    }
-
-    /// §20.4.3.2 get Symbol.prototype.description — the [[Description]] (a string, or undefined).
-    fn symbolDescription(self: *Interpreter, this_val: Value) EvalError!Completion {
-        const sym: *Symbol = switch (this_val) {
-            .symbol => |s| s,
-            .object => |o| if (o.primitive) |p| (if (p == .symbol) p.symbol else return self.throwError("TypeError", "not a Symbol")) else return self.throwError("TypeError", "not a Symbol"),
-            else => return self.throwError("TypeError", "get description requires that 'this' be a Symbol"),
-        };
-        return .{ .normal = if (sym.description) |d| .{ .string = d } else .undefined };
-    }
-
-    /// §20.4.2.2 Symbol.for ( key ) / §20.4.2.6 Symbol.keyFor ( sym ).
-    fn symbolStatic(self: *Interpreter, native_name: []const u8, args: []const Value) EvalError!Completion {
-        const arg0: Value = if (args.len > 0) args[0] else .undefined;
-        if (std.mem.eql(u8, native_name, "for")) {
-            const sc = try self.toStringValuePub(arg0); // §20.4.2.2 step 1: stringKey = ToString(key)
-            if (sc.isAbrupt()) return sc;
-            const k = sc.normal.string;
-            if (self.symbol_registry.get(k)) |existing| return .{ .normal = .{ .symbol = existing } };
-            const sym = try builtins.newSymbol(self.arena, k);
-            sym.registry_key = k;
-            try self.symbol_registry.put(self.arena, k, sym);
-            return .{ .normal = .{ .symbol = sym } };
-        }
-        // §20.4.2.6 Symbol.keyFor ( sym ) — sym MUST be a Symbol; returns its registry key or undefined.
-        if (arg0 != .symbol) return self.throwError("TypeError", "Symbol.keyFor requires a Symbol argument");
-        return .{ .normal = if (arg0.symbol.registry_key) |rk| .{ .string = rk } else .undefined };
     }
 
     /// §7.1.13 ToBigInt — a primitive `prim` (after ToPrimitive) to a BigInt, or an abrupt completion
