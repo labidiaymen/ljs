@@ -341,6 +341,11 @@ pub const NativeId = enum {
     /// the INDIRECT path (global env, global `this`); the interpreter's `evalCall` intercepts the DIRECT
     /// case (callee is the IdentifierReference `eval` resolving to this intrinsic) before dispatch.
     eval_fn,
+    /// §19.2 the global function intrinsics — `native_name` selects which: `isNaN`/`isFinite`
+    /// (§19.2.2/.3, COERCING), `parseInt`/`parseFloat` (§19.2.5/.4), and the four URI handlers
+    /// `encodeURI`/`encodeURIComponent`/`decodeURI`/`decodeURIComponent` (§19.2.6). Installed on the
+    /// global env (and thus mirrored onto globalThis as non-enumerable own properties).
+    global_fn,
 };
 
 /// §10.4.1 A Bound Function Exotic Object's internal slots: the wrapped target, the bound `this`, and

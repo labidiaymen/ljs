@@ -2765,8 +2765,36 @@ pub const Interpreter = struct {
                 }
                 return .{ .normal = .undefined };
             },
+            .number => {
+                // §21.1.3: transparent boxing — `(255).toString` / `valueOf` / `toFixed` / `constructor`
+                // resolve on Number.prototype (accessors get `this` = the original primitive base).
+                if (self.globalProto("Number")) |proto| {
+                    const loc = proto.getProp(key) orelse return .{ .normal = .undefined };
+                    switch (loc.pv.payload) {
+                        .data => |dv| return .{ .normal = dv },
+                        .accessor => |a| {
+                            const getter = a.get orelse return .{ .normal = .undefined };
+                            return self.callFunction(getter, &.{}, base);
+                        },
+                    }
+                }
+                return .{ .normal = .undefined };
+            },
+            .boolean => {
+                // §20.3.3: transparent boxing — `(true).toString` / `valueOf` resolve on Boolean.prototype.
+                if (self.globalProto("Boolean")) |proto| {
+                    const loc = proto.getProp(key) orelse return .{ .normal = .undefined };
+                    switch (loc.pv.payload) {
+                        .data => |dv| return .{ .normal = dv },
+                        .accessor => |a| {
+                            const getter = a.get orelse return .{ .normal = .undefined };
+                            return self.callFunction(getter, &.{}, base);
+                        },
+                    }
+                }
+                return .{ .normal = .undefined };
+            },
             .undefined, .null => return self.throwError("TypeError", "Cannot read properties of null or undefined"),
-            else => return .{ .normal = .undefined },
         }
     }
 
@@ -3103,6 +3131,17 @@ pub const Interpreter = struct {
         // §7.1.4 step 2: ToNumber(BigInt) throws a TypeError (it does NOT silently become NaN).
         if (prim == .bigint) return self.throwError("TypeError", "Cannot convert a BigInt value to a number");
         return .{ .normal = .{ .number = toNumber(prim) } };
+    }
+
+    /// §7.1.5 ToIntegerOrInfinity — ToNumber, then NaN→0, truncate toward zero, ±Inf preserved. Returns
+    /// the integral (or ±Inf) value as a Number; propagates an abrupt ToNumber completion.
+    fn toIntegerOrInfinity(self: *Interpreter, v: Value) EvalError!Completion {
+        const nc = try self.toNumberV(v);
+        if (nc.isAbrupt()) return nc;
+        const n = nc.normal.number;
+        if (std.math.isNan(n)) return .{ .normal = .{ .number = 0 } };
+        if (std.math.isInf(n)) return .{ .normal = .{ .number = n } };
+        return .{ .normal = .{ .number = std.math.trunc(n) } };
     }
 
     /// §7.1.17 ToString in a coercion context: ToPrimitive (string hint) an object, then ToString.
@@ -6250,6 +6289,294 @@ pub const Interpreter = struct {
         }
     }
 
+    // ── §19.2 global function intrinsics ─────────────────────────────────────────
+
+    /// §19.2 dispatch the global functions by name (the `global_fn` native).
+    fn globalFn(self: *Interpreter, name: []const u8, args: []const Value) EvalError!Completion {
+        const arg0: Value = if (args.len > 0) args[0] else .undefined;
+        if (std.mem.eql(u8, name, "isNaN")) {
+            // §19.2.3 isNaN ( number ): ToNumber, then test NaN (COERCES, unlike Number.isNaN).
+            const nc = try self.toNumberV(arg0);
+            if (nc.isAbrupt()) return nc;
+            return .{ .normal = .{ .boolean = std.math.isNan(nc.normal.number) } };
+        }
+        if (std.mem.eql(u8, name, "isFinite")) {
+            // §19.2.2 isFinite ( number ): ToNumber, then test finiteness (COERCES).
+            const nc = try self.toNumberV(arg0);
+            if (nc.isAbrupt()) return nc;
+            return .{ .normal = .{ .boolean = std.math.isFinite(nc.normal.number) } };
+        }
+        if (std.mem.eql(u8, name, "parseInt")) return self.parseIntFn(args);
+        if (std.mem.eql(u8, name, "parseFloat")) return self.parseFloatFn(args);
+        // §19.2.6 the URI handlers — encode/decode select via the preserved-char sets.
+        if (std.mem.eql(u8, name, "encodeURI")) return self.uriEncode(arg0, .uri);
+        if (std.mem.eql(u8, name, "encodeURIComponent")) return self.uriEncode(arg0, .component);
+        if (std.mem.eql(u8, name, "decodeURI")) return self.uriDecode(arg0, .uri);
+        if (std.mem.eql(u8, name, "decodeURIComponent")) return self.uriDecode(arg0, .component);
+        unreachable;
+    }
+
+    /// §19.2.5 parseInt ( string, radix ).
+    fn parseIntFn(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const sc = try self.toStringThrowing(if (args.len > 0) args[0] else .undefined);
+        if (sc.isAbrupt()) return sc;
+        const s = sc.normal.string;
+        // §19.2.5 step 2: trim leading StrWhiteSpace + LineTerminator (§22.1.3.32).
+        var i: usize = trimLeadingWhiteSpace(s);
+        // §19.2.5 steps 3–4: optional sign.
+        var sign: f64 = 1;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) {
+            if (s[i] == '-') sign = -1;
+            i += 1;
+        }
+        // §19.2.5 steps 7–8: ToInt32(radix); 0 ⇒ default handling.
+        var radix: i64 = 0;
+        if (args.len > 1) {
+            const rc = try self.toNumberV(args[1]);
+            if (rc.isAbrupt()) return rc;
+            radix = ops.numberToInt32(rc.normal.number);
+        }
+        var strip_prefix = false;
+        if (radix != 0) {
+            if (radix < 2 or radix > 36) return .{ .normal = .{ .number = std.math.nan(f64) } };
+            if (radix == 16) strip_prefix = true;
+        } else {
+            radix = 10;
+            strip_prefix = true; // a `0x` prefix forces radix 16 below
+        }
+        // §19.2.5 step 11: an optional `0x`/`0X` prefix (radix 16 or default) selects radix 16.
+        if (strip_prefix and i + 1 < s.len and s[i] == '0' and (s[i + 1] == 'x' or s[i + 1] == 'X')) {
+            i += 2;
+            radix = 16;
+        }
+        // §19.2.5 steps 12–16: parse the longest valid-digit prefix.
+        const r: u8 = @intCast(radix);
+        var value: f64 = 0;
+        var any = false;
+        while (i < s.len) : (i += 1) {
+            const d = digitValue(s[i]) orelse break;
+            if (d >= r) break;
+            value = value * @as(f64, @floatFromInt(r)) + @as(f64, @floatFromInt(d));
+            any = true;
+        }
+        if (!any) return .{ .normal = .{ .number = std.math.nan(f64) } };
+        return .{ .normal = .{ .number = sign * value } };
+    }
+
+    /// §19.2.4 parseFloat ( string ) — parse the longest leading StrDecimalLiteral prefix.
+    fn parseFloatFn(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const sc = try self.toStringThrowing(if (args.len > 0) args[0] else .undefined);
+        if (sc.isAbrupt()) return sc;
+        const s = sc.normal.string;
+        const rest = s[trimLeadingWhiteSpace(s)..];
+        // §19.2.4: an `Infinity` / `+Infinity` / `-Infinity` prefix → ±Infinity.
+        {
+            var k: usize = 0;
+            var sgn: f64 = 1;
+            if (k < rest.len and (rest[k] == '+' or rest[k] == '-')) {
+                if (rest[k] == '-') sgn = -1;
+                k += 1;
+            }
+            if (std.mem.startsWith(u8, rest[k..], "Infinity")) {
+                return .{ .normal = .{ .number = sgn * std.math.inf(f64) } };
+            }
+        }
+        // Scan the longest StrDecimalLiteral prefix: [sign] digits [. digits] [(e|E) [sign] digits].
+        var j: usize = 0;
+        if (j < rest.len and (rest[j] == '+' or rest[j] == '-')) j += 1;
+        var saw_digit = false;
+        while (j < rest.len and isAsciiDigit(rest[j])) : (j += 1) saw_digit = true;
+        if (j < rest.len and rest[j] == '.') {
+            j += 1;
+            while (j < rest.len and isAsciiDigit(rest[j])) : (j += 1) saw_digit = true;
+        }
+        if (!saw_digit) return .{ .normal = .{ .number = std.math.nan(f64) } };
+        if (j < rest.len and (rest[j] == 'e' or rest[j] == 'E')) {
+            var k = j + 1;
+            if (k < rest.len and (rest[k] == '+' or rest[k] == '-')) k += 1;
+            var exp_digit = false;
+            while (k < rest.len and isAsciiDigit(rest[k])) : (k += 1) exp_digit = true;
+            if (exp_digit) j = k; // include the exponent only if it has digits
+        }
+        const prefix = rest[0..j];
+        const n = std.fmt.parseFloat(f64, prefix) catch return .{ .normal = .{ .number = std.math.nan(f64) } };
+        return .{ .normal = .{ .number = n } };
+    }
+
+    const UriKind = enum { uri, component };
+
+    /// §19.2.6.4/.5 Encode — percent-encode the UTF-8 bytes of `v`, preserving the kind's unescaped
+    /// (and, for encodeURI, reserved) set. A lone surrogate in the source → URIError.
+    fn uriEncode(self: *Interpreter, v: Value, kind: UriKind) EvalError!Completion {
+        const sc = try self.toStringThrowing(v);
+        if (sc.isAbrupt()) return sc;
+        const s = sc.normal.string;
+        var out: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < s.len) {
+            const c = s[i];
+            if (c < 0x80) {
+                // ASCII: preserve iff in the unescaped (+reserved for encodeURI) set.
+                if (isUriPreserved(c, kind)) {
+                    try out.append(self.arena, c);
+                } else {
+                    try appendPercent(self.arena, &out, c);
+                }
+                i += 1;
+            } else {
+                // Multi-byte UTF-8: validate the sequence, reject lone surrogates / invalid bytes.
+                const len = std.unicode.utf8ByteSequenceLength(c) catch return self.throwError("URIError", "URI malformed");
+                if (i + len > s.len) return self.throwError("URIError", "URI malformed");
+                _ = std.unicode.utf8Decode(s[i .. i + len]) catch return self.throwError("URIError", "URI malformed");
+                for (s[i .. i + len]) |b| try appendPercent(self.arena, &out, b);
+                i += len;
+            }
+        }
+        return .{ .normal = .{ .string = out.items } };
+    }
+
+    /// §19.2.6.2/.3 Decode — turn each `%XX` back into a byte; for decodeURI, an escape whose decoded
+    /// code point is in the reserved set is preserved as the literal `%XX`. Malformed `%`/UTF-8 →
+    /// URIError.
+    fn uriDecode(self: *Interpreter, v: Value, kind: UriKind) EvalError!Completion {
+        const sc = try self.toStringThrowing(v);
+        if (sc.isAbrupt()) return sc;
+        const s = sc.normal.string;
+        var out: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < s.len) {
+            if (s[i] != '%') {
+                try out.append(self.arena, s[i]);
+                i += 1;
+                continue;
+            }
+            // §19.2.6.7 Decode: a `%` must be followed by two hex digits.
+            const b0 = decodeHexByte(s, i) orelse return self.throwError("URIError", "URI malformed");
+            if (b0 < 0x80) {
+                // Single-byte: for decodeURI, preserve a reserved-set escape verbatim.
+                if (kind == .uri and isUriReserved(b0)) {
+                    try out.appendSlice(self.arena, s[i .. i + 3]);
+                } else {
+                    try out.append(self.arena, b0);
+                }
+                i += 3;
+                continue;
+            }
+            // Multi-byte UTF-8: the lead byte fixes the length; each continuation must be a `%XX`.
+            const n: usize = std.unicode.utf8ByteSequenceLength(b0) catch return self.throwError("URIError", "URI malformed");
+            var seq: [4]u8 = undefined;
+            seq[0] = b0;
+            var k: usize = 1;
+            while (k < n) : (k += 1) {
+                const off = i + k * 3;
+                const bk = decodeHexByte(s, off) orelse return self.throwError("URIError", "URI malformed");
+                if (bk < 0x80 or bk >= 0xC0) return self.throwError("URIError", "URI malformed"); // not a continuation byte
+                seq[k] = bk;
+            }
+            _ = std.unicode.utf8Decode(seq[0..n]) catch return self.throwError("URIError", "URI malformed");
+            try out.appendSlice(self.arena, seq[0..n]);
+            i += n * 3;
+        }
+        return .{ .normal = .{ .string = out.items } };
+    }
+
+    // ── §21.1.3 Number.prototype methods ─────────────────────────────────────────
+
+    /// §21.1.3 thisNumberValue(this): a Number primitive, or a `new Number(x)` wrapper unboxed via its
+    /// [[NumberData]] primitive slot. Else null (caller throws TypeError).
+    fn thisNumberValue(this_val: Value) ?f64 {
+        return switch (this_val) {
+            .number => |x| x,
+            .object => |o| if (o.primitive != null and o.primitive.? == .number) o.primitive.?.number else null,
+            else => null,
+        };
+    }
+
+    /// §21.1.3 Number.prototype.{toString,toLocaleString,valueOf,toFixed,toExponential,toPrecision}.
+    fn numberMethod(self: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
+        const n = thisNumberValue(this_val) orelse
+            return self.throwError("TypeError", "Number.prototype method called on incompatible receiver");
+        if (std.mem.eql(u8, name, "valueOf")) return .{ .normal = .{ .number = n } }; // §21.1.3.26
+        if (std.mem.eql(u8, name, "toString") or std.mem.eql(u8, name, "toLocaleString")) {
+            // §21.1.3.6 toString([radix]); §21.1.3.5 toLocaleString ≈ toString for the M-subset.
+            var radix: i64 = 10;
+            if (args.len > 0 and args[0] != .undefined and !std.mem.eql(u8, name, "toLocaleString")) {
+                const rc = try self.toNumberV(args[0]);
+                if (rc.isAbrupt()) return rc;
+                radix = ops.numberToInt32(rc.normal.number);
+            }
+            if (radix < 2 or radix > 36) return self.throwError("RangeError", "toString() radix must be between 2 and 36");
+            if (radix == 10) return .{ .normal = .{ .string = try self.toString(.{ .number = n }) } };
+            return .{ .normal = .{ .string = try numberToRadixString(self.arena, n, @intCast(radix)) } };
+        }
+        if (std.mem.eql(u8, name, "toFixed")) return self.numberToFixed(n, args); // §21.1.3.3
+        if (std.mem.eql(u8, name, "toExponential")) return self.numberToExponential(n, args); // §21.1.3.2
+        if (std.mem.eql(u8, name, "toPrecision")) return self.numberToPrecision(n, args); // §21.1.3.5
+        unreachable;
+    }
+
+    /// §21.1.3.3 Number.prototype.toFixed ( fractionDigits ).
+    fn numberToFixed(self: *Interpreter, n: f64, args: []const Value) EvalError!Completion {
+        const fc = try self.toIntegerOrInfinity(if (args.len > 0) args[0] else .undefined);
+        if (fc.isAbrupt()) return fc;
+        const f = fc.normal.number;
+        if (!(f >= 0 and f <= 100)) return self.throwError("RangeError", "toFixed() digits argument must be between 0 and 100");
+        if (std.math.isNan(n)) return .{ .normal = .{ .string = "NaN" } };
+        // §21.1.3.3 step 9: |x| ≥ 1e21 → ToString(x).
+        if (@abs(n) >= 1e21) return .{ .normal = .{ .string = try self.toString(.{ .number = n }) } };
+        const digits: usize = @intFromFloat(f);
+        const s = try std.fmt.allocPrint(self.arena, "{d:.[1]}", .{ n, digits });
+        return .{ .normal = .{ .string = s } };
+    }
+
+    /// §21.1.3.2 Number.prototype.toExponential ( fractionDigits ).
+    fn numberToExponential(self: *Interpreter, n: f64, args: []const Value) EvalError!Completion {
+        const arg: Value = if (args.len > 0) args[0] else .undefined;
+        const undefined_digits = arg == .undefined;
+        const fc = try self.toIntegerOrInfinity(arg);
+        if (fc.isAbrupt()) return fc;
+        const f = fc.normal.number;
+        if (std.math.isNan(n)) return .{ .normal = .{ .string = "NaN" } };
+        if (std.math.isInf(n)) return .{ .normal = .{ .string = if (n < 0) "-Infinity" else "Infinity" } };
+        if (!undefined_digits and !(f >= 0 and f <= 100))
+            return self.throwError("RangeError", "toExponential() argument must be between 0 and 100");
+        const s = if (undefined_digits)
+            try std.fmt.allocPrint(self.arena, "{e}", .{n})
+        else
+            try std.fmt.allocPrint(self.arena, "{e:.[1]}", .{ n, @as(usize, @intFromFloat(f)) });
+        return .{ .normal = .{ .string = try canonicalizeExponent(self.arena, s) } };
+    }
+
+    /// §21.1.3.5 Number.prototype.toPrecision ( precision ).
+    fn numberToPrecision(self: *Interpreter, n: f64, args: []const Value) EvalError!Completion {
+        const arg: Value = if (args.len > 0) args[0] else .undefined;
+        if (arg == .undefined) return .{ .normal = .{ .string = try self.toString(.{ .number = n }) } }; // §21.1.3.5 step 2
+        const pc = try self.toIntegerOrInfinity(arg);
+        if (pc.isAbrupt()) return pc;
+        const p = pc.normal.number;
+        if (std.math.isNan(n)) return .{ .normal = .{ .string = "NaN" } };
+        if (std.math.isInf(n)) return .{ .normal = .{ .string = if (n < 0) "-Infinity" else "Infinity" } };
+        if (!(p >= 1 and p <= 100)) return self.throwError("RangeError", "toPrecision() argument must be between 1 and 100");
+        const prec: usize = @intFromFloat(p);
+        if (n == 0) {
+            // §21.1.3.5: zero formats as `0`, `0.0`, … with `precision` significant digits.
+            if (prec == 1) return .{ .normal = .{ .string = "0" } };
+            const z = try std.fmt.allocPrint(self.arena, "0.{s}", .{try repeatChar(self.arena, '0', prec - 1)});
+            return .{ .normal = .{ .string = z } };
+        }
+        // Decide fixed vs exponential per the decimal exponent `e` (§21.1.3.5 steps 10–11).
+        const e: i32 = @intFromFloat(@floor(std.math.log10(@abs(n))));
+        if (e < -6 or e >= @as(i32, @intCast(prec))) {
+            const s = try std.fmt.allocPrint(self.arena, "{e:.[1]}", .{ n, prec - 1 });
+            return .{ .normal = .{ .string = try canonicalizeExponent(self.arena, s) } };
+        }
+        // Fixed-point with (prec - 1 - e) fractional digits (clamped at 0).
+        const frac_i: i32 = @as(i32, @intCast(prec)) - 1 - e;
+        const frac: usize = if (frac_i < 0) 0 else @intCast(frac_i);
+        const s = try std.fmt.allocPrint(self.arena, "{d:.[1]}", .{ n, frac });
+        return .{ .normal = .{ .string = s } };
+    }
+
     /// Dispatch a built-in function (§19/§20). Behavior keyed by `func.native`.
     fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
         switch (func.native) {
@@ -6328,6 +6655,7 @@ pub const Interpreter = struct {
             .promise_resolve_fn, .promise_reject_fn => return self.promiseResolvingFn(func, args),
             .promise_finally_thunk => return self.promiseFinallyThunk(func, args),
             .test_done => return self.testDone(args),
+            .global_fn => return self.globalFn(func.native_name, args), // §19.2 global function intrinsics
             .eval_fn => {
                 // §19.2.1: reaching `callNative` means INDIRECT eval (`(0,eval)(s)`, `var e=eval; e(s)`,
                 // `globalThis.eval(s)`) — the direct case is intercepted in `evalCall` before dispatch.
@@ -6442,16 +6770,7 @@ pub const Interpreter = struct {
                     isnum and std.math.isFinite(v) and @floor(v) == v and @abs(v) <= 9007199254740991;
                 return .{ .normal = .{ .boolean = res } };
             },
-            .number_method => { // §21.1.3 Number.prototype.toString/valueOf — primitive `this` or a Number wrapper object
-                const n: f64 = switch (this_val) {
-                    .number => |x| x,
-                    // §21.1.3.3/.7 thisNumberValue: a `new Number(x)` wrapper unwraps via [[NumberData]].
-                    .object => |o| if (o.primitive != null and o.primitive.? == .number) o.primitive.?.number else return self.throwError("TypeError", "Number.prototype method called on incompatible receiver"),
-                    else => return self.throwError("TypeError", "Number.prototype method called on incompatible receiver"),
-                };
-                if (std.mem.eql(u8, func.native_name, "valueOf")) return .{ .normal = .{ .number = n } };
-                return .{ .normal = .{ .string = try self.toString(.{ .number = n }) } };
-            },
+            .number_method => return self.numberMethod(func.native_name, this_val, args), // §21.1.3
             .boolean_method => { // §20.3.3 Boolean.prototype.toString/valueOf — primitive `this` or a Boolean wrapper object
                 const b: bool = switch (this_val) {
                     .boolean => |x| x,
@@ -6515,6 +6834,7 @@ pub const Interpreter = struct {
             .promise_all, .promise_all_settled, .promise_any, .promise_race, .promise_combinator_element => unreachable, // handled in the first switch
             .promise_resolve_fn, .promise_reject_fn, .promise_finally_thunk, .test_done => unreachable, // handled in the first switch
             .eval_fn => unreachable, // §19.2.1 handled in the first switch (indirect eval path)
+            .global_fn => unreachable, // §19.2 handled in the first switch
             .none => unreachable,
         }
     }
@@ -6746,6 +7066,178 @@ pub const Interpreter = struct {
         return .{ .string = try self.toString(v) };
     }
 };
+
+// ── §19.2 global-function lexical helpers ────────────────────────────────────
+
+/// Length of the leading run of §22.1.3.32 StrWhiteSpace (WhiteSpace + LineTerminator) bytes in `s`.
+/// Handles ASCII white space and the multi-byte Unicode space code points (and U+2028/U+2029).
+fn trimLeadingWhiteSpace(s: []const u8) usize {
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c < 0x80) {
+            if (!isStrWhiteSpaceByte(c)) break;
+            i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch break;
+        if (i + len > s.len) break;
+        const cp = std.unicode.utf8Decode(s[i .. i + len]) catch break;
+        if (!isUnicodeWhiteSpaceCp(cp)) break;
+        i += len;
+    }
+    return i;
+}
+
+/// §12.2/§12.3: the ASCII bytes that are StrWhiteSpace — TAB, LF, VT, FF, CR, SP.
+fn isStrWhiteSpaceByte(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0B or c == 0x0C;
+}
+
+/// §12.2 WhiteSpace + §12.3 LineTerminator — the non-ASCII code points that are StrWhiteSpace.
+fn isUnicodeWhiteSpaceCp(cp: u21) bool {
+    return switch (cp) {
+        0x00A0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF => true,
+        else => false,
+    };
+}
+
+fn isAsciiDigit(c: u8) bool {
+    return c >= '0' and c <= '9';
+}
+
+/// Digit value of an ASCII char for radix parsing: '0'..'9' → 0..9, 'a'..'z'/'A'..'Z' → 10..35; else null.
+fn digitValue(c: u8) ?u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'z') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'Z') return c - 'A' + 10;
+    return null;
+}
+
+fn hexValue(c: u8) ?u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return null;
+}
+
+/// Read the `%XX` at `s[at]`; returns the byte, or null if not `%` + two hex digits.
+fn decodeHexByte(s: []const u8, at: usize) ?u8 {
+    if (at + 2 >= s.len or s[at] != '%') return null;
+    const hi = hexValue(s[at + 1]) orelse return null;
+    const lo = hexValue(s[at + 2]) orelse return null;
+    return hi * 16 + lo;
+}
+
+/// Append `%XX` (uppercase hex) for one byte to `out`.
+fn appendPercent(arena: std.mem.Allocator, out: *std.ArrayList(u8), b: u8) std.mem.Allocator.Error!void {
+    const hex = "0123456789ABCDEF";
+    try out.append(arena, '%');
+    try out.append(arena, hex[b >> 4]);
+    try out.append(arena, hex[b & 0x0F]);
+}
+
+/// An arena-allocated string of `count` copies of `c`.
+fn repeatChar(arena: std.mem.Allocator, c: u8, count: usize) std.mem.Allocator.Error![]const u8 {
+    const buf = try arena.alloc(u8, count);
+    @memset(buf, c);
+    return buf;
+}
+
+/// §6.1.6.1.20 Number::toString for radix 2..36 (≠10). NaN/±Inf already handled by the caller's radix-10
+/// path; here `n` is finite. Emits an optional `-`, the integer part by repeated division, then up to
+/// `frac_limit` fractional digits (the spec mandates "as many as needed to uniquely round-trip"; we use a
+/// bounded expansion, matching V8 for the Test262 corpus). Trailing zeros are trimmed.
+fn numberToRadixString(arena: std.mem.Allocator, n: f64, radix: u8) std.mem.Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var x = n;
+    if (std.math.signbit(x)) {
+        try out.append(arena, '-');
+        x = -x;
+    }
+    const digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+    const rf: f64 = @floatFromInt(radix);
+    // Integer part.
+    var int_part = @floor(x);
+    var frac = x - int_part;
+    var int_buf: [1100]u8 = undefined; // f64 max ≈ 1.8e308; ~1075 base-2 digits suffice
+    var ilen: usize = 0;
+    if (int_part == 0) {
+        int_buf[ilen] = '0';
+        ilen += 1;
+    } else {
+        while (int_part >= 1 and ilen < int_buf.len) {
+            const digit: usize = @intFromFloat(@mod(int_part, rf));
+            int_buf[ilen] = digits[digit];
+            ilen += 1;
+            int_part = @floor(int_part / rf);
+        }
+    }
+    // Emit integer digits reversed.
+    var k: usize = ilen;
+    while (k > 0) {
+        k -= 1;
+        try out.append(arena, int_buf[k]);
+    }
+    // Fractional part — bounded expansion, trailing zeros trimmed.
+    if (frac > 0) {
+        try out.append(arena, '.');
+        const frac_limit: usize = 1100;
+        var count: usize = 0;
+        var frac_buf: std.ArrayList(u8) = .empty;
+        while (frac > 0 and count < frac_limit) : (count += 1) {
+            frac *= rf;
+            const digit: usize = @intFromFloat(@floor(frac));
+            try frac_buf.append(arena, digits[if (digit >= radix) radix - 1 else digit]);
+            frac -= @floor(frac);
+        }
+        // Trim trailing zeros.
+        var flen = frac_buf.items.len;
+        while (flen > 0 and frac_buf.items[flen - 1] == '0') flen -= 1;
+        try out.appendSlice(arena, frac_buf.items[0..flen]);
+    }
+    return out.items;
+}
+
+/// Normalize a Zig `{e}`-formatted Number into the ECMAScript form: collapse `e+05` → `e+5`,
+/// `e-007` → `e-7` (strip leading zeros in the exponent), and ensure an explicit sign. Zig already
+/// emits a sign; this only trims the exponent's leading zeros. Input is ASCII.
+fn canonicalizeExponent(arena: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]const u8 {
+    const e_idx = std.mem.indexOfScalar(u8, s, 'e') orelse return s;
+    const mantissa = s[0..e_idx];
+    var rest = s[e_idx + 1 ..];
+    var sign: u8 = '+';
+    if (rest.len > 0 and (rest[0] == '+' or rest[0] == '-')) {
+        sign = rest[0];
+        rest = rest[1..];
+    }
+    // Strip leading zeros (keep at least one digit).
+    var d: usize = 0;
+    while (d + 1 < rest.len and rest[d] == '0') d += 1;
+    return std.fmt.allocPrint(arena, "{s}e{c}{s}", .{ mantissa, sign, rest[d..] });
+}
+
+/// §19.2.6.1.1 uriReserved ∪ '#' — the bytes decodeURI preserves and encodeURI keeps in addition to
+/// the unescaped set: `; / ? : @ & = + $ , #`.
+fn isUriReserved(c: u8) bool {
+    return switch (c) {
+        ';', '/', '?', ':', '@', '&', '=', '+', '$', ',', '#' => true,
+        else => false,
+    };
+}
+
+/// Is byte `c` preserved (not percent-encoded) by the given URI encode kind? `c` is ASCII.
+/// uriUnescaped (§19.2.6.1) = alnum + `- _ . ! ~ * ' ( )`; encodeURI additionally keeps uriReserved+'#'.
+fn isUriPreserved(c: u8, kind: Interpreter.UriKind) bool {
+    const unescaped = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or
+        switch (c) {
+            '-', '_', '.', '!', '~', '*', '\'', '(', ')' => true,
+            else => false,
+        };
+    if (unescaped) return true;
+    if (kind == .uri) return isUriReserved(c);
+    return false;
+}
 
 /// §7.2.3 IsCallable — true iff `obj` is a function object (an AST closure, native, or bound function;
 /// `kind == .function` covers all three). Used by the Promise machinery (executor / handlers / thenable

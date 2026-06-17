@@ -175,8 +175,10 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     if (number_fn.get("prototype")) |pv| {
         if (pv == .object) {
             pv.object.prototype = object_proto; // §21.1.3 Number.prototype inherits %Object.prototype%
-            try defineMethod(arena, pv.object, "toString", .number_method, "toString");
-            try defineMethod(arena, pv.object, "valueOf", .number_method, "valueOf");
+            // §21.1.3 Number.prototype methods (native_name selects the handler).
+            for ([_][]const u8{ "toString", "toLocaleString", "valueOf", "toFixed", "toExponential", "toPrecision" }) |m| {
+                try defineMethod(arena, pv.object, m, .number_method, m);
+            }
         }
     }
     // §21.1.2 Number value properties (non-writable / non-enumerable / non-configurable).
@@ -383,6 +385,21 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     const eval_fn = try Object.createNative(arena, .eval_fn, "eval");
     eval_fn.prototype = function_proto; // §20.2.3 every function object → %Function.prototype%
     try env.declare("eval", .{ .object = eval_fn }, true, true);
+
+    // §19.2 global function intrinsics — declared on the global env (so they are ordinary identifiers)
+    // and, via the globalThis-mirror loop below, exposed as non-enumerable own properties of the global
+    // object. isNaN/isFinite (§19.2.2/.3), parseInt/parseFloat (§19.2.5/.4), and the four §19.2.6 URI
+    // handlers. All share the `global_fn` native, dispatched by name in the interpreter.
+    const global_fns = [_][]const u8{
+        "isNaN",     "isFinite",           "parseInt",  "parseFloat",
+        "encodeURI", "encodeURIComponent", "decodeURI", "decodeURIComponent",
+    };
+    for (global_fns) |gf| {
+        const fn_obj = try Object.createNative(arena, .global_fn, gf);
+        fn_obj.prototype = function_proto;
+        try fn_obj.defineData("name", .{ .string = gf }, false, false, true); // §20.2.4.2
+        try env.declare(gf, .{ .object = fn_obj }, true, true);
+    }
 
     // §21.3 Math — a namespace object (not a constructor): non-enumerable function-valued methods
     // (proto = %Object.prototype%) + the §21.3.1 value properties. `Math.pow(2,32)` backs

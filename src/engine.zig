@@ -3209,3 +3209,61 @@ test "M40: §28.1 Reflect namespace object" {
     try expectStr("Reflect[Symbol.toStringTag]", "Reflect");
     try expectBool("Reflect.getOwnPropertyDescriptor(Reflect, Symbol.toStringTag).enumerable", false);
 }
+
+test "M41: §19.2 global functions (isNaN/isFinite/parseInt/parseFloat/URI)" {
+    // §19.2.3 isNaN / §19.2.2 isFinite — COERCING (unlike Number.isNaN/isFinite).
+    try expectBool("isNaN('x')", true);
+    try expectBool("isNaN('3')", false);
+    try expectBool("isNaN(NaN)", true);
+    try expectBool("isFinite('3')", true);
+    try expectBool("isFinite(Infinity)", false);
+    try expectBool("isFinite('foo')", false);
+    // §19.2.5 parseInt — radix handling, 0x prefix, trim, stop at first invalid char.
+    try expectNumber("parseInt('0x1F')", 31);
+    try expectNumber("parseInt('11', 2)", 3);
+    try expectNumber("parseInt('  42px')", 42);
+    try expectNumber("parseInt('-10', 16)", -16);
+    try expectNumber("parseInt('z', 36)", 35);
+    try expectBool("isNaN(parseInt('xyz'))", true);
+    // §19.2.4 parseFloat — longest StrDecimalLiteral prefix, Infinity, NaN on no prefix.
+    try expectNumber("parseFloat('3.14abc')", 3.14);
+    try expectNumber("parseFloat('Infinity')", std.math.inf(f64));
+    try expectNumber("parseFloat('  6.022e23 ')", 6.022e23);
+    try expectBool("isNaN(parseFloat('abc'))", true);
+    // §19.2.6 URI handlers.
+    try expectStr("encodeURIComponent('a b&c')", "a%20b%26c");
+    try expectStr("decodeURIComponent('a%20b')", "a b");
+    try expectStr("encodeURI('a b/c?d')", "a%20b/c?d"); // reserved `/ ?` preserved
+    try expectStr("decodeURIComponent('%E2%82%AC')", "\u{20AC}"); // euro sign round-trip
+    try expectThrows("decodeURIComponent('%')"); // malformed → URIError
+    try expectThrows("decodeURIComponent('%ZZ')");
+    // globalThis mirror — non-enumerable own properties.
+    try expectBool("globalThis.parseInt === parseInt", true);
+    try expectBool("Object.getOwnPropertyDescriptor(globalThis,'parseInt').enumerable", false);
+}
+
+test "M41: §21.1.3 Number.prototype methods" {
+    // §21.1.3.6 toString([radix]).
+    try expectStr("(255).toString(16)", "ff");
+    try expectStr("(255).toString()", "255");
+    try expectStr("(10).toString(2)", "1010");
+    try expectStr("(0.5).toString(2)", "0.1");
+    try expectThrows("(5).toString(1)"); // radix < 2 → RangeError
+    try expectThrows("(5).toString(37)");
+    // §21.1.3.26 valueOf — unbox a Number wrapper too.
+    try expectNumber("new Number(7).valueOf()", 7);
+    try expectNumber("(42).valueOf()", 42);
+    // §21.1.3.3 toFixed.
+    try expectStr("(3.14159).toFixed(2)", "3.14");
+    try expectStr("(0).toFixed(0)", "0");
+    try expectStr("(1.005).toFixed(0)", "1");
+    try expectThrows("(1).toFixed(101)"); // > 100 → RangeError
+    // §21.1.3.5 toPrecision.
+    try expectStr("(123.456).toPrecision(4)", "123.5");
+    try expectStr("(0.0001234).toPrecision(2)", "0.00012");
+    try expectThrows("(1).toPrecision(0)"); // < 1 → RangeError
+    // §21.1.3.2 toExponential.
+    try expectStr("(123456).toExponential(2)", "1.23e+5");
+    // §21.1.3.5 toLocaleString ≈ toString for the M-subset.
+    try expectStr("(255).toLocaleString()", "255");
+}
