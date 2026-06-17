@@ -30,6 +30,25 @@ fn findIndex(coll: *Collection, key: Value) ?usize {
     return null;
 }
 
+/// Does `coll` hold `key` (SameValueZero)? Public for the §24.2.3 set-algebra methods (interpreter).
+pub fn contains(coll: *Collection, key: Value) bool {
+    return findIndex(coll, key) != null;
+}
+
+/// Add `v` to a Set-kind collection if absent (SameValueZero, `-0`→`+0`). Public for set-algebra.
+pub fn addElement(it: *Interpreter, coll: *Collection, v: Value) EvalError!void {
+    const k = normKey(v);
+    if (findIndex(coll, k) == null) {
+        try coll.entries.append(it.arena, .{ .key = k, .value = k });
+        coll.size += 1;
+    }
+}
+
+/// Remove `key` from `coll` if present (SameValueZero). Public for set-algebra (symmetricDifference).
+pub fn removeElement(coll: *Collection, key: Value) void {
+    _ = remove(coll, key);
+}
+
 /// Insert or update (Map.set / Set.add / WeakMap.set / WeakSet.add backing): SameValueZero-keyed.
 pub fn put(it: *Interpreter, coll: *Collection, key: Value, value: Value) EvalError!void {
     const k = normKey(key);
@@ -199,5 +218,8 @@ pub fn setMethod(it: *Interpreter, name: []const u8, this_val: Value, args: []co
         return .{ .normal = .undefined };
     }
     if (eql(u8, name, "forEach")) return forEach(it, coll, this_val, args);
-    unreachable;
+    // §24.2.3 ES2024 set-algebra (union/intersection/difference/symmetricDifference/isSubsetOf/
+    // isSupersetOf/isDisjointFrom) — iteration-heavy + GetSetRecord(other); lives in the interpreter
+    // (private iterator helpers). `coll` already brand-checked `this` as a Set.
+    return it.setAlgebra(name, coll, args);
 }

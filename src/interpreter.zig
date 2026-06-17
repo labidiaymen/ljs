@@ -81,6 +81,12 @@ pub const Interpreter = struct {
     /// resets it to `undefined` so an ordinary call (and nested ordinary calls within the body) sees
     /// `undefined`. A one-shot hand-off that avoids threading a parameter through 39 call sites.
     pending_new_target: Value = .undefined,
+    /// The [[NewTarget]] visible to the NEXT `callNative` — `callFunction` copies the one-shot
+    /// `pending_new_target` here just before dispatching a native, so a built-in *constructor* reached
+    /// through a `super(...)` chain (e.g. `class X extends Map { constructor(){ super() } }`) can tell
+    /// it is being CONSTRUCTED (initialize the instance) vs plainly CALLED (`Map()` → TypeError). The
+    /// top-level `new` path never needs it (handled in `constructNT` before any native dispatch).
+    native_new_target: Value = .undefined,
     /// §21.3.2.27 Math.random RNG state — a fixed-seed xorshift64* (this is a DETERMINISTIC engine and
     /// the Zig sandbox blocks host RNG / `Date.now`, so no entropy source exists). Test262's random
     /// tests only require the result be a Number in [0,1); the fixed seed keeps the engine reproducible.
@@ -2392,7 +2398,13 @@ pub const Interpreter = struct {
             const merged = try self.concatArgs(b.bound_args, args);
             return self.callFunction(b.target, merged, b.bound_this);
         }
-        if (func.native != .none) return self.callNative(func, args, this_val);
+        if (func.native != .none) {
+            // Expose THIS call's [[NewTarget]] to the native — a built-in constructor reached via a
+            // `super(...)` chain (defined → construct) must initialize the instance, while a plain call
+            // (undefined) throws "requires 'new'". Reset by every dispatch so it never leaks.
+            self.native_new_target = pending_new_target;
+            return self.callNative(func, args, this_val);
+        }
         // §15.5.4 / §27.5: calling a generator function does NOT run the body — it returns a fresh
         // Generator object in `suspended_start` (the body runs on its own thread later, on `.next`).
         // Checked before the depth bump so it pays no recursion budget; ordinary functions skip it.
@@ -7317,10 +7329,19 @@ pub const Interpreter = struct {
             .set_method => return builtin_collection.setMethod(self, func.native_name, this_val, args),
             .weakmap_method => return builtin_collection.weakMapMethod(self, func.native_name, this_val, args),
             .weakset_method => return builtin_collection.weakSetMethod(self, func.native_name, this_val, args),
-            // §24.1.1.1 / §24.2.1.1: a collection constructor reached via plain [[Call]] (no `new`) is a
-            // TypeError; the actual construction happens in `constructNT` (where new_target.prototype is
-            // in hand). WeakMap/WeakSet ctors share this guard (their construct path arrives in M46).
-            .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor => return self.throwError("TypeError", "Constructor requires 'new'"),
+            // §24.1.1.1 / §24.2.1.1 / §24.3.1.1 / §24.4.1.1: a collection constructor. A top-level `new`
+            // is fully handled in `constructNT` (never reaches here). What DOES reach here is either a
+            // plain [[Call]] (`Map()` — new_target undefined → TypeError) or a `super(...)` from a
+            // subclass (`class X extends Set` — new_target defined, `this_val` is the derived instance
+            // to initialize the [[SetData]]/[[MapData]] slot on).
+            .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor => {
+                if (self.native_new_target == .undefined or this_val != .object) {
+                    return self.throwError("TypeError", "Constructor requires 'new'");
+                }
+                const ic = try self.initCollectionInstance(func.native, this_val.object, args);
+                if (ic.isAbrupt()) return ic;
+                return .{ .normal = this_val };
+            },
             .collection_size => return self.collectionSize(func.native_name, this_val),
             .collection_iterator => {
                 // `native_name` is "<home>:<which>" — <home> ("map"/"set") brands the receiver, <which>
@@ -7821,6 +7842,238 @@ pub const Interpreter = struct {
             }
         }
         return self.throwError("TypeError", "get size called on an incompatible receiver");
+    }
+
+    /// §24.2.1.2 Set Record — a set-LIKE argument (`other`), duck-typed via `size`/`has`/`keys`. NOT
+    /// necessarily a real Set, so the algebra below must call `has`/`keys` dynamically (observably).
+    const SetRecord = struct { obj: Value, size: f64, has: *Object, keys: *Object };
+
+    /// §24.2.1.2 GetSetRecord ( obj ) — validate the set-like and capture its size/has/keys.
+    fn getSetRecord(self: *Interpreter, obj: Value) EvalError!union(enum) { rec: SetRecord, abrupt: Completion } {
+        if (obj != .object) return .{ .abrupt = try self.throwError("TypeError", "argument is not an object") };
+        const sc = try self.getProperty2(obj, "size");
+        if (sc.isAbrupt()) return .{ .abrupt = sc };
+        const nc = try self.toNumberV(sc.normal); // ToNumber(undefined) = NaN → TypeError below
+        if (nc.isAbrupt()) return .{ .abrupt = nc };
+        if (std.math.isNan(nc.normal.number)) return .{ .abrupt = try self.throwError("TypeError", "size is NaN") };
+        const isc = try self.toIntegerOrInfinityPub(nc.normal);
+        if (isc.isAbrupt()) return .{ .abrupt = isc };
+        const int_size = isc.normal.number;
+        if (int_size < 0) return .{ .abrupt = try self.throwError("RangeError", "size is negative") };
+        const hc = try self.getProperty2(obj, "has");
+        if (hc.isAbrupt()) return .{ .abrupt = hc };
+        if (hc.normal != .object or !isCallable(hc.normal.object)) return .{ .abrupt = try self.throwError("TypeError", "has is not callable") };
+        const kc = try self.getProperty2(obj, "keys");
+        if (kc.isAbrupt()) return .{ .abrupt = kc };
+        if (kc.normal != .object or !isCallable(kc.normal.object)) return .{ .abrupt = try self.throwError("TypeError", "keys is not callable") };
+        return .{ .rec = .{ .obj = obj, .size = int_size, .has = hc.normal.object, .keys = kc.normal.object } };
+    }
+
+    /// %Set.prototype% intrinsic (for the result of the set-algebra methods). Null in a realm-less eval.
+    fn setProto(self: *Interpreter) ?*Object {
+        const g = self.globals orelse return null;
+        const b = g.lookup("Set") orelse return null;
+        if (b.value != .object) return null;
+        const pv = b.value.object.get("prototype") orelse return null;
+        return if (pv == .object) pv.object else null;
+    }
+
+    /// A fresh empty Set instance (proto = %Set.prototype%, kind=set) — the result container.
+    fn newSetInstance(self: *Interpreter) EvalError!*Object {
+        const o = try Object.create(self.arena, self.setProto());
+        const coll = try self.arena.create(object_mod.Collection);
+        coll.* = .{ .kind = .set };
+        o.collection = coll;
+        return o;
+    }
+
+    /// A new Set seeded with a SNAPSHOT of `src`'s present elements (in insertion order) — the
+    /// `resultSetData ← copy of O.[[SetData]]` step shared by union/difference/symmetricDifference.
+    fn cloneSet(self: *Interpreter, src: *object_mod.Collection) EvalError!*Object {
+        const o = try self.newSetInstance();
+        for (src.entries.items) |e| {
+            if (e.present) try builtin_collection.addElement(self, o.collection.?, e.key);
+        }
+        return o;
+    }
+
+    /// Call `other.keys()` and require an object result — the iterator for the set-algebra walks.
+    fn setRecordKeysIter(self: *Interpreter, rec: SetRecord) EvalError!union(enum) { iter: *Object, abrupt: Completion } {
+        const kc = try self.callFunction(rec.keys, &.{}, rec.obj);
+        if (kc.isAbrupt()) return .{ .abrupt = kc };
+        if (kc.normal != .object) return .{ .abrupt = try self.throwError("TypeError", "keys() did not return an object") };
+        return .{ .iter = kc.normal.object };
+    }
+
+    /// §24.2.3 union/intersection/difference/symmetricDifference/isSubsetOf/isSupersetOf/isDisjointFrom.
+    /// `this_coll` is the already-brand-checked Set; `args[0]` is the set-like `other`.
+    pub fn setAlgebra(self: *Interpreter, name: []const u8, this_coll: *object_mod.Collection, args: []const Value) EvalError!Completion {
+        const eql = std.mem.eql;
+        const other: Value = if (args.len > 0) args[0] else .undefined;
+        const rec = switch (try self.getSetRecord(other)) {
+            .rec => |r| r,
+            .abrupt => |c| return c,
+        };
+        const this_size: f64 = @floatFromInt(this_coll.size);
+
+        if (eql(u8, name, "union")) {
+            // §24.2.3.x: result = clone(O); add each of other's keys.
+            const result = try self.cloneSet(this_coll);
+            const iter = switch (try self.setRecordKeysIter(rec)) {
+                .iter => |x| x,
+                .abrupt => |c| return c,
+            };
+            while (true) {
+                switch (try self.iteratorStep(iter)) {
+                    .done => break,
+                    .abrupt => |c| return c,
+                    .value => |v| try builtin_collection.addElement(self, result.collection.?, v),
+                }
+            }
+            return .{ .normal = .{ .object = result } };
+        }
+
+        if (eql(u8, name, "intersection")) {
+            const result = try self.newSetInstance();
+            if (this_size <= rec.size) {
+                var i: usize = 0;
+                while (i < this_coll.entries.items.len) : (i += 1) {
+                    if (!this_coll.entries.items[i].present) continue;
+                    const e = this_coll.entries.items[i].key;
+                    const hc = try self.callFunction(rec.has, &.{e}, rec.obj);
+                    if (hc.isAbrupt()) return hc;
+                    if (toBoolean(hc.normal) and builtin_collection.contains(this_coll, e)) {
+                        try builtin_collection.addElement(self, result.collection.?, e);
+                    }
+                }
+            } else {
+                const iter = switch (try self.setRecordKeysIter(rec)) {
+                    .iter => |x| x,
+                    .abrupt => |c| return c,
+                };
+                while (true) {
+                    switch (try self.iteratorStep(iter)) {
+                        .done => break,
+                        .abrupt => |c| return c,
+                        .value => |v| if (builtin_collection.contains(this_coll, v)) try builtin_collection.addElement(self, result.collection.?, v),
+                    }
+                }
+            }
+            return .{ .normal = .{ .object = result } };
+        }
+
+        if (eql(u8, name, "difference")) {
+            const result = try self.cloneSet(this_coll);
+            if (this_size <= rec.size) {
+                var i: usize = 0;
+                while (i < this_coll.entries.items.len) : (i += 1) {
+                    if (!this_coll.entries.items[i].present) continue;
+                    const e = this_coll.entries.items[i].key;
+                    const hc = try self.callFunction(rec.has, &.{e}, rec.obj);
+                    if (hc.isAbrupt()) return hc;
+                    if (toBoolean(hc.normal)) builtin_collection.removeElement(result.collection.?, e);
+                }
+            } else {
+                const iter = switch (try self.setRecordKeysIter(rec)) {
+                    .iter => |x| x,
+                    .abrupt => |c| return c,
+                };
+                while (true) {
+                    switch (try self.iteratorStep(iter)) {
+                        .done => break,
+                        .abrupt => |c| return c,
+                        .value => |v| builtin_collection.removeElement(result.collection.?, v),
+                    }
+                }
+            }
+            return .{ .normal = .{ .object = result } };
+        }
+
+        if (eql(u8, name, "symmetricDifference")) {
+            const result = try self.cloneSet(this_coll);
+            const iter = switch (try self.setRecordKeysIter(rec)) {
+                .iter => |x| x,
+                .abrupt => |c| return c,
+            };
+            while (true) {
+                switch (try self.iteratorStep(iter)) {
+                    .done => break,
+                    .abrupt => |c| return c,
+                    .value => |v| {
+                        // In O → exclude (remove from result); not in O → include (add).
+                        if (builtin_collection.contains(this_coll, v)) {
+                            builtin_collection.removeElement(result.collection.?, v);
+                        } else {
+                            try builtin_collection.addElement(self, result.collection.?, v);
+                        }
+                    },
+                }
+            }
+            return .{ .normal = .{ .object = result } };
+        }
+
+        if (eql(u8, name, "isSubsetOf")) {
+            if (this_size > rec.size) return .{ .normal = .{ .boolean = false } };
+            var i: usize = 0;
+            while (i < this_coll.entries.items.len) : (i += 1) {
+                if (!this_coll.entries.items[i].present) continue;
+                const e = this_coll.entries.items[i].key;
+                const hc = try self.callFunction(rec.has, &.{e}, rec.obj);
+                if (hc.isAbrupt()) return hc;
+                if (!toBoolean(hc.normal)) return .{ .normal = .{ .boolean = false } };
+            }
+            return .{ .normal = .{ .boolean = true } };
+        }
+
+        if (eql(u8, name, "isSupersetOf")) {
+            if (this_size < rec.size) return .{ .normal = .{ .boolean = false } };
+            const iter = switch (try self.setRecordKeysIter(rec)) {
+                .iter => |x| x,
+                .abrupt => |c| return c,
+            };
+            while (true) {
+                switch (try self.iteratorStep(iter)) {
+                    .done => break,
+                    .abrupt => |c| return c,
+                    .value => |v| if (!builtin_collection.contains(this_coll, v)) {
+                        try self.iteratorClose(iter); // §24.2.3 IteratorClose(_, false)
+                        return .{ .normal = .{ .boolean = false } };
+                    },
+                }
+            }
+            return .{ .normal = .{ .boolean = true } };
+        }
+
+        if (eql(u8, name, "isDisjointFrom")) {
+            if (this_size <= rec.size) {
+                var i: usize = 0;
+                while (i < this_coll.entries.items.len) : (i += 1) {
+                    if (!this_coll.entries.items[i].present) continue;
+                    const e = this_coll.entries.items[i].key;
+                    const hc = try self.callFunction(rec.has, &.{e}, rec.obj);
+                    if (hc.isAbrupt()) return hc;
+                    if (toBoolean(hc.normal)) return .{ .normal = .{ .boolean = false } };
+                }
+            } else {
+                const iter = switch (try self.setRecordKeysIter(rec)) {
+                    .iter => |x| x,
+                    .abrupt => |c| return c,
+                };
+                while (true) {
+                    switch (try self.iteratorStep(iter)) {
+                        .done => break,
+                        .abrupt => |c| return c,
+                        .value => |v| if (builtin_collection.contains(this_coll, v)) {
+                            try self.iteratorClose(iter);
+                            return .{ .normal = .{ .boolean = false } };
+                        },
+                    }
+                }
+            }
+            return .{ .normal = .{ .boolean = true } };
+        }
+
+        unreachable;
     }
 
     /// §22.1.5.1 CreateStringIterator — a fresh String Iterator object over the primitive string's

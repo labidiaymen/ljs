@@ -478,6 +478,14 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         try defineMethod(arena, sp_obj, "delete", .set_method, "delete"); // §24.2.3.4
         try defineMethod(arena, sp_obj, "clear", .set_method, "clear"); // §24.2.3.2
         try defineMethod(arena, sp_obj, "forEach", .set_method, "forEach"); // §24.2.3.6
+        // §24.2.3 ES2024 set-algebra (each takes a set-like `other`); dispatched via set_method → setAlgebra.
+        try defineMethod(arena, sp_obj, "union", .set_method, "union");
+        try defineMethod(arena, sp_obj, "intersection", .set_method, "intersection");
+        try defineMethod(arena, sp_obj, "difference", .set_method, "difference");
+        try defineMethod(arena, sp_obj, "symmetricDifference", .set_method, "symmetricDifference");
+        try defineMethod(arena, sp_obj, "isSubsetOf", .set_method, "isSubsetOf");
+        try defineMethod(arena, sp_obj, "isSupersetOf", .set_method, "isSupersetOf");
+        try defineMethod(arena, sp_obj, "isDisjointFrom", .set_method, "isDisjointFrom");
         try defineMethod(arena, sp_obj, "entries", .collection_iterator, "set:entries"); // §24.2.3.5
         // §24.2.3.8/.10/.11: `values` is shared by `keys` AND [Symbol.iterator] (same function object).
         const set_values = try Object.createNative(arena, .collection_iterator, "set:values");
