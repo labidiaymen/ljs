@@ -20,6 +20,7 @@ const builtin_number = @import("builtin_number.zig");
 const builtin_symbol = @import("builtin_symbol.zig");
 const builtin_iterator = @import("builtin_iterator.zig");
 const builtin_object = @import("builtin_object.zig");
+const builtin_reflect = @import("builtin_reflect.zig");
 const builtins = @import("builtins.zig");
 const bigint = @import("bigint.zig");
 const Parser = @import("parser.zig").Parser;
@@ -1497,7 +1498,7 @@ pub const Interpreter = struct {
     /// [[Prototype]] is read from `new_target.prototype` (an object, else %Object.prototype% per §10.1.13
     /// OrdinaryCreateFromConstructor), while the BODY still runs `ctor`. `new_target` must be a
     /// constructor (the caller validates IsConstructor).
-    fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_target: *Object) EvalError!Completion {
+    pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_target: *Object) EvalError!Completion {
         // §15.3: arrow functions have no [[Construct]] — `new (() => {})` is a TypeError.
         if (ctor.call) |fd| {
             if (fd.is_arrow) return self.throwError("TypeError", "value is not a constructor");
@@ -6065,6 +6066,12 @@ pub const Interpreter = struct {
     pub fn ownEnumerableKeys(self: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!void {
         return builtin_object.ownEnumerableKeys(self, value, out);
     }
+
+    /// §7.1.19 ToPropertyKey then ToString — a thin wrapper kept on the Interpreter so Object/Reflect
+    /// reach the helper now living in builtin_reflect.zig.
+    pub fn toPropertyKeyString(self: *Interpreter, key: Value) EvalError![]const u8 {
+        return builtin_reflect.toPropertyKeyString(self, key);
+    }
     // ── §21.3 Math ──────────────────────────────────────────────────────────
 
     /// §21.3.2.27 Math.random — the next xorshift64* draw mapped to [0,1). A fixed-seed PRNG (no host
@@ -6079,218 +6086,8 @@ pub const Interpreter = struct {
         return @as(f64, @floatFromInt(bits)) * (1.0 / 9007199254740992.0); // / 2^53
     }
 
-    // ── §28.1 Reflect ─────────────────────────────────────────────────────────
-
-    /// §28.1 Reflect.<name>( ...args ) — a thin wrapper over the engine's reflection internals (the same
-    /// ops backing `Object.*` / `[[Get]]` / `[[Set]]` / `in` / delete / [[Construct]]). Every method
-    /// requires `target` be an Object (TypeError otherwise); the predicate methods return a boolean
-    /// rather than throwing on an ordinary failure (e.g. `defineProperty` → false, not a TypeError).
-    fn reflectMethod(self: *Interpreter, name: []const u8, args: []const Value) EvalError!Completion {
-        const arg0 = if (args.len > 0) args[0] else .undefined;
-        const arg1 = if (args.len > 1) args[1] else .undefined;
-        const arg2 = if (args.len > 2) args[2] else .undefined;
-
-        // §28.1.1 Reflect.apply ( target, thisArgument, argumentsList )
-        if (std.mem.eql(u8, name, "apply")) {
-            if (arg0 != .object or !isCallable(arg0.object)) return self.throwError("TypeError", "Reflect.apply target is not callable");
-            const list = try self.createListFromArrayLike(arg2);
-            switch (list) {
-                .abrupt => |c| return c,
-                .list => |l| return self.callFunction(arg0.object, l, arg1),
-            }
-        }
-
-        // §28.1.2 Reflect.construct ( target, argumentsList [ , newTarget ] )
-        if (std.mem.eql(u8, name, "construct")) {
-            if (arg0 != .object or !isConstructor(arg0.object)) return self.throwError("TypeError", "Reflect.construct target is not a constructor");
-            // §28.1.2 step 2–3: newTarget defaults to target; if supplied it must be a constructor.
-            var new_target = arg0.object;
-            if (args.len > 2) {
-                if (arg2 != .object or !isConstructor(arg2.object)) return self.throwError("TypeError", "Reflect.construct newTarget is not a constructor");
-                new_target = arg2.object;
-            }
-            const list = try self.createListFromArrayLike(arg1);
-            switch (list) {
-                .abrupt => |c| return c,
-                .list => |l| return self.constructNT(arg0.object, l, new_target),
-            }
-        }
-
-        // Every remaining method requires `target` (arg0) be an Object (§28.1.x step 1).
-        if (arg0 != .object) return self.throwError("TypeError", "Reflect target must be an object");
-        const target = arg0.object;
-
-        // §28.1.6 Reflect.get ( target, propertyKey [ , receiver ] )
-        if (std.mem.eql(u8, name, "get")) {
-            const receiver: Value = if (args.len > 2) arg2 else arg0;
-            return self.reflectGet(arg0, arg1, receiver);
-        }
-        // §28.1.13 Reflect.set ( target, propertyKey, V [ , receiver ] )
-        if (std.mem.eql(u8, name, "set")) {
-            const v = if (args.len > 2) arg2 else .undefined;
-            const receiver: Value = if (args.len > 3) args[3] else arg0;
-            return self.reflectSet(arg0, arg1, v, receiver);
-        }
-        // §28.1.9 Reflect.has ( target, propertyKey ) → the `in` operation (proto-chain walk).
-        if (std.mem.eql(u8, name, "has")) {
-            const has = try self.hasPropertyV(arg0, arg1);
-            return .{ .normal = .{ .boolean = has } };
-        }
-        // §28.1.4 Reflect.deleteProperty ( target, propertyKey ) → boolean.
-        if (std.mem.eql(u8, name, "deleteProperty")) {
-            if (arg1 == .symbol) {
-                const ok = target.deleteSymbol(arg1.symbol);
-                return .{ .normal = .{ .boolean = ok } };
-            }
-            const key = try self.toPropertyKeyString(arg1);
-            const c = try self.deleteProperty(arg0, key);
-            return c;
-        }
-        // §28.1.11 Reflect.ownKeys ( target ) → own string keys (Array indices, then string props),
-        // then own symbol keys, as an Array.
-        if (std.mem.eql(u8, name, "ownKeys")) {
-            return self.reflectOwnKeys(target);
-        }
-        // §28.1.8 Reflect.getPrototypeOf ( target ) — the [[Prototype]] (object or null).
-        if (std.mem.eql(u8, name, "getPrototypeOf")) {
-            return .{ .normal = if (target.prototype) |p| .{ .object = p } else .null };
-        }
-        // §28.1.14 Reflect.setPrototypeOf ( target, proto ) → boolean (false on a rejected change).
-        if (std.mem.eql(u8, name, "setPrototypeOf")) {
-            const new_proto: ?*Object = switch (arg1) {
-                .null => null,
-                .object => |p| p,
-                else => return self.throwError("TypeError", "Reflect.setPrototypeOf called with an invalid prototype"),
-            };
-            if (target.prototype == new_proto) return .{ .normal = .{ .boolean = true } };
-            if (!target.extensible) return .{ .normal = .{ .boolean = false } }; // §10.4.7.1: reject, don't throw
-            target.prototype = new_proto;
-            return .{ .normal = .{ .boolean = true } };
-        }
-        // §28.1.10 Reflect.isExtensible ( target ) → boolean.
-        if (std.mem.eql(u8, name, "isExtensible")) {
-            return .{ .normal = .{ .boolean = target.extensible } };
-        }
-        // §28.1.12 Reflect.preventExtensions ( target ) → boolean (always succeeds here).
-        if (std.mem.eql(u8, name, "preventExtensions")) {
-            target.extensible = false;
-            return .{ .normal = .{ .boolean = true } };
-        }
-        // §28.1.3 Reflect.defineProperty ( target, propertyKey, attributes ) → boolean (NO throw on a
-        // failed define — returns false, unlike Object.defineProperty).
-        if (std.mem.eql(u8, name, "defineProperty")) {
-            const r = try self.toPropertyDescriptor(arg2);
-            switch (r) {
-                .abrupt => |c| return c,
-                .desc => |d| {
-                    if (arg1 == .symbol) {
-                        const ok = try target.defineSymbol(arg1.symbol, d);
-                        return .{ .normal = .{ .boolean = ok } };
-                    }
-                    const key = try self.toPropertyKeyString(arg1);
-                    const ok = try target.defineProperty(key, d);
-                    return .{ .normal = .{ .boolean = ok } };
-                },
-            }
-        }
-        // §28.1.7 Reflect.getOwnPropertyDescriptor ( target, propertyKey ) → descriptor object or undefined.
-        if (std.mem.eql(u8, name, "getOwnPropertyDescriptor")) {
-            if (arg1 == .symbol) {
-                for (target.symbol_props.items) |*sp| {
-                    if (sp.key == arg1.symbol) return builtin_object.fromPropertyValue(self, sp.pv);
-                }
-                return .{ .normal = .undefined };
-            }
-            return builtin_object.objectGetOwnPropertyDescriptor(self, &.{ arg0, arg1 });
-        }
-
-        return self.throwError("TypeError", "unknown Reflect method");
-    }
-
-    /// §7.1.19 ToPropertyKey for the string path (a Symbol is handled by the caller's symbol branch).
-    pub fn toPropertyKeyString(self: *Interpreter, key: Value) EvalError![]const u8 {
-        return self.toString(key);
-    }
-
-    /// §28.1.6 [[Get]] with an explicit receiver — locate `key` (string or symbol) on `target`'s chain;
-    /// a data property returns its value, an accessor invokes its getter with `this` = receiver.
-    fn reflectGet(self: *Interpreter, target: Value, key: Value, receiver: Value) EvalError!Completion {
-        const o = target.object;
-        if (key == .symbol) {
-            const loc = o.getSymbolProp(key.symbol) orelse return self.getSymbolProperty(target, key.symbol);
-            switch (loc.pv.payload) {
-                .data => |v| return .{ .normal = v },
-                .accessor => |a| {
-                    const getter = a.get orelse return .{ .normal = .undefined };
-                    return self.callFunction(getter, &.{}, receiver);
-                },
-            }
-        }
-        const ks = try self.toPropertyKeyString(key);
-        // Reuse the ordinary [[Get]] for the receiver == target common case (Array/String-exotic aware).
-        if (sameRef(target, receiver)) return self.getProperty(target, ks);
-        const loc = o.getProp(ks) orelse return self.getProperty(target, ks);
-        switch (loc.pv.payload) {
-            .data => |v| return .{ .normal = v },
-            .accessor => |a| {
-                const getter = a.get orelse return .{ .normal = .undefined };
-                return self.callFunction(getter, &.{}, receiver);
-            },
-        }
-    }
-
-    /// §28.1.13 [[Set]] with an explicit receiver → boolean. An inherited/own accessor invokes its
-    /// setter with `this` = receiver; a data write defines/overwrites on the target (M-subset: the
-    /// receiver-divergent OrdinarySet redirection is the common receiver == target model).
-    fn reflectSet(self: *Interpreter, target: Value, key: Value, value: Value, receiver: Value) EvalError!Completion {
-        const o = target.object;
-        if (key == .symbol) {
-            if (o.getSymbolProp(key.symbol)) |loc| if (loc.pv.payload == .accessor) {
-                const setter = loc.pv.payload.accessor.set orelse return .{ .normal = .{ .boolean = false } };
-                const sc = try self.callFunction(setter, &.{value}, receiver);
-                if (sc.isAbrupt()) return sc;
-                return .{ .normal = .{ .boolean = true } };
-            };
-            if (!o.extensible and o.getSymbolProp(key.symbol) == null) return .{ .normal = .{ .boolean = false } };
-            try o.setSymbol(key.symbol, value);
-            return .{ .normal = .{ .boolean = true } };
-        }
-        const ks = try self.toPropertyKeyString(key);
-        // §10.1.9: a non-writable own data property or a getter-only accessor rejects (→ false).
-        if (o.getProp(ks)) |loc| {
-            if (loc.pv.payload == .accessor) {
-                const setter = loc.pv.payload.accessor.set orelse return .{ .normal = .{ .boolean = false } };
-                const sc = try self.callFunction(setter, &.{value}, receiver);
-                if (sc.isAbrupt()) return sc;
-                return .{ .normal = .{ .boolean = true } };
-            }
-            if (loc.holder == o and !loc.pv.writable) return .{ .normal = .{ .boolean = false } };
-        }
-        const sc = try self.setProperty(target, ks, value);
-        if (sc.isAbrupt()) return sc;
-        return .{ .normal = .{ .boolean = true } };
-    }
-
-    /// §28.1.11 Reflect.ownKeys — own string keys (Array indices in numeric order, then `length` for an
-    /// Array, then ordinary own string keys in insertion order), then own symbol keys, as an Array.
-    fn reflectOwnKeys(self: *Interpreter, target: *Object) EvalError!Completion {
-        const arr = try Object.createArray(self.arena, self.arrayProto());
-        if (target.kind == .array) {
-            for (try target.arrayIndices(self.arena)) |i| {
-                try arr.elements.append(self.arena, .{ .string = try numberToString(self.arena, @floatFromInt(i)) });
-            }
-            try arr.elements.append(self.arena, .{ .string = "length" });
-        }
-        var it = target.properties.iterator();
-        while (it.next()) |entry| try arr.elements.append(self.arena, .{ .string = entry.key_ptr.* });
-        // §28.1.11 step 3.b: own symbol keys follow the string keys.
-        for (target.symbol_props.items) |sp| try arr.elements.append(self.arena, .{ .symbol = sp.key });
-        arr.array_length = arr.elements.items.len;
-        return .{ .normal = .{ .object = arr } };
-    }
-
     /// §7.3.12 HasProperty for a Value key (string or symbol) — proto-chain walk (the `in` semantics).
-    fn hasPropertyV(self: *Interpreter, base: Value, key: Value) EvalError!bool {
+    pub fn hasPropertyV(self: *Interpreter, base: Value, key: Value) EvalError!bool {
         const o = base.object;
         if (key == .symbol) return o.getSymbolProp(key.symbol) != null;
         const ks = try self.toPropertyKeyString(key);
@@ -6362,7 +6159,7 @@ pub const Interpreter = struct {
     /// §7.3.18 CreateListFromArrayLike (§20.2.3.1 step 2): null/undefined → empty list; an Array →
     /// its elements; any other object → its `0..length-1` indexed values (M-subset: array-likes via
     /// `.length`); a non-object non-nullish argArray → TypeError.
-    fn createListFromArrayLike(self: *Interpreter, v: Value) EvalError!union(enum) { list: []const Value, abrupt: Completion } {
+    pub fn createListFromArrayLike(self: *Interpreter, v: Value) EvalError!union(enum) { list: []const Value, abrupt: Completion } {
         switch (v) {
             .undefined, .null => return .{ .list = &.{} },
             .object => |o| {
@@ -6646,7 +6443,7 @@ pub const Interpreter = struct {
                 return self.makeCollectionIterator(this_val, kind, home);
             },
             .math_method => return builtin_math.call(self, func.native_name, args),
-            .reflect_method => return self.reflectMethod(func.native_name, args),
+            .reflect_method => return builtin_reflect.reflectMethod(self, func.native_name, args),
             .species_getter => return .{ .normal = this_val }, // §23.1.2.5 get [Symbol.species] returns `this`
             .array_values => return self.makeArrayIterator(this_val, .value), // §23.1.3.34 / Array.prototype[Symbol.iterator]
             .array_keys => return self.makeArrayIterator(this_val, .key), // §23.1.3.18 Array.prototype.keys
@@ -7592,7 +7389,7 @@ pub fn isCallable(obj: *Object) bool {
 /// `construct`: arrow functions, the Symbol/BigInt constructors (callable-but-not-`new`), and built-in
 /// methods/statics (a native with no AST body that is not one of the genuine built-in constructors)
 /// are NOT constructors. Ordinary functions / bound functions / classes ARE.
-fn isConstructor(obj: *Object) bool {
+pub fn isConstructor(obj: *Object) bool {
     if (obj.kind != .function) return false;
     if (obj.call) |fd| {
         if (fd.is_arrow) return false; // arrows + methods/generators handled by the caller's body checks
@@ -7607,7 +7404,7 @@ fn isConstructor(obj: *Object) bool {
 }
 
 /// Identity comparison of two Object-valued `Value`s (same `*Object`). False if either is not an object.
-fn sameRef(a: Value, b: Value) bool {
+pub fn sameRef(a: Value, b: Value) bool {
     return a == .object and b == .object and a.object == b.object;
 }
 
