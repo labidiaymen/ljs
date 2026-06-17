@@ -14,6 +14,7 @@ const ops = @import("abstract_ops.zig");
 const builtin_array = @import("builtin_array.zig");
 const builtin_string = @import("builtin_string.zig");
 const builtin_collection = @import("builtin_collection.zig");
+const builtin_json = @import("builtin_json.zig");
 const builtins = @import("builtins.zig");
 const bigint = @import("bigint.zig");
 const Parser = @import("parser.zig").Parser;
@@ -3384,6 +3385,15 @@ pub const Interpreter = struct {
         return .{ .string = try self.toString(prim) };
     }
 
+    /// §7.1.17 ToString as a Completion — public wrapper for the built-in libraries (JSON, etc.):
+    /// `.normal` holds the coerced string Value; a Symbol argument is an abrupt TypeError.
+    pub fn toStringValuePub(self: *Interpreter, v: Value) EvalError!Completion {
+        return switch (try self.toStringCoerceV(v)) {
+            .string => |s| .{ .normal = .{ .string = s } },
+            .abrupt => |c| c,
+        };
+    }
+
     // ── §7.4 Iteration protocol (Symbol.iterator) ───────────────────────────────
 
     /// §7.3.12 HasProperty(arr, i) over the Array exotic + its prototype chain — used by the
@@ -3436,7 +3446,7 @@ pub const Interpreter = struct {
     /// getter-only accessor, a non-writable own data property, a new property on a non-extensible object,
     /// or a read-only String-wrapper index/length) raises a TypeError rather than silently no-op'ing
     /// (the in-place mutating Array methods rely on this). Emulates §10.1.9 OrdinarySet's success bit.
-    fn setKeyThrow(self: *Interpreter, o: *Object, key: []const u8, v: Value) EvalError!Completion {
+    pub fn setKeyThrow(self: *Interpreter, o: *Object, key: []const u8, v: Value) EvalError!Completion {
         // A `new String(s)` wrapper: the canonical integer indices [0, len) and `length` are read-only,
         // non-configurable own slots (§10.4.3) → any [[Set]] is rejected.
         if (o.primitive) |p| if (p == .string) {
@@ -5517,7 +5527,7 @@ pub const Interpreter = struct {
     /// §13.5.1.2 / §10.1.10 [[Delete]] — remove the own property `key` from `base`. A non-configurable
     /// own property is NOT deleted and yields `false` (so `delete` on a sealed/frozen property reports
     /// correctly); an absent property yields `true`. On a primitive base, deletion is a no-op → true.
-    fn deleteProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
+    pub fn deleteProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
         switch (base) {
             .object => |o| {
                 if (o.kind == .array) {
@@ -6227,7 +6237,7 @@ pub const Interpreter = struct {
     /// §7.3.23 EnumerableOwnPropertyNames (key-collection half) — the OWN enumerable string keys of a
     /// value (no prototype walk): Array indices (numeric order), ordinary own enumerable string keys,
     /// or a primitive String's character indices. Used by Object.keys/values/entries and Object.assign.
-    fn ownEnumerableKeys(self: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!void {
+    pub fn ownEnumerableKeys(self: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!void {
         switch (value) {
             .object => |o| {
                 if (o.kind == .array) {
@@ -7329,6 +7339,8 @@ pub const Interpreter = struct {
             .set_method => return builtin_collection.setMethod(self, func.native_name, this_val, args),
             .weakmap_method => return builtin_collection.weakMapMethod(self, func.native_name, this_val, args),
             .weakset_method => return builtin_collection.weakSetMethod(self, func.native_name, this_val, args),
+            .json_parse => return builtin_json.parse(self, args),
+            .json_stringify => return builtin_json.stringify(self, args),
             // §24.1.1.1 / §24.2.1.1 / §24.3.1.1 / §24.4.1.1: a collection constructor. A top-level `new`
             // is fully handled in `constructNT` (never reaches here). What DOES reach here is either a
             // plain [[Call]] (`Map()` — new_target undefined → TypeError) or a `super(...)` from a
@@ -7599,6 +7611,7 @@ pub const Interpreter = struct {
             .async_generator_method, .async_generator_iterator, .async_from_sync_method, .async_from_sync_wrap => unreachable, // handled in the first switch
             .map_method, .set_method, .weakmap_method, .weakset_method => unreachable, // handled in the first switch
             .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .collection_size, .collection_iterator => unreachable, // handled in the first switch
+            .json_parse, .json_stringify => unreachable, // handled in the first switch
             .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch
             .promise_all, .promise_all_settled, .promise_any, .promise_race, .promise_combinator_element => unreachable, // handled in the first switch
             .promise_resolve_fn, .promise_reject_fn, .promise_finally_thunk, .test_done => unreachable, // handled in the first switch

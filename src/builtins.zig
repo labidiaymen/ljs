@@ -538,6 +538,14 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try defineConstructorBackref(weakset_fn); // §24.4.3.2 WeakSet.prototype.constructor === WeakSet
     try env.declare("WeakSet", .{ .object = weakset_fn }, true, true);
 
+    // §25.5 JSON — a namespace ordinary object (NOT callable / NOT a constructor; proto =
+    // %Object.prototype%) holding `parse`/`stringify` and [Symbol.toStringTag] = "JSON".
+    const json_obj = try Object.create(arena, object_proto);
+    try defineMethod(arena, json_obj, "parse", .json_parse, "parse"); // §25.5.1
+    try defineMethod(arena, json_obj, "stringify", .json_stringify, "stringify"); // §25.5.2
+    if (tag_sym) |s| try json_obj.defineSymbolData(s, .{ .string = "JSON" }, false, false, true); // §25.5.3
+    try env.declare("JSON", .{ .object = json_obj }, true, true);
+
     // §19.2.1 eval — the global `eval` intrinsic (%eval%). A native function object so it is reachable
     // both as the `eval` global binding and (mirrored below) as `globalThis.eval`. Its behavior lives in
     // the interpreter: `callNative(.eval_fn)` is INDIRECT eval (global env, global this); the

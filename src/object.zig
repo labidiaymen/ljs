@@ -350,6 +350,9 @@ pub const NativeId = enum {
     weakset_method, // WeakSet.prototype.<native_name> (add/has/delete)
     collection_size, // get Map.prototype.size / get Set.prototype.size
     collection_iterator, // Map/Set.prototype.keys/values/entries — returns a collection iterator
+    // §25.5 JSON — the namespace object's two methods.
+    json_parse, // JSON.parse(text[, reviver])
+    json_stringify, // JSON.stringify(value[, replacer[, space]])
     // §27.2 Promise — the constructor, prototype methods, and statics.
     promise_ctor, // new Promise(executor)
     promise_then, // Promise.prototype.then
