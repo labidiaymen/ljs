@@ -31,4 +31,7 @@ test {
     _ = @import("interpreter.zig");
     _ = @import("engine.zig");
     _ = @import("engine_tests.zig");
+    _ = @import("engine_tests2.zig");
+    _ = @import("engine_tests3.zig");
+    _ = @import("engine_tests4.zig");
 }
