@@ -1816,15 +1816,24 @@ pub const Interpreter = struct {
         self.pending_new_target = .{ .object = ctor };
         const result = try self.callFunction(ctor, args, .{ .object = new_obj });
         if (result.isAbrupt()) return result;
+        // §21.1.4.1/§22.1.4.1/§20.3.4.1: a primitive-wrapper ctor (and Array, M75) boxes its internal
+        // slot directly on `new_obj` and returns it (`wrapperResult`), so the explicit-object-return
+        // path below carries it back. A ctor whose body returns undefined falls through to `new_obj`.
         if (result.normal == .object) return .{ .normal = result.normal }; // explicit object return wins
-        // §21.1.4.1/§22.1.4.1/§20.3.4.1: `new Number/String/Boolean(x)` is a primitive wrapper exotic —
-        // the constructor native returns the coerced PRIMITIVE; box it on the new object's internal slot
-        // so `Number.prototype.valueOf` etc. (and ToPrimitive) recover it. Other ctors return undefined.
-        switch (ctor.native) {
-            .number_ctor, .string_ctor, .boolean_ctor => new_obj.primitive = result.normal,
-            else => {},
-        }
         return .{ .normal = .{ .object = new_obj } };
+    }
+
+    /// §20.3/§21.1/§22.1 primitive-wrapper constructor result: invoked as a constructor
+    /// (`new`/`super`, so `native_new_target` is defined) with an object receiver, box `prim` on the
+    /// instance's primitive slot ([[BooleanData]]/[[NumberData]]/[[StringData]]) and return the
+    /// instance — so subclassing works and the wrapper's prototype methods recover the value. A plain
+    /// call (no new_target) returns the primitive.
+    fn wrapperResult(self: *Interpreter, prim: Value, this_val: Value) Completion {
+        if (self.native_new_target != .undefined and this_val == .object) {
+            this_val.object.primitive = prim;
+            return .{ .normal = this_val };
+        }
+        return .{ .normal = prim };
     }
 
     /// §15.7.14: run a parent constructor `sup` on an existing `instance` (the `super(...)` /
@@ -7022,21 +7031,24 @@ pub const Interpreter = struct {
                 // throwing coercion. An object operand is ToPrimitive(string)'d first (so a wrapper /
                 // `valueOf`/`toString` object stringifies via its own method).
                 const v: Value = if (args.len > 0) args[0] else .undefined;
-                if (v == .object) {
+                const s: []const u8 = if (v == .object) blk: {
                     const pc = try self.toPrimitive(v, .string);
                     if (pc.isAbrupt()) return pc;
-                    return .{ .normal = .{ .string = try self.toString(pc.normal) } };
-                }
-                return .{ .normal = .{ .string = try self.toString(v) } };
+                    break :blk try self.toString(pc.normal);
+                } else try self.toString(v);
+                return self.wrapperResult(.{ .string = s }, this_val); // §22.1.1.1 box [[StringData]] on new/super
             },
             .number_ctor => { // §21.1.1.1 Number ( value ) — ToNumber (ToPrimitive(number) an object first).
                 const v: Value = if (args.len > 0) args[0] else .undefined;
-                if (args.len == 0) return .{ .normal = .{ .number = 0 } };
-                const nc = try self.toNumberV(v);
-                if (nc.isAbrupt()) return nc;
-                return .{ .normal = nc.normal };
+                const prim: Value = if (args.len == 0) .{ .number = 0 } else blk: {
+                    const nc = try self.toNumberV(v);
+                    if (nc.isAbrupt()) return nc;
+                    break :blk nc.normal;
+                };
+                return self.wrapperResult(prim, this_val); // §21.1.1.1 box [[NumberData]] on `new`/`super`
             },
-            .boolean_ctor => return .{ .normal = .{ .boolean = args.len > 0 and toBoolean(args[0]) } }, // §20.3.1.1 (ToBoolean — no ToPrimitive)
+            // §20.3.1.1 Boolean ( value ) — ToBoolean (no ToPrimitive). Box [[BooleanData]] on new/super.
+            .boolean_ctor => return self.wrapperResult(.{ .boolean = args.len > 0 and toBoolean(args[0]) }, this_val),
             .number_static => { // §21.1.2.2–.5 isNaN/isFinite/isInteger/isSafeInteger — no coercion
                 const x: Value = if (args.len > 0) args[0] else .undefined;
                 const isnum = x == .number;
