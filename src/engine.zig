@@ -425,6 +425,46 @@ test "M38 Array.prototype methods + sparse length (§23.1.3)" {
     try expectNumber("var a=new Array(3); a[10]=1; a.length", 11);
 }
 
+test "M43 deferred Array methods + ArraySpeciesCreate + frozen [[Set]] (§23.1.3)" {
+    // result-creating methods (now backed by ArraySpeciesCreate → plain Array by default)
+    try expectStr("[1,2,3].filter(function(x){return x>1;}).join()", "2,3");
+    try expectNumber("[1,2].concat([3,4]).length", 4);
+    try expectStr("[1,2].concat([3,4]).join()", "1,2,3,4");
+    try expectStr("[1,2].concat(3,[4,5]).join()", "1,2,3,4,5");
+    try expectStr("[1,[2,[3]]].flat(2).join()", "1,2,3");
+    try expectStr("[1,[2,[3]]].flat().join()", "1,2,3"); // default depth 1 → [1,2,[3]]
+    try expectNumber("[1,2].flatMap(function(x){return [x,x];}).length", 4);
+    try expectStr("[1,2].flatMap(function(x){return [x,x];}).join()", "1,1,2,2");
+    // in-place mutation
+    try expectStr("var a=[1,2,3]; a.splice(1,1); a.join()", "1,3");
+    try expectStr("var a=[1,2,3]; var r=a.splice(1,1,9,8); a.join()+'|'+r.join()", "1,9,8,3|2");
+    try expectStr("var a=[1,2]; a.unshift(0); a.join()", "0,1,2");
+    try expectNumber("var a=[1,2]; a.unshift(0)", 3); // returns new length
+    try expectNumber("var a=[1,2,3]; a.shift()", 1);
+    try expectStr("var a=[1,2,3]; a.shift(); a.join()", "2,3");
+    // statics
+    try expectStr("Array.from('ab').join()", "a,b");
+    try expectStr("Array.from([1,2,3], function(x){return x*2;}).join()", "2,4,6");
+    try expectNumber("Array.of(1,2,3).length", 3);
+    try expectStr("Array.of(7).join()", "7"); // unlike Array(7) which is a 7-length sparse array
+    // Symbol.species + Array[Symbol.species]
+    try expectBool("Array[Symbol.species] === Array", true);
+    // ArraySpeciesCreate: a non-constructor @@species → TypeError (callback not invoked)
+    try expectBool("var a=[1]; a.constructor={}; a.constructor[Symbol.species]=42; var t=false; try{a.filter(function(){});}catch(e){t=e instanceof TypeError;} t", true);
+    // a null @@species → plain Array result
+    try expectBool("var a=[1]; a.constructor={}; a.constructor[Symbol.species]=null; Array.isArray(a.filter(function(){return true;}))", true);
+    // frozen array: push / splice / unshift throw TypeError; element & length writes rejected
+    try expectBool("var a=Object.freeze([1]); var t=false; try{a.push(2);}catch(e){t=e instanceof TypeError;} t", true);
+    try expectBool("var a=Object.freeze([1]); var t=false; try{a.splice(0,1);}catch(e){t=e instanceof TypeError;} t", true);
+    try expectBool("var a=Object.freeze([1]); var t=false; try{a.unshift(0);}catch(e){t=e instanceof TypeError;} t", true);
+    try expectBool("var a=Object.freeze([1]); var t=false; try{a.pop();}catch(e){t=e instanceof TypeError;} t", true);
+    // frozen array element write in strict mode → TypeError; sloppy → silent no-op
+    try expectBool("'use strict'; var a=Object.freeze([1]); var t=false; try{a[0]=9;}catch(e){t=e instanceof TypeError;} t", true);
+    try expectNumber("var a=Object.freeze([1]); a[0]=9; a[0]", 1); // sloppy: silent no-op, value unchanged
+    // a frozen array is still readable by the non-mutating methods
+    try expectStr("Object.freeze([1,2,3]).filter(function(x){return x>1;}).join()", "2,3");
+}
+
 test "M2 strings: length, index, methods (US2)" {
     try expectNumber("\"hello\".length", 5);
     try expectStr("\"abc\".charAt(1)", "b");

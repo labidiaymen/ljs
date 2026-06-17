@@ -297,6 +297,7 @@ pub const NativeId = enum {
     // §20.4 Symbol (M8) — the constructor + Symbol.prototype.toString + the iterator natives.
     symbol_ctor, // Symbol([description]) — callable, not a constructor
     symbol_to_string, // Symbol.prototype.toString / Symbol.prototype.valueOf (native_name selects)
+    species_getter, // §23.1.2.5 get Array[Symbol.species] — returns `this` (the receiver constructor)
     array_values, // Array.prototype[Symbol.iterator] / .values — returns an Array Iterator
     array_keys, // Array.prototype.keys — Array Iterator over indices (§23.1.3.18)
     array_entries, // Array.prototype.entries — Array Iterator over [index, value] (§23.1.3.7)
@@ -522,6 +523,18 @@ pub const Object = struct {
     /// §23.1 [[Length]] — tracked separately from the dense store so it can exceed it (sparse arrays).
     /// Meaningful iff `kind == .array`. Always `>= elements.items.len`.
     array_length: usize = 0,
+    /// §23.1 / §7.3.16 element & `length` writability for an Array exotic. Set by `Object.freeze` on an
+    /// array (alongside `extensible=false`): a frozen array's present indices AND `length` become
+    /// non-writable, so any element/length write — through `[[Set]]` or a mutating method — is rejected
+    /// (TypeError in strict / from a method's Throw=true Set). `seal`/`preventExtensions` clear only
+    /// `extensible` (elements stay writable; a NEW index is rejected). Meaningful iff `kind == .array`;
+    /// `false` for the common array (the hot index-set path is `extensible and !array_frozen`).
+    array_frozen: bool = false,
+    /// §23.1 the `length` own data property's [[Writable]] attribute for an Array exotic. Cleared by
+    /// `Object.defineProperty(arr, "length", { writable:false })` and by `Object.freeze`. When false a
+    /// length change (grow or shrink) through `[[Set]]` is rejected (§10.4.2.4 ArraySetLength step 17).
+    /// `true` for the common array. Meaningful iff `kind == .array`.
+    array_length_writable: bool = true,
     /// §23.1 sparse overflow: integer index → value for indices beyond the dense prefix that are too
     /// far to materialize densely. Lazily allocated (null until the first far write). `null` for the
     /// common dense array (zero cost).
@@ -696,6 +709,9 @@ pub const Object = struct {
             try self.elements.append(arena, v);
             // A previously-sparse entry at this exact index (now densified) is superseded; drop it.
             if (self.sparse) |s| _ = s.remove(i);
+            // A stale hole record at this index (e.g. left after a delete then a length shrink that
+            // didn't reach it) must be cleared — the slot now holds a real value.
+            if (self.holes) |h| _ = h.remove(i);
         } else {
             const s = try self.sparseMap(arena);
             try s.put(arena, i, v);
@@ -1128,9 +1144,15 @@ pub const Object = struct {
     }
 
     /// §7.3.16 SetIntegrityLevel("frozen") — clear [[Extensible]], make every own property
-    /// non-configurable, and every own DATA property non-writable (accessors keep their get/set).
+    /// non-configurable, and every own DATA property non-writable (accessors keep their get/set). For an
+    /// Array exotic, also mark the integer indices + `length` non-writable via `array_frozen` (those
+    /// slots are not in `properties`), so a later element/length write is rejected.
     pub fn freezeObject(self: *Object) void {
         self.extensible = false;
+        if (self.kind == .array) {
+            self.array_frozen = true;
+            self.array_length_writable = false;
+        }
         var it = self.properties.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.configurable = false;
@@ -1140,8 +1162,15 @@ pub const Object = struct {
 
     /// §7.3.17 TestIntegrityLevel — `frozen`: non-extensible AND every own property non-configurable
     /// AND every data property non-writable. A non-extensible object with no own properties is frozen.
+    /// An Array with present elements is frozen only if `array_frozen` (its indices are non-writable);
+    /// an empty array (no present indices) is frozen as soon as it is non-extensible.
     pub fn isFrozenObject(self: *Object) bool {
         if (self.extensible) return false;
+        if (self.kind == .array and !self.array_frozen and self.arrayLen() > 0) {
+            // a present index would be a writable, configurable data property → not frozen
+            if (self.elements.items.len > 0) return false;
+            if (self.sparse) |s| if (s.count() > 0) return false;
+        }
         var it = self.properties.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.configurable) return false;
@@ -1151,6 +1180,8 @@ pub const Object = struct {
     }
 
     /// §7.3.17 TestIntegrityLevel — `sealed`: non-extensible AND every own property non-configurable.
+    /// (Array indices are always configurable=false once non-extensible in the M-subset — there is no
+    /// separate per-index configurability — so a non-extensible array is sealed.)
     pub fn isSealedObject(self: *Object) bool {
         if (self.extensible) return false;
         var it = self.properties.iterator();

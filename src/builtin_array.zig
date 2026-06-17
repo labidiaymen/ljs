@@ -35,32 +35,56 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
     const len = arr.arrayLen();
 
     // ── mutation: stack / queue ──────────────────────────────────────────────────────────────────
-    if (eql(u8, name, "push")) {
-        for (args) |a| try arr.arrayPush(it.arena, a);
+    if (eql(u8, name, "push")) { // §23.1.3.23 — each Set(O, len+k, E, true); frozen/non-ext → TypeError
+        var k: usize = len;
+        for (args) |a| {
+            if (try setT(it, arr, k, a)) |c| return c;
+            k += 1;
+        }
+        if (args.len > 0) if (try setLenT(it, arr, k)) |c| return c;
         return .{ .normal = num.v(arr.arrayLen()) };
     }
-    if (eql(u8, name, "pop")) {
-        if (len == 0) return .{ .normal = .undefined };
+    if (eql(u8, name, "pop")) { // §23.1.3.22 — DeletePropertyOrThrow(last) + Set length (Throw=true)
+        if (len == 0) {
+            if (try setLenT(it, arr, 0)) |c| return c;
+            return .{ .normal = .undefined };
+        }
         const last = arr.arrayGet(len - 1);
-        try arr.arraySetLen(len - 1);
+        if (try delT(it, arr, len - 1)) |c| return c;
+        if (try setLenT(it, arr, len - 1)) |c| return c;
         return .{ .normal = last };
     }
     if (eql(u8, name, "shift")) { // §23.1.3.27
-        if (len == 0) return .{ .normal = .undefined };
+        if (len == 0) {
+            if (try setLenT(it, arr, 0)) |c| return c;
+            return .{ .normal = .undefined };
+        }
         const first = arr.arrayGet(0);
         var i: usize = 1;
-        while (i < len) : (i += 1) try arr.arraySet(it.arena, i - 1, arr.arrayGet(i));
-        try arr.arraySetLen(len - 1);
+        while (i < len) : (i += 1) {
+            if (arr.arrayHas(i)) {
+                if (try setT(it, arr, i - 1, arr.arrayGet(i))) |c| return c;
+            } else if (try delT(it, arr, i - 1)) |c| return c;
+        }
+        if (try delT(it, arr, len - 1)) |c| return c;
+        if (try setLenT(it, arr, len - 1)) |c| return c;
         return .{ .normal = first };
     }
     if (eql(u8, name, "unshift")) { // §23.1.3.33
         const argc = args.len;
         if (argc > 0) {
-            // Shift existing elements up by argc, from the top down.
+            // Shift existing elements up by argc, from the top down (Set/Delete with Throw=true).
             var i: usize = len;
-            while (i > 0) : (i -= 1) try arr.arraySet(it.arena, i - 1 + argc, arr.arrayGet(i - 1));
-            for (args, 0..) |a, j| try arr.arraySet(it.arena, j, a);
+            while (i > 0) : (i -= 1) {
+                if (arr.arrayHas(i - 1)) {
+                    if (try setT(it, arr, i - 1 + argc, arr.arrayGet(i - 1))) |c| return c;
+                } else if (try delT(it, arr, i - 1 + argc)) |c| return c;
+            }
+            for (args, 0..) |a, j| if (try setT(it, arr, j, a)) |c| return c;
         }
+        // §23.1.3.33 step 5: Set(O, "length", len + argCount, true) is performed UNCONDITIONALLY — so
+        // `[].unshift()` on a non-writable-length / frozen array still throws.
+        if (try setLenT(it, arr, len + argc)) |c| return c;
         return .{ .normal = num.v(len + argc) };
     }
 
@@ -135,42 +159,65 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
             .abrupt => |c| return c,
             .idx => |x| x,
         };
-        const out = try Object.createArray(it.arena, it.arrayProto());
+        // §23.1.3.28 step 7: A = ArraySpeciesCreate(O, count). Populate via CreateDataPropertyOrThrow.
+        const count: usize = if (end > start) end - start else 0;
+        const ac = try it.arraySpeciesCreate(arr, count);
+        if (ac.isAbrupt()) return ac;
+        const out = ac.normal.object;
+        var n: usize = 0;
         var i = start;
-        while (i < end) : (i += 1) try out.arrayPush(it.arena, arr.arrayGet(i));
+        while (i < end) : (i += 1) {
+            if (arr.arrayHas(i)) if (try cdp(it, out, n, arr.arrayGet(i))) |c| return c;
+            n += 1;
+        }
+        if (out.kind == .array and out.arrayLen() != count) try out.arraySetLen(count);
         return .{ .normal = .{ .object = out } };
     }
     if (eql(u8, name, "concat")) { // §23.1.3.2 (M-subset: spreadable iff Array)
-        const out = try Object.createArray(it.arena, it.arrayProto());
+        // §23.1.3.2 step 1: A = ArraySpeciesCreate(O, 0). Populate via CreateDataPropertyOrThrow.
+        const ac = try it.arraySpeciesCreate(arr, 0);
+        if (ac.isAbrupt()) return ac;
+        const out = ac.normal.object;
+        var n: usize = 0;
         var i: usize = 0;
-        while (i < len) : (i += 1) try out.arrayPush(it.arena, arr.arrayGet(i));
+        while (i < len) : (i += 1) {
+            if (arr.arrayHas(i)) if (try cdp(it, out, n, arr.arrayGet(i))) |c| return c;
+            n += 1;
+        }
         for (args) |a| {
             if (a == .object and a.object.kind == .array) {
                 const al = a.object.arrayLen();
                 var j: usize = 0;
-                while (j < al) : (j += 1) try out.arrayPush(it.arena, a.object.arrayGet(j));
-            } else try out.arrayPush(it.arena, a);
+                while (j < al) : (j += 1) {
+                    if (a.object.arrayHas(j)) if (try cdp(it, out, n, a.object.arrayGet(j))) |c| return c;
+                    n += 1;
+                }
+            } else {
+                if (try cdp(it, out, n, a)) |c| return c;
+                n += 1;
+            }
         }
+        if (out.kind == .array and out.arrayLen() != n) try out.arraySetLen(n);
         return .{ .normal = .{ .object = out } };
     }
 
     // ── mutation: reverse / fill / copyWithin / splice ───────────────────────────────────────────
-    if (eql(u8, name, "reverse")) { // §23.1.3.26
+    if (eql(u8, name, "reverse")) { // §23.1.3.26 (Set/Delete with Throw=true → frozen array TypeErrors)
         if (len > 1) {
             var lo: usize = 0;
             var hi: usize = len - 1;
             while (lo < hi) {
                 const a = arr.arrayGet(lo);
                 const b = arr.arrayGet(hi);
-                try arr.arraySet(it.arena, lo, b);
-                try arr.arraySet(it.arena, hi, a);
+                if (try setT(it, arr, lo, b)) |c| return c;
+                if (try setT(it, arr, hi, a)) |c| return c;
                 lo += 1;
                 hi -= 1;
             }
         }
         return .{ .normal = this_val };
     }
-    if (eql(u8, name, "fill")) { // §23.1.3.8 (visits holes)
+    if (eql(u8, name, "fill")) { // §23.1.3.8 (visits holes; Set with Throw=true)
         const value: Value = if (args.len > 0) args[0] else .undefined;
         const start = switch (try relIndex(it, if (args.len > 1) args[1] else .undefined, len, 0)) {
             .abrupt => |c| return c,
@@ -181,7 +228,7 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
             .idx => |x| x,
         };
         var i = start;
-        while (i < end) : (i += 1) try arr.arraySet(it.arena, i, value);
+        while (i < end) : (i += 1) if (try setT(it, arr, i, value)) |c| return c;
         return .{ .normal = this_val };
     }
     if (eql(u8, name, "copyWithin")) { // §23.1.3.4
@@ -206,13 +253,17 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
             while (count > 0) : (count -= 1) {
                 f -= 1;
                 t -= 1;
-                if (arr.arrayHas(f)) try arr.arraySet(it.arena, t, arr.arrayGet(f)) else try deleteIdx(arr, t);
+                if (arr.arrayHas(f)) {
+                    if (try setT(it, arr, t, arr.arrayGet(f))) |c| return c;
+                } else if (try delT(it, arr, t)) |c| return c;
             }
         } else {
             var f = from;
             var t = to;
             while (count > 0) : (count -= 1) {
-                if (arr.arrayHas(f)) try arr.arraySet(it.arena, t, arr.arrayGet(f)) else try deleteIdx(arr, t);
+                if (arr.arrayHas(f)) {
+                    if (try setT(it, arr, t, arr.arrayGet(f))) |c| return c;
+                } else if (try delT(it, arr, t)) |c| return c;
                 f += 1;
                 t += 1;
             }
@@ -246,8 +297,15 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
     // ── flat ─────────────────────────────────────────────────────────────────────────────────────
     if (eql(u8, name, "flat")) { // §23.1.3.11
         const depth: f64 = if (args.len > 0 and args[0] != .undefined) @trunc(ops.toNumber(args[0])) else 1;
-        const out = try Object.createArray(it.arena, it.arrayProto());
-        try flatten(it, out, arr, len, depth);
+        // §23.1.3.11 step 4: A = ArraySpeciesCreate(O, 0); FlattenIntoArray populates via
+        // CreateDataPropertyOrThrow at a running target index.
+        const ac = try it.arraySpeciesCreate(arr, 0);
+        if (ac.isAbrupt()) return ac;
+        const out = ac.normal.object;
+        var target: usize = 0;
+        const fc = try flatten(it, out, &target, arr, len, depth);
+        if (fc.isAbrupt()) return fc;
+        if (out.kind == .array and out.arrayLen() != target) try out.arraySetLen(target);
         return .{ .normal = .{ .object = out } };
     }
 
@@ -262,8 +320,40 @@ fn isCallable(o: *Object) bool {
     return o.kind == .function;
 }
 
+// ── Throw=true write wrappers ────────────────────────────────────────────────────────────────────
+// The interpreter's CreateDataPropertyOrThrow / array-[[Set]]-with-Throw helpers return a Completion
+// (`.normal=undefined` on success, `.thrown` on a frozen/non-extensible rejection). These thin wrappers
+// return `?Completion` — null on success, the abrupt completion to propagate otherwise — so call sites
+// read `if (try cdp(...)) |c| return c;`.
+
+fn cdp(it: *Interpreter, out: *Object, index: usize, v: Value) EvalError!?Completion {
+    const c = try it.createDataPropertyOrThrow(out, index, v);
+    return if (c.isAbrupt()) c else null;
+}
+fn setT(it: *Interpreter, arr: *Object, index: usize, v: Value) EvalError!?Completion {
+    const c = try it.arraySetThrow(arr, index, v);
+    return if (c.isAbrupt()) c else null;
+}
+fn setLenT(it: *Interpreter, arr: *Object, n: usize) EvalError!?Completion {
+    const c = try it.arraySetLenThrow(arr, n);
+    return if (c.isAbrupt()) c else null;
+}
+fn delT(it: *Interpreter, arr: *Object, index: usize) EvalError!?Completion {
+    const c = try arrayDeleteThrow(it, arr, index);
+    return if (c.isAbrupt()) c else null;
+}
+
 fn deleteIdx(arr: *Object, i: usize) std.mem.Allocator.Error!void {
     try arr.arrayDelete(i);
+}
+
+/// §10.4.2.x DeletePropertyOrThrow of an index during a mutation (splice tail-shift): a frozen array's
+/// non-configurable index cannot be deleted → TypeError; otherwise leave a true hole. Returns the
+/// abrupt `.thrown` completion (or `.normal = undefined`).
+fn arrayDeleteThrow(it: *Interpreter, arr: *Object, i: usize) EvalError!Completion {
+    if (arr.array_frozen) return it.throwError("TypeError", "Cannot delete property of a frozen array");
+    try arr.arrayDelete(i);
+    return .{ .normal = .undefined };
 }
 
 /// §Get(O, ToString(i)): an own dense/sparse value if present, else through the prototype chain (so an
@@ -281,10 +371,17 @@ fn callbackMethod(it: *Interpreter, name: []const u8, this_val: Value, arr: *Obj
         eql(u8, name, "findLast") or eql(u8, name, "findLastIndex");
     const reverse = eql(u8, name, "findLast") or eql(u8, name, "findLastIndex");
 
-    const out: ?*Object = if (eql(u8, name, "map") or eql(u8, name, "filter") or eql(u8, name, "flatMap"))
-        try Object.createArray(it.arena, it.arrayProto())
-    else
-        null;
+    // §23.1.3.x: map → ArraySpeciesCreate(O, len); filter / flatMap → ArraySpeciesCreate(O, 0). The
+    // result is populated via CreateDataPropertyOrThrow (a frozen / non-extensible species result throws).
+    const is_map = eql(u8, name, "map");
+    const is_filter = eql(u8, name, "filter");
+    const is_flatmap = eql(u8, name, "flatMap");
+    const out: ?*Object = if (is_map or is_filter or is_flatmap) blk: {
+        const ac = try it.arraySpeciesCreate(arr, if (is_map) len else 0);
+        if (ac.isAbrupt()) return ac;
+        break :blk ac.normal.object;
+    } else null;
+    var dst: usize = 0; // running destination index for filter / flatMap (dense output)
 
     var idx: usize = 0;
     while (idx < len) : (idx += 1) {
@@ -302,16 +399,28 @@ fn callbackMethod(it: *Interpreter, name: []const u8, this_val: Value, arr: *Obj
         const r = try it.callFunction(cb, &.{ el, num.v(i), this_val }, this_arg);
         if (r.isAbrupt()) return r;
         const rv = r.normal;
-        if (eql(u8, name, "map")) {
-            try out.?.arraySet(it.arena, i, rv);
-        } else if (eql(u8, name, "filter")) {
-            if (ops.toBoolean(rv)) try out.?.arrayPush(it.arena, el);
-        } else if (eql(u8, name, "flatMap")) {
+        if (is_map) {
+            if (try cdp(it, out.?, i, rv)) |c| return c;
+        } else if (is_filter) {
+            if (ops.toBoolean(rv)) {
+                if (try cdp(it, out.?, dst, el)) |c| return c;
+                dst += 1;
+            }
+        } else if (is_flatmap) {
+            // §23.1.3.10 FlatMap depth-1 flatten: a returned Array spreads its present elements.
             if (rv == .object and rv.object.kind == .array) {
                 const al = rv.object.arrayLen();
                 var j: usize = 0;
-                while (j < al) : (j += 1) try out.?.arrayPush(it.arena, rv.object.arrayGet(j));
-            } else try out.?.arrayPush(it.arena, rv);
+                while (j < al) : (j += 1) {
+                    if (rv.object.arrayHas(j)) {
+                        if (try cdp(it, out.?, dst, rv.object.arrayGet(j))) |c| return c;
+                        dst += 1;
+                    }
+                }
+            } else {
+                if (try cdp(it, out.?, dst, rv)) |c| return c;
+                dst += 1;
+            }
         } else if (eql(u8, name, "some")) {
             if (ops.toBoolean(rv)) return .{ .normal = .{ .boolean = true } };
         } else if (eql(u8, name, "every")) {
@@ -323,8 +432,12 @@ fn callbackMethod(it: *Interpreter, name: []const u8, this_val: Value, arr: *Obj
         }
     }
     if (out) |o| {
-        // §23.1.3.21 map preserves length (including the trailing-hole length); filter/flatMap are dense.
-        if (eql(u8, name, "map") and o.arrayLen() < len) try o.arraySetLen(len);
+        // §23.1.3.21 map preserves length (including the trailing-hole length); filter/flatMap are dense
+        // (length = the number of CreateDataProperty calls). Only fix up a plain Array result.
+        if (o.kind == .array) {
+            const want: usize = if (is_map) len else dst;
+            if (o.arrayLen() != want) try o.arraySetLen(want);
+        }
         return .{ .normal = .{ .object = o } };
     }
     if (eql(u8, name, "some")) return .{ .normal = .{ .boolean = false } };
@@ -369,18 +482,23 @@ fn reduce(it: *Interpreter, right: bool, this_val: Value, arr: *Object, len: usi
     return .{ .normal = acc };
 }
 
-/// §23.1.3.11.1 FlattenIntoArray (M-subset: source elements only, no mapper).
-fn flatten(it: *Interpreter, out: *Object, arr: *Object, len: usize, depth: f64) EvalError!void {
+/// §23.1.3.11.1 FlattenIntoArray (M-subset: source elements only, no mapper). Appends each non-nested
+/// element to `out` at the running `target` index via CreateDataPropertyOrThrow (so a frozen /
+/// non-extensible species result throws); recurses into nested arrays up to `depth`.
+fn flatten(it: *Interpreter, out: *Object, target: *usize, arr: *Object, len: usize, depth: f64) EvalError!Completion {
     var i: usize = 0;
     while (i < len) : (i += 1) {
         if (!arr.arrayHas(i)) continue;
         const el = arr.arrayGet(i);
         if (depth > 0 and el == .object and el.object.kind == .array) {
-            try flatten(it, out, el.object, el.object.arrayLen(), depth - 1);
+            const c = try flatten(it, out, target, el.object, el.object.arrayLen(), depth - 1);
+            if (c.isAbrupt()) return c;
         } else {
-            try out.arrayPush(it.arena, el);
+            if (try cdp(it, out, target.*, el)) |c| return c;
+            target.* += 1;
         }
     }
+    return .{ .normal = .undefined };
 }
 
 /// §23.1.3.30 splice(start, deleteCount, ...items). Returns an Array of the removed elements; mutates
@@ -405,10 +523,18 @@ fn splice(it: *Interpreter, arr: *Object, len: usize, args: []const Value) EvalE
     };
     const items: []const Value = if (args.len > 2) args[2..] else &.{};
 
-    const removed = try Object.createArray(it.arena, it.arrayProto());
+    // §23.1.3.30 step 9: A = ArraySpeciesCreate(O, actualDeleteCount). Populate via CreateDataProperty.
+    const ac = try it.arraySpeciesCreate(arr, del_count);
+    if (ac.isAbrupt()) return ac;
+    const removed = ac.normal.object;
     var k: usize = 0;
-    while (k < del_count) : (k += 1) try removed.arrayPush(it.arena, arr.arrayGet(start + k));
+    while (k < del_count) : (k += 1) {
+        if (arr.arrayHas(start + k)) if (try cdp(it, removed, k, arr.arrayGet(start + k))) |c| return c;
+    }
+    if (removed.kind == .array and removed.arrayLen() != del_count) try removed.arraySetLen(del_count);
 
+    // The receiver mutation uses the Throw=true element/length [[Set]] — a frozen / non-extensible array
+    // rejects (TypeError) before any element is moved.
     const new_len = len - del_count + items.len;
     if (items.len < del_count) {
         // shrink: shift the tail left
@@ -416,20 +542,27 @@ fn splice(it: *Interpreter, arr: *Object, len: usize, args: []const Value) EvalE
         while (i < len - del_count) : (i += 1) {
             const from = i + del_count;
             const to = i + items.len;
-            if (arr.arrayHas(from)) try arr.arraySet(it.arena, to, arr.arrayGet(from)) else try deleteIdx(arr, to);
+            if (arr.arrayHas(from)) {
+                if (try setT(it, arr, to, arr.arrayGet(from))) |c| return c;
+            } else if (try delT(it, arr, to)) |c| return c;
         }
-        try arr.arraySetLen(new_len);
+        // delete the now-vacated tail slots [new_len, len) before shrinking length
+        var d = len;
+        while (d > new_len) : (d -= 1) if (try delT(it, arr, d - 1)) |c| return c;
+        if (try setLenT(it, arr, new_len)) |c| return c;
     } else if (items.len > del_count) {
         // grow: shift the tail right, from the top down
         var i = len - del_count;
         while (i > start) : (i -= 1) {
             const from = i + del_count - 1;
             const to = i + items.len - 1;
-            if (arr.arrayHas(from)) try arr.arraySet(it.arena, to, arr.arrayGet(from)) else try deleteIdx(arr, to);
+            if (arr.arrayHas(from)) {
+                if (try setT(it, arr, to, arr.arrayGet(from))) |c| return c;
+            } else if (try delT(it, arr, to)) |c| return c;
         }
     }
-    for (items, 0..) |item, j| try arr.arraySet(it.arena, start + j, item);
-    if (arr.arrayLen() != new_len) try arr.arraySetLen(new_len);
+    for (items, 0..) |item, j| if (try setT(it, arr, start + j, item)) |c| return c;
+    if (arr.arrayLen() != new_len) if (try setLenT(it, arr, new_len)) |c| return c;
     return .{ .normal = .{ .object = removed } };
 }
 
@@ -470,20 +603,21 @@ fn sort(it: *Interpreter, this_val: Value, arr: *Object, len: usize, comparefn: 
         a[m] = key;
     }
     // Write back: sorted values, then undefineds, then truncate to drop holes (they become trailing).
+    // Set/Delete use the Throw=true form so sorting a frozen array TypeErrors.
     i = 0;
     for (a) |v| {
-        try arr.arraySet(it.arena, i, v);
+        if (try setT(it, arr, i, v)) |c| return c;
         i += 1;
     }
     var u: usize = 0;
     while (u < undef_count) : (u += 1) {
-        try arr.arraySet(it.arena, i, .undefined);
+        if (try setT(it, arr, i, .undefined)) |c| return c;
         i += 1;
     }
     // The remaining `hole_count` slots become holes by leaving the length as `len` and deleting them.
     var h: usize = 0;
     while (h < hole_count) : (h += 1) {
-        try deleteIdx(arr, i);
+        if (try delT(it, arr, i)) |c| return c;
         i += 1;
     }
     if (arr.arrayLen() != len) try arr.arraySetLen(len);
@@ -511,11 +645,21 @@ fn compare(it: *Interpreter, comparefn: Value, x: Value, y: Value) EvalError!Com
 }
 
 /// §23.1.2.1 Array.from(items, mapFn?, thisArg?) — from an iterable or array-like.
-/// §23.1.2.3 Array.of(...items).
-pub fn staticCall(it: *Interpreter, name: []const u8, args: []const Value) EvalError!Completion {
-    if (std.mem.eql(u8, name, "of")) {
-        const out = try Object.createArray(it.arena, it.arrayProto());
-        for (args) |a| try out.arrayPush(it.arena, a);
+/// §23.1.2.2 Array.of(...items). `this_val` is the static call's `this` (the target constructor `C`):
+/// `IsConstructor(C) ? Construct(C, «len») : ArrayCreate(len)`, then the result is populated via
+/// CreateDataPropertyOrThrow (so a constructor returning a non-extensible / locked object throws).
+pub fn staticCall(it: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
+    if (std.mem.eql(u8, name, "of")) { // §23.1.2.2
+        const ac = try it.arrayCreateFromCtor(this_val, args.len);
+        if (ac.isAbrupt()) return ac;
+        const out = ac.normal.object;
+        for (args, 0..) |a, k| if (try cdp(it, out, k, a)) |c| return c;
+        // §23.1.2.2 step 8: Set(A, "length", len, true) — for a custom constructor result this records
+        // the final length; the plain Array already tracks it via the index sets.
+        if (out.kind != .array) {
+            const sc = try it.setPropertyPub(.{ .object = out }, "length", num.v(args.len));
+            if (sc.isAbrupt()) return sc;
+        }
         return .{ .normal = .{ .object = out } };
     }
     // from
@@ -533,19 +677,30 @@ pub fn staticCall(it: *Interpreter, name: []const u8, args: []const Value) EvalE
     if (items == .undefined or items == .null) {
         return it.throwError("TypeError", "Array.from requires an array-like or iterable object");
     }
-    const out = try Object.createArray(it.arena, it.arrayProto());
-    // Iterable (string or has @@iterator) → step the iterator AND apply mapFn as we go (so a throwing
-    // mapFn / abrupt next stops immediately and closes the iterator — never drains, never OOMs).
+    // Iterable (string or has @@iterator) → A = arrayCreateFromCtor(C, 0); step the iterator AND apply
+    // mapFn as we go, CreateDataPropertyOrThrow onto A (a throwing mapFn / abrupt next stops immediately
+    // and closes the iterator — never drains, never OOMs).
     if (items == .string or (items == .object and try it.isArrayFromIterable(items))) {
+        const ac = try it.arrayCreateFromCtor(this_val, 0);
+        if (ac.isAbrupt()) return ac;
+        const out = ac.normal.object;
         const c = try it.arrayFromIterate(items, out, map_fn, this_arg);
         if (c.isAbrupt()) return c;
         return .{ .normal = .{ .object = out } };
     }
-    // Array-like: LengthOfArrayLike(items) then read indices 0..len.
+    // Array-like: LengthOfArrayLike(items); A = arrayCreateFromCtor(C, len); read indices 0..len.
     const lc = try it.getProperty2(items, "length");
     if (lc.isAbrupt()) return lc;
-    const flen = ops.toNumber(lc.normal);
-    const alen: usize = if (std.math.isNan(flen) or flen <= 0) 0 else if (flen > 4294967295.0) 4294967295 else @intFromFloat(@trunc(flen));
+    // §7.1.20 LengthOfArrayLike = ToLength(Get(items,"length")) — ToNumber is throwing (a Symbol/BigInt
+    // length → TypeError), then clamp to [0, 2^53-1].
+    const lnc = try it.toNumberThrowing(lc.normal);
+    if (lnc.isAbrupt()) return lnc;
+    const flen = lnc.normal.number;
+    const max_len: f64 = 9007199254740991.0; // 2^53 - 1
+    const alen: usize = if (std.math.isNan(flen) or flen <= 0) 0 else if (flen > max_len) @intFromFloat(max_len) else @intFromFloat(@trunc(flen));
+    const ac = try it.arrayCreateFromCtor(this_val, alen);
+    if (ac.isAbrupt()) return ac;
+    const out = ac.normal.object;
     var k: usize = 0;
     while (k < alen) : (k += 1) {
         const key = try numToKey(it.arena, k);
@@ -556,7 +711,14 @@ pub fn staticCall(it: *Interpreter, name: []const u8, args: []const Value) EvalE
             if (r.isAbrupt()) return r;
             break :blk r.normal;
         } else ec.normal;
-        try out.arrayPush(it.arena, mapped);
+        if (try cdp(it, out, k, mapped)) |c| return c;
+    }
+    // §23.1.2.1 step 12.h-13: Set(A, "length", len, true).
+    if (out.kind == .array) {
+        if (out.arrayLen() != alen) try out.arraySetLen(alen);
+    } else {
+        const sc = try it.setPropertyPub(.{ .object = out }, "length", num.v(alen));
+        if (sc.isAbrupt()) return sc;
     }
     return .{ .normal = .{ .object = out } };
 }

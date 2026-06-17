@@ -2918,6 +2918,12 @@ pub const Interpreter = struct {
     }
 
     /// §10.1.9 [[Set]]. Setting on null/undefined throws; on other primitives is a no-op in M1.
+    /// Public wrapper over `setProperty` for the built-in method files (e.g. Array.from/of setting
+    /// `length` on a non-Array constructor result via §7.3.4 Set).
+    pub fn setPropertyPub(self: *Interpreter, base: Value, key: []const u8, value: Value) EvalError!Completion {
+        return self.setProperty(base, key, value);
+    }
+
     fn setProperty(self: *Interpreter, base: Value, key: []const u8, value: Value) EvalError!Completion {
         switch (base) {
             .object => |o| {
@@ -2929,10 +2935,30 @@ pub const Interpreter = struct {
                         if (std.math.isNan(n) or n < 0 or n > 4294967295.0 or n != @floor(n)) {
                             return self.throwError("RangeError", "Invalid array length");
                         }
-                        try o.arraySetLen(@intFromFloat(n));
+                        const new_len: usize = @intFromFloat(n);
+                        // §10.4.2.4: a non-writable `length` (frozen array, or an explicit
+                        // defineProperty making it non-writable) rejects a CHANGE — TypeError in strict,
+                        // silent no-op in sloppy. A no-op assignment to the same value is allowed.
+                        if (!o.array_length_writable and new_len != o.arrayLen()) {
+                            if (self.strict) return self.throwError("TypeError", "Cannot assign to read only property 'length'");
+                            return .{ .normal = value };
+                        }
+                        try o.arraySetLen(new_len);
                         return .{ .normal = value };
                     }
                     if (parseIndex(key)) |i| {
+                        // Hot path: an extensible, non-frozen array takes the raw dense/sparse set.
+                        if (o.extensible and !o.array_frozen) {
+                            try o.arraySet(o.arena, i, value);
+                            return .{ .normal = value };
+                        }
+                        // §10.1.9.2: a frozen array rejects any element write; a non-extensible array
+                        // rejects a NEW index (an existing index of a sealed array stays writable).
+                        const reject = o.array_frozen or !o.arrayHas(i);
+                        if (reject) {
+                            if (self.strict) return self.throwError("TypeError", "Cannot add/modify property on a non-extensible array");
+                            return .{ .normal = value };
+                        }
                         try o.arraySet(o.arena, i, value);
                         return .{ .normal = value };
                     }
@@ -3383,7 +3409,11 @@ pub const Interpreter = struct {
                         }
                         to_store = r.normal;
                     }
-                    try out.arraySet(self.arena, k, to_store);
+                    const dc = try self.createDataPropertyOrThrow(out, k, to_store);
+                    if (dc.isAbrupt()) {
+                        try self.iteratorClose(iterator); // §7.4.11 close on a failed CreateDataProperty
+                        return dc;
+                    }
                     k += 1;
                 },
             }
@@ -5293,6 +5323,9 @@ pub const Interpreter = struct {
                         // §10.4.2.1: delete an index → a true hole (dense slot recorded in `holes`,
                         // sparse entry removed). The slot reads `undefined` and is absent thereafter.
                         try o.arrayDelete(i);
+                        // Drop any stale string-keyed entry for this index left by a generic
+                        // `Object.defineProperty(arr, i, …)` so the index is no longer an own property.
+                        if (o.properties.count() != 0) _ = o.properties.orderedRemove(key);
                         return .{ .normal = .{ .boolean = true } };
                     }
                 }
@@ -5556,6 +5589,136 @@ pub const Interpreter = struct {
         return self.globalProto("Array");
     }
 
+    /// The realm's well-known `Symbol.species` identity (held on the `Symbol` constructor). Null only in
+    /// a realm-less unit-test eval (no `Symbol`) — ArraySpeciesCreate then defaults to a plain Array.
+    fn wellKnownSpecies(self: *Interpreter) ?*Symbol {
+        const g = self.globals orelse return null;
+        const b = g.lookup("Symbol") orelse return null;
+        if (b.value != .object) return null;
+        const pv = b.value.object.get("species") orelse return null;
+        return if (pv == .symbol) pv.symbol else null;
+    }
+
+    /// §10.4.2.3 ArraySpeciesCreate ( originalArray, length ) — the result-array factory used by
+    /// filter/map/concat/slice/splice/flat/flatMap. Steps:
+    ///   1. originalArray is not an Array exotic → plain ArrayCreate(length) (no `constructor` read).
+    ///   2. C = Get(originalArray, "constructor") — a poisoned getter propagates its abrupt completion.
+    ///   3. C is an Object → C = Get(C, @@species); a null species is treated as undefined (poisoned
+    ///      species getter propagates).
+    ///   4. C undefined → plain ArrayCreate(length).
+    ///   5. C is not a constructor (incl. a non-object `constructor` value) → TypeError.
+    ///   6. else Construct(C, « length »).
+    /// Returns the result object as a Value, or the abrupt completion.
+    pub fn arraySpeciesCreate(self: *Interpreter, original: *Object, length: usize) EvalError!Completion {
+        // §10.4.2.3 step 2: IsArray(originalArray) — false → plain array, constructor untouched.
+        if (original.kind != .array) return self.newArray(length);
+        // step 3: C = Get(originalArray, "constructor")  (own/inherited; getter may throw).
+        const cc = try self.getProperty(.{ .object = original }, "constructor");
+        if (cc.isAbrupt()) return cc;
+        var c = cc.normal;
+        // step 5: if Type(C) is Object, C = Get(C, @@species); a null result → undefined.
+        if (c == .object) {
+            if (self.wellKnownSpecies()) |sp| {
+                const sc = try self.getSymbolProperty(c, sp);
+                if (sc.isAbrupt()) return sc;
+                c = sc.normal;
+            } else {
+                // realm-less eval: no species symbol → treat the object constructor as "use default".
+                c = .undefined;
+            }
+            if (c == .null) c = .undefined;
+        }
+        // step 6: C undefined → plain ArrayCreate(length).
+        if (c == .undefined) return self.newArray(length);
+        // step 7: IsConstructor(C) is false → TypeError (covers a non-object `constructor` and a
+        // non-constructor @@species).
+        if (c != .object or !isConstructor(c.object)) {
+            return self.throwError("TypeError", "ArraySpeciesCreate: constructor species is not a constructor");
+        }
+        // step 8: Construct(C, « length »).
+        return self.construct(c.object, &.{.{ .number = @floatFromInt(length) }});
+    }
+
+    /// A fresh plain Array exotic of [[Length]] `length` (no eager fill — a length-only grow is sparse),
+    /// proto-linked to %Array.prototype%. The default ArraySpeciesCreate result.
+    fn newArray(self: *Interpreter, length: usize) EvalError!Completion {
+        const a = try Object.createArray(self.arena, self.arrayProto());
+        a.array_length = length;
+        return .{ .normal = .{ .object = a } };
+    }
+
+    /// §23.1.2.1/.3 the `A` target for Array.from / Array.of: `IsConstructor(C) ? Construct(C, «len») :
+    /// ArrayCreate(len)`. `C` is the `this` value of the static call (so `Array.from.call(Ctor, …)` uses
+    /// `Ctor`). A non-constructor `this` (e.g. the plain `Array.from(…)` where `this` is the Array ctor,
+    /// or an arbitrary non-ctor receiver) → a plain Array. The result is populated by the caller via
+    /// CreateDataPropertyOrThrow, so a constructor that returns a non-extensible / locked object throws.
+    pub fn arrayCreateFromCtor(self: *Interpreter, this_val: Value, length: usize) EvalError!Completion {
+        if (this_val == .object and isConstructor(this_val.object) and this_val.object.native != .array_ctor) {
+            return self.construct(this_val.object, &.{.{ .number = @floatFromInt(length) }});
+        }
+        return self.newArray(length);
+    }
+
+    /// §7.3.7 CreateDataPropertyOrThrow ( O, P, V ) — define an own data property
+    /// `{ value:V, writable:true, enumerable:true, configurable:true }`, throwing a TypeError if the
+    /// definition is rejected. For an Array exotic at an integer index this is the array [[Set]] with
+    /// Throw=true: a frozen array (non-writable elements) or a non-extensible array gaining a NEW index
+    /// rejects → TypeError. For a generic object (a non-Array species result) it routes through
+    /// [[DefineOwnProperty]] so a configurable non-writable existing prop is redefined writable.
+    /// Returns `.normal = undefined` on success, or the abrupt `.thrown` completion (caller propagates).
+    pub fn createDataPropertyOrThrow(self: *Interpreter, target: *Object, index: usize, value: Value) EvalError!Completion {
+        if (target.kind == .array) {
+            // Throw=true array [[Set]]: reject a write to a frozen element or a new index on a
+            // non-extensible array (independent of strict mode — the method always throws).
+            if (target.array_frozen) return self.throwError("TypeError", "Cannot add property to a frozen array");
+            if (!target.extensible and !target.arrayHas(index)) {
+                return self.throwError("TypeError", "Cannot add property to a non-extensible array");
+            }
+            try target.arraySet(self.arena, index, value);
+            // §7.3.5 CreateDataProperty overwrites with default attributes — drop any stale string-keyed
+            // entry for this index (e.g. a non-writable index installed via Object.defineProperty on the
+            // species result) so the index now reads as a writable/enumerable/configurable own property.
+            if (target.properties.count() != 0) _ = target.properties.orderedRemove(numberToString(self.arena, @floatFromInt(index)) catch return error.OutOfMemory);
+            return .{ .normal = .undefined };
+        }
+        // Generic object: §10.1.6 [[DefineOwnProperty]] with the data-property defaults.
+        const key = try numberToString(self.arena, @floatFromInt(index));
+        const ok = try target.defineProperty(key, .{
+            .value = value,
+            .has_value = true,
+            .writable = true,
+            .enumerable = true,
+            .configurable = true,
+        });
+        if (!ok) return self.throwError("TypeError", "CreateDataPropertyOrThrow: defining the property failed");
+        return .{ .normal = .undefined };
+    }
+
+    /// §10.4.2.4-style array element [[Set]] with Throw=true, used by the in-place mutating methods
+    /// (push/unshift/shift/splice/fill/copyWithin/reverse/sort). Like `createDataPropertyOrThrow` for an
+    /// array but tolerant of overwriting an existing index on an extensible array (the common case).
+    /// Returns `.normal = undefined` on success, or the abrupt `.thrown` completion.
+    pub fn arraySetThrow(self: *Interpreter, arr: *Object, index: usize, value: Value) EvalError!Completion {
+        if (arr.array_frozen) return self.throwError("TypeError", "Cannot modify a frozen array");
+        if (!arr.extensible and !arr.arrayHas(index)) {
+            return self.throwError("TypeError", "Cannot add property to a non-extensible array");
+        }
+        try arr.arraySet(self.arena, index, value);
+        return .{ .normal = .undefined };
+    }
+
+    /// §10.4.2.4 array [[Set]] of `length` with Throw=true — a non-writable `length` (frozen array, or
+    /// `defineProperty(arr,"length",{writable:false})`) rejects ANY length [[Set]], including one to the
+    /// SAME value (ArraySetLength step 17 returns false → Set with Throw=true throws). Matches V8: the
+    /// length Set the mutating methods always perform throws even when the value is unchanged.
+    pub fn arraySetLenThrow(self: *Interpreter, arr: *Object, n: usize) EvalError!Completion {
+        if (!arr.array_length_writable) {
+            return self.throwError("TypeError", "Cannot assign to read only property 'length' of array");
+        }
+        try arr.arraySetLen(n);
+        return .{ .normal = .undefined };
+    }
+
     /// §20.2.3 %Function.prototype% — the [[Prototype]] stamped on every function object (ordinary AST
     /// closures, classes, arrows, bound) so `fn.call`/`.apply`/`.bind` resolve. Null only in a direct
     /// unit-test eval with no realm globals (those tests don't call .call/.bind).
@@ -5641,11 +5804,49 @@ pub const Interpreter = struct {
         switch (r) {
             .abrupt => |c| return c,
             .desc => |d| {
+                // §10.4.2.1 Array exotic [[DefineOwnProperty]] — `length` is synthetic (the real value
+                // lives in `array_length`, with a separate `[[Writable]]`), so it needs the ArraySetLength
+                // path. Integer indices fall through to the ordinary define (the M-subset stores
+                // non-default-attribute indices in the property map; a plain value define is shadowed by
+                // the dense slot a later [[Set]] writes — see specs/043).
+                if (o.object.kind == .array and std.mem.eql(u8, key, "length")) {
+                    const adc = try self.arrayDefineLength(o.object, d);
+                    if (adc.isAbrupt()) return adc;
+                    return .{ .normal = o };
+                }
                 const ok = try o.object.defineProperty(key, d);
                 if (!ok) return self.throwError("TypeError", "Cannot redefine property");
                 return .{ .normal = o };
             },
         }
+    }
+
+    /// §10.4.2.4 ArraySetLength applied to a [[DefineOwnProperty]] on an array's `length`. M-subset:
+    /// validate a present `value` (ToUint32, RangeError on a non-uint32), reject a writability UPGRADE
+    /// on a non-writable length, apply a length change (rejected if non-writable + a different value),
+    /// and record the resulting [[Writable]]. An accessor descriptor for `length` → reject.
+    fn arrayDefineLength(self: *Interpreter, arr: *Object, d: object_mod.Descriptor) EvalError!Completion {
+        if (d.isAccessor()) return self.throwError("TypeError", "Cannot redefine array length as an accessor");
+        if (d.enumerable) |e| if (e) return self.throwError("TypeError", "Cannot make array length enumerable");
+        if (d.configurable) |c| if (c) return self.throwError("TypeError", "Cannot make array length configurable");
+        // A length value change is gated by the CURRENT writability.
+        if (d.has_value) {
+            const n = toNumber(d.value.?);
+            if (std.math.isNan(n) or n < 0 or n > 4294967295.0 or n != @floor(n)) {
+                return self.throwError("RangeError", "Invalid array length");
+            }
+            const new_len: usize = @intFromFloat(n);
+            if (new_len != arr.arrayLen() and !arr.array_length_writable) {
+                return self.throwError("TypeError", "Cannot assign to read only property 'length'");
+            }
+            try arr.arraySetLen(new_len);
+        }
+        // §10.4.2.4 step 17: a non-writable length cannot be made writable again.
+        if (d.writable) |w| {
+            if (w and !arr.array_length_writable) return self.throwError("TypeError", "Cannot redefine non-writable array length as writable");
+            arr.array_length_writable = w;
+        }
+        return .{ .normal = .undefined };
     }
 
     /// §20.1.2.5 Object.defineProperties ( O, Properties ) — DefinePropertiesHelper over each own
@@ -5686,10 +5887,12 @@ pub const Interpreter = struct {
         // Array exotic: indices + `length` have synthetic descriptors (not in the property map).
         if (o.object.kind == .array) {
             if (std.mem.eql(u8, key, "length"))
-                return self.fromDataDescriptor(.{ .number = @floatFromInt(o.object.arrayLen()) }, true, false, false);
+                return self.fromDataDescriptor(.{ .number = @floatFromInt(o.object.arrayLen()) }, o.object.array_length_writable, false, false);
             if (parseIndex(key)) |i| {
                 if (o.object.arrayHas(i))
-                    return self.fromDataDescriptor(o.object.arrayGet(i), true, true, true);
+                    // §10.4.2: an array index is writable/enumerable/configurable unless the array is
+                    // frozen (then its elements are non-writable + non-configurable).
+                    return self.fromDataDescriptor(o.object.arrayGet(i), !o.object.array_frozen, true, !o.object.array_frozen);
             }
         }
         const pv = o.object.properties.get(key) orelse return .{ .normal = .undefined };
@@ -6907,11 +7110,12 @@ pub const Interpreter = struct {
                 return .{ .normal = .{ .object = arr } };
             },
             .array_method => return builtin_array.call(self, func.native_name, this_val, args),
-            .array_static => return builtin_array.staticCall(self, func.native_name, args),
+            .array_static => return builtin_array.staticCall(self, func.native_name, this_val, args),
             .string_method => return builtin_string.call(self, func.native_name, this_val, args),
             .string_static => return builtin_string.staticCall(self, func.native_name, args),
             .math_method => return self.mathMethod(func.native_name, args),
             .reflect_method => return self.reflectMethod(func.native_name, args),
+            .species_getter => return .{ .normal = this_val }, // §23.1.2.5 get [Symbol.species] returns `this`
             .array_values => return self.makeArrayIterator(this_val, .value), // §23.1.3.34 / Array.prototype[Symbol.iterator]
             .array_keys => return self.makeArrayIterator(this_val, .key), // §23.1.3.18 Array.prototype.keys
             .array_entries => return self.makeArrayIterator(this_val, .entry), // §23.1.3.7 Array.prototype.entries
@@ -7145,7 +7349,7 @@ pub const Interpreter = struct {
             .symbol_ctor => return self.symbolConstructor(args), // §20.4.1.1 Symbol([description])
             .promise_ctor => return self.promiseConstructor(args), // §27.2.3.1 Promise(executor) called w/o new
             .array_ctor, .array_method, .array_static, .string_method, .string_static, .math_method, .reflect_method => unreachable, // handled in the first switch
-            .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
+            .species_getter, .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
             .generator_method, .generator_iterator => unreachable, // handled in the first switch
             .async_generator_method, .async_generator_iterator, .async_from_sync_method, .async_from_sync_wrap => unreachable, // handled in the first switch
             .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch

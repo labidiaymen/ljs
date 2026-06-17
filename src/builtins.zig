@@ -254,6 +254,11 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         "every",         "find",       "findIndex",   "findLast",
         "findLastIndex", "reduce",     "reduceRight", "reverse",
         "fill",          "copyWithin", "sort",
+        // M43 §23.1.3: the result-creating / length-mutating methods, now backed by
+        // ArraySpeciesCreate + a frozen/non-extensible [[Set]] / CreateDataPropertyOrThrow.
+               "concat",
+        "splice",        "filter",     "flat",        "flatMap",
+        "shift",         "unshift",
     };
     if (array_fn.get("prototype")) |pv| {
         if (pv == .object) {
@@ -262,6 +267,11 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         }
     }
     try defineMethod(arena, array_fn, "isArray", .array_method, "isArray");
+    // M43 §23.1.2.1/.3 Array.from / Array.of — statics, non-enumerable.
+    try defineMethod(arena, array_fn, "from", .array_static, "from");
+    try defineMethod(arena, array_fn, "of", .array_static, "of");
+    // §23.1.2.5 get Array[Symbol.species] is installed AFTER the Symbol constructor exists (below the
+    // Symbol setup, alongside the iterator-protocol wiring) — it needs the well-known species identity.
     try defineConstructorBackref(array_fn); // §23.1.3.1 Array.prototype.constructor === Array
     try env.declare("Array", .{ .object = array_fn }, true, true);
 
@@ -272,7 +282,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     const symbol_fn = try Object.createNative(arena, .symbol_ctor, "Symbol");
     symbol_fn.prototype = function_proto; // §20.2.3 the Symbol constructor → %Function.prototype%
     // §20.4.2 well-known symbols — installed non-writable/non-enumerable/non-configurable per spec.
-    const well_known = [_][]const u8{ "iterator", "asyncIterator", "toStringTag", "hasInstance", "toPrimitive", "dispose", "asyncDispose" };
+    const well_known = [_][]const u8{ "iterator", "asyncIterator", "toStringTag", "hasInstance", "toPrimitive", "species", "dispose", "asyncDispose" };
     for (well_known) |name| {
         const desc = try std.fmt.allocPrint(arena, "Symbol.{s}", .{name});
         const sym = try newSymbol(arena, desc);
@@ -295,6 +305,14 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     // GetIterator both find it. Array.prototype also exposes `.values` (the same native).
     const iter_pv = symbol_fn.get("iterator") orelse unreachable; // just installed above
     const iter_sym: *Symbol = iter_pv.symbol;
+    // §23.1.2.5 get Array[Symbol.species] — a getter (no setter) returning the receiver `this`, so
+    // ArraySpeciesCreate defaults to `Array` itself. Keyed by the SAME Symbol.species identity that user
+    // code reads as `Symbol.species`, so `Array[Symbol.species] === Array`. Non-enumerable per spec.
+    if (symbol_fn.get("species")) |sp| if (sp == .symbol) {
+        const species_get = try Object.createNative(arena, .species_getter, "get [Symbol.species]");
+        species_get.prototype = function_proto;
+        try array_fn.defineSymbolAccessorEx(sp.symbol, species_get, null, false);
+    };
     if (array_fn.get("prototype")) |pv| {
         if (pv == .object) {
             const values_fn = try Object.createNative(arena, .array_values, "[Symbol.iterator]");
