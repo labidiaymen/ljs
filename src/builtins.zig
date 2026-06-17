@@ -161,11 +161,13 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         if (pv == .object) {
             pv.object.prototype = object_proto; // §22.1.3 String.prototype inherits %Object.prototype%
             const string_methods = [_][]const u8{
-                "charAt",      "charCodeAt", "codePointAt", "at",         "indexOf",
-                "lastIndexOf", "includes",   "startsWith",  "endsWith",   "slice",
-                "substring",   "substr",     "concat",      "repeat",     "padStart",
-                "padEnd",      "trim",       "trimStart",   "trimEnd",    "toUpperCase",
-                "toLowerCase", "split",      "replace",     "replaceAll", "localeCompare",
+                "charAt",            "charCodeAt",        "codePointAt", "at",         "indexOf",
+                "lastIndexOf",       "includes",          "startsWith",  "endsWith",   "slice",
+                "substring",         "substr",            "concat",      "repeat",     "padStart",
+                "padEnd",            "trim",              "trimStart",   "trimEnd",    "toUpperCase",
+                "toLowerCase",       "split",             "replace",     "replaceAll", "localeCompare",
+                // §22.1.3.21/.22: in a non-Intl engine toLocale{Lower,Upper}Case == to{Lower,Upper}Case.
+                "toLocaleLowerCase", "toLocaleUpperCase",
                 // §22.1.3.28/.32: toString/valueOf return the [[StringData]] (so a `new String(x)` wrapper
                 // and ToPrimitive recover the string primitive).
                 "toString",    "valueOf",

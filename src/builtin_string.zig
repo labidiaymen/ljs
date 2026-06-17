@@ -156,8 +156,8 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
         const end: usize = clampPos(ep, s.len);
         return boolean(needle.len <= end and std.mem.eql(u8, s[end - needle.len .. end], needle));
     }
-    if (eql(u8, name, "toUpperCase") or eql(u8, name, "toLowerCase")) {
-        const upper = eql(u8, name, "toUpperCase");
+    if (eql(u8, name, "toUpperCase") or eql(u8, name, "toLowerCase") or eql(u8, name, "toLocaleUpperCase") or eql(u8, name, "toLocaleLowerCase")) {
+        const upper = eql(u8, name, "toUpperCase") or eql(u8, name, "toLocaleUpperCase");
         const out = try it.arena.alloc(u8, s.len);
         for (s, 0..) |c, i| out[i] = if (upper) std.ascii.toUpper(c) else std.ascii.toLower(c);
         return str(out);
