@@ -222,7 +222,20 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     // proto-link to this Array.prototype (interpreter.arrayProto looks it up here).
     const array_fn = try Object.createNative(arena, .array_ctor, "Array");
     array_fn.prototype = function_proto; // §20.2.3 the Array constructor → %Function.prototype%
-    const array_methods = [_][]const u8{ "push", "pop", "indexOf", "includes", "join", "slice", "forEach", "map", "toString" };
+    // M2/M20 + M38 §23.1.3 Array.prototype methods (the M38 "green slice"). The result-creating /
+    // length-mutating methods that require ArraySpeciesCreate-with-throw or a frozen/non-extensible
+    // [[Set]] (concat, splice, filter, flat, flatMap, shift, unshift, and the Array.from/of statics)
+    // are DEFERRED to a follow-up: implementing only their common path would regress the Test262
+    // species / non-extensible-target / frozen-length tests that currently pass (a missing method
+    // throws "not a function", which those tests catch). See specs/038 spec.md "Out of scope".
+    const array_methods = [_][]const u8{
+        "push",          "pop",        "indexOf",     "lastIndexOf",
+        "includes",      "join",       "toString",    "slice",
+        "at",            "forEach",    "map",         "some",
+        "every",         "find",       "findIndex",   "findLast",
+        "findLastIndex", "reduce",     "reduceRight", "reverse",
+        "fill",          "copyWithin", "sort",
+    };
     if (array_fn.get("prototype")) |pv| {
         if (pv == .object) {
             pv.object.prototype = object_proto; // §23.1.3 Array.prototype inherits %Object.prototype%

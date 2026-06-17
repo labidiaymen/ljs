@@ -818,7 +818,7 @@ pub const Interpreter = struct {
                     // Array exotic integer indices (numeric order), then ordinary string keys. `length`
                     // is never enumerated (it is not stored in `properties`).
                     if (o.kind == .array) {
-                        for (o.elements.items, 0..) |_, i| {
+                        for (try o.arrayIndices(self.arena)) |i| {
                             const key = try numberToString(self.arena, @floatFromInt(i));
                             if (seen.contains(key)) continue;
                             try seen.put(self.arena, key, {});
@@ -2670,9 +2670,9 @@ pub const Interpreter = struct {
         switch (base) {
             .object => |o| {
                 if (o.kind == .array) {
-                    if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(o.elements.items.len) } };
+                    if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(o.arrayLen()) } };
                     if (parseIndex(key)) |i| {
-                        return .{ .normal = if (i < o.elements.items.len) o.elements.items[i] else .undefined };
+                        return .{ .normal = o.arrayGet(i) };
                     }
                     // else fall through to the prototype chain (Array.prototype methods)
                 }
@@ -2740,18 +2740,17 @@ pub const Interpreter = struct {
             .object => |o| {
                 if (o.kind == .array) {
                     if (std.mem.eql(u8, key, "length")) {
+                        // §23.1.4.1 ArraySetLength — ToUint32; a non-integral / >2^32-1 value is a
+                        // RangeError. No eager fill on a length increase (sparse): just record it.
                         const n = toNumber(value);
-                        const new_len: usize = if (n >= 0 and n < 1e9) @intFromFloat(n) else o.elements.items.len;
-                        if (new_len < o.elements.items.len) {
-                            o.elements.shrinkRetainingCapacity(new_len);
-                        } else {
-                            while (o.elements.items.len < new_len) try o.elements.append(o.arena, .undefined);
+                        if (std.math.isNan(n) or n < 0 or n > 4294967295.0 or n != @floor(n)) {
+                            return self.throwError("RangeError", "Invalid array length");
                         }
+                        try o.arraySetLen(@intFromFloat(n));
                         return .{ .normal = value };
                     }
                     if (parseIndex(key)) |i| {
-                        while (o.elements.items.len <= i) try o.elements.append(o.arena, .undefined);
-                        o.elements.items[i] = value;
+                        try o.arraySet(o.arena, i, value);
                         return .{ .normal = value };
                     }
                 }
@@ -3081,6 +3080,86 @@ pub const Interpreter = struct {
 
     // ── §7.4 Iteration protocol (Symbol.iterator) ───────────────────────────────
 
+    /// §7.3.12 HasProperty(arr, i) over the Array exotic + its prototype chain — used by the
+    /// iteration/search family's hole check (a deleted own index can still be "present" via
+    /// `Array.prototype[i]`, so it must be visited per §23.1.3.x's `HasProperty` step).
+    pub fn arrayHasPropertyChain(self: *Interpreter, arr: *Object, i: usize) bool {
+        if (arr.arrayHas(i)) return true;
+        // Walk the prototype chain (ordinary objects + array exotics + the key string map).
+        const key = numberToString(self.arena, @floatFromInt(i)) catch return false;
+        var proto: ?*Object = arr.prototype;
+        while (proto) |p| {
+            if (p.kind == .array and p.arrayHas(i)) return true;
+            if (p.getProp(key) != null) return true;
+            proto = p.prototype;
+        }
+        return false;
+    }
+
+    /// Public §7.1.4 ToNumber (throwing) for built-in modules — a Symbol/BigInt operand throws a
+    /// TypeError, an object runs ToPrimitive(number). Used by Array methods whose arg coercion must be
+    /// observable (e.g. `copyWithin(0, Symbol())` → TypeError).
+    pub fn toNumberThrowing(self: *Interpreter, v: Value) EvalError!Completion {
+        return self.toNumberV(v);
+    }
+
+    /// Public [[Get]] wrapper for built-in modules (e.g. `Array.from` reading `.length` / indices of
+    /// an array-like). Same semantics as the internal `getProperty` (invokes getters, throws on
+    /// null/undefined base).
+    pub fn getProperty2(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
+        return self.getProperty(base, key);
+    }
+
+    /// Does `value` expose a `[Symbol.iterator]` method (i.e. is it iterable)? Used by `Array.from` to
+    /// choose the iterable branch over the array-like branch. A primitive String is iterable too, but
+    /// the caller checks that separately.
+    pub fn isArrayFromIterable(self: *Interpreter, value: Value) EvalError!bool {
+        const iter_sym = self.wellKnownIterator() orelse return false;
+        const mc = try self.getSymbolProperty(value, iter_sym);
+        if (mc.isAbrupt()) return false;
+        return mc.normal == .object and mc.normal.object.kind == .function;
+    }
+
+    /// Public wrapper for `iterateToList` (drain an iterable into `out`). Used by `Array.from`.
+    pub fn iterateToListPub(self: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!Completion {
+        return self.iterateToList(value, out);
+    }
+
+    /// §23.1.2.1 Array.from iterable branch (steps 6.b–6.h): step the iterator, apply `map_fn` per
+    /// element AS WE GO, and CreateDataProperty onto `out` at the running index. An abrupt completion
+    /// from `next`/`map_fn` triggers IteratorClose then propagates — so an infinite iterator whose
+    /// mapFn throws on the first element terminates immediately (no draining → no OOM). On success
+    /// `out.array_length` is the count. Returns the abrupt completion if any, else normal/undefined.
+    pub fn arrayFromIterate(self: *Interpreter, items: Value, out: *Object, map_fn: ?*Object, this_arg: Value) EvalError!Completion {
+        const git = try self.getIterator(items);
+        const iterator = switch (git) {
+            .abrupt => |c| return c,
+            .iterator => |i| i,
+        };
+        var k: usize = 0;
+        while (true) {
+            try self.tick(); // a genuinely infinite iterable fails via the watchdog, never hangs
+            const step = try self.iteratorStep(iterator);
+            switch (step) {
+                .abrupt => |c| return c,
+                .done => return .{ .normal = .undefined },
+                .value => |v| {
+                    var to_store = v;
+                    if (map_fn) |f| {
+                        const r = try self.callFunction(f, &.{ v, .{ .number = @floatFromInt(k) } }, this_arg);
+                        if (r.isAbrupt()) {
+                            try self.iteratorClose(iterator); // §7.4.11 close on abrupt mapFn
+                            return r;
+                        }
+                        to_store = r.normal;
+                    }
+                    try out.arraySet(self.arena, k, to_store);
+                    k += 1;
+                },
+            }
+        }
+    }
+
     /// The realm's well-known `Symbol.iterator` identity (the same value held on the `Symbol`
     /// constructor), used by GetIterator. Null only in a realm-less unit-test eval (no `Symbol`).
     fn wellKnownIterator(self: *Interpreter) ?*Symbol {
@@ -3198,7 +3277,14 @@ pub const Interpreter = struct {
         // Fast path: an Array iterates its `elements` directly (skips the per-element next() call),
         // preserving the hot spread/destructuring path. Strings keep their native code-unit walk.
         if (value == .object and value.object.kind == .array) {
-            for (value.object.elements.items) |el| try out.append(self.arena, el);
+            const arr = value.object;
+            const len = arr.arrayLen();
+            if (len == arr.elements.items.len) {
+                for (arr.elements.items) |el| try out.append(self.arena, el); // pure dense (hot path)
+            } else {
+                var i: usize = 0; // sparse tail: holes spread as `undefined` (§13.2.4)
+                while (i < len) : (i += 1) try out.append(self.arena, arr.arrayGet(i));
+            }
             return .{ .normal = .undefined };
         }
         if (value == .string) {
@@ -3321,7 +3407,16 @@ pub const Interpreter = struct {
     /// Array (default iterator) and the §7.4 protocol otherwise. A non-iterable → abrupt TypeError.
     fn destrOpen(self: *Interpreter, value: Value) EvalError!union(enum) { driver: ArrayDestr, abrupt: Completion } {
         if (value == .object and value.object.kind == .array) {
-            return .{ .driver = .{ .fast = .{ .items = value.object.elements.items } } };
+            const arr = value.object;
+            const len = arr.arrayLen();
+            if (len == arr.elements.items.len) {
+                return .{ .driver = .{ .fast = .{ .items = arr.elements.items } } }; // pure dense (hot path)
+            }
+            // Sparse: materialize length items (holes → `undefined`) once, then drive the fast path.
+            var items: std.ArrayListUnmanaged(Value) = .empty;
+            var i: usize = 0;
+            while (i < len) : (i += 1) try items.append(self.arena, arr.arrayGet(i));
+            return .{ .driver = .{ .fast = .{ .items = items.items } } };
         }
         if (value == .string) {
             // A String iterates code units; materialize once (finite) and drive the fast path over them.
@@ -4965,8 +5060,9 @@ pub const Interpreter = struct {
             .object => |o| {
                 if (o.kind == .array) {
                     if (parseIndex(key)) |i| {
-                        // M-subset: leave a hole by writing `undefined` (no true sparse-array model).
-                        if (i < o.elements.items.len) o.elements.items[i] = .undefined;
+                        // §10.4.2.1: delete an index → a true hole (dense slot recorded in `holes`,
+                        // sparse entry removed). The slot reads `undefined` and is absent thereafter.
+                        try o.arrayDelete(i);
                         return .{ .normal = .{ .boolean = true } };
                     }
                 }
@@ -5032,7 +5128,7 @@ pub const Interpreter = struct {
                 const has = blk: {
                     if (o.kind == .array) {
                         if (std.mem.eql(u8, key, "length")) break :blk true;
-                        if (parseIndex(key)) |i| break :blk i < o.elements.items.len;
+                        if (parseIndex(key)) |i| break :blk o.arrayHas(i);
                     }
                     break :blk o.get(key) != null;
                 };
@@ -5364,10 +5460,10 @@ pub const Interpreter = struct {
         // Array exotic: indices + `length` have synthetic descriptors (not in the property map).
         if (o.object.kind == .array) {
             if (std.mem.eql(u8, key, "length"))
-                return self.fromDataDescriptor(.{ .number = @floatFromInt(o.object.elements.items.len) }, true, false, false);
+                return self.fromDataDescriptor(.{ .number = @floatFromInt(o.object.arrayLen()) }, true, false, false);
             if (parseIndex(key)) |i| {
-                if (i < o.object.elements.items.len)
-                    return self.fromDataDescriptor(o.object.elements.items[i], true, true, true);
+                if (o.object.arrayHas(i))
+                    return self.fromDataDescriptor(o.object.arrayGet(i), true, true, true);
             }
         }
         const pv = o.object.properties.get(key) orelse return .{ .normal = .undefined };
@@ -5419,7 +5515,7 @@ pub const Interpreter = struct {
         switch (o) {
             .object => |obj| {
                 if (obj.kind == .array) {
-                    for (obj.elements.items, 0..) |_, i| {
+                    for (try obj.arrayIndices(self.arena)) |i| {
                         try arr.elements.append(self.arena, .{ .string = try numberToString(self.arena, @floatFromInt(i)) });
                     }
                     try arr.elements.append(self.arena, .{ .string = "length" });
@@ -5446,12 +5542,12 @@ pub const Interpreter = struct {
         if (o == .object) {
             const obj = o.object;
             if (obj.kind == .array) {
-                for (obj.elements.items, 0..) |v, i| {
+                for (try obj.arrayIndices(self.arena)) |i| {
                     const key = try numberToString(self.arena, @floatFromInt(i));
-                    const dc = try self.fromDataDescriptor(v, true, true, true);
+                    const dc = try self.fromDataDescriptor(obj.arrayGet(i), true, true, true);
                     try result.set(key, dc.normal);
                 }
-                const lc = try self.fromDataDescriptor(.{ .number = @floatFromInt(obj.elements.items.len) }, true, false, false);
+                const lc = try self.fromDataDescriptor(.{ .number = @floatFromInt(obj.arrayLen()) }, true, false, false);
                 try result.set("length", lc.normal);
             }
             var it = obj.properties.iterator();
@@ -5502,7 +5598,7 @@ pub const Interpreter = struct {
         switch (value) {
             .object => |o| {
                 if (o.kind == .array) {
-                    for (o.elements.items, 0..) |_, i| {
+                    for (try o.arrayIndices(self.arena)) |i| {
                         try out.append(self.arena, .{ .string = try numberToString(self.arena, @floatFromInt(i)) });
                     }
                 }
@@ -5636,7 +5732,7 @@ pub const Interpreter = struct {
             .object => |o| {
                 if (o.kind == .array) {
                     if (std.mem.eql(u8, key, "length")) return true;
-                    if (parseIndex(key)) |i| if (i < o.elements.items.len) return true;
+                    if (parseIndex(key)) |i| if (o.arrayHas(i)) return true;
                 }
                 return o.properties.contains(key);
             },
@@ -5660,7 +5756,7 @@ pub const Interpreter = struct {
             .object => |o| blk: {
                 if (o.kind == .array) {
                     if (std.mem.eql(u8, key, "length")) break :blk false; // Array length is non-enumerable
-                    if (parseIndex(key)) |i| if (i < o.elements.items.len) break :blk true;
+                    if (parseIndex(key)) |i| if (o.arrayHas(i)) break :blk true;
                 }
                 break :blk o.isEnumerable(key);
             },
@@ -5819,10 +5915,23 @@ pub const Interpreter = struct {
         switch (func.native) {
             .array_ctor => {
                 const arr = try Object.createArray(self.arena, self.arrayProto());
-                for (args) |a| try arr.elements.append(self.arena, a);
+                // §23.1.1.1: `Array(len)` with a single Number arg sets [[Length]] (a non-uint32 →
+                // RangeError); any other arg list becomes the elements. The single-number case is sparse
+                // (no eager fill) so `new Array(1e9)` is O(1) and never OOMs.
+                if (args.len == 1 and args[0] == .number) {
+                    const n = args[0].number;
+                    if (n < 0 or n > 4294967295.0 or n != @floor(n)) {
+                        return self.throwError("RangeError", "Invalid array length");
+                    }
+                    try arr.arraySetLen(@intFromFloat(n));
+                } else {
+                    for (args) |a| try arr.elements.append(self.arena, a);
+                    arr.array_length = arr.elements.items.len;
+                }
                 return .{ .normal = .{ .object = arr } };
             },
             .array_method => return builtin_array.call(self, func.native_name, this_val, args),
+            .array_static => return builtin_array.staticCall(self, func.native_name, args),
             .string_method => return builtin_string.call(self, func.native_name, this_val, args),
             .math_method => return self.mathMethod(func.native_name, args),
             .array_values => return self.makeArrayIterator(this_val, .value), // §23.1.3.34 / Array.prototype[Symbol.iterator]
@@ -6056,7 +6165,7 @@ pub const Interpreter = struct {
             .bigint_method => return self.bigintMethod(func.native_name, this_val, args), // §21.2.3 toString/valueOf
             .symbol_ctor => return self.symbolConstructor(args), // §20.4.1.1 Symbol([description])
             .promise_ctor => return self.promiseConstructor(args), // §27.2.3.1 Promise(executor) called w/o new
-            .array_ctor, .array_method, .string_method, .math_method => unreachable, // handled in the first switch
+            .array_ctor, .array_method, .array_static, .string_method, .math_method => unreachable, // handled in the first switch
             .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
             .generator_method, .generator_iterator => unreachable, // handled in the first switch
             .async_generator_method, .async_generator_iterator, .async_from_sync_method, .async_from_sync_wrap => unreachable, // handled in the first switch
@@ -6238,15 +6347,15 @@ pub const Interpreter = struct {
         var value: Value = .undefined;
         var done = true;
         if (st.array) |arr| {
-            if (st.cursor < arr.elements.items.len) {
+            if (st.cursor < arr.arrayLen()) {
                 const idx = st.cursor;
                 value = switch (st.kind) {
-                    .value => arr.elements.items[idx],
+                    .value => arr.arrayGet(idx),
                     .key => .{ .number = @floatFromInt(idx) },
                     .entry => blk: { // [index, value] pair (§23.1.5.2.1)
                         const pair = try Object.createArray(self.arena, self.arrayProto());
                         try pair.elements.append(self.arena, .{ .number = @floatFromInt(idx) });
-                        try pair.elements.append(self.arena, arr.elements.items[idx]);
+                        try pair.elements.append(self.arena, arr.arrayGet(idx));
                         break :blk .{ .object = pair };
                     },
                 };

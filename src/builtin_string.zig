@@ -94,7 +94,11 @@ fn idxArg(args: []const Value, i: usize) ?usize {
     if (i >= args.len) return null;
     const n = ops.toNumber(args[i]);
     if (std.math.isNan(n) or n < 0) return 0;
-    return @intFromFloat(n);
+    // §7.1.5 ToIntegerOrInfinity may be huge (e.g. `slice(1e300)`); cap before the int conversion so
+    // `@intFromFloat` cannot panic. The caller clamps to the string length anyway.
+    const trunc = @trunc(n);
+    if (trunc >= @as(f64, @floatFromInt(std.math.maxInt(usize)))) return std.math.maxInt(usize);
+    return @intFromFloat(trunc);
 }
 fn argStr(it: *Interpreter, args: []const Value, i: usize) EvalError![]const u8 {
     return if (i < args.len) it.toString(args[i]) else "undefined";

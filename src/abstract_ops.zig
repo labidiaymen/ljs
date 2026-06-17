@@ -57,8 +57,11 @@ pub fn toString(arena: std.mem.Allocator, v: Value) error{OutOfMemory}![]const u
         .object => |o| blk: {
             if (o.kind != .array) break :blk "[object Object]"; // §20.1.3.6 (ToPrimitive deferred)
             var buf: std.ArrayList(u8) = .empty;
-            for (o.elements.items, 0..) |el, i| {
+            const len = o.arrayLen(); // §23.1.3.17: holes/undefined/null → empty between separators
+            var i: usize = 0;
+            while (i < len) : (i += 1) {
                 if (i > 0) try buf.appendSlice(arena, ",");
+                const el = o.arrayGet(i);
                 if (el != .undefined and el != .null) try buf.appendSlice(arena, try toString(arena, el));
             }
             break :blk buf.items;
@@ -71,7 +74,10 @@ pub fn numberToString(arena: std.mem.Allocator, n: f64) error{OutOfMemory}![]con
     if (std.math.isNan(n)) return "NaN";
     if (std.math.isPositiveInf(n)) return "Infinity";
     if (std.math.isNegativeInf(n)) return "-Infinity";
-    if (n == @floor(n) and @abs(n) < 1e21) {
+    // Integral values that fit in i64 format cleanly as an integer (no exponent). Numbers in
+    // [2^63, 1e21) are still integral per `@floor` but exceed i64 → `@intFromFloat` would panic, so
+    // fall through to float formatting (which renders them without a spurious decimal point).
+    if (n == @floor(n) and @abs(n) < 9.2e18) {
         return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
     }
     return std.fmt.allocPrint(arena, "{d}", .{n});
@@ -195,6 +201,18 @@ pub fn sameValue(x: Value, y: Value) bool {
         if (std.math.isNan(a) and std.math.isNan(b)) return true; // §6.1.6.1.14: NaN is SameValue NaN
         if (a == 0 and b == 0) return std.math.signbit(a) == std.math.signbit(b); // +0 ≠ -0
         return a == b;
+    }
+    return strictEquals(x, y);
+}
+
+/// §7.2.12 SameValueZero ( x, y ) — like SameValue except +0 and -0 compare equal (NaN still equals
+/// NaN). Used by Array.prototype.includes (§23.1.3.16) and the Map/Set key model.
+pub fn sameValueZero(x: Value, y: Value) bool {
+    if (x == .number and y == .number) {
+        const a = x.number;
+        const b = y.number;
+        if (std.math.isNan(a) and std.math.isNan(b)) return true; // NaN is SameValueZero NaN
+        return a == b; // +0 == -0 here (unlike SameValue)
     }
     return strictEquals(x, y);
 }

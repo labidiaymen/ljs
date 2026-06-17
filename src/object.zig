@@ -243,6 +243,7 @@ pub const NativeId = enum {
     object_value_of, // §20.1.3.7 Object.prototype.valueOf (returns ToObject(this) — the receiver)
     array_ctor, // Array(...)
     array_method, // Array.prototype.<native_name> / Array.isArray
+    array_static, // §23.1.2 Array.from / Array.of
     string_method, // String.prototype.<native_name>
     function_ctor, // Function(...) — minimal (the `.prototype` carrier for call/apply/bind)
     // §20.1.2 Object static reflection
@@ -497,7 +498,25 @@ pub const Object = struct {
     /// only when CREATING a new property (existing-property writes skip the branch), so updates to
     /// already-present data properties pay nothing.
     extensible: bool = true,
-    elements: std.ArrayListUnmanaged(Value) = .empty, // backing store iff kind == .array
+    /// §23.1 Array exotic backing store (iff kind == .array). The DENSE prefix: indices
+    /// `0 .. elements.items.len` live here. `array_length` is the array's `[[Length]]` and may EXCEED
+    /// `elements.items.len` (the suffix `[elements.items.len, array_length)` are holes, except any
+    /// present in `sparse`). A far-out index write (`a[1e9]=x`) lands in `sparse` instead of
+    /// materializing millions of holes — this keeps `arr.length = HUGE` O(1) and avoids the
+    /// conformance-run OOM. Small/contiguous arrays (literals, `push`) stay purely dense.
+    elements: std.ArrayListUnmanaged(Value) = .empty,
+    /// §23.1 [[Length]] — tracked separately from the dense store so it can exceed it (sparse arrays).
+    /// Meaningful iff `kind == .array`. Always `>= elements.items.len`.
+    array_length: usize = 0,
+    /// §23.1 sparse overflow: integer index → value for indices beyond the dense prefix that are too
+    /// far to materialize densely. Lazily allocated (null until the first far write). `null` for the
+    /// common dense array (zero cost).
+    sparse: ?*std.AutoHashMapUnmanaged(usize, Value) = null,
+    /// §23.1 the set of DENSE-prefix indices that are holes (made by `delete arr[i]` on an index inside
+    /// the dense region, or an array-literal elision). A dense slot in this set reads as `undefined` and
+    /// is "absent" for [[HasOwnProperty]] / `in` / forEach-family skipping / sort/reduce hole handling.
+    /// Lazily allocated (null → no holes in the dense region, the common case → zero cost).
+    holes: ?*std.AutoHashMapUnmanaged(usize, void) = null,
     /// §15.7 PrivateName slots — a per-object map keyed by the `#name` (the `#` is part of the key,
     /// so private names never collide with string-keyed properties). Distinct from `properties` so a
     /// PrivateName is NEVER reachable via `[[Get]]`/`[[Set]]`/`in`/enumeration (privacy by storage).
@@ -587,6 +606,150 @@ pub const Object = struct {
         const obj = try create(arena, prototype);
         obj.kind = .array;
         return obj;
+    }
+
+    // (No dense gap-fill: a write at exactly the dense end appends densely; ANY gap spills to `sparse`
+    // so the intervening slots stay true HOLES — never materialized as `undefined`. This both avoids
+    // the OOM on `a[1e9]=x` and keeps hole semantics exact for sort/reduce/forEach/`in`/delete.)
+
+    /// §23.1 the array's [[Length]]. Derived as `max(array_length, dense prefix len)` so that the
+    /// MANY call sites that build an array by appending directly to `elements` (literals, push, spread,
+    /// slice/map outputs, Array ctor, …) never need to also touch `array_length`: a dense append
+    /// implicitly grows the length, while a sparse/length set records a larger `array_length`
+    /// explicitly. The invariant `array_length >= elements.items.len` is restored on the next set.
+    pub fn arrayLen(self: *const Object) usize {
+        return @max(self.array_length, self.elements.items.len);
+    }
+
+    /// §23.1 Array index [[Get]]: the dense slot (unless a dense hole), else the sparse map, else
+    /// `undefined` (a hole). The hot dense path is a single bounds check + slice index.
+    pub fn arrayGet(self: *const Object, i: usize) Value {
+        if (i < self.elements.items.len) {
+            if (self.holes) |h| if (h.contains(i)) return .undefined;
+            return self.elements.items[i];
+        }
+        if (self.sparse) |s| {
+            if (s.get(i)) |v| return v;
+        }
+        return .undefined;
+    }
+
+    /// §23.1 does index `i` hold a value (own property present, not a hole)?
+    pub fn arrayHas(self: *const Object, i: usize) bool {
+        if (i < self.elements.items.len) {
+            if (self.holes) |h| if (h.contains(i)) return false;
+            return true;
+        }
+        if (self.sparse) |s| return s.contains(i);
+        return false;
+    }
+
+    /// §10.4.2.1 [[Delete]] of an index — leave a true hole. A dense slot is recorded in `holes`; a
+    /// sparse slot is removed from the map. (The dense slot's stored value is untouched but masked.)
+    pub fn arrayDelete(self: *Object, i: usize) std.mem.Allocator.Error!void {
+        if (i < self.elements.items.len) {
+            const h = if (self.holes) |h| h else blk: {
+                const m = try self.arena.create(std.AutoHashMapUnmanaged(usize, void));
+                m.* = .{};
+                self.holes = m;
+                break :blk m;
+            };
+            try h.put(self.arena, i, {});
+        } else if (self.sparse) |s| {
+            _ = s.remove(i);
+        }
+    }
+
+    /// §23.1 Array index [[Set]] (assigns and bumps [[Length]] like the exotic [[DefineOwnProperty]]).
+    /// A write inside or exactly at the end of the dense prefix stays dense (the hot sequential path);
+    /// any write that would leave a GAP spills to `sparse`, so the skipped slots remain true holes.
+    pub fn arraySet(self: *Object, arena: std.mem.Allocator, i: usize, v: Value) std.mem.Allocator.Error!void {
+        if (i < self.elements.items.len) {
+            self.elements.items[i] = v;
+            if (self.holes) |h| _ = h.remove(i); // writing fills a former hole
+            return;
+        }
+        if (i == self.elements.items.len) {
+            // Contiguous append — keep dense. If a sparse tail exists it stays beyond this index.
+            try self.elements.append(arena, v);
+            // A previously-sparse entry at this exact index (now densified) is superseded; drop it.
+            if (self.sparse) |s| _ = s.remove(i);
+        } else {
+            const s = try self.sparseMap(arena);
+            try s.put(arena, i, v);
+        }
+        if (i + 1 > self.array_length) self.array_length = i + 1;
+    }
+
+    /// §23.1 set [[Length]] to `n`: shrink → truncate the dense prefix and drop sparse entries `>= n`;
+    /// grow → just record the new length (no fill — the suffix is holes).
+    pub fn arraySetLen(self: *Object, n: usize) std.mem.Allocator.Error!void {
+        if (n < self.elements.items.len) self.elements.shrinkRetainingCapacity(n);
+        if (self.holes) |h| { // drop hole records at/after the new length (and any now-truncated slot)
+            if (n < self.array_length) {
+                var to_remove: std.ArrayListUnmanaged(usize) = .empty;
+                defer to_remove.deinit(self.arena);
+                var it = h.keyIterator();
+                while (it.next()) |k| {
+                    if (k.* >= n) try to_remove.append(self.arena, k.*);
+                }
+                for (to_remove.items) |k| _ = h.remove(k);
+            }
+        }
+        if (self.sparse) |s| {
+            if (n < self.array_length) {
+                var to_remove: std.ArrayListUnmanaged(usize) = .empty;
+                defer to_remove.deinit(self.arena);
+                var it = s.iterator();
+                while (it.next()) |entry| {
+                    if (entry.key_ptr.* >= n) try to_remove.append(self.arena, entry.key_ptr.*);
+                }
+                for (to_remove.items) |k| _ = s.remove(k);
+            }
+        }
+        self.array_length = n;
+    }
+
+    /// §23.1 append a value to the end (dense), keeping [[Length]] in sync. The primitive behind
+    /// array-literal construction, `push`, spread collection, etc. (Only valid when there is no sparse
+    /// tail beyond the dense prefix, which holds for all append-style construction.)
+    pub fn arrayPush(self: *Object, arena: std.mem.Allocator, v: Value) std.mem.Allocator.Error!void {
+        // If length already runs past the dense prefix (sparse tail), append at `array_length`.
+        if (self.array_length > self.elements.items.len) {
+            return self.arraySet(arena, self.array_length, v);
+        }
+        try self.elements.append(arena, v);
+        self.array_length = self.elements.items.len;
+    }
+
+    /// §10.4.2.x own integer-index keys in ascending numeric order: the dense prefix `0..dense_len`
+    /// then any sparse indices, sorted. Used by reflection (getOwnPropertyNames / for-in / Object.keys).
+    /// Caller owns the returned slice (allocated in `arena`).
+    pub fn arrayIndices(self: *const Object, arena: std.mem.Allocator) std.mem.Allocator.Error![]usize {
+        const dense = self.elements.items.len;
+        const sparse_count: usize = if (self.sparse) |s| s.count() else 0;
+        var out: std.ArrayListUnmanaged(usize) = .empty;
+        try out.ensureTotalCapacity(arena, dense + sparse_count);
+        var i: usize = 0;
+        while (i < dense) : (i += 1) {
+            if (self.holes) |h| if (h.contains(i)) continue; // a dense hole is not an own key
+            out.appendAssumeCapacity(i);
+        }
+        if (self.sparse) |s| {
+            const base = out.items.len;
+            var it = s.keyIterator();
+            while (it.next()) |k| out.appendAssumeCapacity(k.*);
+            std.mem.sort(usize, out.items[base..], {}, std.sort.asc(usize));
+        }
+        return out.items;
+    }
+
+    fn sparseMap(self: *Object, arena: std.mem.Allocator) std.mem.Allocator.Error!*std.AutoHashMapUnmanaged(usize, Value) {
+        if (self.sparse) |s| return s;
+        const s = try arena.create(std.AutoHashMapUnmanaged(usize, Value));
+        s.* = .{};
+        self.sparse = s;
+        return s;
     }
 
     /// §10.4.1.3 BoundFunctionCreate — a Bound Function Exotic Object wrapping `target` with a fixed

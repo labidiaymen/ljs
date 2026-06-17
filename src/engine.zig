@@ -391,6 +391,40 @@ test "M2 arrays: literals, index, length, methods (US1)" {
     try expectNumber("var s = 0; [1, 2, 3, 4].forEach(function (x) { s += x; }); s", 10);
 }
 
+test "M38 Array.prototype methods + sparse length (§23.1.3)" {
+    // iteration / search (the M38 green slice; Species/frozen-edge mutators are deferred — see spec).
+    try expectNumber("[1,2,3].reduce(function(a,b){return a+b;},0)", 6);
+    try expectNumber("[1,2,3,4].reduceRight(function(a,b){return a-b;})", -2); // 4-3-2-1
+    try expectNumber("[1,2,3].find(function(x){return x===2;})", 2);
+    try expectNumber("[1,2,3].findIndex(function(x){return x===2;})", 1);
+    try expectNumber("[1,2,3].findLast(function(x){return x<3;})", 2);
+    try expectNumber("[1,2,3].findLastIndex(function(x){return x<3;})", 1);
+    try expectBool("[1,2,3].some(function(x){return x===2;})", true);
+    try expectBool("[1,2,3].every(function(x){return x>0;})", true);
+    try expectNumber("[1,2,2,3].lastIndexOf(2)", 2);
+    try expectNumber("[1,2,3].map(function(x){return x*2;})[2]", 6);
+    try expectNumber("[1,2,3].at(-1)", 3);
+    try expectNumber("[1,2,3].at(0)", 1);
+    // mutation (in-place; no result-array creation)
+    try expectNumber("[3,1,2].sort()[0]", 1);
+    try expectNumber("[3,1,2].sort(function(a,b){return b-a;})[0]", 3);
+    try expectNumber("[1,2,3].reverse()[0]", 3);
+    try expectNumber("[1,2,3,4].fill(0,1,3)[2]", 0);
+    try expectNumber("[1,2,3,4,5].copyWithin(0,3)[0]", 4);
+    // search arg coercion: a Symbol fromIndex / relative index throws (ToIntegerOrInfinity)
+    try expectBool("var t=false;try{[1].copyWithin(0,Symbol());}catch(e){t=e instanceof TypeError;}t", true);
+    // true holes: delete leaves a hole that forEach/reduce skip
+    try expectNumber("var a=[1,2,3];delete a[1];var n=0;a.forEach(function(){n++;});n", 2);
+    // sparse length — no OOM, lazy
+    try expectNumber("var a=[]; a.length=100; a.length", 100);
+    try expectNumber("var a=[]; a[1000000]=7; a.length", 1000001);
+    try expectNumber("var a=[]; a[1000000]=7; a[1000000]", 7);
+    try expectBool("var a=[];a[1000000]=7;!(500 in a)", true); // gap stays a hole
+    try expectNumber("var a=[1,2,3]; a.length=2; a.length", 2);
+    try expectNumber("new Array(5).length", 5);
+    try expectNumber("var a=new Array(3); a[10]=1; a.length", 11);
+}
+
 test "M2 strings: length, index, methods (US2)" {
     try expectNumber("\"hello\".length", 5);
     try expectStr("\"abc\".charAt(1)", "b");
