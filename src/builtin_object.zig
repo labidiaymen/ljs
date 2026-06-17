@@ -620,10 +620,19 @@ pub fn objectTestIntegrity(it: *Interpreter, args: []const Value, t: IntegrityTe
     return .{ .normal = .{ .boolean = r } };
 }
 
-/// §20.1.3.2 Object.prototype.hasOwnProperty ( V ) — own property only (no chain walk).
+/// §20.1.3.2 Object.prototype.hasOwnProperty ( V ) — own property only (no chain walk). §20.1.3.2:
+/// ToPropertyKey(V) BEFORE ToObject(this), so a Symbol key checks the symbol-keyed own store.
 pub fn objectHasOwnProperty(it: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
-    const key = try it.toString(if (args.len > 0) args[0] else .undefined);
-    return .{ .normal = .{ .boolean = try hasOwnProp(it, this_val, key) } };
+    const pk = try it.toPropertyKey(if (args.len > 0) args[0] else .undefined);
+    if (pk.isAbrupt()) return pk.completion;
+    if (pk.symbol) |sym| {
+        if (this_val == .undefined or this_val == .null) return it.throwError("TypeError", "Cannot convert undefined or null to object");
+        if (this_val == .object) {
+            for (this_val.object.symbol_props.items) |sp| if (sp.key == sym) return .{ .normal = .{ .boolean = true } };
+        }
+        return .{ .normal = .{ .boolean = false } };
+    }
+    return .{ .normal = .{ .boolean = try hasOwnProp(it, this_val, pk.key) } };
 }
 
 /// HasOwnProperty over the engine's value model (Array indices/length, String index/length,
@@ -650,9 +659,19 @@ pub fn hasOwnProp(it: *Interpreter, base: Value, key: []const u8) EvalError!bool
     }
 }
 
-/// §20.1.3.4 Object.prototype.propertyIsEnumerable ( V ).
+/// §20.1.3.4 Object.prototype.propertyIsEnumerable ( V ). ToPropertyKey(V) first — a Symbol key reads
+/// the symbol-keyed own store's [[Enumerable]] attribute.
 pub fn objectPropertyIsEnumerable(it: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
-    const key = try it.toString(if (args.len > 0) args[0] else .undefined);
+    const pk = try it.toPropertyKey(if (args.len > 0) args[0] else .undefined);
+    if (pk.isAbrupt()) return pk.completion;
+    if (pk.symbol) |sym| {
+        if (this_val == .undefined or this_val == .null) return it.throwError("TypeError", "Cannot convert undefined or null to object");
+        if (this_val == .object) {
+            for (this_val.object.symbol_props.items) |sp| if (sp.key == sym) return .{ .normal = .{ .boolean = sp.pv.enumerable } };
+        }
+        return .{ .normal = .{ .boolean = false } };
+    }
+    const key = pk.key;
     const enumerable: bool = switch (this_val) {
         .object => |o| blk: {
             if (o.kind == .array) {

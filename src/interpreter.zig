@@ -5510,7 +5510,16 @@ pub const Interpreter = struct {
                 if (oc.isAbrupt()) return oc;
                 const kc = try self.evalExpr(ix.key, env);
                 if (kc.isAbrupt()) return kc;
-                return self.deleteProperty(oc.normal, try self.toString(kc.normal));
+                // §13.5.1.2 / §10.1.10: ToPropertyKey first — a Symbol key deletes from the symbol-keyed
+                // own store (`toString` would stringify it and silently no-op, leaving the prop in place).
+                const pk = try self.toPropertyKey(kc.normal);
+                if (pk.isAbrupt()) return pk.completion;
+                if (pk.symbol) |sym| {
+                    if (oc.normal == .object) return .{ .normal = .{ .boolean = oc.normal.object.deleteSymbol(sym) } };
+                    if (oc.normal == .undefined or oc.normal == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
+                    return .{ .normal = .{ .boolean = true } };
+                }
+                return self.deleteProperty(oc.normal, pk.key);
             },
             // §13.5.1.2 step 3 / §9.1.1.4.18 DeleteBinding: `delete` of an unqualified
             // IdentifierReference. A binding created by a sloppy assignment to an unresolved name
