@@ -77,6 +77,14 @@ pub const Interpreter = struct {
     /// The current `this` binding (§9.4.5 GetThisEnvironment, M1 subset): set by method calls,
     /// undefined otherwise. Saved/restored around each [[Call]].
     this_val: Value = .undefined,
+    /// §13.3.7 / §9.3.3 [[ThisBindingStatus]]: a per-`this`-binding "initialized" cell, or null when the
+    /// active binding is always-initialized (ordinary functions, base constructors, global/eval). A
+    /// DERIVED class constructor allocates a cell starting `false` (TDZ) that `super(...)` flips to true;
+    /// reading `this` (or a derived ctor returning undefined) while false is a ReferenceError, and a
+    /// second `super()` while true is too. An ARROW captures the enclosing cell LEXICALLY (so a `super()`
+    /// in an IIFE arrow targets the constructor's binding even when invoked from an unrelated method —
+    /// e.g. via an iterator's `return()` during a `for-of` abrupt completion), not the dynamic caller's.
+    this_init_cell: ?*bool = null,
     /// §9.2.5 / §13.3.5 the active function's [[HomeObject]] — set when a class/object method is
     /// invoked (to its `home_object`), null otherwise. `super.x` resolves against
     /// `home_object.[[Prototype]]`; `super(...)` invokes `home_object`'s constructor's superclass.
@@ -1175,7 +1183,12 @@ pub const Interpreter = struct {
                 }
                 return .{ .normal = .{ .string = buf.items } };
             },
-            .this => return .{ .normal = self.this_val },
+            .this => {
+                // §13.3.7 / §9.3.3 GetThisBinding: reading `this` before `super(...)` in a derived
+                // constructor (the TDZ) is a ReferenceError.
+                if (self.this_init_cell) |c| if (!c.*) return self.throwError("ReferenceError", "Must call super constructor in derived class before accessing 'this'");
+                return .{ .normal = self.this_val };
+            },
             // §13.3.12.1 NewTarget — the active function's [[NewTarget]] (the constructor when invoked
             // via `new`/`super(...)`, else `undefined`). Arrows inherit it lexically (saved/restored
             // like `this_val`, never reset on an arrow [[Call]]).
@@ -1289,6 +1302,9 @@ pub const Interpreter = struct {
         // (`super_ctor`) and this class's own instance fields, initialized AFTER the parent returns.
         const cur_fd = self.currentCtorData() orelse
             return self.throwError("SyntaxError", "'super' keyword unexpected here");
+        // §13.3.7.1 step 1: `this` must be uninitialized — a second `super(...)` in the same derived
+        // constructor (BindThisValue on an already-bound `this`) is a ReferenceError.
+        if (self.this_init_cell) |c| if (c.*) return self.throwError("ReferenceError", "Super constructor may only be called once");
         var args: std.ArrayListUnmanaged(Value) = .empty;
         const alc = try self.evalSpreadList(arg_nodes, env, &args);
         if (alc.isAbrupt()) return alc;
@@ -1300,6 +1316,9 @@ pub const Interpreter = struct {
             const pc = try self.runParentCtor(sup, args.items, instance);
             if (pc.isAbrupt()) return pc;
         }
+        // §13.3.7.1: `this` is now bound (BindThisValue) — leave the TDZ before field initializers run
+        // (a field initializer may reference `this`).
+        if (self.this_init_cell) |c| c.* = true;
         const fc = try self.initInstanceFields(cur_fd, instance);
         if (fc.isAbrupt()) return fc;
         return .{ .normal = self.this_val };
@@ -1575,7 +1594,7 @@ pub const Interpreter = struct {
         // `super(...args)` then initializes its own fields. Synthesize that here (the body is empty).
         if (is_derived) {
             const fd = ctor.call.?;
-            if (fd.body.len == 0) {
+            if (fd.is_default_ctor) {
                 if (fd.super_ctor) |sup| {
                     // §13.3.12: a synthesized default derived constructor forwards the original `new`
                     // target down the implicit `super(...)`. Set the active `new_target` to this ctor so
@@ -1982,6 +2001,7 @@ pub const Interpreter = struct {
             .closure = class_env,
             .is_class_ctor = true,
             .is_derived_ctor = is_derived,
+            .is_default_ctor = ctor_fn == null, // no explicit `constructor` → synthesized default
             .super_ctor = super_ctor,
             .strict = true, // §15.7: a class body (and thus its constructor) is always strict
         });
@@ -2294,6 +2314,8 @@ pub const Interpreter = struct {
             .is_async = f.is_async,
             .is_method = f.is_method,
             .captured_this = if (f.is_arrow) self.this_val else .undefined,
+            .captured_this_init_cell = if (f.is_arrow) self.this_init_cell else null, // §13.3.7 lexical TDZ
+            .captured_home_object = if (f.is_arrow) self.home_object else null, // §13.3.5 lexical [[HomeObject]]
             .strict = f.strict,
         });
         obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
@@ -2493,11 +2515,30 @@ pub const Interpreter = struct {
             break :blk this_val;
         };
         defer self.this_val = saved_this;
+        // §13.3.7 [[ThisBindingStatus]]: select the active `this`-binding init cell. An ARROW restores
+        // the cell it captured at creation (its lexical constructor's TDZ state); a DERIVED constructor
+        // allocates a fresh cell starting `false` (TDZ until `super()`); every other function has an
+        // always-initialized `this` (null cell). Saved/restored so nesting (and an arrow invoked from an
+        // unrelated method mid-construction) resolves `this`/`super()` against the correct binding.
+        const saved_init_cell = self.this_init_cell;
+        if (fd.is_arrow) {
+            self.this_init_cell = fd.captured_this_init_cell;
+        } else if (fd.is_derived_ctor) {
+            const cell = try self.arena.create(bool);
+            cell.* = false;
+            self.this_init_cell = cell;
+        } else {
+            self.this_init_cell = null;
+        }
+        defer self.this_init_cell = saved_init_cell;
         // §9.2.5/§13.3.5: a method invocation installs its [[HomeObject]] for `super` resolution.
         // An arrow has no own home object — it lexically keeps the enclosing one (like `this`), so
         // it is left untouched; an ordinary function's home_object is null, masking outer `super`.
         const saved_home = self.home_object;
-        if (!fd.is_arrow) self.home_object = fd.home_object;
+        // §13.3.5: an arrow uses the [[HomeObject]] it captured LEXICALLY (so `super` resolves against
+        // its defining method/constructor regardless of how the arrow is invoked); an ordinary function
+        // installs its own (null for a non-method, masking outer `super`).
+        self.home_object = if (fd.is_arrow) fd.captured_home_object else fd.home_object;
         defer self.home_object = saved_home;
         // §13.3.12: install [[NewTarget]] for this body. An ordinary [[Call]] gets `undefined`; a
         // [[Construct]] (`construct` set `pending_new_target` to the constructor right before this call)
@@ -2595,12 +2636,24 @@ pub const Interpreter = struct {
             const c = try self.evalStmt(stmt, call_env);
             switch (c) {
                 .normal => {},
-                .ret => |v| return .{ .normal = v },
+                .ret => |v| return self.finishCtorReturn(fd, v),
                 .throw => return c,
                 .brk, .cont => {}, // not produced inside a function body (loops/labels consume them)
             }
         }
-        return .{ .normal = .undefined }; // implicit return
+        return self.finishCtorReturn(fd, .undefined); // implicit return
+    }
+
+    /// §10.2.1.3 EvaluateBody (constructor return): a DERIVED constructor that returns `undefined`
+    /// (an explicit `return;` or an implicit fall-off) without having called `super(...)` leaves `this`
+    /// uninitialized → ReferenceError (GetThisBinding). An object return, or any return after super(),
+    /// is unchanged. (Non-derived functions return their value untouched.)
+    fn finishCtorReturn(self: *Interpreter, fd: object_mod.FunctionData, value: Value) EvalError!Completion {
+        if (fd.is_derived_ctor and value == .undefined) {
+            if (self.this_init_cell) |c| if (!c.*)
+                return self.throwError("ReferenceError", "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
+        }
+        return .{ .normal = value };
     }
 
     /// Concatenate two argument slices into a freshly-allocated slice (`a ++ b`). Used by the bound

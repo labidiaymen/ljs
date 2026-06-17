@@ -481,6 +481,13 @@ pub const FunctionData = struct {
     closure: *Environment,
     is_arrow: bool = false,
     captured_this: Value = .undefined, // §15.3: the enclosing `this` (arrows only)
+    /// §13.3.7 an arrow lexically captures the enclosing [[ThisBindingStatus]] cell (arrows only; null
+    /// otherwise), so `this`/`super()` inside it observes the enclosing constructor's TDZ state.
+    captured_this_init_cell: ?*bool = null,
+    /// §13.3.5 / §9.2.5 an arrow lexically captures the enclosing [[HomeObject]] (arrows only), so
+    /// `super.x` / `super(...)` inside it resolve against the defining method/constructor even when the
+    /// arrow is invoked from an unrelated dynamic context. Null for ordinary functions.
+    captured_home_object: ?*Object = null,
     /// §15.7.14: a class constructor carries its instance FieldDefinitions; [[Construct]]
     /// (`evalNew`) runs each initializer on the new instance (with `this` = instance) before the
     /// constructor body. Empty for ordinary functions and for non-constructor class methods.
@@ -518,6 +525,11 @@ pub const FunctionData = struct {
     /// is only legal here; `super_ctor` is the superclass constructor object to invoke. Default
     /// derived constructor (no explicit `constructor`) forwards its args to `super(...)`.
     is_derived_ctor: bool = false,
+    /// §15.7.14: a SYNTHESIZED default constructor (the class has no explicit `constructor`). A default
+    /// derived constructor performs an implicit `super(...args)`; an EXPLICIT empty `constructor(){}`
+    /// does NOT (so it leaves `this` uninitialized → ReferenceError). Distinguishes the two (both have
+    /// an empty body) for the implicit-super path in `constructNT`.
+    is_default_ctor: bool = false,
     super_ctor: ?*Object = null,
     /// §11.2.2 strict-mode flag of this function's body (from `ast.Function.strict`): inherited strict,
     /// an own `"use strict"` prologue, or a class member (always strict). The interpreter restores its
