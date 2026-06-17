@@ -5765,6 +5765,41 @@ pub const Interpreter = struct {
     /// writes of surrounding bindings work; `let`/`const`/`class` are eval-local) or the GLOBAL env for
     /// INDIRECT eval. `this_val`/`home_object` are left at the interpreter's current values (inherited
     /// for direct; the caller resets them for indirect). Non-string `source` is handled by the caller.
+    /// §20.2.1.1 / §20.2.1.1.1 CreateDynamicFunction — `Function(p1, …, pN, body)`: the last argument is
+    /// the function body, the rest are parameter texts (joined with `,`). Builds the source
+    /// `(function anonymous(<params>\n) {\n<body>\n})` and evaluates it in the GLOBAL scope (the dynamic
+    /// function closes over global bindings, not the caller's), returning the resulting function. A
+    /// malformed parameter/body → a catchable SyntaxError (via performEval). The `\n` after the params
+    /// and around the body match the spec text (prevent `//`-comment / `)` injection from hiding the
+    /// closing delimiters). The function's name is `anonymous`; its strictness comes from its own body.
+    fn functionConstructor(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const genv = self.globals orelse return self.throwError("EvalError", "Function: no realm");
+        var params: std.ArrayListUnmanaged(u8) = .empty;
+        var body: []const u8 = "";
+        if (args.len > 0) {
+            for (args[0 .. args.len - 1], 0..) |p, i| {
+                const sc = try self.toStringValuePub(p);
+                if (sc.isAbrupt()) return sc;
+                if (i > 0) try params.appendSlice(self.arena, ",");
+                try params.appendSlice(self.arena, sc.normal.string);
+            }
+            const bc = try self.toStringValuePub(args[args.len - 1]);
+            if (bc.isAbrupt()) return bc;
+            body = bc.normal.string;
+        }
+        const source = try std.fmt.allocPrint(self.arena, "(function anonymous({s}\n) {{\n{s}\n}})", .{ params.items, body });
+        // Evaluate in the global context with the global `this` (the dynamic function is created there).
+        const saved_this = self.this_val;
+        const saved_home = self.home_object;
+        defer {
+            self.this_val = saved_this;
+            self.home_object = saved_home;
+        }
+        self.this_val = if (genv.lookup("%GlobalThis%")) |b| b.value else .undefined;
+        self.home_object = null;
+        return self.performEval(source, genv, false);
+    }
+
     fn performEval(self: *Interpreter, source: []const u8, target_env: *Environment, inherit_strict: bool) EvalError!Completion {
         // §19.2.1.1: the eval code is strict iff it carries its own `"use strict"` prologue OR (DIRECT
         // eval only) the calling context is strict (`inherit_strict`). Parsing with the inherited flag
@@ -7574,7 +7609,7 @@ pub const Interpreter = struct {
                 .undefined, .null => self.throwError("TypeError", "Object.prototype.valueOf called on null or undefined"),
                 else => .{ .normal = this_val },
             },
-            .function_ctor => return self.throwError("TypeError", "Function constructor is not supported"),
+            .function_ctor => return self.functionConstructor(args),
             .function_proto_noop => return .{ .normal = .undefined }, // §20.2.3 %Function.prototype%() → undefined
             .object_define_property => return self.objectDefineProperty(args),
             .object_define_properties => return self.objectDefineProperties(args),
