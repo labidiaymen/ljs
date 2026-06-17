@@ -366,8 +366,19 @@ pub const Interpreter = struct {
                 var result = try self.runScope(s.block, try Environment.create(self.arena, env));
                 if (result == .throw and s.catch_block != null) {
                     const catch_env = try Environment.create(self.arena, env);
-                    if (s.catch_param) |p| try catch_env.declare(p, result.throw, true, true);
-                    result = try self.runScope(s.catch_block.?, catch_env);
+                    // §14.15.2 CatchClauseEvaluation: BindingInitialization of the CatchParameter
+                    // (BindingIdentifier or destructuring BindingPattern) with the thrown value. A throw
+                    // raised by the binding (e.g. a non-iterable for `catch([a])`) replaces the original
+                    // and skips the Catch Block — but `finally` below still runs.
+                    var bound = true;
+                    if (s.catch_param) |pat| {
+                        const bc = try self.bindPattern(pat, result.throw, catch_env, true);
+                        if (bc.isAbrupt()) {
+                            result = bc;
+                            bound = false;
+                        }
+                    }
+                    if (bound) result = try self.runScope(s.catch_block.?, catch_env);
                 }
                 if (s.finally_block) |fb| {
                     const fc = try self.runScope(fb, try Environment.create(self.arena, env));

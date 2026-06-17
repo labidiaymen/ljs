@@ -325,7 +325,7 @@ pub const Stmt = union(enum) {
     throw_stmt: *const Node, // §14.14
     try_stmt: struct { // §14.15
         block: []const Stmt,
-        catch_param: ?[]const u8,
+        catch_param: ?*const Pattern, // §14.15 CatchParameter — BindingIdentifier or BindingPattern
         catch_block: ?[]const Stmt,
         finally_block: ?[]const Stmt,
     },

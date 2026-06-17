@@ -693,20 +693,24 @@ pub const Parser = struct {
     fn parseTry(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // try
         const block = try self.parseBlock();
-        var catch_param: ?[]const u8 = null;
+        var catch_param: ?*const ast.Pattern = null;
         var catch_block: ?[]const ast.Stmt = null;
         var finally_block: ?[]const ast.Stmt = null;
         if (self.peek().kind == .kw_catch) {
             _ = self.advance();
             if (self.peek().kind == .lparen) {
                 _ = self.advance();
-                const cp = try self.expect(.identifier);
-                // §12.7.1: an escaped ReservedWord is not a valid catch-parameter BindingIdentifier.
-                if (isEscapedReservedIdent(cp)) return ParseError.UnexpectedToken;
-                // §13.1.1 Early Error: in strict, a catch parameter (a BindingIdentifier) may not be
-                // `eval`/`arguments` or a future-reserved word.
-                if (self.strict and isStrictReservedBindingName(cp.lexeme)) return ParseError.UnexpectedToken;
-                catch_param = cp.lexeme;
+                // §14.15 CatchParameter : BindingIdentifier | BindingPattern. `parsePattern` enforces the
+                // §12.7.1 escaped-reserved and await/yield-context BindingIdentifier rules for either form.
+                const pat = try self.parsePattern();
+                // §13.1.1 Early Error: a simple-identifier catch parameter may not be `eval`/`arguments`
+                // or a future-reserved word in strict mode.
+                if (pat.* == .identifier and self.strict and isStrictReservedBindingName(pat.identifier)) return ParseError.UnexpectedToken;
+                // §14.15.1 Early Error: BoundNames of CatchParameter must not contain duplicates
+                // (`catch ([x, x])` / `catch ({ a: x, b: x })`).
+                var cp_names: NameSet = .init();
+                if (cp_names.addPatternDup(pat)) return ParseError.UnexpectedToken;
+                catch_param = pat;
                 _ = try self.expect(.rparen);
             }
             catch_block = try self.parseBlock();
@@ -1696,8 +1700,14 @@ pub const Parser = struct {
     fn finishArrowAsync(self: *Parser, pl: ParamList, is_async: bool) ParseError!*const ast.Node {
         const enclosing_strict = self.strict;
         const saved_in_async = self.in_async;
+        const saved_in_static = self.in_static_block;
         defer self.strict = enclosing_strict; // §11.2.2: never un-strict on the way out
         defer self.in_async = saved_in_async;
+        defer self.in_static_block = saved_in_static;
+        // §15.7.11: the static-block `Contains await` Early Error does not recurse into an
+        // ArrowFunction body, so `await` is an ordinary identifier there (`static { () => { let
+        // await; }; }`) — un-reserve it for the body (the params were already parsed by the caller).
+        self.in_static_block = false;
         // §15.3.1 Early Error: `ArrowParameters [no LineTerminator here] =>` — a line terminator
         // between the parameters and `=>` is a SyntaxError (ASI must not insert a semicolon here).
         if (self.peek().newline_before) return ParseError.UnexpectedToken;
@@ -3679,21 +3689,54 @@ fn collectScopeLexicalNames(stmts: []const ast.Stmt, kind: ScopeKind, strict: bo
     return false;
 }
 
-/// Validate one scope's StatementList (rules 1 + 2). `catch_param`, when set, is the simple-identifier
-/// CatchParameter binding the Block is the body of: §14.15.1 makes it a Syntax Error if the parameter
-/// also occurs in the Block's LexicallyDeclaredNames (`catch(e){ let e }` / `catch(e){ function e(){} }`).
-/// It does NOT participate in the §14.2.1 LexicallyDeclaredNames∩VarDeclaredNames check — Annex B B.3.4
-/// permits a simple-identifier catch param to be re-declared as a `var` in the Block (`catch(e){var e}`).
-fn checkScopeNames(stmts: []const ast.Stmt, kind: ScopeKind, strict: bool, catch_param: ?[]const u8) ParseError!void {
+/// Is any BoundName of a CatchParameter pattern present in `set`? (No-alloc recursion over the
+/// identifier / array / object pattern forms — used for the §14.15.1 catch-parameter Early Errors.)
+fn catchBoundNameInSet(pattern: *const ast.Pattern, set: *const NameSet) bool {
+    switch (pattern.*) {
+        .identifier => |n| return set.has(n),
+        .array => |ap| {
+            for (ap.elements) |el| if (el.target) |t| {
+                if (catchBoundNameInSet(t, set)) return true;
+            };
+            if (ap.rest) |r| return catchBoundNameInSet(r, set);
+            return false;
+        },
+        .object => |op| {
+            for (op.properties) |p| if (catchBoundNameInSet(p.target, set)) return true;
+            if (op.rest) |r| return set.has(r);
+            return false;
+        },
+    }
+}
+
+/// Validate one scope's StatementList (rules 1 + 2). `catch_param`, when set, is the CatchParameter the
+/// Block is the body of: §14.15.1 makes it a Syntax Error if any of its BoundNames also occurs in the
+/// Block's LexicallyDeclaredNames (`catch(e){ let e }` / `catch([e]){ let e }`). A SIMPLE-identifier
+/// catch param does NOT participate in the §14.2.1 LexicallyDeclaredNames∩VarDeclaredNames check —
+/// Annex B B.3.4 permits `catch(e){var e}` — but a destructuring CatchParameter (a BindingPattern) has
+/// no such exception, so its BoundNames may not collide with the Block's VarDeclaredNames either.
+fn checkScopeNames(stmts: []const ast.Stmt, kind: ScopeKind, strict: bool, catch_param: ?*const ast.Pattern) ParseError!void {
     var lex_set: NameSet = .init();
     if (collectScopeLexicalNames(stmts, kind, strict, &lex_set)) return ParseError.UnexpectedToken;
-    // §14.15.1: the CatchParameter may not also be a LexicallyDeclaredName of the Catch Block.
-    if (catch_param) |cp| if (lex_set.has(cp)) return ParseError.UnexpectedToken;
-    if (lex_set.len == 0) return;
+    // §14.15.1: a CatchParameter BoundName may not also be a LexicallyDeclaredName of the Catch Block.
+    if (catch_param) |cp| if (catchBoundNameInSet(cp, &lex_set)) return ParseError.UnexpectedToken;
+    if (lex_set.len == 0) {
+        // §14.15.1 (non-Annex-B): a destructuring CatchParameter's BoundNames also exclude VarDeclaredNames.
+        if (catch_param) |cp| if (cp.* != .identifier) {
+            var var_set: NameSet = .init();
+            collectScopeVarNames(stmts, kind, &var_set);
+            if (catchBoundNameInSet(cp, &var_set)) return ParseError.UnexpectedToken;
+        };
+        return;
+    }
     // §14.2.1 rule 2: LexicallyDeclaredNames ∩ VarDeclaredNames = ∅.
     var var_set: NameSet = .init();
     collectScopeVarNames(stmts, kind, &var_set);
     for (lex_set.buf[0..lex_set.len]) |nm| if (var_set.has(nm)) return ParseError.UnexpectedToken;
+    // §14.15.1 (non-Annex-B): a destructuring CatchParameter's BoundNames also exclude VarDeclaredNames.
+    if (catch_param) |cp| if (cp.* != .identifier) {
+        if (catchBoundNameInSet(cp, &var_set)) return ParseError.UnexpectedToken;
+    };
 }
 
 /// VarDeclaredNames of a whole scope: every statement's bubbled-up `var` names (functions never
@@ -3718,7 +3761,7 @@ fn collectScopeVarNames(stmts: []const ast.Stmt, kind: ScopeKind, set: *NameSet)
 /// (blocks, function/method/arrow bodies, switch CaseBlocks, catch). `strict` is the strictness in
 /// effect for `stmts`; it tightens going into a function body carrying its own `"use strict"`.
 fn validateScope(stmts: []const ast.Stmt, kind: ScopeKind, strict: bool) ParseError!void {
-    try checkScopeNames(stmts, kind, strict, @as(?[]const u8, null));
+    try checkScopeNames(stmts, kind, strict, @as(?*const ast.Pattern, null));
     for (stmts) |stmt| try descendStmt(stmt, strict);
 }
 
@@ -3810,7 +3853,7 @@ fn descendStmt(stmt: ast.Stmt, strict: bool) ParseError!void {
                     overflow = true;
                 };
             };
-            if (!overflow) try checkScopeNames(merged.items, .block, strict, @as(?[]const u8, null));
+            if (!overflow) try checkScopeNames(merged.items, .block, strict, @as(?*const ast.Pattern, null));
             // Descend into each clause's nested scopes regardless.
             for (s.cases) |cs| {
                 if (cs.test_expr) |t| try descendNode(t, strict);
