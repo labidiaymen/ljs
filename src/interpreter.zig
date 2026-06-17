@@ -2275,13 +2275,20 @@ pub const Interpreter = struct {
     }
 
     fn evalFunctionExpr(self: *Interpreter, f: *const ast.Function, env: *Environment) EvalError!Completion {
+        // §15.2.5 InstantiateOrdinaryFunctionExpression: a NAMED FunctionExpression `function g(){…}`
+        // binds its own name `g` in an inner DeclarativeEnvironment that is the function's [[Environment]]
+        // — so the body (and parameter defaults) can self-reference / recurse via `g`, while `g` is NOT
+        // visible in the enclosing scope. The binding is immutable. Arrows have no name; a method's name
+        // is not a self-binding either — both use the outer `env` directly.
+        const has_self_name = f.name != null and !f.is_arrow and !f.is_method;
+        const closure_env = if (has_self_name) try Environment.create(self.arena, env) else env;
         // §15.3: an arrow captures the enclosing `this` at creation time (lexical `this`); an
         // ordinary function gets `this` bound per-call instead.
         const obj = try Object.createFunction(self.arena, .{
             .params = f.params,
             .rest = f.rest,
             .body = f.body,
-            .closure = env,
+            .closure = closure_env,
             .is_arrow = f.is_arrow,
             .is_generator = f.is_generator,
             .is_async = f.is_async,
@@ -2295,6 +2302,8 @@ pub const Interpreter = struct {
         try setFunctionLength(obj, paramCount(f.params));
         try self.setFunctionName(obj, f.name orelse "", "");
         try setConstructorBackref(obj); // §10.2.4 MakeConstructor: F.prototype.constructor === F (no-op for arrows)
+        // §15.2.5 step 4: initialize the immutable self-name binding to the created function object.
+        if (has_self_name) try closure_env.declare(f.name.?, .{ .object = obj }, false, true);
         return .{ .normal = .{ .object = obj } };
     }
 
