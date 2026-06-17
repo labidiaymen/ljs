@@ -157,6 +157,8 @@ clause + test delta. Each line = one commit, all gates green (build/test/lint/co
 - [x] **M71** `var` hoisting to the VariableEnvironment (§10.2.11/§16.1.7/§14.3.2.1) — 89.0%→89.3%
   (+157). First milestone under FULL SDD: see `specs/059-var-hoisting/`. (From here, each milestone
   gets its own `specs/NNN-<slug>/` spec folder; this ledger remains a compact index.)
+- [x] **M72** SuperProperty as assignment/update target (§13.3.5/§6.2.5.6/§10.1.9.2) — 89.3%→89.4%
+  (+12). `specs/060-super-property-write/`.
 - [ ] Async/Promise/microtask family (~325 tests; also the Node bridge)
-- [ ] Class runtime-semantics long-tail (private methods/#x-in, static blocks, super-property, field-init order)
-- [ ] **Target: language 93%**
+- [ ] Class runtime-semantics long-tail (private methods/#x-in, static blocks, field-init order)
+- [ ] **Target: language 93%** (currently 89.4%, need ~+1590)
