@@ -6059,22 +6059,31 @@ pub const Interpreter = struct {
     fn objectDefineProperty(self: *Interpreter, args: []const Value) EvalError!Completion {
         const o = if (args.len > 0) args[0] else .undefined;
         if (o != .object) return self.throwError("TypeError", "Object.defineProperty called on non-object");
-        const key = try self.toString(if (args.len > 1) args[1] else .undefined);
+        // §20.1.2.4 step 2: ToPropertyKey(P) BEFORE step 3 ToPropertyDescriptor(Attributes).
+        const pk = try self.toPropertyKey(if (args.len > 1) args[1] else .undefined);
+        if (pk.isAbrupt()) return pk.completion;
+        const sym_key: ?*Symbol = pk.symbol;
+        const str_key: []const u8 = pk.key;
         const r = try self.toPropertyDescriptor(if (args.len > 2) args[2] else .undefined);
         switch (r) {
             .abrupt => |c| return c,
             .desc => |d| {
+                if (sym_key) |sym| {
+                    const ok = try o.object.defineSymbolProperty(sym, d);
+                    if (!ok) return self.throwError("TypeError", "Cannot redefine property");
+                    return .{ .normal = o };
+                }
                 // §10.4.2.1 Array exotic [[DefineOwnProperty]] — `length` is synthetic (the real value
                 // lives in `array_length`, with a separate `[[Writable]]`), so it needs the ArraySetLength
                 // path. Integer indices fall through to the ordinary define (the M-subset stores
                 // non-default-attribute indices in the property map; a plain value define is shadowed by
                 // the dense slot a later [[Set]] writes — see specs/043).
-                if (o.object.kind == .array and std.mem.eql(u8, key, "length")) {
+                if (o.object.kind == .array and std.mem.eql(u8, str_key, "length")) {
                     const adc = try self.arrayDefineLength(o.object, d);
                     if (adc.isAbrupt()) return adc;
                     return .{ .normal = o };
                 }
-                const ok = try o.object.defineProperty(key, d);
+                const ok = try o.object.defineProperty(str_key, d);
                 if (!ok) return self.throwError("TypeError", "Cannot redefine property");
                 return .{ .normal = o };
             },
@@ -6131,6 +6140,20 @@ pub const Interpreter = struct {
                 },
             }
         }
+        // §20.1.2.5: OwnPropertyKeys includes SYMBOL keys — define each enumerable symbol-keyed one too.
+        for (props.object.symbol_props.items) |sp| {
+            if (!sp.pv.enumerable) continue;
+            const ac = try self.getSymbolProperty(props, sp.key);
+            if (ac.isAbrupt()) return ac;
+            const r = try self.toPropertyDescriptor(ac.normal);
+            switch (r) {
+                .abrupt => |c| return c,
+                .desc => |d| {
+                    const ok = try o.object.defineSymbolProperty(sp.key, d);
+                    if (!ok) return self.throwError("TypeError", "Cannot redefine property");
+                },
+            }
+        }
         return .{ .normal = o };
     }
 
@@ -6143,7 +6166,16 @@ pub const Interpreter = struct {
             if (o == .undefined or o == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
             return .{ .normal = .undefined };
         }
-        const key = try self.toString(if (args.len > 1) args[1] else .undefined);
+        // §20.1.2.8 step 2: ToPropertyKey(P) — a Symbol key reads the symbol-keyed store.
+        const pk = try self.toPropertyKey(if (args.len > 1) args[1] else .undefined);
+        if (pk.isAbrupt()) return pk.completion;
+        if (pk.symbol) |sym| {
+            for (o.object.symbol_props.items) |sp| {
+                if (sp.key == sym) return self.fromPropertyValue(sp.pv);
+            }
+            return .{ .normal = .undefined };
+        }
+        const key = pk.key;
         // Array exotic: indices + `length` have synthetic descriptors (not in the property map).
         if (o.object.kind == .array) {
             if (std.mem.eql(u8, key, "length"))

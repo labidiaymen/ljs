@@ -1239,23 +1239,25 @@ pub const Object = struct {
     /// keeps unstated fields. Returns false (the caller throws a TypeError) on an incompatible
     /// redefinition of a non-configurable property (basic guard — the full §10.1.6.3 invariant matrix
     /// is M-subset-deferred). Data↔accessor and value/flag changes are allowed when configurable.
-    pub fn defineProperty(self: *Object, key: []const u8, d: Descriptor) std.mem.Allocator.Error!bool {
-        const existing = self.properties.getPtr(key);
+    /// §10.1.6.3 ValidateAndApplyPropertyDescriptor — merge `d` onto `existing` (null = a new property),
+    /// returning the resulting PropertyValue, or null if the (re)definition must be REJECTED. Shared by
+    /// the string-keyed (`defineProperty`) and Symbol-keyed (`defineSymbolProperty`) paths.
+    fn applyDescriptor(existing: ?PropertyValue, d: Descriptor, extensible: bool) ?PropertyValue {
         // §10.1.6.3 step 2.a: a property absent from a non-extensible object cannot be added.
-        if (existing == null and !self.extensible) return false;
+        if (existing == null and !extensible) return null;
         if (existing) |cur| {
             // §10.1.6.3 step 2–4: a non-configurable current property restricts the redefinition.
             if (!cur.configurable) {
-                if (d.configurable orelse false) return false; // can't make it configurable
-                if (d.enumerable) |e| if (e != cur.enumerable) return false;
+                if (d.configurable orelse false) return null; // can't make it configurable
+                if (d.enumerable) |e| if (e != cur.enumerable) return null;
                 const cur_is_accessor = cur.payload == .accessor;
-                if (d.isAccessor() and !cur_is_accessor) return false;
-                if (d.isData() and cur_is_accessor) return false;
+                if (d.isAccessor() and !cur_is_accessor) return null;
+                if (d.isData() and cur_is_accessor) return null;
                 if (!cur_is_accessor and !cur.writable) {
-                    if (d.writable orelse false) return false; // can't make it writable
+                    if (d.writable orelse false) return null; // can't make it writable
                     if (d.has_value) {
                         // a non-writable, non-configurable data prop: only an identical value is allowed
-                        if (!sameValueLoose(cur.payload.data, d.value.?)) return false;
+                        if (!sameValueLoose(cur.payload.data, d.value.?)) return null;
                     }
                 }
             }
@@ -1286,12 +1288,34 @@ pub const Object = struct {
                 payload = .{ .data = .undefined }; // accessor→data with no value: value defaults undefined
             }
         }
-        try self.properties.put(self.arena, key, .{
-            .payload = payload,
-            .writable = writable,
-            .enumerable = enumerable,
-            .configurable = configurable,
-        });
+        return .{ .payload = payload, .writable = writable, .enumerable = enumerable, .configurable = configurable };
+    }
+
+    pub fn defineProperty(self: *Object, key: []const u8, d: Descriptor) std.mem.Allocator.Error!bool {
+        const existing: ?PropertyValue = if (self.properties.getPtr(key)) |p| p.* else null;
+        const merged = applyDescriptor(existing, d, self.extensible) orelse return false;
+        try self.properties.put(self.arena, key, merged);
+        return true;
+    }
+
+    /// §10.1.6 [[DefineOwnProperty]] for a Symbol key — mirrors `defineProperty` over the `symbol_props`
+    /// store (keyed by Symbol identity). Used by `Object.defineProperty(o, sym, desc)` / `Reflect`.
+    pub fn defineSymbolProperty(self: *Object, key: *Symbol, d: Descriptor) std.mem.Allocator.Error!bool {
+        var existing: ?PropertyValue = null;
+        var idx: ?usize = null;
+        for (self.symbol_props.items, 0..) |*sp, i| {
+            if (sp.key == key) {
+                existing = sp.pv;
+                idx = i;
+                break;
+            }
+        }
+        const merged = applyDescriptor(existing, d, self.extensible) orelse return false;
+        if (idx) |i| {
+            self.symbol_props.items[i].pv = merged;
+        } else {
+            try self.symbol_props.append(self.arena, .{ .key = key, .pv = merged });
+        }
         return true;
     }
 
