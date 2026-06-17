@@ -33,6 +33,12 @@ pub const Parser = struct {
     /// class with an `extends` heritage). `super(...)` is a SyntaxError anywhere else — including a
     /// non-derived constructor and any non-constructor method. Saved/restored like `in_method`.
     in_derived_ctor: bool = false,
+    /// §13.3.12 NewTarget context: true while parsing inside any function body (ordinary function,
+    /// method / accessor / constructor, async, generator, and — by lexical inheritance — arrow bodies)
+    /// or a class static initialization block. The MetaProperty `new.target` is a §13.3.12.1 SyntaxError
+    /// outside such a context (e.g. at Script top level). Set true around every non-arrow function body
+    /// and static block; arrows deliberately leave it as-is so they inherit it lexically (like `this`).
+    in_function: bool = false,
     /// §15.7 PrivateName context: true while parsing anything lexically inside a ClassBody (any
     /// nesting). A PrivateIdentifier (`#x`) — as a member access `obj.#x` or the brand check
     /// `#x in obj` — is a SyntaxError outside a class body. Set true around a ClassBody and inherited
@@ -346,6 +352,18 @@ pub const Parser = struct {
     /// binds to the `new`, so `new a.b.C(x)` constructs `a.b.C`.
     fn parseNew(self: *Parser) ParseError!*const ast.Node {
         _ = self.advance(); // new
+        // §13.3.12 NewTarget MetaProperty `new` `.` `target`. The only MetaProperty in the grammar is
+        // `new.target`: after the `.`, the IdentifierName must be exactly `target` (no escapes), else a
+        // SyntaxError. A §13.3.12.1 Early Error makes `new.target` a SyntaxError outside a function body
+        // (e.g. at Script top level) — gated on `in_function`.
+        if (self.peek().kind == .dot) {
+            _ = self.advance(); // .
+            const m = self.peek();
+            if (m.kind != .identifier or m.had_escape or !std.mem.eql(u8, m.lexeme, "target")) return ParseError.UnexpectedToken;
+            _ = self.advance(); // target
+            if (!self.in_function) return ParseError.UnexpectedToken;
+            return self.alloc(.new_target);
+        }
         var callee = try self.parsePrimary();
         while (true) {
             switch (self.peek().kind) {
@@ -1015,14 +1033,17 @@ pub const Parser = struct {
         const saved_in_static = self.in_static_block;
         const saved_in_generator = self.in_generator;
         const saved_in_async = self.in_async;
+        const saved_in_function = self.in_function;
         defer self.in_method = saved_in_method;
         defer self.in_derived_ctor = saved_in_derived;
         defer self.in_static_block = saved_in_static;
         defer self.in_generator = saved_in_generator;
         defer self.in_async = saved_in_async;
+        defer self.in_function = saved_in_function;
         self.in_method = false;
         self.in_derived_ctor = false;
         self.in_static_block = false; // §15.7.11: a nested ordinary function un-reserves `await`
+        self.in_function = true; // §13.3.12: a function body is a NewTarget context (`new.target` legal)
         // §15.5: a leading `*` marks a generator. `yield` is the §14.4 operator only inside ITS body;
         // an ordinary nested function un-sets `in_generator` (yield does not cross into it).
         const is_generator = self.peek().kind == .star;
@@ -1372,11 +1393,14 @@ pub const Parser = struct {
             // but it is NOT a constructor (so `super(...)` is a SyntaxError here). Save/restore.
             const saved_in_method = self.in_method;
             const saved_in_derived = self.in_derived_ctor;
+            const saved_in_function = self.in_function;
             self.in_method = true;
             self.in_derived_ctor = false;
+            self.in_function = true; // §13.3.12: `new.target` in a field initializer yields `undefined`
             field_init = try self.parseAssignment();
             self.in_method = saved_in_method;
             self.in_derived_ctor = saved_in_derived;
+            self.in_function = saved_in_function;
             // §15.7.1 Early Error: a FieldDefinition Initializer may not contain `arguments`
             // (ContainsArguments) — `x = arguments` / `[k] = f(arguments)` are SyntaxErrors.
             if (containsArguments(field_init.?)) return ParseError.UnexpectedToken;
@@ -1408,13 +1432,16 @@ pub const Parser = struct {
         const saved_in_static = self.in_static_block;
         const saved_in_async = self.in_async;
         const saved_in_generator = self.in_generator;
+        const saved_in_function = self.in_function;
         defer self.in_method = saved_in_method;
         defer self.in_derived_ctor = saved_in_derived;
         defer self.in_static_block = saved_in_static;
         defer self.in_async = saved_in_async;
         defer self.in_generator = saved_in_generator;
+        defer self.in_function = saved_in_function;
         self.in_method = true;
         self.in_derived_ctor = false;
+        self.in_function = true; // §13.3.12: `new.target` is legal in a static block (yields `undefined`)
         // §15.7.11: a ClassStaticBlock is NOT an async/generator context — `await`/`yield` are not
         // operators here. `await` is RESERVED (a binding/reference is a SyntaxError, via `in_static_block`)
         // and `ContainsAwait` of the block is a Syntax Error, so an `await`-led form must not parse as
@@ -2219,6 +2246,9 @@ pub const Parser = struct {
             // (parenthesized) YieldExpression / AwaitExpression is not (`++(yield)` in a generator,
             // `++(await x)` in an async function are SyntaxErrors).
             if (target.* == .yield_expr or target.* == .await_expr) return ParseError.UnexpectedToken;
+            // §13.3.12.1 / §13.4.1.1: NewTarget has AssignmentTargetType `invalid` — `++new.target`
+            // (and the covered `++(new.target)`, parens already collapsed) is a SyntaxError.
+            if (target.* == .new_target) return ParseError.UnexpectedToken;
             // §13.4.1.1 Early Error: in strict, the operand of a prefix update may not be the
             // reference `eval`/`arguments`.
             if (self.strict) switch (target.*) {
@@ -2387,6 +2417,9 @@ pub const Parser = struct {
             // simple assignment target — `(yield)++` in a generator, `(await x)++` in an async
             // function are SyntaxErrors.
             if (expr.* == .yield_expr or expr.* == .await_expr) return ParseError.UnexpectedToken;
+            // §13.3.12.1 / §13.4.1.1: NewTarget has AssignmentTargetType `invalid` — `new.target++`
+            // (and the covered `(new.target)++`) is a SyntaxError.
+            if (expr.* == .new_target) return ParseError.UnexpectedToken;
             const op: ast.UpdateOp = if (self.peek().kind == .plus_plus) .inc else .dec;
             _ = self.advance();
             expr = try self.alloc(.{ .update = .{ .op = op, .prefix = false, .target = expr } });
@@ -2403,6 +2436,20 @@ pub const Parser = struct {
     /// caller can record it on the `ast.Function` for runtime strict gating. (`self.strict` is restored
     /// to the enclosing value on the way out, so it can't be read back at the creation site.)
     fn parseMethodBody(self: *Parser, pl: ParamList, strict_out: ?*bool) ParseError![]const ast.Stmt {
+        // §13.3.5 SuperProperty: every MethodDefinition body (class OR object-literal method /
+        // accessor / generator / async method) has a [[HomeObject]], so `super.x` / `super[k]` is
+        // allowed. Class methods/accessors already set `in_method` at the call site (and the derived
+        // constructor sets `in_derived_ctor` for `super(...)`); object-literal methods do not, so set
+        // `in_method` here to cover them uniformly. `in_derived_ctor` is left untouched — it is set
+        // only by the derived-constructor caller, so `super(...)` stays a SyntaxError in object methods.
+        const saved_in_method = self.in_method;
+        defer self.in_method = saved_in_method;
+        self.in_method = true;
+        // §13.3.12: a method body is a NewTarget context (`new.target` is legal; it is `undefined`
+        // unless the method was invoked via `new`, which only happens for a class constructor).
+        const saved_in_function = self.in_function;
+        defer self.in_function = saved_in_function;
+        self.in_function = true;
         const enclosing_strict = self.strict;
         defer self.strict = enclosing_strict;
         const body_strict = enclosing_strict or
@@ -2466,6 +2513,12 @@ pub const Parser = struct {
                     const saved_in_async = self.in_async;
                     defer self.in_generator = saved_in_generator;
                     defer self.in_async = saved_in_async;
+                    // §13.3.5: an object-literal generator/async method has a [[HomeObject]], so `super.x`
+                    // is allowed in BOTH its params (a default `m(x = super.k)`) and body. Set `in_method`
+                    // before `parseParams` (the body re-asserts it via `parseMethodBody`).
+                    const saved_om_in_method = self.in_method;
+                    defer self.in_method = saved_om_in_method;
+                    self.in_method = true;
                     // §15.5/§15.8: the params parse `~Yield`/`~Await` (a `yield`/`await` operator there
                     // is a §15.5.1/§15.8.1 SyntaxError), the body `+Yield`/`+Await`.
                     self.in_generator = false;
@@ -2501,6 +2554,12 @@ pub const Parser = struct {
                 const is_get = std.mem.eql(u8, w.lexeme, "get");
                 _ = self.advance(); // get / set
                 const name = try self.parsePropertyName();
+                // §13.3.5: an object-literal accessor has a [[HomeObject]] — `super.x` is allowed in its
+                // params (a setter default `set x(v = super.k)`) and body. Set `in_method` before the
+                // params parse (the body re-asserts it in `parseMethodBody`).
+                const saved_acc_in_method = self.in_method;
+                defer self.in_method = saved_acc_in_method;
+                self.in_method = true;
                 const pl = try self.parseParams();
                 // §13.2.5.1 accessor arity Early Errors: a getter takes an empty parameter list
                 // (`get x()`); a setter takes exactly one PropertySetParameter (`set x(v)`). The
@@ -2541,6 +2600,11 @@ pub const Parser = struct {
                 const saved_in_generator = self.in_generator;
                 defer self.in_generator = saved_in_generator;
                 self.in_generator = false;
+                // §13.3.5: an object-literal method has a [[HomeObject]] — `super.x` is allowed in its
+                // params (a default `m(x = super.k)`) and body. Set `in_method` before the params parse.
+                const saved_m_in_method = self.in_method;
+                defer self.in_method = saved_m_in_method;
+                self.in_method = true;
                 const pl = try self.parseParams();
                 var body_strict: bool = false;
                 const body = try self.parseMethodBody(pl, &body_strict);
@@ -3271,7 +3335,7 @@ fn collectBoundNames(pattern: *const ast.Pattern, names: *std.ArrayList([]const 
 fn containsArguments(node: *const ast.Node) bool {
     switch (node.*) {
         .identifier => |n| return std.mem.eql(u8, n, "arguments"),
-        .number, .string, .boolean, .null, .this => return false,
+        .number, .string, .boolean, .null, .this, .new_target => return false,
         .unary => |u| return containsArguments(u.operand),
         .update => |u| return containsArguments(u.target),
         .comma => |c| return containsArguments(c.left) or containsArguments(c.right),

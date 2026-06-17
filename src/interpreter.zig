@@ -69,6 +69,16 @@ pub const Interpreter = struct {
     /// `home_object.[[Prototype]]`; `super(...)` invokes `home_object`'s constructor's superclass.
     /// Saved/restored around each [[Call]] alongside `this_val`.
     home_object: ?*Object = null,
+    /// §13.3.12 the active function's [[NewTarget]] — the constructor when the running function was
+    /// invoked via `new` / a `super(...)` chain (set in `construct`), else `undefined` (cleared for an
+    /// ordinary `[[Call]]`). The `new.target` MetaProperty reads it. Saved/restored around each
+    /// [[Call]] alongside `this_val` / `home_object`; arrows inherit it lexically (they don't reset it).
+    new_target: Value = .undefined,
+    /// The [[NewTarget]] to install for the NEXT non-arrow `callFunction` body. `construct` sets it to
+    /// the constructor right before invoking the body; `callFunction` consumes it into `new_target` and
+    /// resets it to `undefined` so an ordinary call (and nested ordinary calls within the body) sees
+    /// `undefined`. A one-shot hand-off that avoids threading a parameter through 39 call sites.
+    pending_new_target: Value = .undefined,
     /// The realm's global environment — used to resolve the Error family for engine-thrown
     /// errors (so they carry the right prototype + name). Set by the engine after setup.
     globals: ?*Environment = null,
@@ -1096,6 +1106,10 @@ pub const Interpreter = struct {
                 return .{ .normal = .{ .string = buf.items } };
             },
             .this => return .{ .normal = self.this_val },
+            // §13.3.12.1 NewTarget — the active function's [[NewTarget]] (the constructor when invoked
+            // via `new`/`super(...)`, else `undefined`). Arrows inherit it lexically (saved/restored
+            // like `this_val`, never reset on an arrow [[Call]]).
+            .new_target => return .{ .normal = self.new_target },
             .super_call => |args| return self.evalSuperCall(args, env),
             .super_member => |sm| {
                 // §13.3.5 SuperProperty (read) — `super.x` / `super[k]`: look up on the home object's
@@ -1355,6 +1369,12 @@ pub const Interpreter = struct {
             const fd = ctor.call.?;
             if (fd.body.len == 0) {
                 if (fd.super_ctor) |sup| {
+                    // §13.3.12: a synthesized default derived constructor forwards the original `new`
+                    // target down the implicit `super(...)`. Set the active `new_target` to this ctor so
+                    // `runParentCtor` propagates it (mirroring an explicit `super()` from a real body).
+                    const saved_nt = self.new_target;
+                    self.new_target = .{ .object = ctor };
+                    defer self.new_target = saved_nt;
                     // Run the parent constructor (base or derived) on the new instance.
                     const pc = try self.runParentCtor(sup, args, new_obj);
                     if (pc.isAbrupt()) return pc;
@@ -1366,6 +1386,9 @@ pub const Interpreter = struct {
             }
         }
 
+        // §13.3.12: a [[Construct]] sets the running body's [[NewTarget]] to the constructor. Handed off
+        // to `callFunction` via the one-shot `pending_new_target` slot, which it consumes for this body.
+        self.pending_new_target = .{ .object = ctor };
         const result = try self.callFunction(ctor, args, .{ .object = new_obj });
         if (result.isAbrupt()) return result;
         if (result.normal == .object) return .{ .normal = result.normal }; // explicit object return wins
@@ -1390,6 +1413,10 @@ pub const Interpreter = struct {
                 if (fc.isAbrupt()) return fc;
             }
         }
+        // §13.3.12: `new.target` propagates DOWN a `super(...)` chain unchanged — the parent constructor
+        // sees the SAME [[NewTarget]] as the derived class that invoked it (the original `new` target).
+        // The active `new_target` is that value (set when this derived ctor body / construct began).
+        self.pending_new_target = self.new_target;
         return self.callFunction(sup, args, .{ .object = instance });
     }
 
@@ -1482,6 +1509,10 @@ pub const Interpreter = struct {
                     const fc = try self.evalExpr(p.value, env);
                     if (fc.isAbrupt()) return fc;
                     const f = fc.normal.object; // a `function` node always yields a function object
+                    // §13.2.5.6 / §13.3.5: an object-literal accessor is a MethodDefinition with a
+                    // [[HomeObject]] = the object literal, so `super.x` inside it resolves against
+                    // `obj.[[Prototype]]`. Set it here (class accessors get theirs via MakeMethod).
+                    if (f.call) |*afd| afd.home_object = obj;
                     // §13.2.5.6: an accessor's name is "get x" / "set x" (the key with the kind prefix).
                     const name_key = if (key.symbol) |sym| try self.symbolPropName(sym) else key.key;
                     try self.setFunctionName(f, name_key, if (p.kind == .get) "get" else "set");
@@ -1499,6 +1530,13 @@ pub const Interpreter = struct {
                     if (key.isAbrupt()) return key.completion;
                     const c = try self.evalExpr(p.value, env);
                     if (c.isAbrupt()) return c;
+                    // §13.2.5 / §13.3.5: an object-literal METHOD (`{m(){}}`) is a MethodDefinition with a
+                    // [[HomeObject]] = the object literal, so `super.x` inside its body resolves against
+                    // `obj.[[Prototype]]`. An ordinary value (`{f: function(){}}`, `{x: 1}`) is NOT a
+                    // method and keeps no home — gate on the AST `function` node's `is_method` flag.
+                    if (p.value.* == .function and p.value.function.is_method and c.normal == .object) {
+                        if (c.normal.object.call) |*mfd| mfd.home_object = obj;
+                    }
                     // §B.3.1 `__proto__` Property Names in Object Initializers: a `{__proto__: v}`
                     // colon property (literal, non-computed name) sets [[Prototype]] instead of
                     // creating an own property — if `v` is an Object (set proto to it) or null (null
@@ -2156,6 +2194,11 @@ pub const Interpreter = struct {
 
     /// §10.2.1 [[Call]] — native built-in, else an ordinary AST-closure function.
     pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
+        // §13.3.12: consume the one-shot [[NewTarget]] hand-off from a preceding `construct` (else
+        // `undefined`) and clear the slot immediately — so it cannot leak past this [[Call]] into a
+        // sibling/native/bound/generator dispatch. Installed below for the non-arrow ordinary body path.
+        const pending_new_target = self.pending_new_target;
+        self.pending_new_target = .undefined;
         // §10.4.1.1 [[Call]] of a Bound Function Exotic Object: run the target with `this` =
         // [[BoundThis]] and args = [[BoundArguments]] ++ callArgs. Cheap early branch (the common
         // case is `.bound == null`, a single optional test off the hot path).
@@ -2184,6 +2227,29 @@ pub const Interpreter = struct {
         if (self.depth > self.max_depth) return self.throwError("RangeError", "Maximum call stack size exceeded");
         const fd = func.call orelse return self.throwError("TypeError", "value is not a function");
         const call_env = try Environment.create(self.arena, fd.closure);
+        // §10.2.11 FunctionDeclarationInstantiation: the `this` / [[HomeObject]] / [[NewTarget]] bindings
+        // are established BEFORE parameter initialization, so a default-parameter initializer (`m(x =
+        // super.k)`, `f(p = this.q)`, `C(t = new.target)`) sees the correct method context. Installed
+        // here (ahead of the param loop), saved/restored on return.
+        // §15.3: an arrow has no own `this` binding — it uses the `this` captured at creation,
+        // ignoring however it was called. Ordinary functions take the call-site `this`.
+        const saved_this = self.this_val;
+        self.this_val = if (fd.is_arrow) fd.captured_this else this_val;
+        defer self.this_val = saved_this;
+        // §9.2.5/§13.3.5: a method invocation installs its [[HomeObject]] for `super` resolution.
+        // An arrow has no own home object — it lexically keeps the enclosing one (like `this`), so
+        // it is left untouched; an ordinary function's home_object is null, masking outer `super`.
+        const saved_home = self.home_object;
+        if (!fd.is_arrow) self.home_object = fd.home_object;
+        defer self.home_object = saved_home;
+        // §13.3.12: install [[NewTarget]] for this body. An ordinary [[Call]] gets `undefined`; a
+        // [[Construct]] (`construct` set `pending_new_target` to the constructor right before this call)
+        // gets that constructor. An arrow has no own [[NewTarget]] — it keeps the enclosing one lexically
+        // (like `this`), so it is left untouched. The pending slot was consumed at the top of this
+        // [[Call]] so nested ordinary calls within the body see `undefined`.
+        const saved_new_target = self.new_target;
+        if (!fd.is_arrow) self.new_target = pending_new_target;
+        defer self.new_target = saved_new_target;
         for (fd.params, 0..) |param, i| {
             var v: Value = if (i < args.len) args[i] else .undefined; // missing args → undefined
             var defaulted = false;
@@ -2229,17 +2295,6 @@ pub const Interpreter = struct {
             const ao = try self.makeArgumentsObject(args);
             try call_env.declare("arguments", .{ .object = ao }, true, true);
         }
-        // §15.3: an arrow has no own `this` binding — it uses the `this` captured at creation,
-        // ignoring however it was called. Ordinary functions take the call-site `this`.
-        const saved_this = self.this_val;
-        self.this_val = if (fd.is_arrow) fd.captured_this else this_val;
-        defer self.this_val = saved_this;
-        // §9.2.5/§13.3.5: a method invocation installs its [[HomeObject]] for `super` resolution.
-        // An arrow has no own home object — it lexically keeps the enclosing one (like `this`), so
-        // it is left untouched; an ordinary function's home_object is null, masking outer `super`.
-        const saved_home = self.home_object;
-        if (!fd.is_arrow) self.home_object = fd.home_object;
-        defer self.home_object = saved_home;
         // §14.13: labels do not cross a function boundary — the body starts with no pending label
         // (e.g. a call inside a labelled statement must not leak that label into the callee's loops).
         const saved_labels = self.pending_labels;

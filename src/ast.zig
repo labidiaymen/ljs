@@ -73,6 +73,11 @@ pub const Node = union(enum) {
     template: struct { quasis: []const []const u8, exprs: []const *const Node }, // §13.2.8 `a${x}b`
     spread: *const Node, // §13.2.4 / §13.3 spread element `...expr` (in array literals & call args)
     this, // §13.2.1 ThisExpression
+    /// §13.3.12 NewTarget MetaProperty `new` `.` `target` — evaluates to the active function's
+    /// [[NewTarget]]: the constructor when the function was invoked via `new` (or through a `super()`
+    /// chain), else `undefined`. An arrow inherits its enclosing non-arrow function's value (lexical,
+    /// like `this`). A SyntaxError outside any function body (parse-restricted to function contexts).
+    new_target,
     class_expr: *const Class, // §15.7 ClassExpression
     /// §13.3.9 OptionalExpression — one access link of an optional chain applied to `base`.
     /// `optional` is true for the `?.` form (this link short-circuits when `base` is nullish);

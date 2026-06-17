@@ -136,7 +136,26 @@ pub const Lexer = struct {
     arena: std.mem.Allocator,
 
     pub fn init(arena: std.mem.Allocator, src: []const u8) Lexer {
-        return .{ .src = src, .arena = arena };
+        var self = Lexer{ .src = src, .arena = arena };
+        // §12.5 HashbangComment — a `#!` at the VERY START of the source (offset 0, before any token or
+        // whitespace) begins a comment that runs to the end of the line (like a `//` SingleLineComment).
+        // Only the leading `#!` of a Script is a hashbang; a `#!` anywhere else is not (and a `#` there
+        // is a PrivateIdentifier — handled in `scanToken`). Consumed here so `next` never sees it.
+        if (src.len >= 2 and src[0] == '#' and src[1] == '!') {
+            self.pos = 2;
+            while (self.pos < src.len and src[self.pos] != '\n' and src[self.pos] != '\r') : (self.pos += 1) {
+                // §12.3 LineTerminator: also stop at a raw U+2028/U+2029 (encoded as 3-byte UTF-8).
+                const c = src[self.pos];
+                if (c >= 0x80) {
+                    const len = std.unicode.utf8ByteSequenceLength(c) catch continue;
+                    if (self.pos + len <= src.len) {
+                        const cp = std.unicode.utf8Decode(src[self.pos .. self.pos + len]) catch continue;
+                        if (cp == 0x2028 or cp == 0x2029) break;
+                    }
+                }
+            }
+        }
+        return self;
     }
 
     fn peek(self: *Lexer) u8 {

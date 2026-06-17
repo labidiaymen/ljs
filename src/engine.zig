@@ -2882,3 +2882,64 @@ test "M32: §14.3.1 `using` is a CONTEXTUAL keyword (identifier elsewhere)" {
     // `using x = …` is allowed inside a block.
     try expectStr("var log=[]; { using x = { [Symbol.dispose](){ log.push('d'); } }; } log.join(',')", "d");
 }
+
+test "M35: §12.5 HashbangComment — `#!` at source start is a line comment" {
+    // A `#!` at the very start of the Script runs to end of line, like `//`.
+    try expectNumber("#!/usr/bin/env node\n42", 42);
+    // The hashbang line is fully ignored; the next line evaluates normally.
+    try expectNumber("#!shebang ignored 1 + ( garbage\nlet x = 40; x + 2", 42);
+    // A bare `#!` with no following newline (whole source is the hashbang) → empty program (undefined).
+    try expectUndefined("#!only-a-hashbang");
+    // §12.5: a `#!` NOT at offset 0 is NOT a hashbang — leading whitespace disqualifies it, and `#`
+    // there is a PrivateIdentifier outside any class → SyntaxError.
+    try expectSyntaxError(" #!/usr/bin/env node\n42");
+    // A `#!` after a newline is likewise not a hashbang (offset != 0) → SyntaxError.
+    try expectSyntaxError("\n#!/usr/bin/env node\n42");
+}
+
+test "M35: §13.3.5 SuperProperty in object-literal methods / accessors" {
+    // An object-literal method has a [[HomeObject]] (the object), so `super.x` resolves against its
+    // prototype. Here `o`'s proto is %Object.prototype%, so `super.hasOwnProperty` is a function.
+    try expectBool("var o = { m(){ return typeof super.hasOwnProperty === 'function'; } }; o.m()", true);
+    // `super.x` reads the prototype's property, not the object's own shadowing one.
+    try expectNumber(
+        "var proto = { v: 1 }; var o = { v: 99, m(){ return super.v; } }; Object.setPrototypeOf(o, proto); o.m()",
+        1,
+    );
+    // Computed `super[k]` works in an object method too.
+    try expectNumber(
+        "var proto = { v: 7 }; var o = { m(){ return super['v']; } }; Object.setPrototypeOf(o, proto); o.m()",
+        7,
+    );
+    // A getter has a [[HomeObject]] as well — `super.x` is allowed inside it.
+    try expectNumber(
+        "var proto = { v: 5 }; var o = { get g(){ return super.v; } }; Object.setPrototypeOf(o, proto); o.g",
+        5,
+    );
+    // §13.3.7: `super(...)` is NOT allowed in an object method (not a derived constructor) → SyntaxError.
+    try expectSyntaxError("var o = { m(){ return super(); } };");
+}
+
+test "M35: §13.3.12 new.target meta-property" {
+    // Called via `new`, `new.target` is the constructor function. (A `new` call discards a primitive
+    // body return and yields the instance, so capture the result on the instance / via a global.)
+    try expectBool("function C(){ this.t = new.target; } (new C()).t === C", true);
+    // Called ordinarily, `new.target` is undefined.
+    try expectBool("function f(){ return new.target === undefined; } f()", true);
+    // An arrow inherits the enclosing function's new.target lexically.
+    try expectBool("function C(){ var g = () => new.target; this.t = g(); } (new C()).t === C", true);
+    try expectBool("function f(){ var g = () => new.target; return g() === undefined; } f()", true);
+    // A nested ordinary call inside a constructed body sees its OWN new.target (undefined), not the
+    // enclosing one (no leak through the call boundary).
+    try expectBool("var inner; function g(){ inner = new.target; } function C(){ g(); } new C(); inner === undefined", true);
+    // §13.3.12.1: `new.target` outside any function body (Script top level) is a SyntaxError.
+    try expectSyntaxError("new.target");
+    try expectSyntaxErrorStrict("new.target;");
+    // `new` `.` followed by anything other than `target` is a SyntaxError.
+    try expectSyntaxError("function f(){ return new.foo; }");
+    // `new.target` propagates down a `super(...)` chain — the base ctor sees the derived target.
+    try expectBool(
+        "var nt; class A { constructor(){ nt = new.target; } } class B extends A {} new B(); nt === B",
+        true,
+    );
+}
