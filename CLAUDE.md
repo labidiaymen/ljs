@@ -27,19 +27,33 @@ Constitution: `.specify/memory/constitution.md` — correctness/conformance befo
 - Do **not** set Claude/Anthropic as the commit author — commits are authored by the user.
 - No "Generated with Claude Code" or similar attribution in commit messages or PR descriptions.
 
-## Autonomous implementation loop
-Drive `specs/001-test262-harness/tasks.md` in priority order, one **cycle** at a time:
-1. **Implement** the next coherent increment (a user story / phase, or a self-contained task
-   group) end to end. Make reasonable design calls autonomously — do NOT stop for per-step
-   confirmation. Mark tasks `[x]` in `tasks.md` as they complete.
+## Autonomous implementation loop — FULL Spec-Driven Development
+Every milestone is one **cycle** and gets its OWN spec folder; do not skip the paper trail even
+for a small fix. One **cycle** at a time:
+0. **Spec first.** Create `specs/NNN-<slug>/` (next free NNN) seeded from `.specify/templates/`:
+   - `spec.md` — User Scenarios with Given/When/Then acceptance derived from the failing
+     Test262 cases, the governing ECMA-262 clause(s), in/out of scope, and success criteria
+     (the expected conformance delta).
+   - `plan.md` — implementation approach (files/functions touched, design calls, perf-hot-path
+     risk), plus the Constitution Check (correctness-leads + the perf no-regression gate).
+   - `tasks.md` — an ordered, checkable `- [ ]` task list.
+1. **Implement** the tasks in order. Make reasonable design calls autonomously — do NOT stop for
+   per-step confirmation. Mark tasks `[x]` in the cycle's `tasks.md` as they complete. (Discovery
+   and gate EXECUTION may be delegated to subagents to keep main-thread context lean; INTEGRATION
+   and the build gate stay sequential on the main thread.)
 2. **Verify** before the gate: `zig build`, `zig build test`, and `zig build lint` all green,
-   plus the relevant `quickstart.md` checks (for perf cycles, `zig build bench`).
+   plus the relevant `quickstart.md` checks (for perf cycles, `zig build bench`). Use the FRESH
+   runner exe (`ls -t .zig-cache/o/*/ljs-test262.exe | head -1`), never a stale alphabetical pick.
 3. **Commit gate (the ONLY stop):** present a short summary, the verification results, the
    diff stat, and the exact proposed commit message. Then wait.
-4. On the user's validation → commit (author `Aymen <labidi@aymen.co>`, no Claude
-   attribution) + push, then **immediately begin the next cycle** and run it to its gate.
+4. On the user's validation → set the spec folder's Status to **Done** with the measured
+   conformance delta, then commit the **spec folder together with the code** (author
+   `Aymen <labidi@aymen.co>`, no Claude attribution) + push, then **immediately begin the next
+   cycle** and run it to its gate.
 
-Surface significant assumptions/decisions at the gate, not mid-cycle.
+Surface significant assumptions/decisions at the gate, not mid-cycle. Each milestone's spec
+folder (`spec.md`/`plan.md`/`tasks.md`) is part of its commit — the code and its paper trail
+land together.
 
 ### Autonomous mode
 When the user authorizes autonomous looping ("loop by yourself", "don't wait for me"), the
