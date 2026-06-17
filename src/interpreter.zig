@@ -1841,7 +1841,11 @@ pub const Interpreter = struct {
         // §13.3.12: `new.target` propagates DOWN a `super(...)` chain unchanged — the parent constructor
         // sees the SAME [[NewTarget]] as the derived class that invoked it (the original `new` target).
         // The active `new_target` is that value (set when this derived ctor body / construct began).
-        self.pending_new_target = self.new_target;
+        // A `super(...)` is ALWAYS a [[Construct]], so signal that to `callFunction` (whose §15.7.14
+        // class-ctor [[Call]] guard keys on a non-undefined hand-off) even in the edge where the active
+        // new_target was lost — e.g. an arrow `() => super()` invoked from an iterator-return handler
+        // after the derived ctor body already left (the parent ctor `sup` is itself the fallback marker).
+        self.pending_new_target = if (self.new_target == .undefined) .{ .object = sup } else self.new_target;
         return self.callFunction(sup, args, .{ .object = instance });
     }
 
@@ -2668,6 +2672,15 @@ pub const Interpreter = struct {
         // sibling/native/bound/generator dispatch. Installed below for the non-arrow ordinary body path.
         const pending_new_target = self.pending_new_target;
         self.pending_new_target = .undefined;
+        // §15.7.14: a class constructor's [[Call]] always throws — only [[Construct]] (a preceding
+        // `construct` that handed off [[NewTarget]] via `pending_new_target`) runs its body. An
+        // undefined hand-off ⇒ this is a plain [[Call]] (direct OR via call/apply/bind), so reject it
+        // here at the single [[Call]] chokepoint. A bound wrapper has `func.call == null`, so the
+        // check no-ops on it and fires on the unwrapped target's recursive call.
+        if (pending_new_target == .undefined) {
+            if (func.call) |cfd| if (cfd.is_class_ctor)
+                return self.throwError("TypeError", "Class constructor cannot be invoked without 'new'");
+        }
         // §10.4.1.1 [[Call]] of a Bound Function Exotic Object: run the target with `this` =
         // [[BoundThis]] and args = [[BoundArguments]] ++ callArgs. Cheap early branch (the common
         // case is `.bound == null`, a single optional test off the hot path).
