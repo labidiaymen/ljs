@@ -30,4 +30,5 @@ test {
     _ = @import("parser.zig");
     _ = @import("interpreter.zig");
     _ = @import("engine.zig");
+    _ = @import("engine_tests.zig");
 }
