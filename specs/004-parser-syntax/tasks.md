@@ -163,8 +163,15 @@ clause + test delta. Each line = one commit, all gates green (build/test/lint/co
   89.4% (+4). `specs/061-class-ctor-call-guard/`.
 - [x] **M74** class heritage `prototype` validation (§15.7.14) — 89.4% (+6).
   `specs/062-class-heritage-prototype-validation/`.
-- [ ] **M75 (next, bigger):** built-in subclassing exotic instances (`class S extends Array{}` →
-  `new S(3).length`) — construct-model rework: super() must create the exotic `this`. Array first.
+- [x] **M75** Array subclassing — exotic instance via super() (§23.1.1.1) — 89.4% (+14).
+  `specs/063-array-subclassing/`.
+- [x] **M76** primitive-wrapper subclassing (Boolean/Number/String) (§20.3/§21.1/§22.1) — 89.4%
+  (+6). `specs/064-wrapper-subclassing/`.
+- [x] **M77** Error/NativeError subclassing (§20.5.1.1) — 89.4% (+2). `specs/065-error-subclassing/`.
+- [ ] **M78 (next, BIGGEST lever ~50-128 tests):** §7.4.11 IteratorClose must propagate `return()`
+  errors on a NORMAL incoming completion (and TypeError on non-object return), while still swallowing
+  them when the incoming completion is a throw. Needs `iteratorClose` to take the incoming completion;
+  ~15 call sites. See memory `ljs-conformance-state` for the per-site plan. Do in fresh context.
 - [ ] Async/Promise/microtask family (~325 tests; also the Node bridge)
 - [ ] Class runtime-semantics long-tail (private methods/#x-in, static blocks, field-init order)
 - [ ] **Target: language 93%** (currently 89.4%, need ~+1590)
