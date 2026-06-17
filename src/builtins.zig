@@ -248,17 +248,21 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     // species / non-extensible-target / frozen-length tests that currently pass (a missing method
     // throws "not a function", which those tests catch). See specs/038 spec.md "Out of scope".
     const array_methods = [_][]const u8{
-        "push",          "pop",        "indexOf",     "lastIndexOf",
-        "includes",      "join",       "toString",    "slice",
-        "at",            "forEach",    "map",         "some",
-        "every",         "find",       "findIndex",   "findLast",
-        "findLastIndex", "reduce",     "reduceRight", "reverse",
+        "push",          "pop",        "indexOf",        "lastIndexOf",
+        "includes",      "join",       "toString",       "slice",
+        "at",            "forEach",    "map",            "some",
+        "every",         "find",       "findIndex",      "findLast",
+        "findLastIndex", "reduce",     "reduceRight",    "reverse",
         "fill",          "copyWithin", "sort",
         // M43 §23.1.3: the result-creating / length-mutating methods, now backed by
         // ArraySpeciesCreate + a frozen/non-extensible [[Set]] / CreateDataPropertyOrThrow.
-               "concat",
-        "splice",        "filter",     "flat",        "flatMap",
+                  "concat",
+        "splice",        "filter",     "flat",           "flatMap",
         "shift",         "unshift",
+        // M44 §23.1.3: now generic over array-likes. toLocaleString + the ES2023 change-array-by-copy
+        // family (each returns a NEW dense Array, reads the source via Get).
+           "toLocaleString", "with",
+        "toReversed",    "toSorted",   "toSpliced",
     };
     if (array_fn.get("prototype")) |pv| {
         if (pv == .object) {
@@ -282,7 +286,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     const symbol_fn = try Object.createNative(arena, .symbol_ctor, "Symbol");
     symbol_fn.prototype = function_proto; // §20.2.3 the Symbol constructor → %Function.prototype%
     // §20.4.2 well-known symbols — installed non-writable/non-enumerable/non-configurable per spec.
-    const well_known = [_][]const u8{ "iterator", "asyncIterator", "toStringTag", "hasInstance", "toPrimitive", "species", "dispose", "asyncDispose" };
+    const well_known = [_][]const u8{ "iterator", "asyncIterator", "toStringTag", "hasInstance", "toPrimitive", "species", "dispose", "asyncDispose", "unscopables" };
     for (well_known) |name| {
         const desc = try std.fmt.allocPrint(arena, "Symbol.{s}", .{name});
         const sym = try newSymbol(arena, desc);
@@ -321,6 +325,20 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
             try defineMethod(arena, pv.object, "values", .array_values, "values"); // §23.1.3.34
             try defineMethod(arena, pv.object, "keys", .array_keys, "keys"); // §23.1.3.18
             try defineMethod(arena, pv.object, "entries", .array_entries, "entries"); // §23.1.3.7
+            // §23.1.3.38 Array.prototype[@@unscopables] — a null-prototype object listing the post-ES5
+            // method names as `true`; the property itself is { writable:false, enumerable:false,
+            // configurable:true }. Used by `with`-statement binding resolution (§9.1.1.2.1).
+            if (symbol_fn.get("unscopables")) |us| if (us == .symbol) {
+                const list = try Object.create(arena, null); // [[Prototype]] = null
+                const names = [_][]const u8{
+                    "at",         "copyWithin", "entries",   "fill",
+                    "find",       "findIndex",  "findLast",  "findLastIndex",
+                    "flat",       "flatMap",    "includes",  "keys",
+                    "toReversed", "toSorted",   "toSpliced", "values",
+                };
+                for (names) |nm| try list.defineData(nm, .{ .boolean = true }, true, true, true);
+                try pv.object.defineSymbolData(us.symbol, .{ .object = list }, false, false, true);
+            };
         }
     }
     if (string_fn.get("prototype")) |pv| {

@@ -930,16 +930,41 @@ pub const Interpreter = struct {
             .object_literal => |props| return self.evalObjectLiteral(props, env),
             .array_literal => |elems| {
                 // §13.2.4 ArrayLiteral — `...spread` elements flatten in place; an `elision` hole
-                // contributes one `undefined` element (M-subset: no true sparse model). A trailing
-                // elision that the parser appended to mark `[...x,]` (a valid literal trailing comma
-                // after a spread) is dropped here so it adds no element.
+                // contributes a TRUE hole (it advances the index without defining the slot, so the
+                // resulting array is sparse there: `1 in [1,,3]` is false, holes are skipped by
+                // forEach/reduce/indexOf, etc.). A trailing elision the parser appended to mark `[...x,]`
+                // (a valid literal trailing comma after a spread) is dropped here so it adds no slot.
                 var list = elems;
                 if (list.len >= 2 and list[list.len - 1].* == .elision and list[list.len - 2].* == .spread) {
                     list = list[0 .. list.len - 1];
                 }
                 const arr = try Object.createArray(self.arena, self.arrayProto());
-                const lc = try self.evalSpreadList(list, env, &arr.elements);
-                if (lc.isAbrupt()) return lc;
+                var idx: usize = 0;
+                for (list) |n| {
+                    if (n.* == .elision) {
+                        idx += 1; // hole — leave the slot undefined/absent
+                        continue;
+                    }
+                    if (n.* == .spread) {
+                        const sc = try self.evalExpr(n.spread, env);
+                        if (sc.isAbrupt()) return sc;
+                        var tmp: std.ArrayListUnmanaged(Value) = .empty;
+                        const ic = try self.iterateToList(sc.normal, &tmp);
+                        if (ic.isAbrupt()) return ic;
+                        for (tmp.items) |v| {
+                            try arr.arraySet(self.arena, idx, v);
+                            idx += 1;
+                        }
+                        continue;
+                    }
+                    const c = try self.evalExpr(n, env);
+                    if (c.isAbrupt()) return c;
+                    try arr.arraySet(self.arena, idx, c.normal);
+                    idx += 1;
+                }
+                // A trailing elision (e.g. `[1,,]` ⇒ length 2 with a hole at index 1) sets the length
+                // past the last defined slot; `arraySet` only bumps length up to the last write.
+                if (idx > arr.arrayLen()) try arr.arraySetLen(idx);
                 return .{ .normal = .{ .object = arr } };
             },
             .elision => return .{ .normal = .undefined }, // §13.2.4 array hole → `undefined` value
@@ -3352,6 +3377,136 @@ pub const Interpreter = struct {
         return false;
     }
 
+    /// §7.3.12 HasProperty(O, ToString(i)) over an ARBITRARY object + its prototype chain — the
+    /// generic-array-like counterpart of `arrayHasPropertyChain`. An array exotic checks its dense /
+    /// sparse store first; every kind then falls back to the string-keyed chain walk.
+    pub fn hasIndexChain(self: *Interpreter, o: *Object, i: usize) bool {
+        if (o.kind == .array and o.arrayHas(i)) return true;
+        const key = numberToString(self.arena, @floatFromInt(i)) catch return false;
+        var p: ?*Object = o;
+        while (p) |obj| {
+            if (obj.kind == .array and obj.arrayHas(i)) return true;
+            if (obj.getProp(key) != null) return true;
+            p = obj.prototype;
+        }
+        return false;
+    }
+
+    /// §7.3.18 LengthOfArrayLike ( obj ) = ToLength(Get(obj, "length")). Clamped to [0, 2^53-1].
+    /// Throwing (a Symbol/BigInt length → TypeError via ToNumber). Returns the length, or the abrupt
+    /// completion to propagate. The Array exotic short-circuits to its tracked length.
+    pub fn lengthOfArrayLike(self: *Interpreter, o: *Object) EvalError!union(enum) { len: usize, abrupt: Completion } {
+        if (o.kind == .array) return .{ .len = o.arrayLen() };
+        const lc = try self.getProperty(.{ .object = o }, "length");
+        if (lc.isAbrupt()) return .{ .abrupt = lc };
+        const nc = try self.toNumberV(lc.normal);
+        if (nc.isAbrupt()) return .{ .abrupt = nc };
+        const n = nc.normal.number;
+        const max_len: f64 = 9007199254740991.0; // 2^53 - 1
+        const len: usize = if (std.math.isNan(n) or n <= 0) 0 else if (n > max_len) @intFromFloat(max_len) else @intFromFloat(@trunc(n));
+        return .{ .len = len };
+    }
+
+    /// §7.3.4 Set(O, key, v, true) for an arbitrary object — Throw=true, so a failed [[Set]] (a
+    /// getter-only accessor, a non-writable own data property, a new property on a non-extensible object,
+    /// or a read-only String-wrapper index/length) raises a TypeError rather than silently no-op'ing
+    /// (the in-place mutating Array methods rely on this). Emulates §10.1.9 OrdinarySet's success bit.
+    fn setKeyThrow(self: *Interpreter, o: *Object, key: []const u8, v: Value) EvalError!Completion {
+        // A `new String(s)` wrapper: the canonical integer indices [0, len) and `length` are read-only,
+        // non-configurable own slots (§10.4.3) → any [[Set]] is rejected.
+        if (o.primitive) |p| if (p == .string) {
+            if (std.mem.eql(u8, key, "length")) return self.throwError("TypeError", "Cannot assign to read only property 'length' of String");
+            if (parseIndex(key)) |idx| if (idx < p.string.len) {
+                return self.throwError("TypeError", "Cannot assign to read only String index");
+            };
+        };
+        // §10.1.9.2 OrdinarySetWithOwnDescriptor — resolve the property on the chain.
+        if (o.getProp(key)) |loc| {
+            switch (loc.pv.payload) {
+                .accessor => |a| {
+                    const setter = a.set orelse return self.throwError("TypeError", "Cannot set property with only a getter");
+                    const sc = try self.callFunction(setter, &.{v}, .{ .object = o });
+                    if (sc.isAbrupt()) return sc;
+                    return .{ .normal = .undefined };
+                },
+                .data => {
+                    // An OWN non-writable data property rejects; an INHERITED one is shadowed by a new own
+                    // property (subject to extensibility).
+                    if (o.properties.getPtr(key)) |own| {
+                        if (own.payload == .data and !own.writable) {
+                            return self.throwError("TypeError", "Cannot assign to read only property");
+                        }
+                        own.payload = .{ .data = v };
+                        return .{ .normal = .undefined };
+                    }
+                    if (!o.extensible) return self.throwError("TypeError", "Cannot add property, object is not extensible");
+                    try o.set(key, v);
+                    return .{ .normal = .undefined };
+                },
+            }
+        }
+        // Absent everywhere: create iff extensible.
+        if (!o.extensible) return self.throwError("TypeError", "Cannot add property, object is not extensible");
+        try o.set(key, v);
+        return .{ .normal = .undefined };
+    }
+
+    /// §7.3.4 Set(O, ToString(i), v, true) for an arbitrary object. Array exotic uses the element store.
+    pub fn setIndexThrow(self: *Interpreter, o: *Object, i: usize, v: Value) EvalError!Completion {
+        if (o.kind == .array) return self.arraySetThrow(o, i, v);
+        return self.setKeyThrow(o, try numberToString(self.arena, @floatFromInt(i)), v);
+    }
+
+    /// §7.3.5 Set(O, "length", n, true) for an arbitrary object (the mutating methods' final length set).
+    pub fn setLengthThrow(self: *Interpreter, o: *Object, n: usize) EvalError!Completion {
+        if (o.kind == .array) return self.arraySetLenThrow(o, n);
+        return self.setKeyThrow(o, "length", .{ .number = @floatFromInt(n) });
+    }
+
+    /// §7.3.10 DeletePropertyOrThrow(O, ToString(i)) for an arbitrary object — a non-configurable own
+    /// property (incl. a String-wrapper index) rejects → TypeError. Array exotic deletes a true hole.
+    pub fn deleteIndexThrow(self: *Interpreter, o: *Object, i: usize) EvalError!Completion {
+        if (o.kind == .array) {
+            if (o.array_frozen) return self.throwError("TypeError", "Cannot delete property of a frozen array");
+            try o.arrayDelete(i);
+            return .{ .normal = .undefined };
+        }
+        // A String-wrapper canonical index is non-configurable → DeletePropertyOrThrow rejects.
+        if (o.primitive) |p| if (p == .string) {
+            if (i < p.string.len) return self.throwError("TypeError", "Cannot delete read only String index");
+        };
+        const key = try numberToString(self.arena, @floatFromInt(i));
+        const dc = try self.deleteProperty(.{ .object = o }, key);
+        if (dc.isAbrupt()) return dc;
+        if (dc.normal == .boolean and !dc.normal.boolean) {
+            return self.throwError("TypeError", "Cannot delete property");
+        }
+        return .{ .normal = .undefined };
+    }
+
+    /// §7.1.18 ToObject ( argument ) restricted to the cases the Array.prototype methods meet: an object
+    /// passes through; `undefined`/`null` throw; a primitive boxes into the matching wrapper so its
+    /// indexed reads (notably a String's chars / length) are observable as own properties.
+    pub fn toObjectForArrayLike(self: *Interpreter, v: Value) EvalError!union(enum) { obj: *Object, abrupt: Completion } {
+        switch (v) {
+            .object => |o| return .{ .obj = o },
+            .undefined, .null => return .{ .abrupt = try self.throwError("TypeError", "Array.prototype method called on null or undefined") },
+            .string => |s| {
+                const w = try Object.create(self.arena, self.globalProto("String"));
+                w.primitive = .{ .string = s };
+                return .{ .obj = w };
+            },
+            else => {
+                // number / boolean / symbol / bigint box into an ordinary wrapper with no indexed own
+                // props (M-subset: length is absent → LengthOfArrayLike yields 0, which matches the spec
+                // result for these — they have no "length").
+                const w = try Object.create(self.arena, self.objectProto());
+                w.primitive = v;
+                return .{ .obj = w };
+            },
+        }
+    }
+
     /// Public §7.1.4 ToNumber (throwing) for built-in modules — a Symbol/BigInt operand throws a
     /// TypeError, an object runs ToPrimitive(number). Used by Array methods whose arg coercion must be
     /// observable (e.g. `copyWithin(0, Symbol())` → TypeError).
@@ -3359,11 +3514,33 @@ pub const Interpreter = struct {
         return self.toNumberV(v);
     }
 
+    /// Public §7.1.5 ToIntegerOrInfinity for built-in modules (e.g. `with` / `flat` index/depth args).
+    pub fn toIntegerOrInfinityPub(self: *Interpreter, v: Value) EvalError!Completion {
+        return self.toIntegerOrInfinity(v);
+    }
+
     /// Public [[Get]] wrapper for built-in modules (e.g. `Array.from` reading `.length` / indices of
     /// an array-like). Same semantics as the internal `getProperty` (invokes getters, throws on
     /// null/undefined base).
     pub fn getProperty2(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
         return self.getProperty(base, key);
+    }
+
+    /// Public §20.1.3.6 Object.prototype.toString wrapper for built-in modules (Array.prototype.toString
+    /// fallback when the object's `join` is not callable).
+    pub fn objectPrototypeToString(self: *Interpreter, this_val: Value) EvalError!Completion {
+        return self.objectToString(this_val);
+    }
+
+    /// §7.3.20 Invoke ( V, P, argumentsList ) = Call(? GetV(V, P), V, args). Used by
+    /// Array.prototype.toLocaleString (it invokes each element's own `toLocaleString`).
+    pub fn invokeMethod(self: *Interpreter, v: Value, name: []const u8, args: []const Value) EvalError!Completion {
+        const mc = try self.getProperty(v, name);
+        if (mc.isAbrupt()) return mc;
+        if (mc.normal != .object or mc.normal.object.kind != .function) {
+            return self.throwError("TypeError", "property is not a function");
+        }
+        return self.callFunction(mc.normal.object, args, v);
     }
 
     /// Does `value` expose a `[Symbol.iterator]` method (i.e. is it iterable)? Used by `Array.from` to
@@ -5639,9 +5816,11 @@ pub const Interpreter = struct {
         return self.construct(c.object, &.{.{ .number = @floatFromInt(length) }});
     }
 
-    /// A fresh plain Array exotic of [[Length]] `length` (no eager fill — a length-only grow is sparse),
-    /// proto-linked to %Array.prototype%. The default ArraySpeciesCreate result.
+    /// §10.4.2.2 ArrayCreate(length): a fresh plain Array exotic of [[Length]] `length` (no eager fill —
+    /// a length-only grow is sparse), proto-linked to %Array.prototype%. The default ArraySpeciesCreate
+    /// result. A length above 2^32-1 → RangeError (step 1).
     fn newArray(self: *Interpreter, length: usize) EvalError!Completion {
+        if (length > 4294967295) return self.throwError("RangeError", "Invalid array length");
         const a = try Object.createArray(self.arena, self.arrayProto());
         a.array_length = length;
         return .{ .normal = .{ .object = a } };
@@ -6782,7 +6961,15 @@ pub const Interpreter = struct {
         switch (v) {
             .undefined, .null => return .{ .list = &.{} },
             .object => |o| {
-                if (o.kind == .array) return .{ .list = o.elements.items };
+                // Fast path ONLY for a TRULY dense array: backing store == [0..length) with every
+                // index an own data property. A sparse array / one with holes (e.g. `[1,,2]`, whose
+                // gap spilled to `sparse`) must NOT short-circuit here — its `elements.items` omits
+                // the holes, so it would drop arguments. Fall through to LengthOfArrayLike + Get,
+                // which reads each hole index as `undefined` (CreateListFromArrayLike, §7.3.18).
+                if (o.kind == .array and o.array_length == o.elements.items.len and
+                    (o.holes == null or o.holes.?.count() == 0) and
+                    (o.sparse == null or o.sparse.?.count() == 0))
+                    return .{ .list = o.elements.items };
                 // Generic array-like: read `length` then index 0..length-1.
                 const lc = try self.getProperty(v, "length");
                 if (lc.isAbrupt()) return .{ .abrupt = lc };
