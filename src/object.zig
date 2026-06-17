@@ -280,6 +280,10 @@ pub const NativeId = enum {
     number_static, // Number.<native_name> (isNaN/isFinite/isInteger/isSafeInteger/parseInt/parseFloat)
     number_method, // Number.prototype.<native_name> (toString/valueOf)
     boolean_method, // Boolean.prototype.<native_name> (toString/valueOf)
+    // §21.2 BigInt (M36) — the constructor (callable, NOT new), prototype methods, and statics.
+    bigint_ctor, // BigInt( x ) — ToBigInt; `new BigInt` → TypeError
+    bigint_method, // BigInt.prototype.<native_name> (toString/valueOf)
+    bigint_static, // BigInt.<native_name> (asIntN/asUintN)
     // §20.4 Symbol (M8) — the constructor + Symbol.prototype.toString + the iterator natives.
     symbol_ctor, // Symbol([description]) — callable, not a constructor
     symbol_to_string, // Symbol.prototype.toString / Symbol.prototype.valueOf (native_name selects)
@@ -943,6 +947,7 @@ fn sameValueLoose(a: Value, b: Value) bool {
         .boolean => |x| b == .boolean and b.boolean == x,
         .number => |x| b == .number and (x == b.number or (std.math.isNan(x) and std.math.isNan(b.number))),
         .string => |x| b == .string and std.mem.eql(u8, x, b.string),
+        .bigint => |x| b == .bigint and x.eql(b.bigint.*),
         .symbol => |x| b == .symbol and b.symbol == x,
         .object => |x| b == .object and b.object == x,
     };

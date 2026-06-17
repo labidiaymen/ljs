@@ -4,6 +4,7 @@
 //! so the evaluator stays focused and these stay 1:1 with their spec clauses.
 const std = @import("std");
 const Value = @import("value.zig").Value;
+const bigint = @import("bigint.zig");
 
 /// §7.1.4 ToNumber (subset; primitives only).
 pub fn toNumber(v: Value) f64 {
@@ -18,6 +19,7 @@ pub fn toNumber(v: Value) f64 {
             break :blk std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
         },
         .symbol => std.math.nan(f64), // §7.1.4: ToNumber(Symbol) throws — surfaced as NaN here (caller checks)
+        .bigint => std.math.nan(f64), // §7.1.4: ToNumber(BigInt) throws — surfaced as NaN (caller checks tag)
         .object => std.math.nan(f64), // ToPrimitive deferred → NaN
     };
 }
@@ -29,6 +31,7 @@ pub fn toBoolean(v: Value) bool {
         .boolean => |b| b,
         .number => |n| n != 0 and !std.math.isNan(n),
         .string => |s| s.len != 0,
+        .bigint => |b| !bigint.isZero(b), // §7.1.2: 0n → false, every other BigInt → true
         .symbol => true, // §7.1.2: a Symbol is always truthy
         .object => true,
     };
@@ -42,6 +45,8 @@ pub fn toString(arena: std.mem.Allocator, v: Value) error{OutOfMemory}![]const u
         .null => "null",
         .boolean => |b| if (b) "true" else "false",
         .number => |n| numberToString(arena, n),
+        // §6.1.6.2.23 BigInt::toString — decimal digits, leading '-' for negatives.
+        .bigint => |b| bigint.toStringRadix(arena, b, 10) catch return error.OutOfMemory,
         // §7.1.17 ToString(Symbol) throws a TypeError; that throw is raised by the interpreter's
         // `toString` wrapper before reaching here. This descriptive form is only a fallback for the
         // ALLOWED conversions (`String(sym)` / `sym.toString()`), which route here deliberately.
@@ -104,6 +109,7 @@ pub fn typeOf(v: Value) []const u8 {
         .boolean => "boolean",
         .number => "number",
         .string => "string",
+        .bigint => "bigint", // §13.5.3
         .symbol => "symbol", // §13.5.3
         .object => |o| if (o.kind == .function) "function" else "object",
     };
@@ -111,16 +117,25 @@ pub fn typeOf(v: Value) []const u8 {
 
 pub const RelOp = enum { lt, gt, le, ge };
 
-/// §7.2.13 / §13.10 Relational comparison.
+fn applyOrder(order: std.math.Order, op: RelOp) bool {
+    return switch (op) {
+        .lt => order == .lt,
+        .gt => order == .gt,
+        .le => order != .gt,
+        .ge => order != .lt,
+    };
+}
+
+/// §7.2.13 / §13.10 Relational comparison. Operands are already primitives (ToPrimitive done by the
+/// caller's `relationalV`). BigInt compares numerically against BigInt / Number / numeric String.
 pub fn relational(l: Value, r: Value, op: RelOp) bool {
     if (l == .string and r == .string) {
-        const order = std.mem.order(u8, l.string, r.string);
-        return switch (op) {
-            .lt => order == .lt,
-            .gt => order == .gt,
-            .le => order != .gt,
-            .ge => order != .lt,
-        };
+        return applyOrder(std.mem.order(u8, l.string, r.string), op);
+    }
+    // §7.2.13: any BigInt operand makes the comparison a numeric (mathematical) ordering.
+    if (l == .bigint or r == .bigint) {
+        const o = bigintRelOrder(l, r) orelse return false; // NaN-involved → false
+        return applyOrder(o, op);
     }
     const a = toNumber(l);
     const b = toNumber(r);
@@ -133,6 +148,29 @@ pub fn relational(l: Value, r: Value, op: RelOp) bool {
     };
 }
 
+/// §7.2.13 the mathematical ordering of `l` ? `r` when at least one is a BigInt. Returns null when a
+/// numeric operand is NaN (an unordered comparison → always false). A String operand is parsed as a
+/// Number (StringToNumber); a Boolean/etc. is ToNumber'd. BigInt↔BigInt is exact; BigInt↔Number
+/// compares the BigInt's value (via f64; exact for integral Numbers, ±Inf saturation is correct).
+fn bigintRelOrder(l: Value, r: Value) ?std.math.Order {
+    if (l == .bigint and r == .bigint) return bigint.order(l.bigint, r.bigint);
+    if (l == .bigint) {
+        const rn = if (r == .string) strToNumber(r.string) else toNumber(r);
+        if (std.math.isNan(rn)) return null;
+        return std.math.order(bigint.toF64(l.bigint), rn);
+    }
+    // r is bigint, l is not
+    const ln = if (l == .string) strToNumber(l.string) else toNumber(l);
+    if (std.math.isNan(ln)) return null;
+    return std.math.order(ln, bigint.toF64(r.bigint));
+}
+
+fn strToNumber(s: []const u8) f64 {
+    const t = std.mem.trim(u8, s, " \t\r\n");
+    if (t.len == 0) return 0;
+    return std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
+}
+
 /// §7.2.16 IsStrictlyEqual (===).
 pub fn strictEquals(l: Value, r: Value) bool {
     return switch (l) {
@@ -141,6 +179,8 @@ pub fn strictEquals(l: Value, r: Value) bool {
         .boolean => |b| r == .boolean and r.boolean == b,
         .number => |n| r == .number and r.number == n,
         .string => |s| r == .string and std.mem.eql(u8, s, r.string),
+        // §7.2.16: BigInt === only another BigInt with the same numeric value (so `1n === 1` is false).
+        .bigint => |b| r == .bigint and bigint.eql(b, r.bigint),
         .symbol => |s| r == .symbol and r.symbol == s, // §6.1.5: Symbols are equal iff the same identity
         .object => |o| r == .object and r.object == o, // reference equality
     };
@@ -164,7 +204,39 @@ pub fn looseEquals(l: Value, r: Value) bool {
     if (@as(std.meta.Tag(Value), l) == @as(std.meta.Tag(Value), r)) return strictEquals(l, r);
     if ((l == .null and r == .undefined) or (l == .undefined and r == .null)) return true;
     if (l == .undefined or l == .null or r == .undefined or r == .null) return false;
+    // §7.2.15 steps 6–10: BigInt ↔ Number/String/Boolean compares numerically (cross-type). A Symbol
+    // is never == a BigInt. (BigInt ↔ BigInt took the tag-equal fast path above.)
+    if (l == .bigint or r == .bigint) {
+        if (l == .symbol or r == .symbol) return false;
+        return bigintLooseEqual(l, r);
+    }
     return toNumber(l) == toNumber(r);
+}
+
+/// §7.2.15 a BigInt loosely equals a Number iff it equals the Number mathematically (so `1n == 1`,
+/// `1n == 1.0`, but not `1n == 1.5`); against a String, the String is parsed as a BigInt (an invalid
+/// numeric string → not equal); a Boolean is ToNumber'd first. Exactly one operand is a BigInt here.
+fn bigintLooseEqual(l: Value, r: Value) bool {
+    const b = if (l == .bigint) l.bigint else r.bigint;
+    const other = if (l == .bigint) r else l;
+    switch (other) {
+        .boolean => |bo| return std.math.order(bigint.toF64(b), if (bo) @as(f64, 1) else 0) == .eq,
+        .number => |n| {
+            if (std.math.isNan(n) or std.math.isInf(n)) return false;
+            if (@floor(n) != n) return false; // a non-integer Number is never == a BigInt
+            return std.math.order(bigint.toF64(b), n) == .eq;
+        },
+        .string => |s| {
+            // §7.2.15: let `o` = StringToBigInt(s); if `o` is undefined return false; else b == o.
+            // We approximate via f64 ordering (exact for the integral magnitudes Test262 uses).
+            const t = std.mem.trim(u8, s, " \t\r\n");
+            if (t.len == 0) return bigint.isZero(b);
+            const n = std.fmt.parseFloat(f64, t) catch return false;
+            if (@floor(n) != n or std.math.isInf(n)) return false;
+            return std.math.order(bigint.toF64(b), n) == .eq;
+        },
+        else => return false,
+    }
 }
 
 /// §13.10.2 InstanceofOperator (M1: ordinary prototype-chain check; lenient on non-callable RHS).

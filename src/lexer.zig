@@ -126,6 +126,10 @@ pub const Token = struct {
     /// Identifier / BindingIdentifier / IdentifierReference positions only (so an escaped reserved word
     /// is still a valid IdentifierName for a property name, e.g. `o.\u{69}f`); see `isEscapedReservedIdent`.
     had_escape: bool = false,
+    /// §12.9.3.2: a `.number` token carried a BigIntLiteralSuffix `n` (e.g. `10n`, `0x1Fn`). `lexeme`
+    /// excludes the `n` (it is the digit text); the parser builds a `bigint` node from it. Only set
+    /// for integer literals — `n` after a fraction / exponent / non-octal-decimal is rejected here.
+    is_bigint: bool = false,
 };
 
 pub const LexError = error{ UnexpectedCharacter, UnterminatedString, InvalidEscape, OutOfMemory };
@@ -238,6 +242,10 @@ pub const Lexer = struct {
         // `_` NumericLiteralSeparators. The value is computed by the parser from `lexeme` (BigInt `n`
         // suffix is not consumed → deferred).
         if (isDigit(c) or (c == '.' and isDigit(self.peek2()))) {
+            // §12.9.3.2: a BigIntLiteralSuffix `n` is only legal after an INTEGER literal (radix-prefixed
+            // or a `.`-less / `e`-less DecimalDigits). Track whether we saw a fraction/exponent (which
+            // forbids `n`) and whether this is a leading-`0` non-octal decimal (`08`, which also forbids `n`).
+            var bigint_eligible = true;
             if (c == '0' and self.pos + 1 < self.src.len and switch (self.src[self.pos + 1]) {
                 'x', 'X', 'o', 'O', 'b', 'B' => true,
                 else => false,
@@ -245,24 +253,39 @@ pub const Lexer = struct {
                 self.pos += 2; // 0x / 0o / 0b — over-accept hex digits; the parser validates per radix
                 while (self.pos < self.src.len and (isHexDigit(self.src[self.pos]) or self.src[self.pos] == '_')) self.pos += 1;
             } else {
+                // A `0`-led literal followed by another decimal digit is a LegacyOctal /
+                // NonOctalDecimal — never BigInt-eligible (`08n`/`010n` → SyntaxError).
+                if (c == '0' and self.pos + 1 < self.src.len and isDigit(self.src[self.pos + 1])) bigint_eligible = false;
                 while (self.pos < self.src.len and (isDigit(self.src[self.pos]) or self.src[self.pos] == '_')) self.pos += 1;
                 if (self.pos < self.src.len and self.src[self.pos] == '.') {
+                    bigint_eligible = false; // §12.9.3.2: no `n` after a fraction
                     self.pos += 1;
                     while (self.pos < self.src.len and (isDigit(self.src[self.pos]) or self.src[self.pos] == '_')) self.pos += 1;
                 }
                 if (self.pos < self.src.len and (self.src[self.pos] == 'e' or self.src[self.pos] == 'E')) {
+                    bigint_eligible = false; // §12.9.3.2: no `n` after an exponent
                     self.pos += 1;
                     if (self.pos < self.src.len and (self.src[self.pos] == '+' or self.src[self.pos] == '-')) self.pos += 1;
                     while (self.pos < self.src.len and (isDigit(self.src[self.pos]) or self.src[self.pos] == '_')) self.pos += 1;
                 }
             }
-            // §12.9.3: the char immediately after a NumericLiteral must not be an IdentifierStart or a
-            // digit (a `\` begins a `\u` IdentifierStart escape) — an Early Error (catches `3in`, `0b0a`).
+            // §12.9.3.2 BigIntLiteralSuffix: consume a trailing `n` on an eligible integer literal. The
+            // returned `lexeme` is the digit text (excluding `n`); `is_bigint` flags it for the parser.
+            const num_end = self.pos;
+            var is_bigint = false;
+            if (self.pos < self.src.len and self.src[self.pos] == 'n') {
+                if (!bigint_eligible) return LexError.UnexpectedCharacter; // `1.5n` / `1e2n` / `08n`
+                is_bigint = true;
+                self.pos += 1;
+            }
+            // §12.9.3: the char immediately after a NumericLiteral (incl. its `n`) must not be an
+            // IdentifierStart or a digit (a `\` begins a `\u` IdentifierStart escape) — an Early Error
+            // (catches `3in`, `0b0a`, `1nn`).
             if (self.pos < self.src.len) {
                 const nxt = self.src[self.pos];
                 if (isIdentStart(nxt) or nxt == '\\' or isDigit(nxt)) return LexError.UnexpectedCharacter;
             }
-            return .{ .kind = .number, .lexeme = self.src[start..self.pos] };
+            return .{ .kind = .number, .lexeme = self.src[start..num_end], .is_bigint = is_bigint };
         }
 
         // Identifiers / keywords. §12.7. An IdentifierName starts with an ASCII IdentifierStart

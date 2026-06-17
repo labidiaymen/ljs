@@ -1,5 +1,7 @@
 //! Abstract syntax tree. M1 adds statements (declarations, blocks) and the identifier /
 //! assignment expressions on top of the M0 expression grammar (ECMA-262 §13–§14).
+const std = @import("std");
+
 pub const UnaryOp = enum { plus, minus, not, typeof_, void_, delete_, bit_not }; // §13.5
 
 pub const LogicalOp = enum { or_, and_, coalesce }; // §13.13 (short-circuit; `coalesce` = `??`)
@@ -31,6 +33,8 @@ pub const BinaryOp = enum {
 
 pub const Node = union(enum) {
     number: f64,
+    /// §12.9.3.2 BigIntLiteral — the value parsed at lex/parse time, arena-owned (immutable `Const`).
+    bigint: *const std.math.big.int.Const,
     string: []const u8,
     boolean: bool,
     null,

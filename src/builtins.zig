@@ -201,6 +201,23 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try defineConstructorBackref(boolean_fn); // §20.3.3.1 Boolean.prototype.constructor === Boolean
     try env.declare("Boolean", .{ .object = boolean_fn }, true, true);
 
+    // §21.2 BigInt( x ) — ToBigInt (callable, NOT a constructor: `new BigInt` throws, §21.2.1). The
+    // prototype carries toString/valueOf (§21.2.3); the statics are asIntN/asUintN (§21.2.2).
+    const bigint_fn = try Object.createNative(arena, .bigint_ctor, "BigInt");
+    bigint_fn.prototype = function_proto; // §20.2.3 the BigInt constructor → %Function.prototype%
+    if (bigint_fn.get("prototype")) |pv| {
+        if (pv == .object) {
+            pv.object.prototype = object_proto; // §21.2.3 BigInt.prototype inherits %Object.prototype%
+            try defineMethod(arena, pv.object, "toString", .bigint_method, "toString");
+            try defineMethod(arena, pv.object, "valueOf", .bigint_method, "valueOf");
+        }
+    }
+    for ([_][]const u8{ "asIntN", "asUintN" }) |m| {
+        try defineMethod(arena, bigint_fn, m, .bigint_static, m); // §21.2.2.1/.2
+    }
+    try defineConstructorBackref(bigint_fn); // §21.2.3.4 BigInt.prototype.constructor === BigInt
+    try env.declare("BigInt", .{ .object = bigint_fn }, true, true);
+
     // §23.1 Array — constructor, Array.prototype methods, Array.isArray. Array literals
     // proto-link to this Array.prototype (interpreter.arrayProto looks it up here).
     const array_fn = try Object.createNative(arena, .array_ctor, "Array");

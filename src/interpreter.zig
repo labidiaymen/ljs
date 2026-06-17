@@ -14,6 +14,7 @@ const ops = @import("abstract_ops.zig");
 const builtin_array = @import("builtin_array.zig");
 const builtin_string = @import("builtin_string.zig");
 const builtins = @import("builtins.zig");
+const bigint = @import("bigint.zig");
 const Parser = @import("parser.zig").Parser;
 
 // ECMA-262 abstract operations live in abstract_ops.zig; alias them so call sites read naturally.
@@ -872,6 +873,7 @@ pub const Interpreter = struct {
         if (self.depth > self.max_depth) return self.throwError("RangeError", "Maximum call stack size exceeded");
         switch (node.*) {
             .number => |n| return .{ .normal = .{ .number = n } },
+            .bigint => |b| return .{ .normal = .{ .bigint = b } }, // §12.9.3.2 BigIntLiteral
             .string => |s| return .{ .normal = .{ .string = s } },
             .boolean => |b| return .{ .normal = .{ .boolean = b } },
             .null => return .{ .normal = .null },
@@ -1344,6 +1346,8 @@ pub const Interpreter = struct {
         }
         // §20.4.1: the `Symbol` constructor has no [[Construct]] — `new Symbol()` is a TypeError.
         if (ctor.native == .symbol_ctor) return self.throwError("TypeError", "Symbol is not a constructor");
+        // §21.2.1: the `BigInt` constructor has no [[Construct]] — `new BigInt()` is a TypeError.
+        if (ctor.native == .bigint_ctor) return self.throwError("TypeError", "BigInt is not a constructor");
         var proto: ?*Object = null;
         if (ctor.get("prototype")) |pv| {
             if (pv == .object) proto = pv.object;
@@ -2703,6 +2707,21 @@ pub const Interpreter = struct {
                 }
                 if (self.globalProto("Symbol")) |proto| {
                     if (proto.get(key)) |m| return .{ .normal = m };
+                }
+                return .{ .normal = .undefined };
+            },
+            .bigint => {
+                // §6.1.6.2: transparent boxing — `(1n).toString` / `valueOf` / `constructor` resolve on
+                // BigInt.prototype. (Accessors on the proto get `this` = the original primitive base.)
+                if (self.globalProto("BigInt")) |proto| {
+                    const loc = proto.getProp(key) orelse return .{ .normal = .undefined };
+                    switch (loc.pv.payload) {
+                        .data => |dv| return .{ .normal = dv },
+                        .accessor => |a| {
+                            const getter = a.get orelse return .{ .normal = .undefined };
+                            return self.callFunction(getter, &.{}, base);
+                        },
+                    }
                 }
                 return .{ .normal = .undefined };
             },
@@ -4866,10 +4885,22 @@ pub const Interpreter = struct {
             .typeof_, .delete_ => unreachable,
             else => {},
         }
-        // §13.5.4/.5/.6: unary `+`/`-`/`~` ToNumber the operand (ToPrimitive number-hint for an object).
-        const nc = try self.toNumberV(v);
-        if (nc.isAbrupt()) return nc;
-        const n = nc.normal.number;
+        // §13.5.4/.5/.6: unary `+`/`-`/`~` ToPrimitive (number hint), then operate. A BigInt primitive
+        // takes the BigInt path: `-`/`~` produce a BigInt; unary `+` on a BigInt is a TypeError (§13.5.4.1).
+        const pc = try self.toPrimitive(v, .number);
+        if (pc.isAbrupt()) return pc;
+        const prim = pc.normal;
+        if (prim == .bigint) {
+            const b = prim.bigint;
+            switch (op) {
+                .plus => return self.throwError("TypeError", "Cannot convert a BigInt value to a number"), // §13.5.4.1
+                .minus => return .{ .normal = .{ .bigint = bigint.neg(self.arena, b) catch |e| return self.bigintError(e) } }, // §13.5.5
+                .bit_not => return .{ .normal = .{ .bigint = bigint.bitNot(self.arena, b) catch |e| return self.bigintError(e) } }, // §13.5.6
+                else => unreachable,
+            }
+        }
+        if (prim == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a number");
+        const n = toNumber(prim);
         return switch (op) {
             .plus => .{ .normal = .{ .number = n } }, // §13.5.4
             .minus => .{ .normal = .{ .number = -n } }, // §13.5.5
@@ -4975,6 +5006,9 @@ pub const Interpreter = struct {
                     const rs = try self.toString(rp);
                     return .{ .normal = .{ .string = try std.mem.concat(self.arena, u8, &.{ ls, rs }) } };
                 }
+                // §13.15.3 step 4: neither is a String. BigInt + BigInt adds; a BigInt mixed with a
+                // non-BigInt numeric operand → TypeError (§6.1.6.2 — no implicit conversion).
+                if (lp == .bigint or rp == .bigint) return self.bigintBinary(lp, rp, .add);
                 // numeric: §13.8.1 a Symbol operand throws on ToNumber.
                 if (lp == .symbol or rp == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a number");
                 return .{ .normal = .{ .number = toNumber(lp) + toNumber(rp) } };
@@ -5028,12 +5062,21 @@ pub const Interpreter = struct {
     /// `+`): ToNumber (via ToPrimitive number-hint) both operands left-to-right, then the IEEE-754 /
     /// Int32 / UInt32 operation. A Symbol operand → TypeError (raised by `toNumberV`).
     fn numericBinary(self: *Interpreter, l: Value, r: Value, op: ast.BinaryOp) EvalError!Completion {
-        const lc = try self.toNumberV(l);
-        if (lc.isAbrupt()) return lc;
-        const rc = try self.toNumberV(r);
-        if (rc.isAbrupt()) return rc;
-        const a = lc.normal.number;
-        const b = rc.normal.number;
+        // §13.15.3 / §7.1.3 ToNumeric: process the operands STRICTLY in order — ToNumeric(lhs) fully
+        // (ToPrimitive + the Symbol→TypeError check) BEFORE ToNumeric(rhs) begins, so the side-effect
+        // ordering matches the spec (a Symbol lhs throws before rhs's valueOf runs). A BigInt primitive
+        // is left as-is for the operator step (which enforces the no-mixing TypeError).
+        const lpc = try self.toPrimitive(l, .number);
+        if (lpc.isAbrupt()) return lpc;
+        const lp = lpc.normal;
+        if (lp == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a number");
+        const rpc = try self.toPrimitive(r, .number);
+        if (rpc.isAbrupt()) return rpc;
+        const rp = rpc.normal;
+        if (rp == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a number");
+        if (lp == .bigint or rp == .bigint) return self.bigintBinary(lp, rp, op);
+        const a = toNumber(lp);
+        const b = toNumber(rp);
         return switch (op) {
             .sub => .{ .normal = .{ .number = a - b } },
             .mul => .{ .normal = .{ .number = a * b } },
@@ -5057,6 +5100,46 @@ pub const Interpreter = struct {
                 break :blk .{ .normal = .{ .number = @floatFromInt(numToUint32(a) >> sh) } };
             },
             else => unreachable,
+        };
+    }
+
+    /// §13.15.3 / §6.1.6.2 — the binary operators with at least one BigInt primitive operand. Both
+    /// MUST be BigInt (mixing a BigInt with a Number/String/etc. in an arithmetic or bitwise op is a
+    /// TypeError); `>>>` (UnsignedRightShift) is itself a TypeError for BigInt. Maps each op to the
+    /// `bigint` module and turns its error tags into the matching JS exception.
+    fn bigintBinary(self: *Interpreter, l: Value, r: Value, op: ast.BinaryOp) EvalError!Completion {
+        if (op == .shr_un) return self.throwError("TypeError", "BigInts have no unsigned right shift, use >> instead");
+        if (l != .bigint or r != .bigint) {
+            return self.throwError("TypeError", "Cannot mix BigInt and other types, use explicit conversions");
+        }
+        const a = l.bigint;
+        const b = r.bigint;
+        const res = switch (op) {
+            .add => bigint.add(self.arena, a, b),
+            .sub => bigint.sub(self.arena, a, b),
+            .mul => bigint.mul(self.arena, a, b),
+            .div => bigint.div(self.arena, a, b),
+            .mod => bigint.rem(self.arena, a, b),
+            .exp => bigint.pow(self.arena, a, b),
+            .bit_and => bigint.bitAnd(self.arena, a, b),
+            .bit_or => bigint.bitOr(self.arena, a, b),
+            .bit_xor => bigint.bitXor(self.arena, a, b),
+            .shl => bigint.shl(self.arena, a, b),
+            .shr => bigint.shr(self.arena, a, b),
+            else => unreachable,
+        } catch |e| return self.bigintError(e);
+        return .{ .normal = .{ .bigint = res } };
+    }
+
+    /// Map a `bigint.Error` to the right JS exception (or propagate OutOfMemory).
+    fn bigintError(self: *Interpreter, e: bigint.Error) EvalError!Completion {
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.DivisionByZero => self.throwError("RangeError", "Division by zero"),
+            error.NegativeExponent => self.throwError("RangeError", "Exponent must be non-negative"),
+            error.ShiftRange => self.throwError("RangeError", "BigInt is too large"),
+            error.NotAnInteger => self.throwError("RangeError", "The number is not a safe integer"),
+            error.InvalidString => self.throwError("SyntaxError", "Cannot convert string to a BigInt"),
         };
     }
 
@@ -5968,6 +6051,9 @@ pub const Interpreter = struct {
             .object_property_is_enumerable => return self.objectPropertyIsEnumerable(this_val, args),
             .object_is_prototype_of => return self.objectIsPrototypeOf(this_val, args),
             .function_method => return self.functionPrototypeMethod(func.native_name, this_val, args),
+            .bigint_ctor => return self.bigintConstructor(args), // §21.2.1.1 BigInt(value)
+            .bigint_static => return self.bigintStatic(func.native_name, args), // §21.2.2 asIntN/asUintN
+            .bigint_method => return self.bigintMethod(func.native_name, this_val, args), // §21.2.3 toString/valueOf
             .symbol_ctor => return self.symbolConstructor(args), // §20.4.1.1 Symbol([description])
             .promise_ctor => return self.promiseConstructor(args), // §27.2.3.1 Promise(executor) called w/o new
             .array_ctor, .array_method, .string_method, .math_method => unreachable, // handled in the first switch
@@ -6002,6 +6088,79 @@ pub const Interpreter = struct {
     fn symbolToString(self: *Interpreter, this_val: Value) EvalError!Completion {
         if (this_val != .symbol) return self.throwError("TypeError", "Symbol.prototype.toString requires that 'this' be a Symbol");
         return .{ .normal = .{ .string = try self.toString(this_val) } };
+    }
+
+    /// §7.1.13 ToBigInt — a primitive `prim` (after ToPrimitive) to a BigInt, or an abrupt completion
+    /// carrying the right exception. Boolean→0n/1n, BigInt→itself, String→StringToBigInt (invalid →
+    /// SyntaxError), Number→NumberToBigInt (non-integer → RangeError), Symbol/Number-NaN handled.
+    /// undefined/null → TypeError. Returns `.{ .normal = .bigint }` on success.
+    fn toBigIntPrim(self: *Interpreter, prim: Value) EvalError!Completion {
+        switch (prim) {
+            .bigint => return .{ .normal = prim },
+            .boolean => |b| return .{ .normal = .{ .bigint = bigint.fromI64(self.arena, if (b) 1 else 0) catch |e| return self.bigintError(e) } },
+            .number => |n| return .{ .normal = .{ .bigint = bigint.fromF64(self.arena, n) catch |e| return self.bigintError(e) } },
+            .string => |s| {
+                const maybe = bigint.fromString(self.arena, s) catch |e| return self.bigintError(e);
+                const b = maybe orelse return self.throwError("SyntaxError", "Cannot convert string to a BigInt");
+                return .{ .normal = .{ .bigint = b } };
+            },
+            .symbol => return self.throwError("TypeError", "Cannot convert a Symbol value to a BigInt"),
+            .undefined, .null => return self.throwError("TypeError", "Cannot convert undefined or null to a BigInt"),
+            .object => unreachable, // caller ToPrimitive'd first
+        }
+    }
+
+    /// §21.2.1.1 BigInt ( value ) — ToPrimitive(number) the argument, then ToBigInt.
+    fn bigintConstructor(self: *Interpreter, args: []const Value) EvalError!Completion {
+        const v: Value = if (args.len > 0) args[0] else .undefined;
+        const pc = try self.toPrimitive(v, .number);
+        if (pc.isAbrupt()) return pc;
+        return self.toBigIntPrim(pc.normal);
+    }
+
+    /// §21.2.2.1/.2 BigInt.asIntN(bits, x) / BigInt.asUintN(bits, x) — `bits` = ToIndex, `x` = ToBigInt.
+    fn bigintStatic(self: *Interpreter, name: []const u8, args: []const Value) EvalError!Completion {
+        const bits_arg: Value = if (args.len > 0) args[0] else .undefined;
+        const x_arg: Value = if (args.len > 1) args[1] else .undefined;
+        // §7.1.22 ToIndex: ToIntegerOrInfinity, must be a non-negative integer < 2^53.
+        const bits_n = toNumber(bits_arg);
+        if (std.math.isNan(bits_n) or bits_n < 0 or @floor(bits_n) != bits_n or bits_n > 9007199254740991.0) {
+            return self.throwError("RangeError", "Invalid bit count for BigInt.asIntN/asUintN");
+        }
+        const bits: usize = @intFromFloat(bits_n);
+        const xpc = try self.toPrimitive(x_arg, .number);
+        if (xpc.isAbrupt()) return xpc;
+        const xc = try self.toBigIntPrim(xpc.normal);
+        if (xc.isAbrupt()) return xc;
+        const x = xc.normal.bigint;
+        const res = if (std.mem.eql(u8, name, "asIntN"))
+            bigint.asIntN(self.arena, bits, x)
+        else
+            bigint.asUintN(self.arena, bits, x);
+        return .{ .normal = .{ .bigint = res catch |e| return self.bigintError(e) } };
+    }
+
+    /// §21.2.3 BigInt.prototype.toString([radix]) / valueOf — `this` must be a BigInt (or a wrapper,
+    /// but the M-subset never boxes BigInt into an object, so only a primitive `this` is accepted).
+    fn bigintMethod(self: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
+        const b: *const std.math.big.int.Const = switch (this_val) {
+            .bigint => |x| x,
+            // a `new Object(1n)` style wrapper would carry [[BigIntData]] on `.primitive`; accept it.
+            .object => |o| if (o.primitive != null and o.primitive.? == .bigint) o.primitive.?.bigint else return self.throwError("TypeError", "BigInt.prototype method called on incompatible receiver"),
+            else => return self.throwError("TypeError", "BigInt.prototype method called on incompatible receiver"),
+        };
+        if (std.mem.eql(u8, name, "valueOf")) return .{ .normal = .{ .bigint = b } };
+        // toString([radix]): radix defaults to 10; otherwise ToIntegerOrInfinity in [2,36].
+        var radix: u8 = 10;
+        if (args.len > 0 and args[0] != .undefined) {
+            const rn = toNumber(args[0]);
+            if (std.math.isNan(rn) or rn < 2 or rn > 36 or @floor(rn) != rn) {
+                return self.throwError("RangeError", "toString() radix must be between 2 and 36");
+            }
+            radix = @intFromFloat(rn);
+        }
+        const s = bigint.toStringRadix(self.arena, b, radix) catch |e| return self.bigintError(e);
+        return .{ .normal = .{ .string = s } };
     }
 
     /// §10.4.4 CreateUnmappedArgumentsObject — the `arguments` exotic given to an ordinary

@@ -4,6 +4,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const lex = @import("lexer.zig");
+const bigint = @import("bigint.zig");
 
 pub const ParseError = error{ UnexpectedToken, UnexpectedEof } || lex.LexError;
 
@@ -2760,11 +2761,39 @@ pub const Parser = struct {
         return std.fmt.parseFloat(f64, s) catch ParseError.UnexpectedToken;
     }
 
+    /// §12.9.3.2 — the value of a BigIntLiteral lexeme (the digit text, `n` already stripped by the
+    /// lexer). Strips `_` separators, detects a `0x`/`0o`/`0b` radix prefix (else decimal), and parses
+    /// the digits into an arena-owned BigInt. Reuses the same separator-placement Early Error.
+    fn parseBigIntLiteral(self: *Parser, lexeme: []const u8) ParseError!*const std.math.big.int.Const {
+        if (!validNumericSeparators(lexeme)) return ParseError.UnexpectedToken;
+        var buf: std.ArrayList(u8) = .empty;
+        for (lexeme) |ch| if (ch != '_') try buf.append(self.arena, ch);
+        var s = buf.items;
+        var base: u8 = 10;
+        if (s.len >= 2 and s[0] == '0') {
+            base = switch (s[1]) {
+                'x', 'X' => 16,
+                'o', 'O' => 8,
+                'b', 'B' => 2,
+                else => 10,
+            };
+            if (base != 10) {
+                if (s.len == 2) return ParseError.UnexpectedToken; // prefix with no digits
+                s = s[2..];
+            }
+        }
+        return bigint.fromDigits(self.arena, s, base, false) catch ParseError.UnexpectedToken;
+    }
+
     fn parsePrimary(self: *Parser) ParseError!*const ast.Node {
         const t = self.peek();
         switch (t.kind) {
             .number => {
                 _ = self.advance();
+                if (t.is_bigint) { // §12.9.3.2 BigIntLiteral
+                    const b = self.parseBigIntLiteral(t.lexeme) catch return ParseError.UnexpectedToken;
+                    return self.alloc(.{ .bigint = b });
+                }
                 const n = self.parseNumericLiteral(t.lexeme) catch return ParseError.UnexpectedToken;
                 return self.alloc(.{ .number = n });
             },
@@ -3335,7 +3364,7 @@ fn collectBoundNames(pattern: *const ast.Pattern, names: *std.ArrayList([]const 
 fn containsArguments(node: *const ast.Node) bool {
     switch (node.*) {
         .identifier => |n| return std.mem.eql(u8, n, "arguments"),
-        .number, .string, .boolean, .null, .this, .new_target => return false,
+        .number, .bigint, .string, .boolean, .null, .this, .new_target => return false,
         .unary => |u| return containsArguments(u.operand),
         .update => |u| return containsArguments(u.target),
         .comma => |c| return containsArguments(c.left) or containsArguments(c.right),

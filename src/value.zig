@@ -1,5 +1,6 @@
 //! ECMAScript language values (ECMA-262 §6.1). M1 adds the Object reference; M8 adds Symbol;
-//! BigInt arrives in a later milestone.
+//! M36 adds BigInt (§6.1.6.2) — an arbitrary-precision integer backed by `std.math.big.int.Const`,
+//! its limbs slice owned by the realm arena (see `bigint.zig`).
 const std = @import("std");
 const Object = @import("object.zig").Object;
 
@@ -21,6 +22,9 @@ pub const Value = union(enum) {
     number: f64,
     /// §6.1.4 String — UTF-8 bytes owned by the evaluation arena.
     string: []const u8,
+    /// §6.1.6.2 BigInt — an arbitrary-precision integer; the `Const` and its limbs live in the realm
+    /// arena (immutable, shared freely; arithmetic snapshots fresh results). See `bigint.zig`.
+    bigint: *const std.math.big.int.Const,
     /// §6.1.5 Symbol — a unique primitive identity (reference into the realm arena).
     symbol: *Symbol,
     /// §6.1.7 Object — reference into the realm arena.
@@ -35,6 +39,11 @@ pub const Value = union(enum) {
             .null => try w.writeAll("null"),
             .boolean => |b| try w.writeAll(if (b) "true" else "false"),
             .number => |n| try writeNumber(w, n),
+            // §6.1.6.2 BigInt — decimal digits with a trailing `n` (the REPL/display form, like V8).
+            .bigint => |b| {
+                try b.format(w);
+                try w.writeAll("n");
+            },
             .string => |s| try w.print("\"{s}\"", .{s}),
             .symbol => |s| { // §20.4.3.3 SymbolDescriptiveString: `Symbol(desc)`
                 try w.writeAll("Symbol(");

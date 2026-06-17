@@ -2943,3 +2943,88 @@ test "M35: §13.3.12 new.target meta-property" {
         true,
     );
 }
+
+test "M36: §6.1.6.2 BigInt — literals, typeof, ToBoolean" {
+    try expectStr("typeof 1n", "bigint");
+    try expectStr("typeof BigInt(5)", "bigint");
+    // §12.9.3.2 radix literals
+    try expectBool("0xFFn === 255n", true);
+    try expectBool("0o17n === 15n", true);
+    try expectBool("0b1010n === 10n", true);
+    try expectBool("123_456n === 123456n", true); // separators
+    // §7.1.2 ToBoolean
+    try expectBool("Boolean(0n)", false);
+    try expectBool("Boolean(1n)", true);
+    try expectBool("!0n", true);
+    // §12.9.3.2: `n` after a fraction / exponent / non-octal-decimal is a SyntaxError.
+    try expectSyntaxError("1.5n");
+    try expectSyntaxError("1e2n");
+    try expectSyntaxError("08n");
+}
+
+test "M36: §6.1.6.2 BigInt — arithmetic (both operands BigInt)" {
+    try expectBool("1n + 2n === 3n", true);
+    try expectBool("10n * 10n === 100n", true);
+    try expectBool("7n / 2n === 3n", true); // truncates toward zero
+    try expectBool("-7n / 2n === -3n", true);
+    try expectBool("7n % 3n === 1n", true);
+    try expectBool("-7n % 3n === -1n", true); // remainder follows the dividend's sign
+    try expectBool("2n ** 10n === 1024n", true);
+    try expectBool("5n - 8n === -3n", true);
+    // bitwise + shifts (two's-complement infinite semantics)
+    try expectBool("(12n & 10n) === 8n", true);
+    try expectBool("(12n | 10n) === 14n", true);
+    try expectBool("(12n ^ 10n) === 6n", true);
+    try expectBool("(1n << 64n) === 18446744073709551616n", true);
+    try expectBool("(-1n >> 1n) === -1n", true);
+    try expectBool("~0n === -1n", true);
+    try expectBool("-(5n) === -5n", true);
+    // huge values stay exact (beyond f64 precision)
+    try expectBool("9007199254740993n + 1n === 9007199254740994n", true);
+}
+
+test "M36: §6.1.6.2 BigInt — errors (mixing, /0n, **-, >>>, unary +)" {
+    try expectThrows("1n + 1"); // §13.15.3 mixing BigInt + Number → TypeError
+    try expectThrows("1 - 1n");
+    try expectThrows("1n & 1");
+    try expectThrows("1n / 0n"); // RangeError: division by zero
+    try expectThrows("1n % 0n");
+    try expectThrows("2n ** -1n"); // RangeError: negative exponent
+    try expectThrows("1n >>> 1n"); // TypeError: no unsigned right shift for BigInt
+    try expectThrows("+1n"); // TypeError: unary + on a BigInt
+    try expectThrows("new BigInt(1)"); // TypeError: BigInt is not a constructor
+}
+
+test "M36: §7.2.13/§7.2.15 BigInt comparisons (cross-type)" {
+    try expectBool("1n == 1", true); // loose == compares numerically
+    try expectBool("1n === 1", false); // strict === is false across types
+    try expectBool("1n == 1.0", true);
+    try expectBool("1n == 1.5", false);
+    try expectBool("1n == '1'", true); // string side parsed
+    try expectBool("2n > 1", true); // relational cross-type
+    try expectBool("1n < 2", true);
+    try expectBool("2n >= 2", true);
+    try expectBool("1n == true", true); // Boolean → numeric
+    try expectBool("0n == false", true);
+}
+
+test "M36: §21.2.1.1 BigInt(x) + §21.2.3 ToString" {
+    try expectBool("BigInt(5) + 1n === 6n", true);
+    try expectBool("BigInt(true) === 1n", true);
+    try expectBool("BigInt(false) === 0n", true);
+    try expectBool("BigInt('0x1F') === 31n", true);
+    try expectBool("BigInt('  42  ') === 42n", true); // trimmed
+    try expectThrows("BigInt(1.5)"); // RangeError: not an integer
+    try expectThrows("BigInt('xyz')"); // SyntaxError: invalid string
+    // §21.2.3 ToString / template / String()
+    try expectStr("String(123n)", "123");
+    try expectStr("String(-7n)", "-7");
+    try expectStr("(255n).toString(16)", "ff");
+    try expectStr("(10n).toString(2)", "1010");
+    try expectStr("`${42n}`", "42"); // template substitution
+    try expectStr("'' + 5n", "5"); // string concat via ToString
+    try expectBool("(255n).valueOf() === 255n", true);
+    // §21.2.2 asIntN / asUintN
+    try expectBool("BigInt.asUintN(8, 256n) === 0n", true);
+    try expectBool("BigInt.asIntN(8, 255n) === -1n", true);
+}
