@@ -19,6 +19,7 @@ const builtin_math = @import("builtin_math.zig");
 const builtin_number = @import("builtin_number.zig");
 const builtin_symbol = @import("builtin_symbol.zig");
 const builtin_iterator = @import("builtin_iterator.zig");
+const builtin_object = @import("builtin_object.zig");
 const builtins = @import("builtins.zig");
 const bigint = @import("bigint.zig");
 const Parser = @import("parser.zig").Parser;
@@ -1756,13 +1757,13 @@ pub const Interpreter = struct {
         return .{ .normal = .{ .object = obj } };
     }
 
-    const KeyResult = struct {
+    pub const KeyResult = struct {
         key: []const u8 = "",
         /// Non-null when a computed `[expr]` key evaluated to a Symbol (§13.2.5 ComputedPropertyName +
         /// §7.1.19 ToPropertyKey) — the property is symbol-keyed, not string-keyed.
         symbol: ?*Symbol = null,
         completion: Completion = .{ .normal = .undefined },
-        fn isAbrupt(self: KeyResult) bool {
+        pub fn isAbrupt(self: KeyResult) bool {
             return self.completion.isAbrupt();
         }
     };
@@ -1781,7 +1782,7 @@ pub const Interpreter = struct {
     /// §7.1.19 ToPropertyKey ( argument ) — a Symbol stays a Symbol; an object is ToPrimitive(string)'d
     /// (which may itself yield a Symbol), then any non-symbol primitive is ToString'd. So a computed
     /// `[fn]` key uses the function's `toString` (consistent with `String(fn)`), not a raw fallback.
-    fn toPropertyKey(self: *Interpreter, v: Value) EvalError!KeyResult {
+    pub fn toPropertyKey(self: *Interpreter, v: Value) EvalError!KeyResult {
         if (v == .symbol) return .{ .symbol = v.symbol }; // §7.1.19 step 2
         if (v == .object) {
             const pc = try self.toPrimitive(v, .string);
@@ -2868,7 +2869,7 @@ pub const Interpreter = struct {
 
     /// §10.1.8 [[Get]]. Property access on null/undefined throws (§13.3); other primitives
     /// have no own properties in M1 (no boxing yet) → undefined.
-    fn getProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
+    pub fn getProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
         switch (base) {
             .object => |o| {
                 if (o.kind == .array) {
@@ -2982,7 +2983,7 @@ pub const Interpreter = struct {
         return self.setProperty(base, key, value);
     }
 
-    fn setProperty(self: *Interpreter, base: Value, key: []const u8, value: Value) EvalError!Completion {
+    pub fn setProperty(self: *Interpreter, base: Value, key: []const u8, value: Value) EvalError!Completion {
         switch (base) {
             .object => |o| {
                 if (o.kind == .array) {
@@ -3175,7 +3176,7 @@ pub const Interpreter = struct {
 
     /// A well-known Symbol identity (`Symbol.<name>`) held on the `Symbol` constructor. Null only in a
     /// realm-less unit eval (no `Symbol`). Used by the §ER dispose machinery (`dispose`/`asyncDispose`).
-    fn wellKnownSymbol(self: *Interpreter, name: []const u8) ?*Symbol {
+    pub fn wellKnownSymbol(self: *Interpreter, name: []const u8) ?*Symbol {
         const g = self.globals orelse return null;
         const b = g.lookup("Symbol") orelse return null;
         if (b.value != .object) return null;
@@ -3571,7 +3572,7 @@ pub const Interpreter = struct {
     /// Public §20.1.3.6 Object.prototype.toString wrapper for built-in modules (Array.prototype.toString
     /// fallback when the object's `join` is not callable).
     pub fn objectPrototypeToString(self: *Interpreter, this_val: Value) EvalError!Completion {
-        return self.objectToString(this_val);
+        return builtin_object.objectToString(self, this_val);
     }
 
     /// §7.3.20 Invoke ( V, P, argumentsList ) = Call(? GetV(V, P), V, args). Used by
@@ -3752,7 +3753,7 @@ pub const Interpreter = struct {
     /// via the full Symbol.iterator protocol. Used by spread / array destructuring (which need the
     /// whole sequence up front). Arrays/Strings have native iterators (fast), but ANY object with a
     /// `[Symbol.iterator]` returning a `next`-having object works. A non-iterable → abrupt TypeError.
-    fn iterateToList(self: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!Completion {
+    pub fn iterateToList(self: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!Completion {
         // Fast path: an Array iterates its `elements` directly (skips the per-element next() call),
         // preserving the hot spread/destructuring path. Strings keep their native code-unit walk.
         if (value == .object and value.object.kind == .array) {
@@ -5831,7 +5832,7 @@ pub const Interpreter = struct {
     }
 
     /// The `.prototype` object of a named global constructor (Error/Array/…), or null.
-    fn globalProto(self: *Interpreter, name: []const u8) ?*Object {
+    pub fn globalProto(self: *Interpreter, name: []const u8) ?*Object {
         const g = self.globals orelse return null;
         const b = g.lookup(name) orelse return null;
         if (b.value != .object) return null;
@@ -6010,7 +6011,7 @@ pub const Interpreter = struct {
     /// §6.2.6 ToPropertyDescriptor — read a descriptor object's own `value`/`writable`/`get`/`set`/
     /// `enumerable`/`configurable` fields into a `Descriptor` (each present-or-absent via HasProperty).
     /// `get`/`set` must be callable or `undefined` (TypeError otherwise). Returns null+throw on error.
-    fn toPropertyDescriptor(self: *Interpreter, attrs: Value) EvalError!union(enum) { desc: object_mod.Descriptor, abrupt: Completion } {
+    pub fn toPropertyDescriptor(self: *Interpreter, attrs: Value) EvalError!union(enum) { desc: object_mod.Descriptor, abrupt: Completion } {
         if (attrs != .object) return .{ .abrupt = (try self.throwError("TypeError", "Property description must be an object")) };
         const o = attrs.object;
         var d: object_mod.Descriptor = .{};
@@ -6059,674 +6060,11 @@ pub const Interpreter = struct {
         return .{ .desc = d };
     }
 
-    /// §20.1.2.4 Object.defineProperty ( O, P, Attributes ).
-    fn objectDefineProperty(self: *Interpreter, args: []const Value) EvalError!Completion {
-        const o = if (args.len > 0) args[0] else .undefined;
-        if (o != .object) return self.throwError("TypeError", "Object.defineProperty called on non-object");
-        // §20.1.2.4 step 2: ToPropertyKey(P) BEFORE step 3 ToPropertyDescriptor(Attributes).
-        const pk = try self.toPropertyKey(if (args.len > 1) args[1] else .undefined);
-        if (pk.isAbrupt()) return pk.completion;
-        const sym_key: ?*Symbol = pk.symbol;
-        const str_key: []const u8 = pk.key;
-        const r = try self.toPropertyDescriptor(if (args.len > 2) args[2] else .undefined);
-        switch (r) {
-            .abrupt => |c| return c,
-            .desc => |d| {
-                if (sym_key) |sym| {
-                    const ok = try o.object.defineSymbolProperty(sym, d);
-                    if (!ok) return self.throwError("TypeError", "Cannot redefine property");
-                    return .{ .normal = o };
-                }
-                // §10.4.2.1 Array exotic [[DefineOwnProperty]] — `length` is synthetic (the real value
-                // lives in `array_length`, with a separate `[[Writable]]`), so it needs the ArraySetLength
-                // path. Integer indices fall through to the ordinary define (the M-subset stores
-                // non-default-attribute indices in the property map; a plain value define is shadowed by
-                // the dense slot a later [[Set]] writes — see specs/043).
-                if (o.object.kind == .array and std.mem.eql(u8, str_key, "length")) {
-                    const adc = try self.arrayDefineLength(o.object, d);
-                    if (adc.isAbrupt()) return adc;
-                    return .{ .normal = o };
-                }
-                const ok = try o.object.defineProperty(str_key, d);
-                if (!ok) return self.throwError("TypeError", "Cannot redefine property");
-                return .{ .normal = o };
-            },
-        }
-    }
-
-    /// §10.4.2.4 ArraySetLength applied to a [[DefineOwnProperty]] on an array's `length`. M-subset:
-    /// validate a present `value` (ToUint32, RangeError on a non-uint32), reject a writability UPGRADE
-    /// on a non-writable length, apply a length change (rejected if non-writable + a different value),
-    /// and record the resulting [[Writable]]. An accessor descriptor for `length` → reject.
-    fn arrayDefineLength(self: *Interpreter, arr: *Object, d: object_mod.Descriptor) EvalError!Completion {
-        if (d.isAccessor()) return self.throwError("TypeError", "Cannot redefine array length as an accessor");
-        if (d.enumerable) |e| if (e) return self.throwError("TypeError", "Cannot make array length enumerable");
-        if (d.configurable) |c| if (c) return self.throwError("TypeError", "Cannot make array length configurable");
-        // A length value change is gated by the CURRENT writability.
-        if (d.has_value) {
-            const n = toNumber(d.value.?);
-            if (std.math.isNan(n) or n < 0 or n > 4294967295.0 or n != @floor(n)) {
-                return self.throwError("RangeError", "Invalid array length");
-            }
-            const new_len: usize = @intFromFloat(n);
-            if (new_len != arr.arrayLen() and !arr.array_length_writable) {
-                return self.throwError("TypeError", "Cannot assign to read only property 'length'");
-            }
-            try arr.arraySetLen(new_len);
-        }
-        // §10.4.2.4 step 17: a non-writable length cannot be made writable again.
-        if (d.writable) |w| {
-            if (w and !arr.array_length_writable) return self.throwError("TypeError", "Cannot redefine non-writable array length as writable");
-            arr.array_length_writable = w;
-        }
-        return .{ .normal = .undefined };
-    }
-
-    /// §20.1.2.5 Object.defineProperties ( O, Properties ) — DefinePropertiesHelper over each own
-    /// enumerable key of `Properties`.
-    fn objectDefineProperties(self: *Interpreter, args: []const Value) EvalError!Completion {
-        const o = if (args.len > 0) args[0] else .undefined;
-        if (o != .object) return self.throwError("TypeError", "Object.defineProperties called on non-object");
-        const props = if (args.len > 1) args[1] else .undefined;
-        if (props != .object) return self.throwError("TypeError", "Cannot convert undefined or null to object");
-        var it = props.object.properties.iterator();
-        while (it.next()) |entry| {
-            if (!entry.value_ptr.enumerable) continue;
-            const key = entry.key_ptr.*;
-            const ac = try self.getProperty(props, key);
-            if (ac.isAbrupt()) return ac;
-            const r = try self.toPropertyDescriptor(ac.normal);
-            switch (r) {
-                .abrupt => |c| return c,
-                .desc => |d| {
-                    const ok = try o.object.defineProperty(key, d);
-                    if (!ok) return self.throwError("TypeError", "Cannot redefine property");
-                },
-            }
-        }
-        // §20.1.2.5: OwnPropertyKeys includes SYMBOL keys — define each enumerable symbol-keyed one too.
-        for (props.object.symbol_props.items) |sp| {
-            if (!sp.pv.enumerable) continue;
-            const ac = try self.getSymbolProperty(props, sp.key);
-            if (ac.isAbrupt()) return ac;
-            const r = try self.toPropertyDescriptor(ac.normal);
-            switch (r) {
-                .abrupt => |c| return c,
-                .desc => |d| {
-                    const ok = try o.object.defineSymbolProperty(sp.key, d);
-                    if (!ok) return self.throwError("TypeError", "Cannot redefine property");
-                },
-            }
-        }
-        return .{ .normal = o };
-    }
-
-    /// §20.1.2.8 Object.getOwnPropertyDescriptor ( O, P ) → §6.2.6 FromPropertyDescriptor or undefined.
-    fn objectGetOwnPropertyDescriptor(self: *Interpreter, args: []const Value) EvalError!Completion {
-        const o = if (args.len > 0) args[0] else .undefined;
-        if (o != .object) {
-            // §20.1.2.8 step 1: ToObject — a String boxes (index/length keys); else no own props.
-            if (o == .string) return self.stringDescriptor(o.string, try self.toString(if (args.len > 1) args[1] else .undefined));
-            if (o == .undefined or o == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
-            return .{ .normal = .undefined };
-        }
-        // §20.1.2.8 step 2: ToPropertyKey(P) — a Symbol key reads the symbol-keyed store.
-        const pk = try self.toPropertyKey(if (args.len > 1) args[1] else .undefined);
-        if (pk.isAbrupt()) return pk.completion;
-        if (pk.symbol) |sym| {
-            for (o.object.symbol_props.items) |sp| {
-                if (sp.key == sym) return self.fromPropertyValue(sp.pv);
-            }
-            return .{ .normal = .undefined };
-        }
-        const key = pk.key;
-        // Array exotic: indices + `length` have synthetic descriptors (not in the property map).
-        if (o.object.kind == .array) {
-            if (std.mem.eql(u8, key, "length"))
-                return self.fromDataDescriptor(.{ .number = @floatFromInt(o.object.arrayLen()) }, o.object.array_length_writable, false, false);
-            if (parseIndex(key)) |i| {
-                if (o.object.arrayHas(i))
-                    // §10.4.2: an array index is writable/enumerable/configurable unless the array is
-                    // frozen (then its elements are non-writable + non-configurable).
-                    return self.fromDataDescriptor(o.object.arrayGet(i), !o.object.array_frozen, true, !o.object.array_frozen);
-            }
-        }
-        const pv = o.object.properties.get(key) orelse return .{ .normal = .undefined };
-        return self.fromPropertyValue(pv);
-    }
-
-    /// §6.2.6 FromPropertyDescriptor of a stored `PropertyValue` → a fresh descriptor object.
-    fn fromPropertyValue(self: *Interpreter, pv: object_mod.PropertyValue) EvalError!Completion {
-        const desc = try Object.create(self.arena, self.globalProto("Object"));
-        switch (pv.payload) {
-            .data => |v| {
-                try desc.set("value", v);
-                try desc.set("writable", .{ .boolean = pv.writable });
-            },
-            .accessor => |a| {
-                try desc.set("get", if (a.get) |g| .{ .object = g } else .undefined);
-                try desc.set("set", if (a.set) |s| .{ .object = s } else .undefined);
-            },
-        }
-        try desc.set("enumerable", .{ .boolean = pv.enumerable });
-        try desc.set("configurable", .{ .boolean = pv.configurable });
-        return .{ .normal = .{ .object = desc } };
-    }
-
-    fn fromDataDescriptor(self: *Interpreter, value: Value, writable: bool, enumerable: bool, configurable: bool) EvalError!Completion {
-        return self.fromPropertyValue(.{
-            .payload = .{ .data = value },
-            .writable = writable,
-            .enumerable = enumerable,
-            .configurable = configurable,
-        });
-    }
-
-    /// A String's own index/length property descriptor (the ToObject boxing path).
-    fn stringDescriptor(self: *Interpreter, s: []const u8, key: []const u8) EvalError!Completion {
-        if (std.mem.eql(u8, key, "length"))
-            return self.fromDataDescriptor(.{ .number = @floatFromInt(s.len) }, false, false, false);
-        if (parseIndex(key)) |i| {
-            if (i < s.len) return self.fromDataDescriptor(.{ .string = s[i .. i + 1] }, false, true, false);
-        }
-        return .{ .normal = .undefined };
-    }
-
-    /// §20.1.2.10 Object.getOwnPropertyNames ( O ) — all own string keys (enumerable or not). For an
-    /// Array: the indices (numeric order) + `"length"`, then ordinary string keys.
-    fn objectGetOwnPropertyNames(self: *Interpreter, args: []const Value) EvalError!Completion {
-        const o = if (args.len > 0) args[0] else .undefined;
-        const arr = try Object.createArray(self.arena, self.arrayProto());
-        switch (o) {
-            .object => |obj| {
-                if (obj.kind == .array) {
-                    for (try obj.arrayIndices(self.arena)) |i| {
-                        try arr.elements.append(self.arena, .{ .string = try numberToString(self.arena, @floatFromInt(i)) });
-                    }
-                    try arr.elements.append(self.arena, .{ .string = "length" });
-                }
-                var it = obj.properties.iterator();
-                while (it.next()) |entry| try arr.elements.append(self.arena, .{ .string = entry.key_ptr.* });
-            },
-            .string => |s| {
-                for (0..s.len) |i| try arr.elements.append(self.arena, .{ .string = try numberToString(self.arena, @floatFromInt(i)) });
-                try arr.elements.append(self.arena, .{ .string = "length" });
-            },
-            .undefined, .null => return self.throwError("TypeError", "Cannot convert undefined or null to object"),
-            else => {},
-        }
-        return .{ .normal = .{ .object = arr } };
-    }
-
-    /// §20.1.2.9 Object.getOwnPropertyDescriptors ( O ) — an object mapping each own key to its
-    /// FromPropertyDescriptor result (all own string keys, enumerable or not).
-    fn objectGetOwnPropertyDescriptors(self: *Interpreter, args: []const Value) EvalError!Completion {
-        const o = if (args.len > 0) args[0] else .undefined;
-        if (o == .undefined or o == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
-        const result = try Object.create(self.arena, self.objectProto());
-        if (o == .object) {
-            const obj = o.object;
-            if (obj.kind == .array) {
-                for (try obj.arrayIndices(self.arena)) |i| {
-                    const key = try numberToString(self.arena, @floatFromInt(i));
-                    const dc = try self.fromDataDescriptor(obj.arrayGet(i), true, true, true);
-                    try result.set(key, dc.normal);
-                }
-                const lc = try self.fromDataDescriptor(.{ .number = @floatFromInt(obj.arrayLen()) }, true, false, false);
-                try result.set("length", lc.normal);
-            }
-            var it = obj.properties.iterator();
-            while (it.next()) |entry| {
-                const dc = try self.fromPropertyValue(entry.value_ptr.*);
-                try result.set(entry.key_ptr.*, dc.normal);
-            }
-        }
-        return .{ .normal = .{ .object = result } };
-    }
-
-    const KveKind = enum { keys, values, entries };
-
-    /// §20.1.2.19/.23/.6 Object.keys / values / entries — over the own ENUMERABLE string keys of
-    /// ToObject(O), in property order (Array indices first, then string keys; String chars for a
-    /// primitive string). `keys` → the key strings; `values` → the values (getters invoked); `entries`
-    /// → `[key, value]` two-element arrays.
-    fn objectKeysValuesEntries(self: *Interpreter, args: []const Value, kind: KveKind) EvalError!Completion {
-        const o = if (args.len > 0) args[0] else .undefined;
-        if (o == .undefined or o == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
-        const out = try Object.createArray(self.arena, self.arrayProto());
-        var keys: std.ArrayListUnmanaged(Value) = .empty;
-        try self.ownEnumerableKeys(o, &keys);
-        for (keys.items) |k| {
-            switch (kind) {
-                .keys => try out.elements.append(self.arena, k),
-                .values, .entries => {
-                    const vc = try self.getProperty(o, k.string);
-                    if (vc.isAbrupt()) return vc;
-                    if (kind == .values) {
-                        try out.elements.append(self.arena, vc.normal);
-                    } else {
-                        const pair = try Object.createArray(self.arena, self.arrayProto());
-                        try pair.elements.append(self.arena, k);
-                        try pair.elements.append(self.arena, vc.normal);
-                        try out.elements.append(self.arena, .{ .object = pair });
-                    }
-                },
-            }
-        }
-        return .{ .normal = .{ .object = out } };
-    }
-
-    /// §7.3.23 EnumerableOwnPropertyNames (key-collection half) — the OWN enumerable string keys of a
-    /// value (no prototype walk): Array indices (numeric order), ordinary own enumerable string keys,
-    /// or a primitive String's character indices. Used by Object.keys/values/entries and Object.assign.
+    /// §7.3.23 own ENUMERABLE string keys of `value` — a thin wrapper kept on the Interpreter so JSON
+    /// and other built-ins reach the helper now living in builtin_object.
     pub fn ownEnumerableKeys(self: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!void {
-        switch (value) {
-            .object => |o| {
-                if (o.kind == .array) {
-                    for (try o.arrayIndices(self.arena)) |i| {
-                        try out.append(self.arena, .{ .string = try numberToString(self.arena, @floatFromInt(i)) });
-                    }
-                }
-                var it = o.properties.iterator();
-                while (it.next()) |entry| {
-                    if (!entry.value_ptr.enumerable) continue; // §7.3.23: enumerable own keys only
-                    try out.append(self.arena, .{ .string = entry.key_ptr.* });
-                }
-            },
-            .string => |s| {
-                for (0..s.len) |i| try out.append(self.arena, .{ .string = try numberToString(self.arena, @floatFromInt(i)) });
-            },
-            else => {}, // number/boolean ToObject → no own enumerable string keys (M-subset)
-        }
+        return builtin_object.ownEnumerableKeys(self, value, out);
     }
-
-    /// §20.1.2.2 Object.create ( O, Properties ) — a new ordinary object with [[Prototype]] = O (an
-    /// object or null), then (if Properties is not undefined) §20.1.2.5 ObjectDefineProperties.
-    fn objectCreate(self: *Interpreter, args: []const Value) EvalError!Completion {
-        const proto_arg = if (args.len > 0) args[0] else .undefined;
-        const proto: ?*Object = switch (proto_arg) {
-            .null => null,
-            .object => |p| p,
-            else => return self.throwError("TypeError", "Object prototype may only be an Object or null"),
-        };
-        const obj = try Object.create(self.arena, proto);
-        const props = if (args.len > 1) args[1] else .undefined;
-        if (props != .undefined) {
-            const r = try self.objectDefineProperties(&.{ .{ .object = obj }, props });
-            if (r.isAbrupt()) return r;
-        }
-        return .{ .normal = .{ .object = obj } };
-    }
-
-    /// §20.1.2.1 Object.assign ( target, ...sources ) — ToObject(target), then for each source copy
-    /// every own ENUMERABLE property (Get from source, Set on target). Returns target.
-    fn objectAssign(self: *Interpreter, args: []const Value) EvalError!Completion {
-        const target = if (args.len > 0) args[0] else .undefined;
-        if (target == .undefined or target == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
-        if (target != .object) return .{ .normal = target }; // M-subset: primitive target wrapper is read-only → return as-is
-        if (args.len > 1) for (args[1..]) |source| {
-            if (source == .undefined or source == .null) continue; // §20.1.2.1 step 4.a: skip nullish
-            var keys: std.ArrayListUnmanaged(Value) = .empty;
-            try self.ownEnumerableKeys(source, &keys);
-            for (keys.items) |k| {
-                const vc = try self.getProperty(source, k.string);
-                if (vc.isAbrupt()) return vc;
-                const sc = try self.setProperty(target, k.string, vc.normal);
-                if (sc.isAbrupt()) return sc;
-            }
-        };
-        return .{ .normal = target };
-    }
-
-    /// §20.1.3.6 Object.prototype.toString ( ) — the brand/tag algorithm. Returns `"[object <Tag>]"`
-    /// where Tag is `Get(O, @@toStringTag)` (when a String) else the builtin tag from O's internal-slot
-    /// brand. undefined/null short-circuit to "Undefined"/"Null"; a primitive `this` boxes to its
-    /// wrapper brand (Number/String/Boolean) — symbol/bigint box to "Object".
-    fn objectToString(self: *Interpreter, this_val: Value) EvalError!Completion {
-        // §20.1.3.6 steps 1-2.
-        switch (this_val) {
-            .undefined => return .{ .normal = .{ .string = "[object Undefined]" } },
-            .null => return .{ .normal = .{ .string = "[object Null]" } },
-            else => {},
-        }
-        // §20.1.3.6 steps 4-14: builtinTag from the ordered internal-slot probe.
-        const builtin_tag: []const u8 = switch (this_val) {
-            .object => |o| blk: {
-                if (o.kind == .array) break :blk "Array"; // IsArray
-                if (o.is_arguments) break :blk "Arguments"; // [[ParameterMap]]
-                if (o.kind == .function) break :blk "Function"; // [[Call]]
-                if (o.error_data) break :blk "Error"; // [[ErrorData]]
-                if (o.primitive) |p| switch (p) {
-                    .boolean => break :blk "Boolean", // [[BooleanData]]
-                    .number => break :blk "Number", // [[NumberData]]
-                    .string => break :blk "String", // [[StringData]]
-                    else => {},
-                };
-                break :blk "Object";
-            },
-            // A primitive receiver via `.call(prim)`: ToObject → the matching wrapper brand.
-            .boolean => "Boolean",
-            .number => "Number",
-            .string => "String",
-            else => "Object", // symbol / bigint box to an ordinary Object
-        };
-        // §20.1.3.6 step 15: tag = Get(O, @@toStringTag); use it only when it is a String.
-        var tag = builtin_tag;
-        if (self.wellKnownSymbol("toStringTag")) |sym| {
-            const tc = try self.getSymbolProperty(this_val, sym);
-            if (tc.isAbrupt()) return tc;
-            if (tc.normal == .string) tag = tc.normal.string;
-        }
-        // §20.1.3.6 step 16: "[object " + tag + "]".
-        const out = try std.fmt.allocPrint(self.arena, "[object {s}]", .{tag});
-        return .{ .normal = .{ .string = out } };
-    }
-
-    /// §20.1.2.7 Object.fromEntries ( iterable ) — a fresh ordinary object whose own enumerable data
-    /// properties come from the `[key, value]` entries of the iterable. Each entry must be an Object.
-    fn objectFromEntries(self: *Interpreter, args: []const Value) EvalError!Completion {
-        const iterable = if (args.len > 0) args[0] else .undefined;
-        // §20.1.2.7 step 1: RequireObjectCoercible (GetIterator throws on undefined/null anyway).
-        if (iterable == .undefined or iterable == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
-        const obj = try Object.create(self.arena, self.objectProto());
-        var entries: std.ArrayListUnmanaged(Value) = .empty;
-        const lc = try self.iterateToList(iterable, &entries);
-        if (lc.isAbrupt()) return lc;
-        for (entries.items) |entry| {
-            // §20.1.2.7 / §7.4 step: each entry must be an Object.
-            if (entry != .object) return self.throwError("TypeError", "Iterator value is not an entry object");
-            const kc = try self.getProperty(entry, "0");
-            if (kc.isAbrupt()) return kc;
-            const vc = try self.getProperty(entry, "1");
-            if (vc.isAbrupt()) return vc;
-            // §7.3.5 CreateDataPropertyOnObject: an own enumerable, writable, configurable data property.
-            if (kc.normal == .symbol) {
-                try obj.defineSymbolData(kc.normal.symbol, vc.normal, true, true, true);
-            } else {
-                const key = try self.toPropertyKeyString(kc.normal);
-                try obj.defineData(key, vc.normal, true, true, true);
-            }
-        }
-        return .{ .normal = .{ .object = obj } };
-    }
-
-    /// §20.1.2.13 Object.hasOwn ( O, P ) — HasOwnProperty(ToObject(O), ToPropertyKey(P)). Own string OR
-    /// symbol key, regardless of enumerability; no prototype walk.
-    fn objectHasOwn2(self: *Interpreter, args: []const Value) EvalError!Completion {
-        const o = if (args.len > 0) args[0] else .undefined;
-        if (o == .undefined or o == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
-        const p = if (args.len > 1) args[1] else .undefined;
-        if (p == .symbol) {
-            const has = if (o == .object) blk: {
-                for (o.object.symbol_props.items) |sp| if (sp.key == p.symbol) break :blk true;
-                break :blk false;
-            } else false;
-            return .{ .normal = .{ .boolean = has } };
-        }
-        const key = try self.toPropertyKeyString(p);
-        return .{ .normal = .{ .boolean = try self.hasOwnProp(o, key) } };
-    }
-
-    /// §20.1.2.10 Object.getOwnPropertySymbols ( O ) — a fresh Array of the own Symbol keys of
-    /// ToObject(O), in insertion order. (Strings/primitives box to objects with no symbol keys.)
-    fn objectGetOwnPropertySymbols(self: *Interpreter, args: []const Value) EvalError!Completion {
-        const o = if (args.len > 0) args[0] else .undefined;
-        if (o == .undefined or o == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
-        const arr = try Object.createArray(self.arena, self.arrayProto());
-        if (o == .object) {
-            for (o.object.symbol_props.items) |sp| {
-                try arr.elements.append(self.arena, .{ .symbol = sp.key });
-            }
-        }
-        return .{ .normal = .{ .object = arr } };
-    }
-
-    /// §20.1.2.11 Object.groupBy ( items, callback ) — §7.3.35 GroupBy (property coercion): iterate
-    /// `items`, key each by ToPropertyKey(callback(item, index)), collect items into per-key arrays,
-    /// and return an object with a NULL prototype whose own enumerable data properties are those arrays.
-    fn objectGroupBy(self: *Interpreter, args: []const Value) EvalError!Completion {
-        const items = if (args.len > 0) args[0] else .undefined;
-        const callback = if (args.len > 1) args[1] else .undefined;
-        // §7.3.35 step 2: callback must be callable.
-        if (callback != .object or callback.object.kind != .function) return self.throwError("TypeError", "Object.groupBy callback is not a function");
-        if (items == .undefined or items == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
-        var list: std.ArrayListUnmanaged(Value) = .empty;
-        const lc = try self.iterateToList(items, &list);
-        if (lc.isAbrupt()) return lc;
-        // The result object has a null [[Prototype]] (§7.3.35 step 5: OrdinaryObjectCreate(null)).
-        const obj = try Object.create(self.arena, null);
-        for (list.items, 0..) |item, i| {
-            const kc = try self.callFunction(callback.object, &.{ item, .{ .number = @floatFromInt(i) } }, .undefined);
-            if (kc.isAbrupt()) return kc;
-            // §7.3.35: a Symbol key is allowed (PROPERTY coercion → ToPropertyKey).
-            if (kc.normal == .symbol) {
-                const sym = kc.normal.symbol;
-                const group: *Object = blk: {
-                    if (obj.getSymbolProp(sym)) |loc| if (loc.pv.payload == .data and loc.pv.payload.data == .object) break :blk loc.pv.payload.data.object;
-                    const fresh = try Object.createArray(self.arena, self.arrayProto());
-                    try obj.defineSymbolData(sym, .{ .object = fresh }, true, true, true);
-                    break :blk fresh;
-                };
-                try group.elements.append(self.arena, item);
-            } else {
-                const key = try self.toPropertyKeyString(kc.normal);
-                const group: *Object = blk: {
-                    if (obj.properties.get(key)) |pv| if (pv.payload == .data and pv.payload.data == .object) break :blk pv.payload.data.object;
-                    const fresh = try Object.createArray(self.arena, self.arrayProto());
-                    try obj.defineData(key, .{ .object = fresh }, true, true, true);
-                    break :blk fresh;
-                };
-                try group.elements.append(self.arena, item);
-            }
-        }
-        return .{ .normal = .{ .object = obj } };
-    }
-
-    /// §B.2.2.1.1 get Object.prototype.__proto__ — O = ToObject(this); return O.[[GetPrototypeOf]]().
-    /// Delegates to the §20.1.2.12 op (so a primitive `this` boxes to its wrapper proto's prototype).
-    fn objectProtoGet(self: *Interpreter, this_val: Value) EvalError!Completion {
-        return self.objectGetPrototypeOf(&.{this_val});
-    }
-
-    /// §B.2.2.2–.5 the legacy accessor helpers on Object.prototype: `__defineGetter__`/`__defineSetter__`
-    /// install an enumerable, configurable accessor; `__lookupGetter__`/`__lookupSetter__` walk the
-    /// prototype chain for an own accessor with the requested get/set (a data property → undefined).
-    fn objectLegacyAccessor(self: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
-        const eql = std.mem.eql;
-        const o = switch (try self.toObjectForArrayLike(this_val)) { // §B.2.2.x step 1: ToObject(this)
-            .obj => |obj| obj,
-            .abrupt => |c| return c,
-        };
-        const key_arg: Value = if (args.len > 0) args[0] else .undefined;
-        const is_get = eql(u8, name, "__defineGetter__") or eql(u8, name, "__lookupGetter__");
-
-        if (eql(u8, name, "__defineGetter__") or eql(u8, name, "__defineSetter__")) {
-            const fnv: Value = if (args.len > 1) args[1] else .undefined;
-            if (fnv != .object or !isCallable(fnv.object)) {
-                return self.throwError("TypeError", "Object.prototype.__define[GS]etter__: Expecting function");
-            }
-            const desc: object_mod.Descriptor = if (is_get)
-                .{ .get = fnv.object, .enumerable = true, .configurable = true }
-            else
-                .{ .set = fnv.object, .enumerable = true, .configurable = true };
-            const pk = try self.toPropertyKey(key_arg);
-            if (pk.isAbrupt()) return pk.completion;
-            const ok = if (pk.symbol) |sym| try o.defineSymbolProperty(sym, desc) else try o.defineProperty(pk.key, desc);
-            if (!ok) return self.throwError("TypeError", "Cannot define accessor");
-            return .{ .normal = .undefined };
-        }
-
-        // __lookupGetter__ / __lookupSetter__: walk the prototype chain for an own accessor.
-        const pk = try self.toPropertyKey(key_arg);
-        if (pk.isAbrupt()) return pk.completion;
-        var cur: ?*Object = o;
-        while (cur) |c| : (cur = c.prototype) {
-            const pv: ?object_mod.PropertyValue = if (pk.symbol) |sym| blk: {
-                for (c.symbol_props.items) |sp| {
-                    if (sp.key == sym) break :blk sp.pv;
-                }
-                break :blk null;
-            } else (if (c.properties.get(pk.key)) |p| p else null);
-            if (pv) |found| {
-                switch (found.payload) {
-                    .accessor => |a| {
-                        const fnp = if (is_get) a.get else a.set;
-                        return .{ .normal = if (fnp) |f| .{ .object = f } else .undefined };
-                    },
-                    .data => return .{ .normal = .undefined }, // a data property shadows → no accessor
-                }
-            }
-        }
-        return .{ .normal = .undefined };
-    }
-
-    /// §B.2.2.1.2 set Object.prototype.__proto__ — O = RequireObjectCoercible(this). A value that is
-    /// neither Object nor null is a no-op (NOT a throw). A non-Object `this` is a no-op. Otherwise
-    /// O.[[SetPrototypeOf]](value) (may throw on a non-extensible/cyclic change). Returns undefined.
-    fn objectProtoSet(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
-        if (this_val == .undefined or this_val == .null) return self.throwError("TypeError", "Cannot set property '__proto__' of null or undefined");
-        const value = if (args.len > 0) args[0] else .undefined;
-        // §B.2.2.1.2 steps 2-3: only Object/null values are applied; everything else is a silent no-op.
-        if (value != .object and value != .null) return .{ .normal = .undefined };
-        if (this_val != .object) return .{ .normal = .undefined }; // boxed primitive — no slot to set
-        const sc = try self.objectSetPrototypeOf(&.{ this_val, value });
-        if (sc.isAbrupt()) return sc;
-        return .{ .normal = .undefined };
-    }
-
-    /// §20.1.2.12 Object.getPrototypeOf ( O ) — the [[Prototype]] of ToObject(O) (an object or null).
-    fn objectGetPrototypeOf(self: *Interpreter, args: []const Value) EvalError!Completion {
-        const o = if (args.len > 0) args[0] else .undefined;
-        switch (o) {
-            .object => |obj| return .{ .normal = if (obj.prototype) |p| .{ .object = p } else .null },
-            .string => return .{ .normal = if (self.stringProto()) |p| .{ .object = p } else .null },
-            .undefined, .null => return self.throwError("TypeError", "Cannot convert undefined or null to object"),
-            else => return .{ .normal = .null }, // number/boolean: M-subset (no boxed wrapper proto)
-        }
-    }
-
-    /// §20.1.2.22 Object.setPrototypeOf ( O, proto ) — set [[Prototype]] of O to proto (object or
-    /// null). A non-extensible object with a *different* current proto rejects (TypeError); a primitive
-    /// O is returned unchanged. Returns O.
-    fn objectSetPrototypeOf(self: *Interpreter, args: []const Value) EvalError!Completion {
-        const o = if (args.len > 0) args[0] else .undefined;
-        if (o == .undefined or o == .null) return self.throwError("TypeError", "Object.setPrototypeOf called on null or undefined");
-        const proto_arg = if (args.len > 1) args[1] else .undefined;
-        const new_proto: ?*Object = switch (proto_arg) {
-            .null => null,
-            .object => |p| p,
-            else => return self.throwError("TypeError", "Object prototype may only be an Object or null"),
-        };
-        if (o != .object) return .{ .normal = o }; // primitive: no internal slot to set (M-subset)
-        const obj = o.object;
-        if (obj.prototype == new_proto) return .{ .normal = o }; // §10.4.7.1 step 4: same proto → ok
-        if (!obj.extensible) return self.throwError("TypeError", "#<Object> is not extensible");
-        obj.prototype = new_proto;
-        return .{ .normal = o };
-    }
-
-    const IntegrityOp = enum { freeze, seal, prevent };
-
-    /// §20.1.2.7/.21/.20 Object.freeze / seal / preventExtensions — apply the integrity level to O and
-    /// return O. A non-object argument is returned unchanged (§20.1.2.7 step 1).
-    fn objectSetIntegrity(self: *Interpreter, args: []const Value, op: IntegrityOp) EvalError!Completion {
-        _ = self;
-        const o = if (args.len > 0) args[0] else .undefined;
-        if (o != .object) return .{ .normal = o };
-        switch (op) {
-            .freeze => o.object.freezeObject(),
-            .seal => o.object.sealObject(),
-            .prevent => o.object.extensible = false,
-        }
-        return .{ .normal = o };
-    }
-
-    const IntegrityTest = enum { frozen, sealed, extensible };
-
-    /// §20.1.2.16/.17/.15 Object.isFrozen / isSealed / isExtensible. A non-object argument is treated
-    /// as already frozen/sealed (true) and not extensible (false) per the spec's primitive handling.
-    fn objectTestIntegrity(self: *Interpreter, args: []const Value, t: IntegrityTest) EvalError!Completion {
-        _ = self;
-        const o = if (args.len > 0) args[0] else .undefined;
-        if (o != .object) {
-            // §20.1.2.15 step 2 / §20.1.2.16-17: a primitive is non-extensible and (vacuously) frozen+sealed.
-            return .{ .normal = .{ .boolean = t != .extensible } };
-        }
-        const r = switch (t) {
-            .frozen => o.object.isFrozenObject(),
-            .sealed => o.object.isSealedObject(),
-            .extensible => o.object.extensible,
-        };
-        return .{ .normal = .{ .boolean = r } };
-    }
-
-    /// §20.1.3.2 Object.prototype.hasOwnProperty ( V ) — own property only (no chain walk).
-    fn objectHasOwnProperty(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
-        const key = try self.toString(if (args.len > 0) args[0] else .undefined);
-        return .{ .normal = .{ .boolean = try self.hasOwnProp(this_val, key) } };
-    }
-
-    /// HasOwnProperty over the engine's value model (Array indices/length, String index/length,
-    /// ordinary own property map). Used by hasOwnProperty + propertyIsEnumerable.
-    fn hasOwnProp(self: *Interpreter, base: Value, key: []const u8) EvalError!bool {
-        switch (base) {
-            .object => |o| {
-                if (o.kind == .array) {
-                    if (std.mem.eql(u8, key, "length")) return true;
-                    if (parseIndex(key)) |i| if (o.arrayHas(i)) return true;
-                }
-                return o.properties.contains(key);
-            },
-            .string => |s| {
-                if (std.mem.eql(u8, key, "length")) return true;
-                if (parseIndex(key)) |i| return i < s.len;
-                return false;
-            },
-            .undefined, .null => {
-                _ = try self.throwError("TypeError", "Cannot convert undefined or null to object");
-                return false;
-            },
-            else => return false,
-        }
-    }
-
-    /// §20.1.3.4 Object.prototype.propertyIsEnumerable ( V ).
-    fn objectPropertyIsEnumerable(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
-        const key = try self.toString(if (args.len > 0) args[0] else .undefined);
-        const enumerable: bool = switch (this_val) {
-            .object => |o| blk: {
-                if (o.kind == .array) {
-                    if (std.mem.eql(u8, key, "length")) break :blk false; // Array length is non-enumerable
-                    if (parseIndex(key)) |i| if (o.arrayHas(i)) break :blk true;
-                }
-                break :blk o.isEnumerable(key);
-            },
-            .string => |s| blk: {
-                if (std.mem.eql(u8, key, "length")) break :blk false;
-                if (parseIndex(key)) |i| break :blk i < s.len; // String chars are enumerable
-                break :blk false;
-            },
-            .undefined, .null => return self.throwError("TypeError", "Cannot convert undefined or null to object"),
-            else => false,
-        };
-        return .{ .normal = .{ .boolean = enumerable } };
-    }
-
-    /// §20.1.3.3 Object.prototype.isPrototypeOf ( V ) — is `this` anywhere on V's prototype chain.
-    fn objectIsPrototypeOf(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
-        _ = self;
-        if (this_val != .object) return .{ .normal = .{ .boolean = false } };
-        const target = this_val.object;
-        const v = if (args.len > 0) args[0] else .undefined;
-        if (v != .object) return .{ .normal = .{ .boolean = false } };
-        var p: ?*Object = v.object.prototype;
-        while (p) |proto| {
-            if (proto == target) return .{ .normal = .{ .boolean = true } };
-            p = proto.prototype;
-        }
-        return .{ .normal = .{ .boolean = false } };
-    }
-
     // ── §21.3 Math ──────────────────────────────────────────────────────────
 
     /// §21.3.2.27 Math.random — the next xorshift64* draw mapped to [0,1). A fixed-seed PRNG (no host
@@ -6859,18 +6197,18 @@ pub const Interpreter = struct {
         if (std.mem.eql(u8, name, "getOwnPropertyDescriptor")) {
             if (arg1 == .symbol) {
                 for (target.symbol_props.items) |*sp| {
-                    if (sp.key == arg1.symbol) return self.fromPropertyValue(sp.pv);
+                    if (sp.key == arg1.symbol) return builtin_object.fromPropertyValue(self, sp.pv);
                 }
                 return .{ .normal = .undefined };
             }
-            return self.objectGetOwnPropertyDescriptor(&.{ arg0, arg1 });
+            return builtin_object.objectGetOwnPropertyDescriptor(self, &.{ arg0, arg1 });
         }
 
         return self.throwError("TypeError", "unknown Reflect method");
     }
 
     /// §7.1.19 ToPropertyKey for the string path (a Symbol is handled by the caller's symbol branch).
-    fn toPropertyKeyString(self: *Interpreter, key: Value) EvalError![]const u8 {
+    pub fn toPropertyKeyString(self: *Interpreter, key: Value) EvalError![]const u8 {
         return self.toString(key);
     }
 
@@ -7519,7 +6857,7 @@ pub const Interpreter = struct {
                 if (args.len > 0 and args[0] == .object) return .{ .normal = args[0] };
                 return .{ .normal = .{ .object = try Object.create(self.arena, self.objectProto()) } };
             },
-            .object_to_string => return self.objectToString(this_val),
+            .object_to_string => return builtin_object.objectToString(self, this_val),
             // §20.1.3.7 Object.prototype.valueOf returns ToObject(this). For an object receiver that is
             // the receiver itself (so OrdinaryToPrimitive's valueOf step yields a non-primitive and falls
             // through to toString — the default object→"[object Object]" behavior). undefined/null throw.
@@ -7529,35 +6867,35 @@ pub const Interpreter = struct {
             },
             .function_ctor => return self.functionConstructor(args),
             .function_proto_noop => return .{ .normal = .undefined }, // §20.2.3 %Function.prototype%() → undefined
-            .object_define_property => return self.objectDefineProperty(args),
-            .object_define_properties => return self.objectDefineProperties(args),
-            .object_get_own_property_descriptor => return self.objectGetOwnPropertyDescriptor(args),
-            .object_get_own_property_descriptors => return self.objectGetOwnPropertyDescriptors(args),
-            .object_get_own_property_names => return self.objectGetOwnPropertyNames(args),
-            .object_keys => return self.objectKeysValuesEntries(args, .keys),
-            .object_values => return self.objectKeysValuesEntries(args, .values),
-            .object_entries => return self.objectKeysValuesEntries(args, .entries),
-            .object_create => return self.objectCreate(args),
-            .object_assign => return self.objectAssign(args),
-            .object_from_entries => return self.objectFromEntries(args),
-            .object_has_own => return self.objectHasOwn2(args),
-            .object_get_own_property_symbols => return self.objectGetOwnPropertySymbols(args),
-            .object_group_by => return self.objectGroupBy(args),
-            .object_proto_getter => return self.objectProtoGet(this_val),
-            .object_proto_setter => return self.objectProtoSet(this_val, args),
-            .object_legacy_accessor => return self.objectLegacyAccessor(func.native_name, this_val, args),
-            .object_get_prototype_of => return self.objectGetPrototypeOf(args),
-            .object_set_prototype_of => return self.objectSetPrototypeOf(args),
+            .object_define_property => return builtin_object.objectDefineProperty(self, args),
+            .object_define_properties => return builtin_object.objectDefineProperties(self, args),
+            .object_get_own_property_descriptor => return builtin_object.objectGetOwnPropertyDescriptor(self, args),
+            .object_get_own_property_descriptors => return builtin_object.objectGetOwnPropertyDescriptors(self, args),
+            .object_get_own_property_names => return builtin_object.objectGetOwnPropertyNames(self, args),
+            .object_keys => return builtin_object.objectKeysValuesEntries(self, args, .keys),
+            .object_values => return builtin_object.objectKeysValuesEntries(self, args, .values),
+            .object_entries => return builtin_object.objectKeysValuesEntries(self, args, .entries),
+            .object_create => return builtin_object.objectCreate(self, args),
+            .object_assign => return builtin_object.objectAssign(self, args),
+            .object_from_entries => return builtin_object.objectFromEntries(self, args),
+            .object_has_own => return builtin_object.objectHasOwn2(self, args),
+            .object_get_own_property_symbols => return builtin_object.objectGetOwnPropertySymbols(self, args),
+            .object_group_by => return builtin_object.objectGroupBy(self, args),
+            .object_proto_getter => return builtin_object.objectProtoGet(self, this_val),
+            .object_proto_setter => return builtin_object.objectProtoSet(self, this_val, args),
+            .object_legacy_accessor => return builtin_object.objectLegacyAccessor(self, func.native_name, this_val, args),
+            .object_get_prototype_of => return builtin_object.objectGetPrototypeOf(self, args),
+            .object_set_prototype_of => return builtin_object.objectSetPrototypeOf(self, args),
             .object_is => return .{ .normal = .{ .boolean = ops.sameValue(if (args.len > 0) args[0] else .undefined, if (args.len > 1) args[1] else .undefined) } },
-            .object_freeze => return self.objectSetIntegrity(args, .freeze),
-            .object_seal => return self.objectSetIntegrity(args, .seal),
-            .object_prevent_extensions => return self.objectSetIntegrity(args, .prevent),
-            .object_is_frozen => return self.objectTestIntegrity(args, .frozen),
-            .object_is_sealed => return self.objectTestIntegrity(args, .sealed),
-            .object_is_extensible => return self.objectTestIntegrity(args, .extensible),
-            .object_has_own_property => return self.objectHasOwnProperty(this_val, args),
-            .object_property_is_enumerable => return self.objectPropertyIsEnumerable(this_val, args),
-            .object_is_prototype_of => return self.objectIsPrototypeOf(this_val, args),
+            .object_freeze => return builtin_object.objectSetIntegrity(self, args, .freeze),
+            .object_seal => return builtin_object.objectSetIntegrity(self, args, .seal),
+            .object_prevent_extensions => return builtin_object.objectSetIntegrity(self, args, .prevent),
+            .object_is_frozen => return builtin_object.objectTestIntegrity(self, args, .frozen),
+            .object_is_sealed => return builtin_object.objectTestIntegrity(self, args, .sealed),
+            .object_is_extensible => return builtin_object.objectTestIntegrity(self, args, .extensible),
+            .object_has_own_property => return builtin_object.objectHasOwnProperty(self, this_val, args),
+            .object_property_is_enumerable => return builtin_object.objectPropertyIsEnumerable(self, this_val, args),
+            .object_is_prototype_of => return builtin_object.objectIsPrototypeOf(self, this_val, args),
             .function_method => return self.functionPrototypeMethod(func.native_name, this_val, args),
             .bigint_ctor => return self.bigintConstructor(args), // §21.2.1.1 BigInt(value)
             .bigint_static => return self.bigintStatic(func.native_name, args), // §21.2.2 asIntN/asUintN
