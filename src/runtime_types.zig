@@ -34,6 +34,14 @@ pub const HelperKind = enum { map, filter, take, drop, flat_map, wrap };
 /// §27.1.4 Iterator Helper state — present iff this object is a lazy helper (map/filter/…/from wrapper).
 /// Its `next` native (`iterator_helper_next`) pulls from `underlying` (via the cached `next_fn`),
 /// applies the transform, and tracks per-kind state. Created by the %Iterator.prototype% lazy methods.
+/// §28.2 a Proxy exotic object's internal slots: [[ProxyTarget]] + [[ProxyHandler]]. Present iff
+/// `Object.proxy != null`; internal methods route through the handler trap (or forward to the target).
+pub const ProxyData = struct {
+    target: *Object,
+    handler: *Object,
+    revoked: bool = false,
+};
+
 pub const HelperState = struct {
     kind: HelperKind,
     underlying: *Object,
@@ -383,6 +391,10 @@ pub const NativeId = enum {
     json_parse, // JSON.parse(text[, reviver])
     json_stringify, // JSON.stringify(value[, replacer[, space]])
     // §27.2 Promise — the constructor, prototype methods, and statics.
+    // §28.2 Proxy — the constructor, Proxy.revocable, and the per-revocable revoke function.
+    proxy_ctor, // new Proxy(target, handler)
+    proxy_revocable, // Proxy.revocable(target, handler)
+    proxy_revoke, // the revoker returned by Proxy.revocable (clears target/handler)
     promise_ctor, // new Promise(executor)
     promise_then, // Promise.prototype.then
     promise_catch, // Promise.prototype.catch

@@ -13,6 +13,7 @@ pub const IterState = rt.IterState;
 pub const IterKind = rt.IterKind;
 pub const HelperKind = rt.HelperKind;
 pub const HelperState = rt.HelperState;
+pub const ProxyData = rt.ProxyData;
 pub const CollectionKind = rt.CollectionKind;
 pub const CollectionEntry = rt.CollectionEntry;
 pub const Collection = rt.Collection;
@@ -111,6 +112,9 @@ pub const Object = struct {
     /// §27.1.4 Iterator Helper state — present iff this object is a lazy iterator helper (a result of
     /// `map`/`filter`/`take`/`drop`/`flatMap` or `Iterator.from`'s wrapper). Null otherwise (zero cost).
     iter_helper: ?*HelperState = null,
+    /// §28.2 Proxy state — present iff this object is a Proxy exotic. Every internal method routes
+    /// through its handler trap (or forwards to the target). Null for every other object (zero cost).
+    proxy: ?*ProxyData = null,
     /// §27.5 Generator state — present iff this object is a Generator (made by calling a `function*`).
     /// Holds the suspendable-execution machinery (body thread + ping-pong semaphores). Null for every
     /// other object (zero cost). The %GeneratorPrototype% `next`/`return`/`throw` natives drive it.

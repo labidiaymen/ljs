@@ -599,6 +599,14 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try defineConstructorBackref(weakset_fn); // §24.4.3.2 WeakSet.prototype.constructor === WeakSet
     try env.declare("WeakSet", .{ .object = weakset_fn }, true, true);
 
+    // §28.2 Proxy — the constructor (new-only) + Proxy.revocable. A Proxy has NO own `.prototype`
+    // property (§28.2.2 lists only `revocable`), so the carrier createNative made is removed.
+    const proxy_fn = try Object.createNative(arena, .proxy_ctor, "Proxy");
+    proxy_fn.prototype = function_proto;
+    _ = proxy_fn.properties.swapRemove("prototype"); // §28.2.2: Proxy has no `prototype` property
+    try defineMethod(arena, proxy_fn, "revocable", .proxy_revocable, "revocable"); // §28.2.2.1
+    try env.declare("Proxy", .{ .object = proxy_fn }, true, true);
+
     // §25.5 JSON — a namespace ordinary object (NOT callable / NOT a constructor; proto =
     // %Object.prototype%) holding `parse`/`stringify` and [Symbol.toStringTag] = "JSON".
     const json_obj = try Object.create(arena, object_proto);

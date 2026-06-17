@@ -23,6 +23,7 @@ const builtin_iterator = @import("builtin_iterator.zig");
 const builtin_object = @import("builtin_object.zig");
 const builtin_reflect = @import("builtin_reflect.zig");
 const builtin_bigint = @import("builtin_bigint.zig");
+const builtin_proxy = @import("builtin_proxy.zig");
 const builtins = @import("builtins.zig");
 const bigint = @import("bigint.zig");
 const Parser = @import("parser.zig").Parser;
@@ -1515,7 +1516,7 @@ pub const Interpreter = struct {
         // functions / bound functions / classes have `native == .none` and a `call` body, so they pass.
         if (ctor.call == null and ctor.native != .none) {
             const constructible = switch (ctor.native) {
-                .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor => true,
+                .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor, .proxy_ctor => true,
                 else => false,
             };
             if (!constructible) return self.throwError("TypeError", "value is not a constructor");
@@ -1539,6 +1540,7 @@ pub const Interpreter = struct {
                 if (ic.isAbrupt()) return ic;
                 return .{ .normal = .{ .object = new_obj } };
             },
+            .proxy_ctor => return builtin_proxy.construct(self, new_obj, args), // §28.2.1.1
             else => {},
         }
 
@@ -2875,6 +2877,7 @@ pub const Interpreter = struct {
     pub fn getProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
         switch (base) {
             .object => |o| {
+                if (o.proxy) |pd| return builtin_proxy.get(self, pd, .{ .string = key }, base); // §28.2.5.4 [[Get]]
                 if (o.kind == .array) {
                     if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(o.arrayLen()) } };
                     if (parseIndex(key)) |i| {
@@ -3100,6 +3103,7 @@ pub const Interpreter = struct {
     pub fn getSymbolProperty(self: *Interpreter, base: Value, key: *Symbol) EvalError!Completion {
         switch (base) {
             .object => |o| {
+                if (o.proxy) |pd| return builtin_proxy.get(self, pd, .{ .symbol = key }, base); // §28.2.5.4 [[Get]]
                 const loc = o.getSymbolProp(key) orelse return .{ .normal = .undefined };
                 switch (loc.pv.payload) {
                     .data => |v| return .{ .normal = v },
@@ -6428,6 +6432,10 @@ pub const Interpreter = struct {
                 if (ic.isAbrupt()) return ic;
                 return .{ .normal = this_val };
             },
+            // §28.2.1.1 a plain `Proxy(...)` call (no new) throws; construction is handled in constructNT.
+            .proxy_ctor => return self.throwError("TypeError", "Constructor Proxy requires 'new'"),
+            .proxy_revocable => return builtin_proxy.revocable(self, args), // §28.2.2.1
+            .proxy_revoke => return builtin_proxy.revoke(self, func), // §28.2.2.1.1
             .collection_size => return self.collectionSize(func.native_name, this_val),
             .collection_iterator => {
                 // `native_name` is "<home>:<which>" — <home> ("map"/"set") brands the receiver, <which>
@@ -6708,6 +6716,7 @@ pub const Interpreter = struct {
             .async_generator_method, .async_generator_iterator, .async_from_sync_method, .async_from_sync_wrap => unreachable, // handled in the first switch
             .map_method, .set_method, .weakmap_method, .weakset_method => unreachable, // handled in the first switch
             .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .collection_size, .collection_iterator => unreachable, // handled in the first switch
+            .proxy_ctor, .proxy_revocable, .proxy_revoke => unreachable, // handled in the first switch
             .json_parse, .json_stringify => unreachable, // handled in the first switch
             .iterator_helper, .iterator_helper_next, .iterator_from, .iterator_ctor => unreachable, // handled in the first switch
             .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch
