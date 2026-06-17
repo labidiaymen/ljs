@@ -9,6 +9,16 @@ const Symbol = @import("value.zig").Symbol;
 // Runtime type definitions live in runtime_types.zig (split out to keep this file < 1000 lines);
 // re-exported here so `@import("object.zig").<Type>` keeps working unchanged.
 const rt = @import("runtime_types.zig");
+const Environment = @import("environment.zig").Environment;
+
+/// §10.4.4 [[ParameterMap]] backing for a mapped `arguments` object: the live parameter environment
+/// plus, per integer index, the parameter name it aliases (`""` = an index that is not mapped).
+pub const MappedParams = struct {
+    env: *Environment,
+    /// `names[i]` = the parameter name aliased by index `i`, or `""` once that index leaves the map
+    /// (its property was deleted or redefined non-writable / as an accessor). Mutable for that shedding.
+    names: [][]const u8,
+};
 pub const IterState = rt.IterState;
 pub const IterKind = rt.IterKind;
 pub const HelperKind = rt.HelperKind;
@@ -167,6 +177,11 @@ pub const Object = struct {
     /// arguments object is otherwise ordinary; this flag exists only so §20.1.3.6 Object.prototype.toString
     /// yields the `"Arguments"` builtin tag.
     is_arguments: bool = false,
+    /// §10.4.4 [[ParameterMap]] — present for a MAPPED arguments object (a sloppy function with a simple
+    /// parameter list). An integer index `i < names.len` with a non-empty `names[i]` aliases the
+    /// parameter binding of that name in `env`: reading/writing `arguments[i]` reads/writes the live
+    /// parameter (and vice-versa). Null for an unmapped (strict / non-simple-params) arguments object.
+    mapped_params: ?MappedParams = null,
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);

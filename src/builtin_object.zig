@@ -49,6 +49,23 @@ pub fn objectDefineProperty(it: *Interpreter, args: []const Value) EvalError!Com
             }
             const ok = try o.object.defineProperty(str_key, d);
             if (!ok) return it.throwError("TypeError", "Cannot redefine property");
+            // §10.4.4.2: keep a MAPPED arguments index consistent with its [[ParameterMap]] — a present
+            // value writes the live parameter; the index leaves the map once it becomes an accessor or a
+            // non-writable data property (so it stops aliasing the parameter thereafter).
+            if (o.object.mapped_params) |mp| {
+                if (parseIndex(str_key)) |i| if (i < mp.names.len and mp.names[i].len > 0) {
+                    if (d.isAccessor()) {
+                        mp.names[i] = "";
+                    } else {
+                        if (d.value) |v| {
+                            if (mp.env.lookupLocal(mp.names[i])) |b| b.value = v;
+                        }
+                        if (d.writable) |w| {
+                            if (!w) mp.names[i] = "";
+                        }
+                    }
+                };
+            }
             return .{ .normal = o };
         },
     }

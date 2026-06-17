@@ -2590,7 +2590,7 @@ pub const Interpreter = struct {
         // when a parameter (or the rest binding) already binds the name `arguments` (it shadows). Arrows
         // inherit the enclosing `arguments` lexically, so they get none of their own.
         if (!fd.is_arrow and call_env.lookupLocal("arguments") == null) {
-            const ao = try self.makeArgumentsObject(args);
+            const ao = try self.makeArgumentsObject(args, func, call_env, fd);
             try call_env.declare("arguments", .{ .object = ao }, true, true);
         }
         // §14.13: labels do not cross a function boundary — the body starts with no pending label
@@ -2994,6 +2994,15 @@ pub const Interpreter = struct {
                         if (i < sv.len) return .{ .normal = .{ .string = sv[i .. i + 1] } };
                     }
                 }
+                // §10.4.4.3: a MAPPED arguments index reads the LIVE parameter binding (the map takes
+                // precedence over the stored value, which may be stale after the parameter was reassigned).
+                if (o.mapped_params) |mp| {
+                    if (parseIndex(key)) |i| {
+                        if (i < mp.names.len and mp.names[i].len > 0) {
+                            if (mp.env.lookupLocal(mp.names[i])) |b| return .{ .normal = b.value };
+                        }
+                    }
+                }
                 // §10.1.8.1 OrdinaryGet — locate the property (data or accessor) on the chain.
                 // Data-property fast path: a single descriptor read, no accessor branch.
                 const loc = o.getProp(key) orelse return .{ .normal = .undefined };
@@ -3147,6 +3156,15 @@ pub const Interpreter = struct {
                     if (!loc.pv.writable) {
                         if (self.strict) return self.throwError("TypeError", "Cannot assign to read only property");
                         return .{ .normal = value };
+                    }
+                }
+                // §10.4.4.4: writing a MAPPED arguments index also writes the live parameter binding
+                // (and vice-versa — keeping `arguments[i]` and the parameter in sync).
+                if (o.mapped_params) |mp| {
+                    if (parseIndex(key)) |i| {
+                        if (i < mp.names.len and mp.names[i].len > 0) {
+                            if (mp.env.lookupLocal(mp.names[i])) |b| b.value = value;
+                        }
                     }
                 }
                 try o.set(key, value);
@@ -4248,7 +4266,7 @@ pub const Interpreter = struct {
             }
         }
         if (call_env.lookupLocal("arguments") == null) {
-            const ao = try self.makeArgumentsObject(args);
+            const ao = try self.makeArgumentsObject(args, gen.func, call_env, fd);
             try call_env.declare("arguments", .{ .object = ao }, true, true);
         }
         return call_env;
@@ -5686,6 +5704,13 @@ pub const Interpreter = struct {
                 if (o.properties.get(key)) |pv| {
                     if (!pv.configurable) return .{ .normal = .{ .boolean = false } }; // §10.1.10.1 step 4
                     _ = o.properties.orderedRemove(key); // ordered delete preserves the remaining keys' order
+                    // §10.4.4.4: deleting a MAPPED arguments index also removes it from the [[ParameterMap]],
+                    // so a later read no longer aliases the (still-live) parameter binding.
+                    if (o.mapped_params) |mp| {
+                        if (parseIndex(key)) |i| if (i < mp.names.len) {
+                            mp.names[i] = "";
+                        };
+                    }
                 }
                 return .{ .normal = .{ .boolean = true } };
             },
@@ -6868,7 +6893,11 @@ pub const Interpreter = struct {
     /// (`for (x of arguments)`, `[...arguments]`). The `array_values` native iterates `.elements`, so
     /// the args are mirrored there as the iterator's backing store (this does NOT make it an Array —
     /// `kind` stays `.ordinary`, so indexed [[Get]]/`length` still read the `properties` map).
-    fn makeArgumentsObject(self: *Interpreter, args: []const Value) EvalError!*Object {
+    /// §10.4.4 a function's `arguments` exotic. A SLOPPY function with a simple parameter list gets a
+    /// MAPPED object (a `callee` = the function, and indices that alias the live parameter bindings);
+    /// a strict / non-simple-params function gets an unmapped one. (The strict `callee` poison accessor
+    /// is deferred — left absent.)
+    fn makeArgumentsObject(self: *Interpreter, args: []const Value, func: *Object, call_env: *Environment, fd: object_mod.FunctionData) EvalError!*Object {
         const ao = try Object.create(self.arena, self.objectProto());
         ao.is_arguments = true; // §10.4.4 [[ParameterMap]] presence → §20.1.3.6 "Arguments" tag
         for (args, 0..) |a, i| {
@@ -6884,7 +6913,42 @@ pub const Interpreter = struct {
             values_fn.prototype = self.functionProto();
             try ao.defineSymbolData(iter_sym, .{ .object = values_fn }, true, false, true);
         }
+        if (!fd.strict) {
+            // §10.4.4 CreateMappedArgumentsObject: `callee` is the function (writable, non-enumerable,
+            // configurable). (A strict/unmapped `callee` is the %ThrowTypeError% poison — deferred.)
+            try ao.defineData("callee", .{ .object = func }, true, false, true);
+            // The [[ParameterMap]] exists only for a SIMPLE parameter list (no defaults / rest /
+            // destructuring). Indices [0, min(argc, paramcount)) alias their parameter binding.
+            if (isSimpleParamList(fd)) {
+                const n = @min(args.len, fd.params.len);
+                if (n > 0) {
+                    const names = try self.arena.alloc([]const u8, n);
+                    for (0..n) |i| names[i] = fd.params[i].pattern.identifier;
+                    // §10.4.4: with duplicate parameter names only the LAST index maps; blank the rest.
+                    for (0..n) |i| {
+                        for (i + 1..n) |j| {
+                            if (std.mem.eql(u8, names[i], names[j])) {
+                                names[i] = "";
+                                break;
+                            }
+                        }
+                    }
+                    ao.mapped_params = .{ .env = call_env, .names = names };
+                }
+            }
+        }
         return ao;
+    }
+
+    /// §10.4.4: a simple parameter list — every parameter is a plain BindingIdentifier with no
+    /// initializer, and there is no rest element. Required for a mapped `arguments` object.
+    fn isSimpleParamList(fd: object_mod.FunctionData) bool {
+        if (fd.rest != null) return false;
+        for (fd.params) |p| {
+            if (p.default != null) return false;
+            if (p.pattern.* != .identifier) return false;
+        }
+        return true;
     }
 
     /// §23.1.5.1 CreateArrayIterator — a fresh Array Iterator object (proto = %Object.prototype% in the
