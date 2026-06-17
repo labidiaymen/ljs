@@ -1278,6 +1278,22 @@ pub const Interpreter = struct {
                         if (sc.isAbrupt()) return sc;
                         return .{ .normal = .{ .number = if (u.prefix) old + delta else old } };
                     },
+                    .super_member => |sm| {
+                        // §13.4 `super.x++` — read via the SuperProperty getter, ToNumber, write back.
+                        const key = if (sm.key) |kn| blk: {
+                            const kc = try self.evalExpr(kn, env);
+                            if (kc.isAbrupt()) return kc;
+                            break :blk try self.toString(kc.normal);
+                        } else sm.name;
+                        const cur = try self.getSuperProperty(key);
+                        if (cur.isAbrupt()) return cur;
+                        const oldc = try self.toNumberV(cur.normal);
+                        if (oldc.isAbrupt()) return oldc;
+                        const old = oldc.normal.number;
+                        const sc = try self.setSuperProperty(key, .{ .number = old + delta });
+                        if (sc.isAbrupt()) return sc;
+                        return .{ .normal = .{ .number = if (u.prefix) old + delta else old } };
+                    },
                     else => return self.throwError("SyntaxError", "Invalid update expression target"),
                 }
             },
@@ -1318,6 +1334,18 @@ pub const Interpreter = struct {
                     break :blk try self.toString(kc.normal);
                 } else sm.name;
                 return self.getSuperProperty(key);
+            },
+            .super_assign => |sa| {
+                // §13.3.5/§6.2.5.6 `super.x = v` / `super[k] = v` — evaluate the (computed) key, then
+                // the value, then PutValue through the SuperProperty reference (receiver = `this`).
+                const key = if (sa.key) |kn| blk: {
+                    const kc = try self.evalExpr(kn, env);
+                    if (kc.isAbrupt()) return kc;
+                    break :blk try self.toString(kc.normal);
+                } else sa.name;
+                const vc = try self.evalExpr(sa.value, env);
+                if (vc.isAbrupt()) return vc;
+                return self.setSuperProperty(key, vc.normal);
             },
             .private_member => |pm| {
                 // §13.3.2 `obj.#x` — read a private member from `obj`'s private slot.
@@ -1404,6 +1432,30 @@ pub const Interpreter = struct {
                 return self.callFunction(getter, &.{}, self.this_val);
             },
         }
+    }
+
+    /// §13.3.5/§6.2.5.6 SuperProperty write — `super.x = v`. The reference's base is the home
+    /// object's [[Prototype]] but the receiver is the current `this` (§10.1.9.2): an accessor found
+    /// on the super chain has its SETTER invoked with `this` = the receiver; otherwise the value is
+    /// written on the RECEIVER (the instance), not the prototype. (A non-writable data property on
+    /// the super chain rejecting the write is an M-subset-deferred edge — see spec 060.)
+    fn setSuperProperty(self: *Interpreter, key: []const u8, value: Value) EvalError!Completion {
+        if (self.home_object) |home| if (home.prototype) |base| {
+            if (base.getProp(key)) |loc| switch (loc.pv.payload) {
+                .accessor => |a| {
+                    const setter = a.set orelse {
+                        if (self.strict) return self.throwError("TypeError", "Cannot set property with only a getter");
+                        return .{ .normal = value };
+                    };
+                    const c = try self.callFunction(setter, &.{value}, self.this_val);
+                    if (c.isAbrupt()) return c;
+                    return .{ .normal = value };
+                },
+                .data => {},
+            };
+        };
+        // No accessor on the super chain → Set on the receiver (this), per OrdinarySet.
+        return self.setProperty(self.this_val, key, value);
     }
 
     /// §13.3.7.1 SuperCall — invoke the superclass constructor with the current `this`. M-subset:
@@ -1503,6 +1555,21 @@ pub const Interpreter = struct {
                 if (rc.isAbrupt()) return rc;
                 return self.setPrivate(oc.normal, pm.name, rc.normal);
             },
+            .super_member => |sm| {
+                // §13.15.2 `super.x ||= v` etc. — read via the SuperProperty getter (key once), guard,
+                // then write via the SuperProperty setter (receiver = `this`).
+                const key = if (sm.key) |kn| blk: {
+                    const kc = try self.evalExpr(kn, env);
+                    if (kc.isAbrupt()) return kc;
+                    break :blk try self.toString(kc.normal);
+                } else sm.name;
+                const cur = try self.getSuperProperty(key);
+                if (cur.isAbrupt()) return cur;
+                if (!shouldAssign(la.op, cur.normal)) return cur;
+                const rc = try self.evalExpr(la.value, env);
+                if (rc.isAbrupt()) return rc;
+                return self.setSuperProperty(key, rc.normal);
+            },
             else => return self.throwError("SyntaxError", "Invalid assignment target"),
         }
     }
@@ -1599,6 +1666,22 @@ pub const Interpreter = struct {
                 const res = try self.applyNumericOrStringOp(ca.op, cur.normal, rc.normal);
                 if (res.isAbrupt()) return res;
                 return self.setPrivate(oc.normal, pm.name, res.normal);
+            },
+            .super_member => |sm| {
+                // §13.15.2 `super.x += v` — read via the SuperProperty getter (key evaluated once),
+                // combine, write via the SuperProperty setter (receiver = `this`).
+                const key = if (sm.key) |kn| blk: {
+                    const kc = try self.evalExpr(kn, env);
+                    if (kc.isAbrupt()) return kc;
+                    break :blk try self.toString(kc.normal);
+                } else sm.name;
+                const cur = try self.getSuperProperty(key);
+                if (cur.isAbrupt()) return cur;
+                const rc = try self.evalExpr(ca.value, env);
+                if (rc.isAbrupt()) return rc;
+                const res = try self.applyNumericOrStringOp(ca.op, cur.normal, rc.normal);
+                if (res.isAbrupt()) return res;
+                return self.setSuperProperty(key, res.normal);
             },
             else => return self.throwError("SyntaxError", "Invalid assignment target"),
         }

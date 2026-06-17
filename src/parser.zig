@@ -1986,7 +1986,7 @@ pub const Parser = struct {
                     // §13.15.1 Early Error: in strict, the assignment target may not be `eval`/`arguments`.
                     if (self.strict and isEvalOrArguments(n)) return ParseError.UnexpectedToken;
                 },
-                .member, .index, .private_member => {},
+                .member, .index, .private_member, .super_member => {},
                 else => return ParseError.UnexpectedToken, // §13.15.1 invalid assignment target
             }
             _ = self.advance();
@@ -2014,7 +2014,7 @@ pub const Parser = struct {
             // §13.15.1: the target of a (compound or plain) assignment must be a simple
             // LeftHandSideExpression — identifier / member / index / private member.
             switch (left.*) {
-                .identifier, .member, .index, .private_member => {},
+                .identifier, .member, .index, .private_member, .super_member => {},
                 else => if (compoundBinOp(op) != null) return ParseError.UnexpectedToken,
             }
             _ = self.advance();
@@ -2030,6 +2030,7 @@ pub const Parser = struct {
                 .member => |m| return self.alloc(.{ .assign_member = .{ .object = m.object, .name = m.name, .value = rhs } }),
                 .index => |ix| return self.alloc(.{ .assign_index = .{ .object = ix.object, .key = ix.key, .value = rhs } }),
                 .private_member => |pm| return self.alloc(.{ .private_assign = .{ .object = pm.object, .name = pm.name, .value = rhs } }),
+                .super_member => |sm| return self.alloc(.{ .super_assign = .{ .name = sm.name, .key = sm.key, .value = rhs } }),
                 else => return ParseError.UnexpectedToken, // invalid assignment target
             }
         }
@@ -3455,6 +3456,7 @@ fn containsArguments(node: *const ast.Node) bool {
             return false;
         },
         .super_member => |sm| return if (sm.key) |k| containsArguments(k) else false,
+        .super_assign => |sa| return (if (sa.key) |k| containsArguments(k) else false) or containsArguments(sa.value),
         .private_member => |pm| return containsArguments(pm.object),
         .private_assign => |pa| return containsArguments(pa.object) or containsArguments(pa.value),
         .private_in => |pi| return containsArguments(pi.object),

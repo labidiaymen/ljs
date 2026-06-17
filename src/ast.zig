@@ -105,6 +105,9 @@ pub const Node = union(enum) {
     /// static IdentifierName; `key` (non-null) is the computed `super[expr]` index. Parse-restricted
     /// to method bodies.
     super_member: struct { name: []const u8 = "", key: ?*const Node = null },
+    /// §13.3.5/§6.2.5.6 `super.name = v` / `super[key] = v` — a plain assignment whose SuperProperty
+    /// reference is written with `this` as the receiver. `key` (non-null) is the computed index.
+    super_assign: struct { name: []const u8 = "", key: ?*const Node = null, value: *const Node },
     /// §13.3.2 MemberExpression `.` PrivateIdentifier — a private member access `obj.#x`. `name`
     /// includes the leading `#`. Resolved against `object`'s per-instance private slot (§15.7); a
     /// missing brand is a runtime TypeError. Parse-restricted to class bodies.
