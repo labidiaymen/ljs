@@ -6786,7 +6786,15 @@ pub const Interpreter = struct {
     fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
         switch (func.native) {
             .array_ctor => {
-                const arr = try Object.createArray(self.arena, self.arrayProto());
+                // §23.1.1.1 / §15.7.14: invoked as a constructor (`new` / `super(...)` from a subclass)
+                // the instance is built ON `this_val` (created in `constructNT` proto-linked to
+                // new_target.prototype) — flip the pre-created plain object into an Array exotic so
+                // `class S extends Array` works. A plain `Array(...)` call (no new_target) makes a fresh
+                // array. Mirrors the collection ctors (`.map_ctor` etc. below).
+                const arr = if (self.native_new_target != .undefined and this_val == .object) blk: {
+                    this_val.object.kind = .array; // a plain instance's array backing fields are zero-init
+                    break :blk this_val.object;
+                } else try Object.createArray(self.arena, self.arrayProto());
                 // §23.1.1.1: `Array(len)` with a single Number arg sets [[Length]] (a non-uint32 →
                 // RangeError); any other arg list becomes the elements. The single-number case is sparse
                 // (no eager fill) so `new Array(1e9)` is O(1) and never OOMs.
