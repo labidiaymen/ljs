@@ -3128,3 +3128,84 @@ test "M39: §22.1.2 String statics + RequireObjectCoercible" {
     // unboxing a String wrapper
     try expectStr("new String(\"hi\").at(0)", "h");
 }
+
+test "M40: §21.3 Math — full method surface + value properties" {
+    // §21.3.2 newly added methods
+    try expectNumber("Math.sign(-3)", -1);
+    try expectNumber("Math.sign(3)", 1);
+    try expectNumber("Math.trunc(4.7)", 4);
+    try expectNumber("Math.trunc(-4.7)", -4);
+    try expectNumber("Math.hypot(3,4)", 5);
+    try expectNumber("Math.hypot(3,4,12)", 13);
+    try expectNumber("Math.log2(8)", 3);
+    try expectNumber("Math.log10(1000)", 3);
+    try expectNumber("Math.cbrt(27)", 3);
+    try expectNumber("Math.clz32(1)", 31);
+    try expectNumber("Math.clz32(0)", 32);
+    try expectNumber("Math.imul(3, 4)", 12);
+    try expectNumber("Math.imul(0xffffffff, 5)", -5);
+    try expectNumber("Math.fround(1.5)", 1.5);
+    try expectNumber("Math.expm1(0)", 0);
+    try expectNumber("Math.atan2(0, 1)", 0);
+    try expectNumber("Math.cosh(0)", 1);
+    // §21.3.2.24/.25 NaN propagation + ToNumber-coerced args
+    try expectBool("Number.isNaN(Math.max(1, NaN))", true);
+    try expectBool("Number.isNaN(Math.min(NaN, 2))", true);
+    try expectNumber("Math.max(1, 2, 3)", 3);
+    try expectNumber("Math.min(-1, -2, -3)", -3);
+    try expectNumber("Math.max('5', 3)", 5); // ToNumber coercion of a string arg
+    // §21.3.2.28 round half-up toward +Inf, including the -0 edge for x in (-0.5, 0]
+    try expectNumber("Math.round(2.5)", 3);
+    try expectNumber("Math.round(-2.5)", -2);
+    try expectBool("1 / Math.round(-0.5) === -Infinity", true); // Math.round(-0.5) is -0
+    // §21.3.2.27 random in [0,1)
+    try expectBool("var r = Math.random(); r >= 0 && r < 1", true);
+    // §21.3.1 value properties (read-only; assignment is a silent no-op)
+    try expectNumber("Math.PI > 3.14 && Math.PI < 3.15 ? 1 : 0", 1);
+    try expectBool("Math.SQRT2 * Math.SQRT2 > 1.9999 && Math.SQRT2 * Math.SQRT2 < 2.0001", true);
+    try expectBool("Math.E > 2.71 && Math.E < 2.72", true);
+    // non-writable: a write is rejected (value unchanged)
+    try expectBool("Math.PI = 0; Math.PI > 3.14", true);
+}
+
+test "M40: §28.1 Reflect namespace object" {
+    // §28.1.9 has → the `in` operation (own + inherited)
+    try expectBool("Reflect.has({a:1}, 'a')", true);
+    try expectBool("Reflect.has({a:1}, 'b')", false);
+    try expectBool("Reflect.has({}, 'toString')", true); // inherited
+    // §28.1.6 get / §28.1.13 set
+    try expectNumber("Reflect.get({a:5}, 'a')", 5);
+    try expectNumber("var o={}; Reflect.set(o,'x',9); o.x", 9);
+    try expectBool("Reflect.set({}, 'x', 1)", true);
+    // §28.1.11 ownKeys
+    try expectNumber("Reflect.ownKeys({a:1, b:2}).length", 2);
+    try expectStr("Reflect.ownKeys({a:1, b:2})[0]", "a");
+    // §28.1.1 apply
+    try expectNumber("Reflect.apply(function(a,b){return a+b}, null, [2,3])", 5);
+    try expectNumber("Reflect.apply(function(){return this.v}, {v:7}, [])", 7);
+    // §28.1.2 construct (with + without explicit newTarget)
+    try expectNumber("Reflect.construct(function(x){this.x=x}, [7]).x", 7);
+    // §28.1.3 defineProperty → boolean (no throw on failure)
+    try expectBool("Reflect.defineProperty({}, 'k', {value:1})", true);
+    try expectBool("var o={}; Reflect.defineProperty(o,'k',{value:1,configurable:false}); Reflect.defineProperty(o,'k',{value:2})", false);
+    try expectNumber("var o={}; Reflect.defineProperty(o,'k',{value:42,enumerable:true}); o.k", 42);
+    // §28.1.4 deleteProperty → boolean
+    try expectBool("var o={a:1}; Reflect.deleteProperty(o,'a')", true);
+    try expectBool("var o={a:1}; Reflect.deleteProperty(o,'a'); 'a' in o", false);
+    // §28.1.7 getOwnPropertyDescriptor
+    try expectNumber("Reflect.getOwnPropertyDescriptor({a:5}, 'a').value", 5);
+    try expectBool("Reflect.getOwnPropertyDescriptor({}, 'a') === undefined", true);
+    // §28.1.8/.14 getPrototypeOf / setPrototypeOf
+    try expectBool("Reflect.getPrototypeOf(Object.create(null)) === null", true);
+    try expectBool("var o={}; var p={}; Reflect.setPrototypeOf(o,p); Reflect.getPrototypeOf(o)===p", true);
+    // §28.1.10/.12 isExtensible / preventExtensions
+    try expectBool("Reflect.isExtensible({})", true);
+    try expectBool("var o={}; Reflect.preventExtensions(o); Reflect.isExtensible(o)", false);
+    // §28.1.x: a non-object target → TypeError
+    try expectThrows("Reflect.get(5, 'x')");
+    try expectThrows("Reflect.ownKeys(5)");
+    try expectThrows("Reflect.apply(5, null, [])"); // non-callable target
+    // §28.1.14 Reflect[Symbol.toStringTag] = "Reflect" (own non-enumerable data property)
+    try expectStr("Reflect[Symbol.toStringTag]", "Reflect");
+    try expectBool("Reflect.getOwnPropertyDescriptor(Reflect, Symbol.toStringTag).enumerable", false);
+}

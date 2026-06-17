@@ -385,12 +385,48 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try env.declare("eval", .{ .object = eval_fn }, true, true);
 
     // §21.3 Math — a namespace object (not a constructor): non-enumerable function-valued methods
-    // (proto = %Object.prototype%). The minimal subset the harness needs: propertyHelper.js's
-    // `Math.pow(2, 32)` (§21.3.2.26); the common companions round out a usable surface for tests.
+    // (proto = %Object.prototype%) + the §21.3.1 value properties. `Math.pow(2,32)` backs
+    // propertyHelper.js; the full §21.3.2 method surface lands here in M40.
     const math_obj = try Object.create(arena, object_proto);
-    const math_methods = [_][]const u8{ "pow", "floor", "ceil", "abs", "round", "trunc", "sign", "sqrt", "max", "min" };
+    const math_methods = [_][]const u8{
+        // §21.3.2 — full method set.
+        "pow",    "floor", "ceil", "abs",    "round", "trunc", "sign",  "sqrt",
+        "max",    "min",   "sin",  "cos",    "tan",   "asin",  "acos",  "atan",
+        "atan2",  "sinh",  "cosh", "tanh",   "asinh", "acosh", "atanh", "exp",
+        "expm1",  "log",   "log2", "log10",  "log1p", "cbrt",  "hypot", "sign",
+        "fround", "clz32", "imul", "random",
+    };
     for (math_methods) |m| try defineMethod(arena, math_obj, m, .math_method, m);
+    // §21.3.1 value properties — non-writable / non-enumerable / non-configurable.
+    try math_obj.defineData("E", .{ .number = std.math.e }, false, false, false);
+    try math_obj.defineData("LN10", .{ .number = std.math.log(f64, std.math.e, 10.0) }, false, false, false);
+    try math_obj.defineData("LN2", .{ .number = std.math.log(f64, std.math.e, 2.0) }, false, false, false);
+    try math_obj.defineData("LOG10E", .{ .number = 1.0 / std.math.log(f64, std.math.e, 10.0) }, false, false, false);
+    try math_obj.defineData("LOG2E", .{ .number = 1.0 / std.math.log(f64, std.math.e, 2.0) }, false, false, false);
+    try math_obj.defineData("PI", .{ .number = std.math.pi }, false, false, false);
+    try math_obj.defineData("SQRT1_2", .{ .number = @sqrt(0.5) }, false, false, false);
+    try math_obj.defineData("SQRT2", .{ .number = std.math.sqrt2 }, false, false, false);
+    // §21.3.1.9 Math[Symbol.toStringTag] = "Math" — non-writable/non-enumerable/configurable.
+    if (symbol_fn.get("toStringTag")) |tag| if (tag == .symbol)
+        try math_obj.defineSymbolData(tag.symbol, .{ .string = "Math" }, false, false, true);
     try env.declare("Math", .{ .object = math_obj }, true, true);
+
+    // §28.1 Reflect — a namespace ordinary object (NOT callable, NOT a constructor; proto =
+    // %Object.prototype%). Each method is a thin wrapper over the engine's existing reflection
+    // internals, returning a boolean (not throwing) on an ordinary [[DefineOwnProperty]] / [[Set]]
+    // failure. `target` must be an Object for every method → TypeError otherwise.
+    const reflect_obj = try Object.create(arena, object_proto);
+    const reflect_methods = [_][]const u8{
+        "apply",                    "construct",      "get",               "set",
+        "has",                      "deleteProperty", "ownKeys",           "getPrototypeOf",
+        "setPrototypeOf",           "isExtensible",   "preventExtensions", "defineProperty",
+        "getOwnPropertyDescriptor",
+    };
+    for (reflect_methods) |m| try defineMethod(arena, reflect_obj, m, .reflect_method, m);
+    // §28.1.14 Reflect[Symbol.toStringTag] = "Reflect" — non-writable/non-enumerable/configurable.
+    if (symbol_fn.get("toStringTag")) |tag| if (tag == .symbol)
+        try reflect_obj.defineSymbolData(tag.symbol, .{ .string = "Reflect" }, false, false, true);
+    try env.declare("Reflect", .{ .object = reflect_obj }, true, true);
 
     // §27.2.4 Promise combinators — installed after the iterator protocol is wired (they consume an
     // iterable via §7.4 GetIterator) and the Promise constructor exists. `Promise.all`/`race`/

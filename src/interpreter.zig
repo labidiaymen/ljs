@@ -80,6 +80,10 @@ pub const Interpreter = struct {
     /// resets it to `undefined` so an ordinary call (and nested ordinary calls within the body) sees
     /// `undefined`. A one-shot hand-off that avoids threading a parameter through 39 call sites.
     pending_new_target: Value = .undefined,
+    /// §21.3.2.27 Math.random RNG state — a fixed-seed xorshift64* (this is a DETERMINISTIC engine and
+    /// the Zig sandbox blocks host RNG / `Date.now`, so no entropy source exists). Test262's random
+    /// tests only require the result be a Number in [0,1); the fixed seed keeps the engine reproducible.
+    rng_state: u64 = 0x9E3779B97F4A7C15,
     /// The realm's global environment — used to resolve the Error family for engine-thrown
     /// errors (so they carry the right prototype + name). Set by the engine after setup.
     globals: ?*Environment = null,
@@ -1338,8 +1342,18 @@ pub const Interpreter = struct {
     /// §10.2.2 [[Construct]] — instantiate `ctor` with already-evaluated `args`. Creates the new object
     /// (proto = `ctor.prototype`), runs base/derived class field + `super` ordering, invokes the
     /// constructor body with `this` = the new object, and returns an explicit object return if any.
-    /// Shared by `new C()` and a bound function's [[Construct]] (§10.4.1.2).
+    /// Shared by `new C()` and a bound function's [[Construct]] (§10.4.1.2). The instance's [[Prototype]]
+    /// derives from `ctor` (i.e. newTarget === ctor); `Reflect.construct` uses `constructNT` for an
+    /// explicit newTarget.
     fn construct(self: *Interpreter, ctor: *Object, args: []const Value) EvalError!Completion {
+        return self.constructNT(ctor, args, ctor);
+    }
+
+    /// §10.2.2 [[Construct]] with an explicit [[NewTarget]] (§28.1.2 Reflect.construct). The instance's
+    /// [[Prototype]] is read from `new_target.prototype` (an object, else %Object.prototype% per §10.1.13
+    /// OrdinaryCreateFromConstructor), while the BODY still runs `ctor`. `new_target` must be a
+    /// constructor (the caller validates IsConstructor).
+    fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_target: *Object) EvalError!Completion {
         // §15.3: arrow functions have no [[Construct]] — `new (() => {})` is a TypeError.
         if (ctor.call) |fd| {
             if (fd.is_arrow) return self.throwError("TypeError", "value is not a constructor");
@@ -1359,8 +1373,12 @@ pub const Interpreter = struct {
             };
             if (!constructible) return self.throwError("TypeError", "value is not a constructor");
         }
-        var proto: ?*Object = null;
-        if (ctor.get("prototype")) |pv| {
+        // §10.1.13 OrdinaryCreateFromConstructor: the instance proto is `new_target.prototype` if an
+        // object, else the realm's %Object.prototype% intrinsic (matched here by leaving it null when
+        // `new_target.prototype` is absent — Object.create(null) then inherits nothing, but a non-object
+        // `.prototype` falls back to %Object.prototype%). For `new C()` new_target === ctor.
+        var proto: ?*Object = self.objectProto();
+        if (new_target.get("prototype")) |pv| {
             if (pv == .object) proto = pv.object;
         }
         const new_obj = try Object.create(self.arena, proto);
@@ -5812,42 +5830,340 @@ pub const Interpreter = struct {
 
     // ── §21.3 Math ──────────────────────────────────────────────────────────
 
-    /// §21.3.2 Math.<name>( ...args ) — the minimal numeric subset (the harness needs `pow`; the rest
-    /// are cheap companions). Each coerces its operands with ToNumber and returns a Number.
+    /// §21.3.2.27 Math.random — the next xorshift64* draw mapped to [0,1). A fixed-seed PRNG (no host
+    /// entropy in this sandbox; the engine is deterministic). Uses the top 53 bits for a uniform double.
+    fn randomNext(self: *Interpreter) f64 {
+        var s = self.rng_state;
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        self.rng_state = s;
+        const bits: u64 = (s *% 0x2545F4914F6CDD1D) >> 11; // 53 significant bits
+        return @as(f64, @floatFromInt(bits)) * (1.0 / 9007199254740992.0); // / 2^53
+    }
+
+    /// §21.3.2 Math.<name>( ...args ). Each method ToNumber-coerces its operands and returns a Number;
+    /// all backed by `std.math`. The variadic/integer methods (`hypot`/`max`/`min`/`clz32`/`imul`) and
+    /// `random` are handled before the single-operand table.
     fn mathMethod(self: *Interpreter, name: []const u8, args: []const Value) EvalError!Completion {
-        _ = self;
+        // §21.3.2.27 random — no operands.
+        if (std.mem.eql(u8, name, "random")) return .{ .normal = .{ .number = self.randomNext() } };
+
+        // §21.3.2.24/.25 max/min — variadic, ToNumber each, NaN-propagating, ±0-aware.
+        if (std.mem.eql(u8, name, "max")) {
+            var m: f64 = -std.math.inf(f64);
+            for (args) |a| {
+                const v = toNumber(a);
+                if (std.math.isNan(v)) return .{ .normal = .{ .number = std.math.nan(f64) } };
+                // §21.3.2.24 step 4: +0 is considered larger than -0 (so max(+0,-0) = +0).
+                if (v > m or (v == 0 and m == 0 and !std.math.signbit(v))) m = v;
+            }
+            return .{ .normal = .{ .number = m } };
+        }
+        if (std.mem.eql(u8, name, "min")) {
+            var m: f64 = std.math.inf(f64);
+            for (args) |a| {
+                const v = toNumber(a);
+                if (std.math.isNan(v)) return .{ .normal = .{ .number = std.math.nan(f64) } };
+                // §21.3.2.25 step 4: -0 is considered smaller than +0 (so min(+0,-0) = -0).
+                if (v < m or (v == 0 and m == 0 and std.math.signbit(v))) m = v;
+            }
+            return .{ .normal = .{ .number = m } };
+        }
+
+        // §21.3.2.18 hypot — variadic; any ±Inf operand → +Inf (even if a NaN is also present).
+        if (std.mem.eql(u8, name, "hypot")) {
+            var sum: f64 = 0;
+            var any_nan = false;
+            for (args) |a| {
+                const v = toNumber(a);
+                if (std.math.isInf(v)) return .{ .normal = .{ .number = std.math.inf(f64) } };
+                if (std.math.isNan(v)) any_nan = true;
+                sum += v * v;
+            }
+            if (any_nan) return .{ .normal = .{ .number = std.math.nan(f64) } };
+            return .{ .normal = .{ .number = @sqrt(sum) } };
+        }
+
+        // §21.3.2.11 clz32 — ToUint32 then count leading zeros (32 for 0).
+        if (std.mem.eql(u8, name, "clz32")) {
+            const u: u32 = numToUint32(if (args.len > 0) toNumber(args[0]) else std.math.nan(f64));
+            return .{ .normal = .{ .number = @floatFromInt(@clz(u)) } };
+        }
+        // §21.3.2.19 imul — ToInt32 both, multiply mod 2^32, reinterpret as Int32.
+        if (std.mem.eql(u8, name, "imul")) {
+            const a: i32 = numToInt32(if (args.len > 0) toNumber(args[0]) else std.math.nan(f64));
+            const b: i32 = numToInt32(if (args.len > 1) toNumber(args[1]) else std.math.nan(f64));
+            const prod: u32 = @as(u32, @bitCast(a)) *% @as(u32, @bitCast(b));
+            return .{ .normal = .{ .number = @floatFromInt(@as(i32, @bitCast(prod))) } };
+        }
+
         const x = if (args.len > 0) toNumber(args[0]) else std.math.nan(f64);
         const y = if (args.len > 1) toNumber(args[1]) else std.math.nan(f64);
         const r: f64 = blk: {
             if (std.mem.eql(u8, name, "pow")) break :blk std.math.pow(f64, x, y); // §21.3.2.26
+            if (std.mem.eql(u8, name, "atan2")) break :blk std.math.atan2(x, y); // §21.3.2.8
             if (std.mem.eql(u8, name, "floor")) break :blk @floor(x); // §21.3.2.16
             if (std.mem.eql(u8, name, "ceil")) break :blk @ceil(x); // §21.3.2.10
-            if (std.mem.eql(u8, name, "round")) break :blk @floor(x + 0.5); // §21.3.2.28 (M-subset)
+            if (std.mem.eql(u8, name, "round")) { // §21.3.2.28 — half-up toward +Infinity.
+                // NaN / ±0 / ±Inf pass through; a magnitude ≥ 2^52 is already integral (avoid x+0.5
+                // rounding error). For x in (-0.5, 0) the result is -0, so guard the sign explicitly.
+                if (std.math.isNan(x) or x == 0 or std.math.isInf(x)) break :blk x;
+                if (@abs(x) >= 4503599627370496.0) break :blk x;
+                if (x < 0 and x >= -0.5) break :blk -0.0; // (-0.5,0]→-0, and -0.5→-0
+                break :blk @floor(x + 0.5);
+            }
             if (std.mem.eql(u8, name, "trunc")) break :blk @trunc(x); // §21.3.2.38
             if (std.mem.eql(u8, name, "abs")) break :blk @abs(x); // §21.3.2.1
             if (std.mem.eql(u8, name, "sqrt")) break :blk @sqrt(x); // §21.3.2.32
+            if (std.mem.eql(u8, name, "cbrt")) break :blk std.math.cbrt(x); // §21.3.2.9
             if (std.mem.eql(u8, name, "sign")) break :blk std.math.sign(x); // §21.3.2.30
-            if (std.mem.eql(u8, name, "max")) { // §21.3.2.24
-                var m: f64 = -std.math.inf(f64);
-                for (args) |a| {
-                    const v = toNumber(a);
-                    if (std.math.isNan(v)) break :blk std.math.nan(f64);
-                    if (v > m) m = v;
-                }
-                break :blk m;
-            }
-            if (std.mem.eql(u8, name, "min")) { // §21.3.2.25
-                var m: f64 = std.math.inf(f64);
-                for (args) |a| {
-                    const v = toNumber(a);
-                    if (std.math.isNan(v)) break :blk std.math.nan(f64);
-                    if (v < m) m = v;
-                }
-                break :blk m;
-            }
+            if (std.mem.eql(u8, name, "fround")) break :blk @as(f64, @as(f32, @floatCast(x))); // §21.3.2.29
+            // §21.3.2.{2-7} inverse + circular trig.
+            if (std.mem.eql(u8, name, "sin")) break :blk @sin(x);
+            if (std.mem.eql(u8, name, "cos")) break :blk @cos(x);
+            if (std.mem.eql(u8, name, "tan")) break :blk @tan(x);
+            if (std.mem.eql(u8, name, "asin")) break :blk std.math.asin(x);
+            if (std.mem.eql(u8, name, "acos")) break :blk std.math.acos(x);
+            if (std.mem.eql(u8, name, "atan")) break :blk std.math.atan(x);
+            // §21.3.2.{12-17,31-37} hyperbolic + exp/log family.
+            if (std.mem.eql(u8, name, "sinh")) break :blk std.math.sinh(x);
+            if (std.mem.eql(u8, name, "cosh")) break :blk std.math.cosh(x);
+            if (std.mem.eql(u8, name, "tanh")) break :blk std.math.tanh(x);
+            if (std.mem.eql(u8, name, "asinh")) break :blk std.math.asinh(x);
+            if (std.mem.eql(u8, name, "acosh")) break :blk std.math.acosh(x);
+            if (std.mem.eql(u8, name, "atanh")) break :blk std.math.atanh(x);
+            if (std.mem.eql(u8, name, "exp")) break :blk @exp(x); // §21.3.2.14
+            if (std.mem.eql(u8, name, "expm1")) break :blk std.math.expm1(x); // §21.3.2.15
+            if (std.mem.eql(u8, name, "log")) break :blk @log(x); // §21.3.2.20
+            if (std.mem.eql(u8, name, "log2")) break :blk @log2(x); // §21.3.2.23
+            if (std.mem.eql(u8, name, "log10")) break :blk @log10(x); // §21.3.2.21
+            if (std.mem.eql(u8, name, "log1p")) break :blk std.math.log1p(x); // §21.3.2.22
             break :blk std.math.nan(f64);
         };
         return .{ .normal = .{ .number = r } };
+    }
+
+    // ── §28.1 Reflect ─────────────────────────────────────────────────────────
+
+    /// §28.1 Reflect.<name>( ...args ) — a thin wrapper over the engine's reflection internals (the same
+    /// ops backing `Object.*` / `[[Get]]` / `[[Set]]` / `in` / delete / [[Construct]]). Every method
+    /// requires `target` be an Object (TypeError otherwise); the predicate methods return a boolean
+    /// rather than throwing on an ordinary failure (e.g. `defineProperty` → false, not a TypeError).
+    fn reflectMethod(self: *Interpreter, name: []const u8, args: []const Value) EvalError!Completion {
+        const arg0 = if (args.len > 0) args[0] else .undefined;
+        const arg1 = if (args.len > 1) args[1] else .undefined;
+        const arg2 = if (args.len > 2) args[2] else .undefined;
+
+        // §28.1.1 Reflect.apply ( target, thisArgument, argumentsList )
+        if (std.mem.eql(u8, name, "apply")) {
+            if (arg0 != .object or !isCallable(arg0.object)) return self.throwError("TypeError", "Reflect.apply target is not callable");
+            const list = try self.createListFromArrayLike(arg2);
+            switch (list) {
+                .abrupt => |c| return c,
+                .list => |l| return self.callFunction(arg0.object, l, arg1),
+            }
+        }
+
+        // §28.1.2 Reflect.construct ( target, argumentsList [ , newTarget ] )
+        if (std.mem.eql(u8, name, "construct")) {
+            if (arg0 != .object or !isConstructor(arg0.object)) return self.throwError("TypeError", "Reflect.construct target is not a constructor");
+            // §28.1.2 step 2–3: newTarget defaults to target; if supplied it must be a constructor.
+            var new_target = arg0.object;
+            if (args.len > 2) {
+                if (arg2 != .object or !isConstructor(arg2.object)) return self.throwError("TypeError", "Reflect.construct newTarget is not a constructor");
+                new_target = arg2.object;
+            }
+            const list = try self.createListFromArrayLike(arg1);
+            switch (list) {
+                .abrupt => |c| return c,
+                .list => |l| return self.constructNT(arg0.object, l, new_target),
+            }
+        }
+
+        // Every remaining method requires `target` (arg0) be an Object (§28.1.x step 1).
+        if (arg0 != .object) return self.throwError("TypeError", "Reflect target must be an object");
+        const target = arg0.object;
+
+        // §28.1.6 Reflect.get ( target, propertyKey [ , receiver ] )
+        if (std.mem.eql(u8, name, "get")) {
+            const receiver: Value = if (args.len > 2) arg2 else arg0;
+            return self.reflectGet(arg0, arg1, receiver);
+        }
+        // §28.1.13 Reflect.set ( target, propertyKey, V [ , receiver ] )
+        if (std.mem.eql(u8, name, "set")) {
+            const v = if (args.len > 2) arg2 else .undefined;
+            const receiver: Value = if (args.len > 3) args[3] else arg0;
+            return self.reflectSet(arg0, arg1, v, receiver);
+        }
+        // §28.1.9 Reflect.has ( target, propertyKey ) → the `in` operation (proto-chain walk).
+        if (std.mem.eql(u8, name, "has")) {
+            const has = try self.hasPropertyV(arg0, arg1);
+            return .{ .normal = .{ .boolean = has } };
+        }
+        // §28.1.4 Reflect.deleteProperty ( target, propertyKey ) → boolean.
+        if (std.mem.eql(u8, name, "deleteProperty")) {
+            if (arg1 == .symbol) {
+                const ok = target.deleteSymbol(arg1.symbol);
+                return .{ .normal = .{ .boolean = ok } };
+            }
+            const key = try self.toPropertyKeyString(arg1);
+            const c = try self.deleteProperty(arg0, key);
+            return c;
+        }
+        // §28.1.11 Reflect.ownKeys ( target ) → own string keys (Array indices, then string props),
+        // then own symbol keys, as an Array.
+        if (std.mem.eql(u8, name, "ownKeys")) {
+            return self.reflectOwnKeys(target);
+        }
+        // §28.1.8 Reflect.getPrototypeOf ( target ) — the [[Prototype]] (object or null).
+        if (std.mem.eql(u8, name, "getPrototypeOf")) {
+            return .{ .normal = if (target.prototype) |p| .{ .object = p } else .null };
+        }
+        // §28.1.14 Reflect.setPrototypeOf ( target, proto ) → boolean (false on a rejected change).
+        if (std.mem.eql(u8, name, "setPrototypeOf")) {
+            const new_proto: ?*Object = switch (arg1) {
+                .null => null,
+                .object => |p| p,
+                else => return self.throwError("TypeError", "Reflect.setPrototypeOf called with an invalid prototype"),
+            };
+            if (target.prototype == new_proto) return .{ .normal = .{ .boolean = true } };
+            if (!target.extensible) return .{ .normal = .{ .boolean = false } }; // §10.4.7.1: reject, don't throw
+            target.prototype = new_proto;
+            return .{ .normal = .{ .boolean = true } };
+        }
+        // §28.1.10 Reflect.isExtensible ( target ) → boolean.
+        if (std.mem.eql(u8, name, "isExtensible")) {
+            return .{ .normal = .{ .boolean = target.extensible } };
+        }
+        // §28.1.12 Reflect.preventExtensions ( target ) → boolean (always succeeds here).
+        if (std.mem.eql(u8, name, "preventExtensions")) {
+            target.extensible = false;
+            return .{ .normal = .{ .boolean = true } };
+        }
+        // §28.1.3 Reflect.defineProperty ( target, propertyKey, attributes ) → boolean (NO throw on a
+        // failed define — returns false, unlike Object.defineProperty).
+        if (std.mem.eql(u8, name, "defineProperty")) {
+            const r = try self.toPropertyDescriptor(arg2);
+            switch (r) {
+                .abrupt => |c| return c,
+                .desc => |d| {
+                    if (arg1 == .symbol) {
+                        const ok = try target.defineSymbol(arg1.symbol, d);
+                        return .{ .normal = .{ .boolean = ok } };
+                    }
+                    const key = try self.toPropertyKeyString(arg1);
+                    const ok = try target.defineProperty(key, d);
+                    return .{ .normal = .{ .boolean = ok } };
+                },
+            }
+        }
+        // §28.1.7 Reflect.getOwnPropertyDescriptor ( target, propertyKey ) → descriptor object or undefined.
+        if (std.mem.eql(u8, name, "getOwnPropertyDescriptor")) {
+            if (arg1 == .symbol) {
+                for (target.symbol_props.items) |*sp| {
+                    if (sp.key == arg1.symbol) return self.fromPropertyValue(sp.pv);
+                }
+                return .{ .normal = .undefined };
+            }
+            return self.objectGetOwnPropertyDescriptor(&.{ arg0, arg1 });
+        }
+
+        return self.throwError("TypeError", "unknown Reflect method");
+    }
+
+    /// §7.1.19 ToPropertyKey for the string path (a Symbol is handled by the caller's symbol branch).
+    fn toPropertyKeyString(self: *Interpreter, key: Value) EvalError![]const u8 {
+        return self.toString(key);
+    }
+
+    /// §28.1.6 [[Get]] with an explicit receiver — locate `key` (string or symbol) on `target`'s chain;
+    /// a data property returns its value, an accessor invokes its getter with `this` = receiver.
+    fn reflectGet(self: *Interpreter, target: Value, key: Value, receiver: Value) EvalError!Completion {
+        const o = target.object;
+        if (key == .symbol) {
+            const loc = o.getSymbolProp(key.symbol) orelse return self.getSymbolProperty(target, key.symbol);
+            switch (loc.pv.payload) {
+                .data => |v| return .{ .normal = v },
+                .accessor => |a| {
+                    const getter = a.get orelse return .{ .normal = .undefined };
+                    return self.callFunction(getter, &.{}, receiver);
+                },
+            }
+        }
+        const ks = try self.toPropertyKeyString(key);
+        // Reuse the ordinary [[Get]] for the receiver == target common case (Array/String-exotic aware).
+        if (sameRef(target, receiver)) return self.getProperty(target, ks);
+        const loc = o.getProp(ks) orelse return self.getProperty(target, ks);
+        switch (loc.pv.payload) {
+            .data => |v| return .{ .normal = v },
+            .accessor => |a| {
+                const getter = a.get orelse return .{ .normal = .undefined };
+                return self.callFunction(getter, &.{}, receiver);
+            },
+        }
+    }
+
+    /// §28.1.13 [[Set]] with an explicit receiver → boolean. An inherited/own accessor invokes its
+    /// setter with `this` = receiver; a data write defines/overwrites on the target (M-subset: the
+    /// receiver-divergent OrdinarySet redirection is the common receiver == target model).
+    fn reflectSet(self: *Interpreter, target: Value, key: Value, value: Value, receiver: Value) EvalError!Completion {
+        const o = target.object;
+        if (key == .symbol) {
+            if (o.getSymbolProp(key.symbol)) |loc| if (loc.pv.payload == .accessor) {
+                const setter = loc.pv.payload.accessor.set orelse return .{ .normal = .{ .boolean = false } };
+                const sc = try self.callFunction(setter, &.{value}, receiver);
+                if (sc.isAbrupt()) return sc;
+                return .{ .normal = .{ .boolean = true } };
+            };
+            if (!o.extensible and o.getSymbolProp(key.symbol) == null) return .{ .normal = .{ .boolean = false } };
+            try o.setSymbol(key.symbol, value);
+            return .{ .normal = .{ .boolean = true } };
+        }
+        const ks = try self.toPropertyKeyString(key);
+        // §10.1.9: a non-writable own data property or a getter-only accessor rejects (→ false).
+        if (o.getProp(ks)) |loc| {
+            if (loc.pv.payload == .accessor) {
+                const setter = loc.pv.payload.accessor.set orelse return .{ .normal = .{ .boolean = false } };
+                const sc = try self.callFunction(setter, &.{value}, receiver);
+                if (sc.isAbrupt()) return sc;
+                return .{ .normal = .{ .boolean = true } };
+            }
+            if (loc.holder == o and !loc.pv.writable) return .{ .normal = .{ .boolean = false } };
+        }
+        const sc = try self.setProperty(target, ks, value);
+        if (sc.isAbrupt()) return sc;
+        return .{ .normal = .{ .boolean = true } };
+    }
+
+    /// §28.1.11 Reflect.ownKeys — own string keys (Array indices in numeric order, then `length` for an
+    /// Array, then ordinary own string keys in insertion order), then own symbol keys, as an Array.
+    fn reflectOwnKeys(self: *Interpreter, target: *Object) EvalError!Completion {
+        const arr = try Object.createArray(self.arena, self.arrayProto());
+        if (target.kind == .array) {
+            for (try target.arrayIndices(self.arena)) |i| {
+                try arr.elements.append(self.arena, .{ .string = try numberToString(self.arena, @floatFromInt(i)) });
+            }
+            try arr.elements.append(self.arena, .{ .string = "length" });
+        }
+        var it = target.properties.iterator();
+        while (it.next()) |entry| try arr.elements.append(self.arena, .{ .string = entry.key_ptr.* });
+        // §28.1.11 step 3.b: own symbol keys follow the string keys.
+        for (target.symbol_props.items) |sp| try arr.elements.append(self.arena, .{ .symbol = sp.key });
+        arr.array_length = arr.elements.items.len;
+        return .{ .normal = .{ .object = arr } };
+    }
+
+    /// §7.3.12 HasProperty for a Value key (string or symbol) — proto-chain walk (the `in` semantics).
+    fn hasPropertyV(self: *Interpreter, base: Value, key: Value) EvalError!bool {
+        const o = base.object;
+        if (key == .symbol) return o.getSymbolProp(key.symbol) != null;
+        const ks = try self.toPropertyKeyString(key);
+        if (o.kind == .array) {
+            if (std.mem.eql(u8, ks, "length")) return true;
+            if (parseIndex(ks)) |i| if (o.arrayHas(i)) return true;
+        }
+        return o.get(ks) != null;
     }
 
     // ── §20.2.3 Function.prototype methods ──────────────────────────────────
@@ -5959,6 +6275,7 @@ pub const Interpreter = struct {
             .string_method => return builtin_string.call(self, func.native_name, this_val, args),
             .string_static => return builtin_string.staticCall(self, func.native_name, args),
             .math_method => return self.mathMethod(func.native_name, args),
+            .reflect_method => return self.reflectMethod(func.native_name, args),
             .array_values => return self.makeArrayIterator(this_val, .value), // §23.1.3.34 / Array.prototype[Symbol.iterator]
             .array_keys => return self.makeArrayIterator(this_val, .key), // §23.1.3.18 Array.prototype.keys
             .array_entries => return self.makeArrayIterator(this_val, .entry), // §23.1.3.7 Array.prototype.entries
@@ -6190,7 +6507,7 @@ pub const Interpreter = struct {
             .bigint_method => return self.bigintMethod(func.native_name, this_val, args), // §21.2.3 toString/valueOf
             .symbol_ctor => return self.symbolConstructor(args), // §20.4.1.1 Symbol([description])
             .promise_ctor => return self.promiseConstructor(args), // §27.2.3.1 Promise(executor) called w/o new
-            .array_ctor, .array_method, .array_static, .string_method, .string_static, .math_method => unreachable, // handled in the first switch
+            .array_ctor, .array_method, .array_static, .string_method, .string_static, .math_method, .reflect_method => unreachable, // handled in the first switch
             .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
             .generator_method, .generator_iterator => unreachable, // handled in the first switch
             .async_generator_method, .async_generator_iterator, .async_from_sync_method, .async_from_sync_wrap => unreachable, // handled in the first switch
@@ -6435,6 +6752,29 @@ pub const Interpreter = struct {
 /// `then` must be callable).
 fn isCallable(obj: *Object) bool {
     return obj.kind == .function;
+}
+
+/// §7.2.4 IsConstructor — does `obj` have a [[Construct]] internal method. Mirrors the guards in
+/// `construct`: arrow functions, the Symbol/BigInt constructors (callable-but-not-`new`), and built-in
+/// methods/statics (a native with no AST body that is not one of the genuine built-in constructors)
+/// are NOT constructors. Ordinary functions / bound functions / classes ARE.
+fn isConstructor(obj: *Object) bool {
+    if (obj.kind != .function) return false;
+    if (obj.call) |fd| {
+        if (fd.is_arrow) return false; // arrows + methods/generators handled by the caller's body checks
+        return true; // ordinary function / class / bound (M-subset: methods/generators are rare ctor targets)
+    }
+    // A native with no AST body: only the genuine built-in constructors qualify.
+    if (obj.native == .none) return true; // a bound function wrapping a constructible target
+    return switch (obj.native) {
+        .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor => true,
+        else => false,
+    };
+}
+
+/// Identity comparison of two Object-valued `Value`s (same `*Object`). False if either is not an object.
+fn sameRef(a: Value, b: Value) bool {
+    return a == .object and b == .object and a.object == b.object;
 }
 
 /// §27.2.5.4.1: a `then`/`catch` handler argument is used only if it is callable; a non-callable (incl.

@@ -276,6 +276,8 @@ pub const NativeId = enum {
     function_proto_noop, // %Function.prototype% itself — a callable that returns undefined (§20.2.3)
     // §21.3 Math — `native_name` is the method (`pow`/`floor`/…). The Math namespace object holds these.
     math_method, // Math.<native_name>
+    // §28.1 Reflect — `native_name` is the method (`get`/`apply`/…). The Reflect namespace object holds these.
+    reflect_method, // Reflect.<native_name>
     // §21.1 Number / §20.3 Boolean — the constructors (callable conversion) + Number statics.
     number_ctor, // Number( x ) — ToNumber (Number() → 0)
     boolean_ctor, // Boolean( x ) — ToBoolean
@@ -925,6 +927,81 @@ pub const Object = struct {
             }
         }
         try self.symbol_props.append(self.arena, .{ .key = key, .pv = pv });
+    }
+
+    /// §10.1.6 [[DefineOwnProperty]] for a SYMBOL key — applies a §6.2.6 Descriptor to the own
+    /// symbol-keyed property `key`, mirroring the string-keyed `defineProperty` (same false-default fill
+    /// for a new property, same non-configurable redefinition guards). Returns false (the caller — e.g.
+    /// `Reflect.defineProperty` — reports it) on an incompatible redefinition / a new prop on a
+    /// non-extensible object.
+    pub fn defineSymbol(self: *Object, key: *Symbol, d: Descriptor) std.mem.Allocator.Error!bool {
+        var existing: ?*PropertyValue = null;
+        for (self.symbol_props.items) |*sp| {
+            if (sp.key == key) {
+                existing = &sp.pv;
+                break;
+            }
+        }
+        if (existing == null and !self.extensible) return false; // §10.1.6.3 step 2.a
+        if (existing) |cur| {
+            if (!cur.configurable) {
+                if (d.configurable orelse false) return false;
+                if (d.enumerable) |e| if (e != cur.enumerable) return false;
+                const cur_is_accessor = cur.payload == .accessor;
+                if (d.isAccessor() and !cur_is_accessor) return false;
+                if (d.isData() and cur_is_accessor) return false;
+                if (!cur_is_accessor and !cur.writable) {
+                    if (d.writable orelse false) return false;
+                    if (d.has_value) {
+                        if (!sameValueLoose(cur.payload.data, d.value.?)) return false;
+                    }
+                }
+            }
+        }
+        var writable = if (existing) |c| c.writable else false;
+        var enumerable = if (existing) |c| c.enumerable else false;
+        var configurable = if (existing) |c| c.configurable else false;
+        if (d.enumerable) |e| enumerable = e;
+        if (d.configurable) |c| configurable = c;
+        var payload: Payload = if (existing) |c| c.payload else .{ .data = .undefined };
+        if (d.isAccessor()) {
+            var g: ?*Object = null;
+            var s: ?*Object = null;
+            if (payload == .accessor) {
+                g = payload.accessor.get;
+                s = payload.accessor.set;
+            }
+            if (d.get) |gv| g = gv;
+            if (d.set) |sv| s = sv;
+            payload = .{ .accessor = .{ .get = g, .set = s } };
+        } else {
+            if (d.writable) |w| writable = w;
+            if (d.has_value) {
+                payload = .{ .data = d.value.? };
+            } else if (payload == .accessor) {
+                payload = .{ .data = .undefined };
+            }
+        }
+        const pv: PropertyValue = .{ .payload = payload, .writable = writable, .enumerable = enumerable, .configurable = configurable };
+        if (existing) |cur| {
+            cur.* = pv;
+        } else {
+            try self.symbol_props.append(self.arena, .{ .key = key, .pv = pv });
+        }
+        return true;
+    }
+
+    /// §10.1.10 [[Delete]] for a SYMBOL key → true if the property was absent or successfully removed;
+    /// false if it exists but is non-configurable (§10.1.10.1 step 4).
+    pub fn deleteSymbol(self: *Object, key: *Symbol) bool {
+        for (self.symbol_props.items, 0..) |*sp, i| {
+            if (sp.key == key) {
+                if (!sp.pv.configurable) return false;
+                _ = self.symbol_props.orderedRemove(i);
+                return true;
+            }
+        }
+        return true;
     }
 
     /// §13.2.5.6 PropertyDefinitionEvaluation for an accessor — merge `get`/`set` into the own
