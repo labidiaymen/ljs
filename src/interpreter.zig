@@ -6969,11 +6969,15 @@ pub const Interpreter = struct {
         }
         switch (func.native) {
             .error_ctor => {
-                const proto: ?*Object = blk: {
-                    const pv = func.get("prototype") orelse break :blk null;
-                    break :blk if (pv == .object) pv.object else null;
+                // §20.5.1.1 / §15.7.14: as a constructor (`new`/`super`), initialize the error ON the
+                // provided instance (the derived/new object, proto-linked to new_target.prototype) so
+                // `class E extends Error` works; a plain `Error(...)` call makes a fresh error.
+                const err = if (self.native_new_target != .undefined and this_val == .object)
+                    this_val.object
+                else blk: {
+                    const pv = func.get("prototype") orelse break :blk try Object.create(self.arena, null);
+                    break :blk try Object.create(self.arena, if (pv == .object) pv.object else null);
                 };
-                const err = try Object.create(self.arena, proto);
                 err.error_data = true; // §20.5 [[ErrorData]] → §20.1.3.6 "Error" tag
                 try err.set("name", .{ .string = func.native_name });
                 const msg: Value = if (args.len > 0 and args[0] != .undefined)
