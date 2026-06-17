@@ -329,6 +329,11 @@ pub const NativeId = enum {
     array_entries, // Array.prototype.entries — Array Iterator over [index, value] (§23.1.3.7)
     string_iterator, // String.prototype[Symbol.iterator] — returns a String Iterator
     iterator_next, // %ArrayIteratorPrototype%.next / %StringIteratorPrototype%.next (native_name selects)
+    // §27.1 Iterator — the abstract constructor, `Iterator.from`, and the %Iterator.prototype% helper
+    // methods. Eager consumers (M55): reduce/toArray/forEach/some/every/find. `native_name` selects.
+    iterator_ctor, // §27.1.3.1 new Iterator() — abstract (direct construction throws)
+    iterator_from, // §27.1.3.1.1 Iterator.from(O)
+    iterator_helper, // %Iterator.prototype%.<native_name>
     // §27.5 Generator — %GeneratorPrototype% methods + [Symbol.iterator].
     generator_method, // %GeneratorPrototype%.next / .return / .throw (native_name selects)
     generator_iterator, // %GeneratorPrototype%[Symbol.iterator] — returns `this`

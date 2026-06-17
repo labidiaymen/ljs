@@ -1507,7 +1507,7 @@ pub const Interpreter = struct {
         // functions / bound functions / classes have `native == .none` and a `call` body, so they pass.
         if (ctor.call == null and ctor.native != .none) {
             const constructible = switch (ctor.native) {
-                .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor => true,
+                .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor => true,
                 else => false,
             };
             if (!constructible) return self.throwError("TypeError", "value is not a constructor");
@@ -5993,6 +5993,14 @@ pub const Interpreter = struct {
         return if (b.value == .object) b.value.object else null;
     }
 
+    /// §27.1.4 %Iterator.prototype% — the [[Prototype]] of every built-in iterator (so the helper
+    /// methods are inherited). Falls back to %Object.prototype% in a realm-less eval (no Iterator).
+    fn iteratorProto(self: *Interpreter) ?*Object {
+        const g = self.globals orelse return self.objectProto();
+        const b = g.lookup("%IteratorPrototype%") orelse return self.objectProto();
+        return if (b.value == .object) b.value.object else self.objectProto();
+    }
+
     // ── §20.1.2 / §20.1.3 Object reflection ─────────────────────────────────
 
     /// §6.2.6 ToPropertyDescriptor — read a descriptor object's own `value`/`writable`/`get`/`set`/
@@ -7419,6 +7427,19 @@ pub const Interpreter = struct {
             .array_entries => return self.makeArrayIterator(this_val, .entry), // §23.1.3.7 Array.prototype.entries
             .string_iterator => return self.makeStringIterator(this_val), // §22.1.3.36 String.prototype[Symbol.iterator]
             .iterator_next => return self.iteratorNext(this_val), // §23.1.5.2.1 / §22.1.5.2.1 %…IteratorPrototype%.next
+            .iterator_helper => return self.iteratorHelper(func.native_name, this_val, args), // §27.1.4 helpers
+            .iterator_from => return self.throwError("TypeError", "Iterator.from is not yet supported"), // M56
+            .iterator_ctor => {
+                // §27.1.3.1: the abstract `Iterator` constructor — a direct call (no new_target) or
+                // `new Iterator()` (new_target === %Iterator% itself) throws; only a subclass `super()`
+                // (new_target is the subclass) succeeds, returning the already-allocated instance.
+                const nt = self.native_new_target;
+                const iter_ctor: ?*Object = if (self.globals) |g| (if (g.lookup("Iterator")) |b| (if (b.value == .object) b.value.object else null) else null) else null;
+                if (nt == .undefined or (nt == .object and iter_ctor != null and nt.object == iter_ctor.?)) {
+                    return self.throwError("TypeError", "Abstract class Iterator not directly constructable");
+                }
+                return .{ .normal = this_val };
+            },
             .symbol_to_string => return self.symbolToString(func.native_name, this_val), // §20.4.3.3/.4/.5
             .symbol_static => return self.symbolStatic(func.native_name, args), // §20.4.2 for/keyFor
             .symbol_description => return self.symbolDescription(this_val), // §20.4.3.2 get description
@@ -7656,6 +7677,7 @@ pub const Interpreter = struct {
             .map_method, .set_method, .weakmap_method, .weakset_method => unreachable, // handled in the first switch
             .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .collection_size, .collection_iterator => unreachable, // handled in the first switch
             .json_parse, .json_stringify => unreachable, // handled in the first switch
+            .iterator_helper, .iterator_from, .iterator_ctor => unreachable, // handled in the first switch
             .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch
             .promise_all, .promise_all_settled, .promise_any, .promise_race, .promise_combinator_element => unreachable, // handled in the first switch
             .promise_resolve_fn, .promise_reject_fn, .promise_finally_thunk, .test_done => unreachable, // handled in the first switch
@@ -7827,7 +7849,7 @@ pub const Interpreter = struct {
     /// M-subset) carrying the array + cursor in its native `iter` slot, with a `next` method.
     fn makeArrayIterator(self: *Interpreter, this_val: Value, kind: @import("object.zig").IterKind) EvalError!Completion {
         if (this_val != .object) return self.throwError("TypeError", "Array.prototype.values requires an object");
-        const iter = try Object.create(self.arena, self.objectProto());
+        const iter = try Object.create(self.arena, self.iteratorProto()); // §23.1.5.1 proto = %Iterator.prototype%
         iter.iter = .{ .array = this_val.object, .cursor = 0, .kind = kind };
         try self.installIteratorNext(iter);
         return .{ .normal = .{ .object = iter } };
@@ -7920,7 +7942,7 @@ pub const Interpreter = struct {
         if (c.kind != home) {
             return self.throwError("TypeError", "method called on an incompatible receiver");
         }
-        const iter = try Object.create(self.arena, self.objectProto());
+        const iter = try Object.create(self.arena, self.iteratorProto()); // §24.1.5.1 proto = %Iterator.prototype%
         iter.iter = .{ .collection = this_val.object, .cursor = 0, .kind = kind };
         try self.installIteratorNext(iter);
         return .{ .normal = .{ .object = iter } };
@@ -8170,6 +8192,144 @@ pub const Interpreter = struct {
         unreachable;
     }
 
+    /// §27.1.4.x %Iterator.prototype% step over an iterator with a CACHED next method (GetIteratorDirect
+    /// reads `next` once). Returns the yielded value, `.done`, or an abrupt completion.
+    fn iterNextDirect(self: *Interpreter, iterator: Value, next_fn: Value) EvalError!StepResult {
+        if (next_fn != .object or !isCallable(next_fn.object)) {
+            return .{ .abrupt = try self.throwError("TypeError", "iterator.next is not a function") };
+        }
+        const rc = try self.callFunction(next_fn.object, &.{}, iterator);
+        if (rc.isAbrupt()) return .{ .abrupt = rc };
+        if (rc.normal != .object) return .{ .abrupt = try self.throwError("TypeError", "Iterator result is not an object") };
+        const res = rc.normal.object;
+        const dc = try self.getProperty2(.{ .object = res }, "done");
+        if (dc.isAbrupt()) return .{ .abrupt = dc };
+        if (toBoolean(dc.normal)) return .done;
+        const vc = try self.getProperty2(.{ .object = res }, "value");
+        if (vc.isAbrupt()) return .{ .abrupt = vc };
+        return .{ .value = vc.normal };
+    }
+
+    /// §27.1.4 %Iterator.prototype% EAGER consumers: reduce / toArray / forEach / some / every / find.
+    /// `this` is the iterator (GetIteratorDirect: requires an Object, reads `next` once). The callback
+    /// (where required) is validated with the iterator CLOSED on failure (IfAbruptCloseIterator); a
+    /// short-circuit (some/every/find) and a throwing callback also close the iterator.
+    fn iteratorHelper(self: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
+        const eql = std.mem.eql;
+        if (this_val != .object) return self.throwError("TypeError", "Iterator.prototype method called on a non-object");
+        const o = this_val.object;
+        const nc = try self.getProperty2(this_val, "next"); // GetIteratorDirect: read next once
+        if (nc.isAbrupt()) return nc;
+        const next_fn = nc.normal;
+
+        if (eql(u8, name, "toArray")) {
+            const arr = try Object.createArray(self.arena, self.arrayProto());
+            while (true) {
+                switch (try self.iterNextDirect(this_val, next_fn)) {
+                    .done => break,
+                    .abrupt => |c| return c,
+                    .value => |v| {
+                        try arr.elements.append(self.arena, v);
+                        arr.array_length = arr.elements.items.len;
+                    },
+                }
+            }
+            return .{ .normal = .{ .object = arr } };
+        }
+
+        // The remaining helpers all take a callback as args[0]; validate it, closing on failure.
+        const cb: Value = if (args.len > 0) args[0] else .undefined;
+        if (cb != .object or !isCallable(cb.object)) {
+            try self.iteratorClose(o);
+            return self.throwError("TypeError", "Iterator helper callback is not callable");
+        }
+
+        if (eql(u8, name, "forEach")) {
+            var i: f64 = 0;
+            while (true) {
+                switch (try self.iterNextDirect(this_val, next_fn)) {
+                    .done => break,
+                    .abrupt => |c| return c,
+                    .value => |v| {
+                        const r = try self.callFunction(cb.object, &.{ v, .{ .number = i } }, .undefined);
+                        if (r.isAbrupt()) {
+                            try self.iteratorClose(o);
+                            return r;
+                        }
+                        i += 1;
+                    },
+                }
+            }
+            return .{ .normal = .undefined };
+        }
+
+        if (eql(u8, name, "some") or eql(u8, name, "every") or eql(u8, name, "find")) {
+            const is_some = eql(u8, name, "some");
+            const is_find = eql(u8, name, "find");
+            var i: f64 = 0;
+            while (true) {
+                switch (try self.iterNextDirect(this_val, next_fn)) {
+                    .done => break,
+                    .abrupt => |c| return c,
+                    .value => |v| {
+                        const r = try self.callFunction(cb.object, &.{ v, .{ .number = i } }, .undefined);
+                        if (r.isAbrupt()) {
+                            try self.iteratorClose(o);
+                            return r;
+                        }
+                        i += 1;
+                        const t = toBoolean(r.normal);
+                        if (is_find and t) {
+                            try self.iteratorClose(o);
+                            return .{ .normal = v };
+                        }
+                        if (is_some and t) {
+                            try self.iteratorClose(o);
+                            return .{ .normal = .{ .boolean = true } };
+                        }
+                        if (!is_some and !is_find and !t) { // every: a falsy → false
+                            try self.iteratorClose(o);
+                            return .{ .normal = .{ .boolean = false } };
+                        }
+                    },
+                }
+            }
+            // exhausted: some→false, every→true, find→undefined
+            return .{ .normal = if (is_find) .undefined else .{ .boolean = !is_some } };
+        }
+
+        if (eql(u8, name, "reduce")) {
+            var have_acc = args.len > 1;
+            var acc: Value = if (args.len > 1) args[1] else .undefined;
+            var i: f64 = 0;
+            while (true) {
+                switch (try self.iterNextDirect(this_val, next_fn)) {
+                    .done => break,
+                    .abrupt => |c| return c,
+                    .value => |v| {
+                        if (!have_acc) { // §27.1.4.x: first value seeds the accumulator
+                            acc = v;
+                            have_acc = true;
+                            i += 1;
+                            continue;
+                        }
+                        const r = try self.callFunction(cb.object, &.{ acc, v, .{ .number = i } }, .undefined);
+                        if (r.isAbrupt()) {
+                            try self.iteratorClose(o);
+                            return r;
+                        }
+                        acc = r.normal;
+                        i += 1;
+                    },
+                }
+            }
+            if (!have_acc) return self.throwError("TypeError", "Reduce of empty iterator with no initial value");
+            return .{ .normal = acc };
+        }
+
+        unreachable;
+    }
+
     /// §22.1.5.1 CreateStringIterator — a fresh String Iterator object over the primitive string's
     /// code units (M-subset: byte-at-a-time, matching the engine's String indexing model).
     fn makeStringIterator(self: *Interpreter, this_val: Value) EvalError!Completion {
@@ -8177,7 +8337,7 @@ pub const Interpreter = struct {
             .string => |str| str,
             else => return self.throwError("TypeError", "String.prototype[Symbol.iterator] requires a string"),
         };
-        const iter = try Object.create(self.arena, self.objectProto());
+        const iter = try Object.create(self.arena, self.iteratorProto()); // §22.1.5.1 proto = %Iterator.prototype%
         iter.iter = .{ .string = s, .cursor = 0 };
         try self.installIteratorNext(iter);
         return .{ .normal = .{ .object = iter } };

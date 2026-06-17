@@ -369,13 +369,42 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         }
     }
 
+    // §27.1.1 Iterator — the ABSTRACT constructor + %Iterator.prototype%. Every built-in iterator
+    // (array/string/collection iterators, generators) chains its [[Prototype]] here, so the §27.1.4
+    // helper methods are inherited universally. `new Iterator()` is abstract (throws); only a subclass
+    // `super()` succeeds. Stashed under `%IteratorPrototype%` so the runtime iterator factories resolve
+    // it. Built before %GeneratorPrototype% so the latter can chain to it.
+    const iterator_fn = try Object.createNative(arena, .iterator_ctor, "Iterator");
+    iterator_fn.prototype = function_proto;
+    const iterator_proto: ?*Object = blk: {
+        const pv = iterator_fn.get("prototype") orelse break :blk null;
+        break :blk if (pv == .object) pv.object else null;
+    };
+    if (iterator_proto) |ip| {
+        ip.prototype = object_proto; // §27.1.4 %Iterator.prototype% → %Object.prototype%
+        // §27.1.4 eager consumers (M55); the lazy helpers (map/filter/take/drop/flatMap) arrive in M56.
+        try defineMethod(arena, ip, "reduce", .iterator_helper, "reduce");
+        try defineMethod(arena, ip, "toArray", .iterator_helper, "toArray");
+        try defineMethod(arena, ip, "forEach", .iterator_helper, "forEach");
+        try defineMethod(arena, ip, "some", .iterator_helper, "some");
+        try defineMethod(arena, ip, "every", .iterator_helper, "every");
+        try defineMethod(arena, ip, "find", .iterator_helper, "find");
+        // §27.1.4.1 %Iterator.prototype%[Symbol.iterator]() returns `this` (reuse the return-this native).
+        const self_fn = try Object.createNative(arena, .generator_iterator, "[Symbol.iterator]");
+        self_fn.prototype = function_proto;
+        try ip.defineSymbolData(iter_sym, .{ .object = self_fn }, true, false, true);
+        try env.declare("%IteratorPrototype%", .{ .object = ip }, false, true);
+    }
+    try defineConstructorBackref(iterator_fn); // §27.1.4.2 Iterator.prototype.constructor === Iterator
+    try env.declare("Iterator", .{ .object = iterator_fn }, true, true);
+
     // §27.5 %GeneratorPrototype% — the [[Prototype]] of every Generator object (made by calling a
     // `function*`). Carries `next`/`return`/`throw` (§27.5.1.2/.4/.5) and `[Symbol.iterator]()` (which
     // returns `this`, §27.5.1.1) so a generator is iterable through the M8 §7.4 protocol (for-of /
     // spread / destructuring). Stashed under a sentinel global name (not a valid identifier, so user
     // code can't reach or shadow it); `interpreter.generatorProto` resolves it. Its [[Prototype]] is
-    // %Object.prototype% (the M-subset elides the intermediate %IteratorPrototype%).
-    const gen_proto = try Object.create(arena, object_proto);
+    // %Iterator.prototype% (§27.5.1) so a generator inherits the §27.1.4 iterator helpers.
+    const gen_proto = try Object.create(arena, iterator_proto orelse object_proto);
     try defineMethod(arena, gen_proto, "next", .generator_method, "next"); // §27.5.1.2
     try defineMethod(arena, gen_proto, "return", .generator_method, "return"); // §27.5.1.4
     try defineMethod(arena, gen_proto, "throw", .generator_method, "throw"); // §27.5.1.5
