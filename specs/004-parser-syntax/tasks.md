@@ -134,3 +134,29 @@ spec (this is parser/evaluator work; no new architecture).
 Ordered by impact-to-effort: operators first (cheap, common), then template literals, then the
 bigger structural features (spread/destructuring/arrow), then object-literal sugar + access ops.
 Each cycle bench-gated.
+
+---
+
+## Conformance Loop Ledger (M62+) — lightweight milestone tracking
+
+Post-M3 work is **conformance-discovered** (run Test262 → chase the failure cluster →
+implement one coherent spec-clause fix → full gate → commit), not pre-planned per-feature
+folders. This ledger is the running record: one checked line per milestone with the spec
+clause + test delta. Each line = one commit, all gates green (build/test/lint/conformance
+0-regression/bench). `language/` metric = passed / (total − skipped).
+
+- [x] **M62** RegExp literals re-enabled at lexer + `validateLiteral` (§12.9.5) — 87.0%→87.8%
+- [x] **M63** Symbol-keyed property reflection (hasOwnProperty/propertyIsEnumerable, §20.1.3) — 87.8%→88.0%
+- [x] **M64** destructuring catch parameters (§14.15) — 88.0%→88.4%
+- [x] **M65** global/sloppy `this` binding + strict [[Set]]/delete throwing (§10.2.1.2/§9.4.2) — 88.4%→88.7%
+- [x] **M66** named function expression self-binding (§15.2.5) — 88.7%→88.8%
+- [x] **M67** derived-ctor `this` TDZ via per-binding cell + lexical arrow super/home (§13.3.7) — 88.8%→88.9%
+- [x] **M68** mapped `arguments` [[ParameterMap]] bidirectional aliasing (§10.4.4) — 88.9% (+29)
+- [x] **M69** strict/unmapped `arguments.callee` %ThrowTypeError% poison (§10.4.4.6) — 88.9% (+7)
+- [x] **M70** for-in/of lexical duplicate binding-name early error (§14.7.5.1) — 88.9%→89.0% (+8)
+- [x] **M71** `var` hoisting to the VariableEnvironment (§10.2.11/§16.1.7/§14.3.2.1) — 89.0%→89.3%
+  (+157). First milestone under FULL SDD: see `specs/059-var-hoisting/`. (From here, each milestone
+  gets its own `specs/NNN-<slug>/` spec folder; this ledger remains a compact index.)
+- [ ] Async/Promise/microtask family (~325 tests; also the Node bridge)
+- [ ] Class runtime-semantics long-tail (private methods/#x-in, static blocks, super-property, field-init order)
+- [ ] **Target: language 93%**

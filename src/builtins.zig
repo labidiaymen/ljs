@@ -56,6 +56,9 @@ fn defineConstructorBackref(ctor: *Object) std.mem.Allocator.Error!void {
 }
 
 pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Error!void {
+    // §16.1.7: the Global Environment Record is a VariableEnvironment — script-level `var` (and
+    // any `var` bubbling out of a block) hoists here.
+    env.is_var_scope = true;
     // §19.1 Value properties of the global object — `undefined`/`NaN`/`Infinity`. These are
     // non-writable, non-configurable in the spec, so we declare them immutable. Many programs
     // (and the Test262 `assert` harness, e.g. `message === undefined`) depend on these.

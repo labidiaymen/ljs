@@ -202,6 +202,9 @@ pub const Interpreter = struct {
         // body's top-level `let`/`const`/`class` names into the env as TDZ bindings before any statement
         // runs, so a forward reference is a §13.x ReferenceError (not a stray global / outer resolution).
         try self.hoistLexicalNames(program.statements, env);
+        // §16.1.7/§19.2.1.3 (var step): instantiate the Script/eval body's VarDeclaredNames in the
+        // VariableEnvironment (the global env, or for a direct eval the eval scope — both var scopes).
+        try self.hoistVarNames(program.statements, env.varScope());
         var last: Completion = .{ .normal = .undefined };
         for (program.statements) |stmt| {
             last = try self.evalStmt(stmt, env);
@@ -256,12 +259,23 @@ pub const Interpreter = struct {
                         const pc = try self.disposePush(v, d.kind == .await_using_decl);
                         if (pc.isAbrupt()) return pc;
                     }
-                    // Fast path: a plain `var x = …` binds directly, skipping pattern matching so
-                    // the common case pays no destructuring cost (perf gate).
+                    // §10.2.11: a `var` binds into the nearest VariableEnvironment (where `hoistVarNames`
+                    // instantiated it) — or the current scope if lexically inside a `with`; let/const/using
+                    // bind in the current scope. The fast path skips pattern matching for an identifier.
+                    const is_var = d.kind == .var_decl;
+                    const target_env = if (is_var) varInitTarget(env) else env;
                     if (dec.target.* == .identifier) {
-                        try env.declare(dec.target.identifier, v, mutable, true);
+                        if (is_var) {
+                            // §14.3.2.1: a bare `var x;` is a no-op (the hoisted binding keeps its value —
+                            // e.g. a same-named parameter); `var x = e` (re)declares a mutable binding.
+                            if (dec.init != null) try target_env.declare(dec.target.identifier, v, true, true);
+                        } else {
+                            try env.declare(dec.target.identifier, v, mutable, true);
+                        }
                     } else {
-                        const bc = try self.bindPattern(dec.target, v, env, mutable);
+                        // A `var` BindingPattern always has an initializer (parser-enforced); bind its
+                        // names into the var target (let/const patterns bind in the current scope).
+                        const bc = try self.bindPattern(dec.target, v, target_env, mutable);
                         if (bc.isAbrupt()) return bc;
                     }
                 }
@@ -345,8 +359,15 @@ pub const Interpreter = struct {
                 return .{ .normal = .undefined };
             },
             .for_stmt => |s| {
-                // §14.7.4 ForStatement — loop bindings in a fresh scope.
-                const loop_env = try Environment.create(self.arena, env);
+                // §14.7.4 ForStatement: only a LEXICAL head (`let`/`const`/`using`) needs a fresh
+                // per-iteration scope (CreatePerIterationEnvironment). A `var` head hoists out to the
+                // VariableEnvironment, and an expression/empty head declares nothing — so those run
+                // directly in `env`, avoiding an empty per-iteration scope and a wasted resolution hop.
+                const head_is_lexical = if (s.init) |i| i.* == .declaration and switch (i.*.declaration.kind) {
+                    .let_decl, .const_decl, .using_decl, .await_using_decl => true,
+                    else => false,
+                } else false;
+                const loop_env = if (head_is_lexical) try Environment.create(self.arena, env) else env;
                 // §ER: `for (using x = … ; … ; … )` — the using resource(s) are created once in the
                 // head and disposed when the WHOLE loop completes (normal OR abrupt). Gated: only a
                 // using-headed for-loop touches the dispose stack.
@@ -525,6 +546,88 @@ pub const Interpreter = struct {
                 for (op.properties) |prop| try self.hoistPatternNames(prop.target, env);
                 if (op.rest) |r| if (env.lookupLocal(r) == null) try env.declare(r, .undefined, true, false);
             },
+        }
+    }
+
+    /// §10.2.11 / §16.1.7 VarDeclaredNames instantiation: walk `stmts`, descending into nested
+    /// non-function statements (blocks, if/while/do/for/for-in/for-of/try/with/switch/labeled bodies)
+    /// but STOPPING at function/class boundaries, and create each `var` BoundName as an INITIALIZED
+    /// `undefined` binding in `scope` — UNLESS already present (so a parameter, an earlier `var`, or a
+    /// hoisted function of the same name is not clobbered). Mirrors the parser's `collectVarNames`.
+    /// FunctionDeclarations are NOT collected (§14.2.2) — they are instantiated separately. Run once
+    /// per Function/Script/eval entry, after `hoistLexicalNames`.
+    fn hoistVarNames(self: *Interpreter, stmts: []const ast.Stmt, scope: *Environment) EvalError!void {
+        for (stmts) |s| try self.hoistVarNamesStmt(s, scope);
+    }
+
+    fn hoistVarNamesStmt(self: *Interpreter, stmt: ast.Stmt, scope: *Environment) EvalError!void {
+        switch (stmt) {
+            .declaration => |d| {
+                if (d.kind == .var_decl) for (d.decls) |dec| try self.hoistVarPattern(dec.target, scope);
+            },
+            .block => |stmts| try self.hoistVarNames(stmts, scope),
+            .if_stmt => |s| {
+                try self.hoistVarNamesStmt(s.then.*, scope);
+                if (s.otherwise) |e| try self.hoistVarNamesStmt(e.*, scope);
+            },
+            .while_stmt => |s| try self.hoistVarNamesStmt(s.body.*, scope),
+            .do_while_stmt => |s| try self.hoistVarNamesStmt(s.body.*, scope),
+            .for_stmt => |s| {
+                if (s.init) |i| if (i.* == .declaration and i.declaration.kind == .var_decl)
+                    for (i.declaration.decls) |dec| try self.hoistVarPattern(dec.target, scope);
+                try self.hoistVarNamesStmt(s.body.*, scope);
+            },
+            .for_in_stmt => |s| {
+                if (s.head == .decl and s.head.decl.kind == .var_decl) try self.hoistVarPattern(s.head.decl.target, scope);
+                try self.hoistVarNamesStmt(s.body.*, scope);
+            },
+            .for_of_stmt => |s| {
+                if (s.head == .decl and s.head.decl.kind == .var_decl) try self.hoistVarPattern(s.head.decl.target, scope);
+                try self.hoistVarNamesStmt(s.body.*, scope);
+            },
+            .try_stmt => |s| {
+                try self.hoistVarNames(s.block, scope);
+                if (s.catch_block) |cb| try self.hoistVarNames(cb, scope);
+                if (s.finally_block) |fb| try self.hoistVarNames(fb, scope);
+            },
+            .with_stmt => |s| try self.hoistVarNamesStmt(s.body.*, scope),
+            .switch_stmt => |s| for (s.cases) |cs| try self.hoistVarNames(cs.body, scope),
+            .labeled_stmt => |s| try self.hoistVarNamesStmt(s.body.*, scope),
+            else => {},
+        }
+    }
+
+    /// Declare each BindingIdentifier of a `var` pattern as an initialized `undefined` binding in
+    /// `scope`, skipping names already bound (no-clobber). Unlike `hoistPatternNames` (lexical TDZ),
+    /// `var` bindings are created already-initialized (§10.2.11).
+    fn hoistVarPattern(self: *Interpreter, pattern: *const ast.Pattern, scope: *Environment) EvalError!void {
+        switch (pattern.*) {
+            .identifier => |n| {
+                if (scope.lookupLocal(n) == null) try scope.declare(n, .undefined, true, true);
+            },
+            .array => |ap| {
+                for (ap.elements) |el| if (el.target) |t| try self.hoistVarPattern(t, scope);
+                if (ap.rest) |r| try self.hoistVarPattern(r, scope);
+            },
+            .object => |op| {
+                for (op.properties) |prop| try self.hoistVarPattern(prop.target, scope);
+                if (op.rest) |r| if (scope.lookupLocal(r) == null) try scope.declare(r, .undefined, true, true);
+            },
+        }
+    }
+
+    /// §14.3.2.1: the environment a `var` initializer's value lands in. A `var x = e` is `x = e`
+    /// (PutValue) on the running lexical env, so if that env chain crosses an Object Environment
+    /// Record (a `with`) before reaching the VariableEnvironment, the binding lands in the current
+    /// scope (where the with-body's closures resolve it); otherwise it targets the var scope (where
+    /// `hoistVarNames` instantiated it). Using `declare` here (not a direct binding write) refreshes a
+    /// mutable binding even over an immutable global value property (`var NaN = 1` in sloppy code).
+    fn varInitTarget(env: *Environment) *Environment {
+        var e: *Environment = env;
+        while (true) {
+            if (e.with_object != null) return env; // lexically inside a `with` → current scope
+            if (e.is_var_scope) return e; // reached the VariableEnvironment
+            e = e.parent orelse return e;
         }
     }
 
@@ -743,8 +846,20 @@ pub const Interpreter = struct {
             .decl => |d| {
                 const is_using = d.kind == .using_decl or d.kind == .await_using_decl;
                 const mutable = d.kind != .const_decl and !is_using;
-                // §14.7.5.7: let/const/using create a fresh binding each iteration; var reuses the loop env.
-                const target_env = if (d.kind == .var_decl) env else try Environment.create(self.arena, env);
+                // §14.7.5.7: a `var` head writes the iterated value into the hoisted VariableEnvironment
+                // binding (visible after the loop); the body still runs in the loop env `env` (no
+                // per-iteration scope). let/const/using instead get a FRESH per-iteration scope.
+                if (d.kind == .var_decl) {
+                    const vs = varInitTarget(env);
+                    if (d.target.* == .identifier) {
+                        try vs.declare(d.target.identifier, item, true, true);
+                    } else {
+                        const bc = try self.bindPattern(d.target, item, vs, true);
+                        if (bc.isAbrupt()) return .{ .env = env, .completion = bc };
+                    }
+                    return .{ .env = env };
+                }
+                const target_env = try Environment.create(self.arena, env);
                 // §ER: a `for (using x of …)` head registers the iterated value as a DisposableResource
                 // (disposed at the end of each iteration by `evalForOf`). A non-callable @@dispose throws.
                 if (is_using) {
@@ -1956,6 +2071,10 @@ pub const Interpreter = struct {
         // §15.7.14: a class is created in a new declarative scope that holds the (immutable) class
         // binding for self-reference. Methods/field initializers close over this scope.
         const class_env = try Environment.create(self.arena, env);
+        // §15.7.14 step 4: CreateImmutableBinding(className) as UNINITIALIZED (TDZ) BEFORE evaluating
+        // the heritage, so a self-reference in `extends` (`class x extends x {}`) is a ReferenceError.
+        // Re-declared as the initialized class object after the constructor is built (below).
+        if (c.name) |name| try class_env.declare(name, .undefined, false, false);
 
         // §15.7.14 ClassHeritage: evaluate `extends LHS`. `super_ctor` is the parent constructor
         // (null for `extends null` and for a non-derived class); `is_derived` is set by the presence
@@ -2054,6 +2173,8 @@ pub const Interpreter = struct {
                     // constructor, in a scope child of the class scope. Its [[HomeObject]] is the
                     // constructor (so `super.x` resolves against `Super`).
                     const block_env = try Environment.create(self.arena, class_env);
+                    block_env.is_var_scope = true; // §15.7.11: a ClassStaticBlock is its own VariableEnvironment
+                    try self.hoistVarNames(el.value.block, block_env);
                     const saved_this = self.this_val;
                     const saved_home = self.home_object;
                     self.this_val = .{ .object = ctor };
@@ -2428,7 +2549,8 @@ pub const Interpreter = struct {
             const arg: Value = if (args.items.len > 0) args.items[0] else .undefined;
             if (arg != .string) return .{ .normal = arg };
             const eval_env = try Environment.create(self.arena, env);
-            // §19.2.1.1: a DIRECT eval inherits the caller's strictness.
+            // §19.2.1.1: a DIRECT eval inherits the caller's strictness. (Whether the eval scope is a
+            // VariableEnvironment depends on the eval body's OWN strictness — set in `performEval`.)
             return self.performEval(arg.string, eval_env, self.strict);
         }
 
@@ -2505,6 +2627,7 @@ pub const Interpreter = struct {
         if (self.depth > self.max_depth) return self.throwError("RangeError", "Maximum call stack size exceeded");
         const fd = func.call orelse return self.throwError("TypeError", "value is not a function");
         const call_env = try Environment.create(self.arena, fd.closure);
+        call_env.is_var_scope = true; // §10.2.11: a FunctionBody is a VariableEnvironment (var hoist target)
         // §10.2.11 FunctionDeclarationInstantiation: the `this` / [[HomeObject]] / [[NewTarget]] bindings
         // are established BEFORE parameter initialization, so a default-parameter initializer (`m(x =
         // super.k)`, `f(p = this.q)`, `C(t = new.target)`) sees the correct method context. Installed
@@ -2615,6 +2738,9 @@ pub const Interpreter = struct {
         // §10.2.11 FunctionDeclarationInstantiation (lexical step): hoist the body's top-level
         // `let`/`const`/`class` names as TDZ bindings before it runs (so a forward reference throws).
         try self.hoistLexicalNames(fd.body, call_env);
+        // §10.2.11 (var step): instantiate VarDeclaredNames in the FunctionBody VariableEnvironment,
+        // descending through nested blocks/loops/try (no-clobber over params already bound above).
+        try self.hoistVarNames(fd.body, call_env);
         // §ER: a FunctionBody lexically containing a `using`/`await using` disposes its resources on
         // exit (normal return OR throw). Gated on `blockHasUsing` so an ordinary body pays nothing.
         if (blockHasUsing(fd.body)) {
@@ -4230,6 +4356,7 @@ pub const Interpreter = struct {
         const fd = gen.func.call.?;
         const args = gen.args;
         const call_env = try Environment.create(self.arena, fd.closure);
+        call_env.is_var_scope = true; // §10.2.11: a generator/async FunctionBody is a VariableEnvironment
         for (fd.params, 0..) |param, i| {
             var v: Value = if (i < args.len) args[i] else .undefined;
             var defaulted = false;
@@ -4294,6 +4421,8 @@ pub const Interpreter = struct {
         self.strict = fd.strict;
         // §10.2.11 (lexical step): hoist the body's top-level `let`/`const`/`class` names as TDZ bindings.
         try self.hoistLexicalNames(fd.body, call_env);
+        // §10.2.11 (var step): instantiate VarDeclaredNames in the body VariableEnvironment.
+        try self.hoistVarNames(fd.body, call_env);
         // §ER: a GeneratorBody / AsyncFunctionBody / AsyncGeneratorBody lexically containing a
         // `using`/`await using` disposes its resources on body exit (return OR throw). Gated on
         // `blockHasUsing` so an ordinary body pays nothing.
@@ -5979,6 +6108,11 @@ pub const Interpreter = struct {
             // §19.2.1 step 7: a parse failure throws a SyntaxError (a real, catchable error object).
             else => return self.throwError("SyntaxError", "eval: invalid source"),
         };
+        // §19.2.1.3: a STRICT eval gets its OWN VariableEnvironment (its `var`s are eval-local); a
+        // SLOPPY direct eval's `var`s hoist to the caller's var scope (its fresh eval env is left a
+        // non-var-scope so `varScope()` climbs past it). An indirect eval / Function-body eval already
+        // targets the global var scope, which this preserves (`or`-ing keeps an existing var scope).
+        target_env.is_var_scope = target_env.is_var_scope or program.strict;
         // Reuse `run` (ReturnIfAbrupt over the statement list); the completion value is the last
         // statement's value. Counters are the interpreter's own — not reset, so limits still apply.
         return self.run(program, target_env);
