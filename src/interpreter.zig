@@ -13,6 +13,7 @@ const Object = object_mod.Object;
 const ops = @import("abstract_ops.zig");
 const builtin_array = @import("builtin_array.zig");
 const builtin_string = @import("builtin_string.zig");
+const builtin_collection = @import("builtin_collection.zig");
 const builtins = @import("builtins.zig");
 const bigint = @import("bigint.zig");
 const Parser = @import("parser.zig").Parser;
@@ -1496,7 +1497,7 @@ pub const Interpreter = struct {
         // functions / bound functions / classes have `native == .none` and a `call` body, so they pass.
         if (ctor.call == null and ctor.native != .none) {
             const constructible = switch (ctor.native) {
-                .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor => true,
+                .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor => true,
                 else => false,
             };
             if (!constructible) return self.throwError("TypeError", "value is not a constructor");
@@ -1510,6 +1511,18 @@ pub const Interpreter = struct {
             if (pv == .object) proto = pv.object;
         }
         const new_obj = try Object.create(self.arena, proto);
+
+        // §24.1.1.1/§24.2.1.1/§24.3.1.1/§24.4.1.1: a keyed-collection constructor attaches its backing
+        // store to the freshly-created instance (which already has new_target.prototype → subclassing
+        // works), then AddEntriesFromIterable. The instance IS the result (no explicit-return override).
+        switch (ctor.native) {
+            .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor => {
+                const ic = try self.initCollectionInstance(ctor.native, new_obj, args);
+                if (ic.isAbrupt()) return ic;
+                return .{ .normal = .{ .object = new_obj } };
+            },
+            else => {},
+        }
 
         const is_derived = if (ctor.call) |fd| fd.is_derived_ctor else false;
 
@@ -7300,6 +7313,28 @@ pub const Interpreter = struct {
             .array_static => return builtin_array.staticCall(self, func.native_name, this_val, args),
             .string_method => return builtin_string.call(self, func.native_name, this_val, args),
             .string_static => return builtin_string.staticCall(self, func.native_name, args),
+            .map_method => return builtin_collection.mapMethod(self, func.native_name, this_val, args),
+            .set_method => return builtin_collection.setMethod(self, func.native_name, this_val, args),
+            // §24.1.1.1 / §24.2.1.1: a collection constructor reached via plain [[Call]] (no `new`) is a
+            // TypeError; the actual construction happens in `constructNT` (where new_target.prototype is
+            // in hand). WeakMap/WeakSet ctors share this guard (their construct path arrives in M46).
+            .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor => return self.throwError("TypeError", "Constructor requires 'new'"),
+            .collection_size => return self.collectionSize(func.native_name, this_val),
+            .collection_iterator => {
+                // `native_name` is "<home>:<which>" — <home> ("map"/"set") brands the receiver, <which>
+                // ("keys"/"values"/"entries") selects the yield. So Map.prototype.entries.call(aSet) and
+                // Set.prototype.values.call(aMap) both reject (distinct [[MapData]]/[[SetData]] slots).
+                const colon = std.mem.indexOfScalar(u8, func.native_name, ':') orelse 0;
+                const home: object_mod.CollectionKind = if (std.mem.eql(u8, func.native_name[0..colon], "set")) .set else .map;
+                const which = func.native_name[colon + 1 ..];
+                const kind: object_mod.IterKind = if (std.mem.eql(u8, which, "keys"))
+                    .key
+                else if (std.mem.eql(u8, which, "entries"))
+                    .entry
+                else
+                    .value; // "values" / Set keys==values
+                return self.makeCollectionIterator(this_val, kind, home);
+            },
             .math_method => return self.mathMethod(func.native_name, args),
             .reflect_method => return self.reflectMethod(func.native_name, args),
             .species_getter => return .{ .normal = this_val }, // §23.1.2.5 get [Symbol.species] returns `this`
@@ -7539,6 +7574,7 @@ pub const Interpreter = struct {
             .species_getter, .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
             .generator_method, .generator_iterator => unreachable, // handled in the first switch
             .async_generator_method, .async_generator_iterator, .async_from_sync_method, .async_from_sync_wrap => unreachable, // handled in the first switch
+            .map_method, .set_method, .weakmap_method, .weakset_method, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .collection_size, .collection_iterator => unreachable, // handled in the first switch
             .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch
             .promise_all, .promise_all_settled, .promise_any, .promise_race, .promise_combinator_element => unreachable, // handled in the first switch
             .promise_resolve_fn, .promise_reject_fn, .promise_finally_thunk, .test_done => unreachable, // handled in the first switch
@@ -7679,6 +7715,111 @@ pub const Interpreter = struct {
         return .{ .normal = .{ .object = iter } };
     }
 
+    /// §24.1.1.1 / §24.2.1.1 collection construction: attach a fresh `Collection` of the right kind to
+    /// `new_obj`, then §24.1.1.2 AddEntriesFromIterable — if the iterable arg is non-nullish, get the
+    /// instance's (possibly subclass-overridden) `set`/`add` adder and feed each iterated record to it.
+    fn initCollectionInstance(self: *Interpreter, native: object_mod.NativeId, new_obj: *Object, args: []const Value) EvalError!Completion {
+        const kind: object_mod.CollectionKind = switch (native) {
+            .map_ctor => .map,
+            .set_ctor => .set,
+            .weakmap_ctor => .weakmap,
+            .weakset_ctor => .weakset,
+            else => unreachable,
+        };
+        const coll = try self.arena.create(object_mod.Collection);
+        coll.* = .{ .kind = kind };
+        new_obj.collection = coll;
+
+        const iterable: Value = if (args.len > 0) args[0] else .undefined;
+        if (iterable == .undefined or iterable == .null) return .{ .normal = .undefined };
+
+        // §24.1.1.2 step 2: adder = Get(target, "set"/"add"); must be callable.
+        const is_keyed = (kind == .map or kind == .weakmap);
+        const adder_name: []const u8 = if (is_keyed) "set" else "add";
+        const ac = try self.getProperty(.{ .object = new_obj }, adder_name);
+        if (ac.isAbrupt()) return ac;
+        if (ac.normal != .object or !isCallable(ac.normal.object)) {
+            return self.throwError("TypeError", "collection adder is not callable");
+        }
+        const adder = ac.normal.object;
+
+        const itr: *Object = switch (try self.getIterator(iterable)) {
+            .iterator => |x| x,
+            .abrupt => |c| return c,
+        };
+        // §24.1.1.2 step 4: for each record, call the adder; an abrupt completion closes the iterator.
+        while (true) {
+            const step = try self.iteratorStep(itr);
+            switch (step) {
+                .done => break,
+                .abrupt => |c| return c,
+                .value => |v| {
+                    if (is_keyed) {
+                        // §24.1.1.2 step 4.d: each Map entry must be an object with [0]/[1].
+                        if (v != .object) {
+                            const e = try self.throwError("TypeError", "Iterator value is not an entry object");
+                            try self.iteratorClose(itr);
+                            return e;
+                        }
+                        const k0 = try self.getProperty(v, "0");
+                        if (k0.isAbrupt()) {
+                            try self.iteratorClose(itr);
+                            return k0;
+                        }
+                        const v1 = try self.getProperty(v, "1");
+                        if (v1.isAbrupt()) {
+                            try self.iteratorClose(itr);
+                            return v1;
+                        }
+                        const r = try self.callFunction(adder, &.{ k0.normal, v1.normal }, .{ .object = new_obj });
+                        if (r.isAbrupt()) {
+                            try self.iteratorClose(itr);
+                            return r;
+                        }
+                    } else {
+                        const r = try self.callFunction(adder, &.{v}, .{ .object = new_obj });
+                        if (r.isAbrupt()) {
+                            try self.iteratorClose(itr);
+                            return r;
+                        }
+                    }
+                },
+            }
+        }
+        return .{ .normal = .undefined };
+    }
+
+    /// §24.1.5.1 / §24.2.5.1 CreateMapIterator / CreateSetIterator — a fresh iterator object (proto =
+    /// %Object.prototype% in the M-subset) carrying the collection + cursor in its `iter` slot. Requires
+    /// `this` to be a Map/Set instance (not a Weak collection — those are not iterable).
+    fn makeCollectionIterator(self: *Interpreter, this_val: Value, kind: object_mod.IterKind, home: object_mod.CollectionKind) EvalError!Completion {
+        if (this_val != .object or this_val.object.collection == null) {
+            return self.throwError("TypeError", "method called on an incompatible receiver");
+        }
+        const c = this_val.object.collection.?;
+        // Brand: the receiver must be the SAME collection kind the method lives on (a Map iterator on a
+        // Set, or vice versa, throws). Weak collections have no iterators so they never match here.
+        if (c.kind != home) {
+            return self.throwError("TypeError", "method called on an incompatible receiver");
+        }
+        const iter = try Object.create(self.arena, self.objectProto());
+        iter.iter = .{ .collection = this_val.object, .cursor = 0, .kind = kind };
+        try self.installIteratorNext(iter);
+        return .{ .normal = .{ .object = iter } };
+    }
+
+    /// §24.1.3.10 / §24.2.3.9 get size — the count of present entries. `native_name` carries the brand
+    /// ("map"/"set") so the Map getter rejects a Set receiver (distinct [[MapData]]/[[SetData]] slots).
+    fn collectionSize(self: *Interpreter, native_name: []const u8, this_val: Value) EvalError!Completion {
+        const want: object_mod.CollectionKind = if (std.mem.eql(u8, native_name, "set")) .set else .map;
+        if (this_val == .object) {
+            if (this_val.object.collection) |c| {
+                if (c.kind == want) return .{ .normal = .{ .number = @floatFromInt(c.size) } };
+            }
+        }
+        return self.throwError("TypeError", "get size called on an incompatible receiver");
+    }
+
     /// §22.1.5.1 CreateStringIterator — a fresh String Iterator object over the primitive string's
     /// code units (M-subset: byte-at-a-time, matching the engine's String indexing model).
     fn makeStringIterator(self: *Interpreter, this_val: Value) EvalError!Completion {
@@ -7718,7 +7859,32 @@ pub const Interpreter = struct {
         const st = &this_val.object.iter.?;
         var value: Value = .undefined;
         var done = true;
-        if (st.array) |arr| {
+        if (st.collection) |cobj| {
+            // §24.1.5.2 / §24.2.5.2: advance over the backing entries, SKIPPING tombstones; yield
+            // key / value / [key,value] per the iterator kind. Entries added since creation are seen.
+            const c = cobj.collection.?;
+            while (st.cursor < c.entries.items.len) {
+                const e = c.entries.items[st.cursor];
+                st.cursor += 1;
+                if (!e.present) continue;
+                done = false;
+                value = switch (st.kind) {
+                    .value => e.value,
+                    .key => e.key,
+                    .entry => blk: { // [key, value] pair (for a Set, key === value)
+                        const pair = try Object.createArray(self.arena, self.arrayProto());
+                        try pair.elements.append(self.arena, e.key);
+                        try pair.elements.append(self.arena, e.value);
+                        pair.array_length = 2;
+                        break :blk .{ .object = pair };
+                    },
+                };
+                break;
+            }
+            // §24.1.5.2 step 11.b: once the iterator runs off the end it is COMPLETE — null the backing
+            // link so entries added AFTER exhaustion are not resurrected by a later `next()`.
+            if (done) st.collection = null;
+        } else if (st.array) |arr| {
             if (st.cursor < arr.arrayLen()) {
                 const idx = st.cursor;
                 value = switch (st.kind) {
@@ -7952,7 +8118,7 @@ fn isUriPreserved(c: u8, kind: Interpreter.UriKind) bool {
 /// §7.2.3 IsCallable — true iff `obj` is a function object (an AST closure, native, or bound function;
 /// `kind == .function` covers all three). Used by the Promise machinery (executor / handlers / thenable
 /// `then` must be callable).
-fn isCallable(obj: *Object) bool {
+pub fn isCallable(obj: *Object) bool {
     return obj.kind == .function;
 }
 

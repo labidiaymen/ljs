@@ -18,12 +18,36 @@ pub const IterState = struct {
     string: ?[]const u8 = null,
     /// The current cursor: the next array index / byte offset to yield.
     cursor: usize = 0,
+    /// §24.1.5.1 the Map/Set being iterated, or null for an array/string iterator. The `cursor` then
+    /// indexes the collection's `entries` (skipping tombstones); `kind` selects key/value/entry.
+    collection: ?*Object = null,
     /// §23.1.5.1 array-iterator kind: `.value` (Array.prototype.values / [Symbol.iterator]),
     /// `.key` (.keys → indices), `.entry` (.entries → `[index, value]` pairs).
     kind: IterKind = .value,
 };
 
 pub const IterKind = enum { value, key, entry };
+
+/// §24.1 / §24.2 / §24.3 / §24.4 the keyed-collection backing store, attached to an ordinary object
+/// via `Object.collection` (null for every non-collection object → zero cost). Entries are kept in
+/// INSERTION ORDER; a delete leaves a tombstone (`present=false`) so an iterator created earlier still
+/// advances correctly (§24.1.5.2). Key equality is SameValueZero (`abstract_ops.sameValueZero`); a
+/// stored key normalizes `-0 → +0`. Lookup is a linear scan (correctness-first). For a Set/WeakSet the
+/// `value` field mirrors `key` (§24.2.3.1 step 6 stores the value as both).
+pub const CollectionKind = enum { map, set, weakmap, weakset };
+
+pub const CollectionEntry = struct {
+    key: Value,
+    value: Value,
+    present: bool = true,
+};
+
+pub const Collection = struct {
+    kind: CollectionKind,
+    entries: std.ArrayListUnmanaged(CollectionEntry) = .empty,
+    /// Count of present (non-tombstone) entries — the observable `size`.
+    size: usize = 0,
+};
 
 /// §6.1.7.1 one symbol-keyed own property: the Symbol identity plus its value/attribute payload.
 /// Symbol-keyed properties live in a SEPARATE store from the string-keyed `properties` map so the
@@ -314,6 +338,18 @@ pub const NativeId = enum {
     /// §27.1.4.4 AsyncFromSyncIteratorContinuation onFulfilled — wraps an awaited value `v` into a fresh
     /// IteratorResult `{ value: v, done }`. `afs_done` carries the captured `done` flag.
     async_from_sync_wrap,
+    // §24.1/§24.2/§24.3/§24.4 keyed collections — constructors (new-only), prototype methods, the
+    // `size` accessor, and the collection-iterator factories. `native_name` selects the method.
+    map_ctor, // new Map([iterable])
+    set_ctor, // new Set([iterable])
+    weakmap_ctor, // new WeakMap([iterable])
+    weakset_ctor, // new WeakSet([iterable])
+    map_method, // Map.prototype.<native_name> (get/set/has/delete/clear/forEach)
+    set_method, // Set.prototype.<native_name> (add/has/delete/clear/forEach)
+    weakmap_method, // WeakMap.prototype.<native_name> (get/set/has/delete)
+    weakset_method, // WeakSet.prototype.<native_name> (add/has/delete)
+    collection_size, // get Map.prototype.size / get Set.prototype.size
+    collection_iterator, // Map/Set.prototype.keys/values/entries — returns a collection iterator
     // §27.2 Promise — the constructor, prototype methods, and statics.
     promise_ctor, // new Promise(executor)
     promise_then, // Promise.prototype.then
@@ -559,6 +595,9 @@ pub const Object = struct {
     /// §22.1.5/§23.1.5 native Array/String Iterator state — present iff this object is such an iterator
     /// (its `next` native reads/advances it). Null for every ordinary object (zero cost).
     iter: ?IterState = null,
+    /// §24.1/§24.2/§24.3/§24.4 keyed-collection backing store — present iff this object is a
+    /// Map/Set/WeakMap/WeakSet instance. Null for every other object (zero cost).
+    collection: ?*Collection = null,
     /// §27.5 Generator state — present iff this object is a Generator (made by calling a `function*`).
     /// Holds the suspendable-execution machinery (body thread + ping-pong semaphores). Null for every
     /// other object (zero cost). The %GeneratorPrototype% `next`/`return`/`throw` natives drive it.

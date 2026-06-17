@@ -425,6 +425,81 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try defineConstructorBackref(promise_fn); // §27.2.5.2 Promise.prototype.constructor === Promise
     try env.declare("Promise", .{ .object = promise_fn }, true, true);
 
+    // §24.1 Map / §24.2 Set — the keyed collections. Each constructor is new-only (plain call throws,
+    // see callNative); construction + AddEntriesFromIterable happen in the interpreter's constructNT.
+    // The prototype carries get/set/has/delete/clear/forEach (Map) or add/has/delete/clear/forEach
+    // (Set), the keys/values/entries iterators, a `size` accessor, [Symbol.iterator], and
+    // [Symbol.toStringTag]. `get <Ctor>[Symbol.species]` returns the receiver (§24.1.3.10/§24.2.3.10).
+    const species_sym: ?*Symbol = if (symbol_fn.get("species")) |sp| (if (sp == .symbol) sp.symbol else null) else null;
+    const iter_sym2: ?*Symbol = if (symbol_fn.get("iterator")) |it| (if (it == .symbol) it.symbol else null) else null;
+    const tag_sym: ?*Symbol = if (symbol_fn.get("toStringTag")) |t| (if (t == .symbol) t.symbol else null) else null;
+
+    const map_fn = try Object.createNative(arena, .map_ctor, "Map");
+    map_fn.prototype = function_proto;
+    if (map_fn.get("prototype")) |pv| if (pv == .object) {
+        const mp = pv.object;
+        mp.prototype = object_proto; // §24.1.3.1 Map.prototype inherits %Object.prototype%
+        try defineMethod(arena, mp, "get", .map_method, "get"); // §24.1.3.6
+        try defineMethod(arena, mp, "set", .map_method, "set"); // §24.1.3.9
+        try defineMethod(arena, mp, "has", .map_method, "has"); // §24.1.3.7
+        try defineMethod(arena, mp, "delete", .map_method, "delete"); // §24.1.3.3
+        try defineMethod(arena, mp, "clear", .map_method, "clear"); // §24.1.3.1
+        try defineMethod(arena, mp, "forEach", .map_method, "forEach"); // §24.1.3.5
+        try defineMethod(arena, mp, "keys", .collection_iterator, "map:keys"); // §24.1.3.8
+        // §24.1.3.4/.12: `values` and `entries`; entries is shared with [Symbol.iterator].
+        try defineMethod(arena, mp, "values", .collection_iterator, "map:values");
+        const map_entries = try Object.createNative(arena, .collection_iterator, "map:entries");
+        map_entries.prototype = function_proto;
+        try map_entries.defineData("name", .{ .string = "entries" }, false, false, true);
+        try mp.defineData("entries", .{ .object = map_entries }, true, false, true); // §24.1.3.4
+        if (iter_sym2) |s| try mp.defineSymbolData(s, .{ .object = map_entries }, true, false, true); // §24.1.3.13
+        // §24.1.3.10 get size — `native_name` "map" brands it so it rejects a Set receiver.
+        const map_size = try Object.createNative(arena, .collection_size, "map");
+        map_size.prototype = function_proto;
+        try map_size.defineData("name", .{ .string = "get size" }, false, false, true);
+        try mp.defineAccessorEx("size", map_size, null, false);
+        if (tag_sym) |s| try mp.defineSymbolData(s, .{ .string = "Map" }, false, false, true); // §24.1.3.14
+    };
+    if (species_sym) |s| {
+        const sg = try Object.createNative(arena, .species_getter, "get [Symbol.species]");
+        sg.prototype = function_proto;
+        try map_fn.defineSymbolAccessorEx(s, sg, null, false); // §24.1.3.10
+    }
+    try defineConstructorBackref(map_fn); // §24.1.3.2 Map.prototype.constructor === Map
+    try env.declare("Map", .{ .object = map_fn }, true, true);
+
+    const set_fn = try Object.createNative(arena, .set_ctor, "Set");
+    set_fn.prototype = function_proto;
+    if (set_fn.get("prototype")) |pv| if (pv == .object) {
+        const sp_obj = pv.object;
+        sp_obj.prototype = object_proto; // §24.2.3 Set.prototype inherits %Object.prototype%
+        try defineMethod(arena, sp_obj, "add", .set_method, "add"); // §24.2.3.1
+        try defineMethod(arena, sp_obj, "has", .set_method, "has"); // §24.2.3.7
+        try defineMethod(arena, sp_obj, "delete", .set_method, "delete"); // §24.2.3.4
+        try defineMethod(arena, sp_obj, "clear", .set_method, "clear"); // §24.2.3.2
+        try defineMethod(arena, sp_obj, "forEach", .set_method, "forEach"); // §24.2.3.6
+        try defineMethod(arena, sp_obj, "entries", .collection_iterator, "set:entries"); // §24.2.3.5
+        // §24.2.3.8/.10/.11: `values` is shared by `keys` AND [Symbol.iterator] (same function object).
+        const set_values = try Object.createNative(arena, .collection_iterator, "set:values");
+        set_values.prototype = function_proto;
+        try set_values.defineData("name", .{ .string = "values" }, false, false, true);
+        try sp_obj.defineData("values", .{ .object = set_values }, true, false, true);
+        try sp_obj.defineData("keys", .{ .object = set_values }, true, false, true); // §24.2.3.8 keys === values
+        if (iter_sym2) |s| try sp_obj.defineSymbolData(s, .{ .object = set_values }, true, false, true); // §24.2.3.11
+        const set_size = try Object.createNative(arena, .collection_size, "set");
+        set_size.prototype = function_proto;
+        try set_size.defineData("name", .{ .string = "get size" }, false, false, true);
+        try sp_obj.defineAccessorEx("size", set_size, null, false); // §24.2.3.9
+        if (tag_sym) |s| try sp_obj.defineSymbolData(s, .{ .string = "Set" }, false, false, true); // §24.2.3.12
+    };
+    if (species_sym) |s| {
+        const sg = try Object.createNative(arena, .species_getter, "get [Symbol.species]");
+        sg.prototype = function_proto;
+        try set_fn.defineSymbolAccessorEx(s, sg, null, false); // §24.2.3.10
+    }
+    try defineConstructorBackref(set_fn); // §24.2.3.3 Set.prototype.constructor === Set
+    try env.declare("Set", .{ .object = set_fn }, true, true);
+
     // §19.2.1 eval — the global `eval` intrinsic (%eval%). A native function object so it is reachable
     // both as the `eval` global binding and (mirrored below) as `globalThis.eval`. Its behavior lives in
     // the interpreter: `callNative(.eval_fn)` is INDIRECT eval (global env, global this); the
