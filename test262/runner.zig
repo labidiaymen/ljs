@@ -51,6 +51,12 @@ pub fn run(io: std.Io, arena: Allocator, opts: Options, report: *rep.Report) Run
         if (std.mem.indexOf(u8, entry.path, "harness/") != null) continue; // suite's own helpers
 
         const path_owned = try arena.dupe(u8, entry.path); // persists in the report; entry.path invalidated on next()
+        // Test ids are logical Test262 paths (forward-slash separated), matching the suite's layout
+        // and the committed baselines. `Dir.Walker` yields the OS-native separator, so normalize `\`
+        // → `/` on Windows; without this every id mismatches a POSIX-generated baseline.
+        for (path_owned) |*ch| {
+            if (ch.* == '\\') ch.* = '/';
+        }
         _ = scratch_state.reset(.{ .retain_with_limit = 8 << 20 }); // free the previous test's allocations; release pathological spikes (keep up to 8 MiB) so a single huge test doesn't hold memory for the whole run
         const scratch = scratch_state.allocator();
         const source = dir.readFileAlloc(io, entry.path, scratch, .limited(8 << 20)) catch continue;

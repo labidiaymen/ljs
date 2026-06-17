@@ -2,16 +2,16 @@
   "tolerance_pct": 15.0,
   "cases": {
     "loop_mix.js": {
-      "ljs_ms_median": 15.774,
-      "ljs_ms_min": 15.408
+      "ljs_ms_median": 28.2,
+      "ljs_ms_min": 27.797
     },
     "loop_sum.js": {
-      "ljs_ms_median": 14.384,
-      "ljs_ms_min": 12.388
+      "ljs_ms_median": 25.321,
+      "ljs_ms_min": 25.034
     },
     "str_build.js": {
-      "ljs_ms_median": 5.818,
-      "ljs_ms_min": 5.357
+      "ljs_ms_median": 15.521,
+      "ljs_ms_min": 14.826
     }
   }
 }

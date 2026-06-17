@@ -44,6 +44,9 @@ def main():
     args = ap.parse_args()
 
     ljs = args.ljs if os.path.isabs(args.ljs) else os.path.join(ROOT, args.ljs)
+    # On Windows the installed artifact carries a `.exe` suffix that the build's `--ljs` path omits.
+    if not os.path.exists(ljs) and os.path.exists(ljs + ".exe"):
+        ljs += ".exe"
     if not os.path.exists(ljs):
         print(f"setup error: ljs binary not found at {ljs} (run `zig build`)", file=sys.stderr)
         return 2
