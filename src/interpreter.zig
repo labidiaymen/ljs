@@ -2985,8 +2985,10 @@ pub const Interpreter = struct {
                     const bc = try self.bindPattern(rest_pat, .{ .object = rest_arr }, env, mutable);
                     if (bc.isAbrupt()) return bc;
                 } else {
-                    // §13.15.5.3: pattern satisfied with no rest → close the iterator if not done.
-                    try self.destrClose(rec);
+                    // §13.15.5.3: pattern satisfied with no rest → close the iterator if not done. A
+                    // NORMAL completion close (§7.4.11): a throwing `return()` / non-object propagates.
+                    const cc = try self.destrCloseChecked(rec);
+                    if (cc.isAbrupt()) return cc;
                 }
                 return .{ .normal = .undefined };
             },
@@ -3098,8 +3100,10 @@ pub const Interpreter = struct {
                         return tc;
                     }
                 }
-                // §13.15.5.3: pattern satisfied with no rest → close the iterator if not done.
-                try self.destrClose(rec);
+                // §13.15.5.3: pattern satisfied with no rest → close the iterator if not done. A
+                // NORMAL completion close (§7.4.11): a throwing `return()` / non-object propagates.
+                const cc = try self.destrCloseChecked(rec);
+                if (cc.isAbrupt()) return cc;
                 return .{ .normal = .undefined };
             },
             .object_literal => |props| {
@@ -4287,6 +4291,17 @@ pub const Interpreter = struct {
         switch (rec) {
             .fast => {},
             .iter => |it| if (!it.done) try self.iteratorClose(it.iterator),
+        }
+    }
+
+    /// §7.4.11 IteratorClose after a destructuring pattern that completed NORMALLY (no rest, iterator
+    /// not done): a throwing `return()` (or a non-object result) MUST propagate — unlike `destrClose`,
+    /// used after an abrupt completion, which swallows (§7.4.11 step 4). Returns `.normal` on a clean
+    /// close (incl. the fast Array path, which has no iterator object).
+    fn destrCloseChecked(self: *Interpreter, rec: ArrayDestr) EvalError!Completion {
+        switch (rec) {
+            .fast => return .{ .normal = .undefined },
+            .iter => |it| return if (it.done) .{ .normal = .undefined } else self.iteratorCloseChecked(it.iterator),
         }
     }
 
