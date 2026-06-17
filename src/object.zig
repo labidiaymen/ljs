@@ -14,6 +14,7 @@ pub const IterKind = rt.IterKind;
 pub const HelperKind = rt.HelperKind;
 pub const HelperState = rt.HelperState;
 pub const ProxyData = rt.ProxyData;
+pub const RegExpData = rt.RegExpData;
 pub const CollectionKind = rt.CollectionKind;
 pub const CollectionEntry = rt.CollectionEntry;
 pub const Collection = rt.Collection;
@@ -115,6 +116,8 @@ pub const Object = struct {
     /// §28.2 Proxy state — present iff this object is a Proxy exotic. Every internal method routes
     /// through its handler trap (or forwards to the target). Null for every other object (zero cost).
     proxy: ?*ProxyData = null,
+    /// §22.2 RegExp state — present iff this object is a RegExp instance. Null otherwise (zero cost).
+    regexp: ?*RegExpData = null,
     /// §27.5 Generator state — present iff this object is a Generator (made by calling a `function*`).
     /// Holds the suspendable-execution machinery (body thread + ping-pong semaphores). Null for every
     /// other object (zero cost). The %GeneratorPrototype% `next`/`return`/`throw` natives drive it.

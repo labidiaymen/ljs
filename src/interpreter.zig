@@ -24,6 +24,7 @@ const builtin_object = @import("builtin_object.zig");
 const builtin_reflect = @import("builtin_reflect.zig");
 const builtin_bigint = @import("builtin_bigint.zig");
 const builtin_proxy = @import("builtin_proxy.zig");
+const builtin_regexp = @import("builtin_regexp.zig");
 const builtins = @import("builtins.zig");
 const bigint = @import("bigint.zig");
 const Parser = @import("parser.zig").Parser;
@@ -901,6 +902,7 @@ pub const Interpreter = struct {
             .string => |s| return .{ .normal = .{ .string = s } },
             .boolean => |b| return .{ .normal = .{ .boolean = b } },
             .null => return .{ .normal = .null },
+            .regex_literal => |r| return builtin_regexp.makeRegExp(self, r.pattern, r.flags), // §13.2.7
             .identifier => |name| {
                 // §9.4.2 ResolveBinding + §6.2.5.5 GetValue + §9.1.1.1.6 GetBindingValue.
                 if (self.with_depth > 0) switch (self.resolveIdRef(env, name)) {
@@ -1516,7 +1518,7 @@ pub const Interpreter = struct {
         // functions / bound functions / classes have `native == .none` and a `call` body, so they pass.
         if (ctor.call == null and ctor.native != .none) {
             const constructible = switch (ctor.native) {
-                .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor, .proxy_ctor => true,
+                .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor, .proxy_ctor, .regexp_ctor => true,
                 else => false,
             };
             if (!constructible) return self.throwError("TypeError", "value is not a constructor");
@@ -1541,6 +1543,7 @@ pub const Interpreter = struct {
                 return .{ .normal = .{ .object = new_obj } };
             },
             .proxy_ctor => return builtin_proxy.construct(self, new_obj, args), // §28.2.1.1
+            .regexp_ctor => return builtin_regexp.construct(self, args), // §22.2.4.1 (new RegExp)
             else => {},
         }
 
@@ -6436,6 +6439,9 @@ pub const Interpreter = struct {
             .proxy_ctor => return self.throwError("TypeError", "Constructor Proxy requires 'new'"),
             .proxy_revocable => return builtin_proxy.revocable(self, args), // §28.2.2.1
             .proxy_revoke => return builtin_proxy.revoke(self, func), // §28.2.2.1.1
+            .regexp_ctor => return builtin_regexp.construct(self, args), // §22.2.4.1 RegExp(...) without new
+            .regexp_proto_getter => return builtin_regexp.getter(self, func.native_name, this_val), // §22.2.6
+            .regexp_to_string => return builtin_regexp.toString(self, this_val), // §22.2.6.17
             .collection_size => return self.collectionSize(func.native_name, this_val),
             .collection_iterator => {
                 // `native_name` is "<home>:<which>" — <home> ("map"/"set") brands the receiver, <which>
@@ -6717,6 +6723,7 @@ pub const Interpreter = struct {
             .map_method, .set_method, .weakmap_method, .weakset_method => unreachable, // handled in the first switch
             .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .collection_size, .collection_iterator => unreachable, // handled in the first switch
             .proxy_ctor, .proxy_revocable, .proxy_revoke => unreachable, // handled in the first switch
+            .regexp_ctor, .regexp_proto_getter, .regexp_to_string => unreachable, // handled in the first switch
             .json_parse, .json_stringify => unreachable, // handled in the first switch
             .iterator_helper, .iterator_helper_next, .iterator_from, .iterator_ctor => unreachable, // handled in the first switch
             .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch

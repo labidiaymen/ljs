@@ -2821,6 +2821,10 @@ pub const Parser = struct {
                 _ = self.advance();
                 return self.alloc(.null);
             },
+            .regex => { // §13.2.7 RegularExpressionLiteral — lexeme = pattern, string_value = flags
+                _ = self.advance();
+                return self.alloc(.{ .regex_literal = .{ .pattern = t.lexeme, .flags = t.string_value } });
+            },
             .identifier => {
                 // §12.7.1: an escaped §12.7.2 ReservedWord is not a valid IdentifierReference.
                 if (isEscapedReservedIdent(t)) return ParseError.UnexpectedToken;
@@ -3368,7 +3372,7 @@ fn collectBoundNames(pattern: *const ast.Pattern, names: *std.ArrayList([]const 
 fn containsArguments(node: *const ast.Node) bool {
     switch (node.*) {
         .identifier => |n| return std.mem.eql(u8, n, "arguments"),
-        .number, .bigint, .string, .boolean, .null, .this, .new_target => return false,
+        .number, .bigint, .string, .boolean, .null, .this, .new_target, .regex_literal => return false,
         .unary => |u| return containsArguments(u.operand),
         .update => |u| return containsArguments(u.target),
         .comma => |c| return containsArguments(c.left) or containsArguments(c.right),

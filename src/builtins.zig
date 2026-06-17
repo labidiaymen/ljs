@@ -607,6 +607,25 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try defineMethod(arena, proxy_fn, "revocable", .proxy_revocable, "revocable"); // §28.2.2.1
     try env.declare("Proxy", .{ .object = proxy_fn }, true, true);
 
+    // §22.2 RegExp — the constructor + %RegExp.prototype% accessor getters + toString. (M1: metadata;
+    // the matcher exec/test + Symbol.match/replace/search/split arrive next.)
+    const regexp_fn = try Object.createNative(arena, .regexp_ctor, "RegExp");
+    regexp_fn.prototype = function_proto;
+    if (regexp_fn.get("prototype")) |pv| if (pv == .object) {
+        const rp = pv.object;
+        rp.prototype = object_proto; // §22.2.6 RegExp.prototype inherits %Object.prototype%
+        const getters = [_][]const u8{ "source", "flags", "global", "ignoreCase", "multiline", "dotAll", "unicode", "unicodeSets", "sticky", "hasIndices" };
+        for (getters) |gn| {
+            const gf = try Object.createNative(arena, .regexp_proto_getter, gn);
+            gf.prototype = function_proto;
+            try gf.defineData("name", .{ .string = try std.fmt.allocPrint(arena, "get {s}", .{gn}) }, false, false, true);
+            try rp.defineAccessorEx(gn, gf, null, false);
+        }
+        try defineMethod(arena, rp, "toString", .regexp_to_string, "toString"); // §22.2.6.17
+    };
+    try defineConstructorBackref(regexp_fn); // §22.2.6.1 RegExp.prototype.constructor === RegExp
+    try env.declare("RegExp", .{ .object = regexp_fn }, true, true);
+
     // §25.5 JSON — a namespace ordinary object (NOT callable / NOT a constructor; proto =
     // %Object.prototype%) holding `parse`/`stringify` and [Symbol.toStringTag] = "JSON".
     const json_obj = try Object.create(arena, object_proto);

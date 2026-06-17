@@ -38,6 +38,8 @@ pub const Node = union(enum) {
     string: []const u8,
     boolean: bool,
     null,
+    /// §13.2.7 RegularExpressionLiteral `/pattern/flags` — evaluated to a fresh RegExp object.
+    regex_literal: struct { pattern: []const u8, flags: []const u8 },
     identifier: []const u8, // §13.1 IdentifierReference
     unary: struct { op: UnaryOp, operand: *const Node },
     /// §13.16 Comma / sequence operator `a, b` — evaluate `left` (for side effects, discarding its

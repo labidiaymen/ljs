@@ -51,6 +51,7 @@ pub const TokenKind = enum {
     shr, // >>
     shr_un, // >>>
     template, // `...${}...` (raw inner stored in string_value)
+    regex, // §12.9.5 RegularExpressionLiteral `/pattern/flags` — `lexeme` = pattern, `string_value` = flags
     private_identifier, // §12.7 PrivateIdentifier `#name` (only valid inside a class body; §15.7)
     ellipsis, // ...
     fat_arrow, // => (ArrowFunction, §15.3)
@@ -395,7 +396,7 @@ pub const Lexer = struct {
                 }
                 return self.maybeCompound(.star, .star_assign, start);
             },
-            '/' => return self.maybeCompound(.slash, .slash_assign, start),
+            '/' => return self.maybeCompound(.slash, .slash_assign, start), // (regex literals: M2, with the pattern validator)
             '%' => return self.maybeCompound(.percent, .percent_assign, start),
             '?' => {
                 // §13.13 nullish coalescing `??` / §13.15.2 logical assignment `??=`

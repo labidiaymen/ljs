@@ -42,6 +42,22 @@ pub const ProxyData = struct {
     revoked: bool = false,
 };
 
+/// §22.2 a RegExp instance's internal slots: [[OriginalSource]] / [[OriginalFlags]] + the parsed flag
+/// booleans. `last_index` is mirrored as an own writable `lastIndex` data property. Present iff
+/// `Object.regexp != null`. (M1: source/flags/getters/toString; the matcher arrives in M2.)
+pub const RegExpData = struct {
+    source: []const u8,
+    flags: []const u8, // canonical-order flag string (d,g,i,m,s,u,v,y)
+    global: bool = false,
+    ignore_case: bool = false,
+    multiline: bool = false,
+    dot_all: bool = false,
+    unicode: bool = false,
+    unicode_sets: bool = false,
+    sticky: bool = false,
+    has_indices: bool = false,
+};
+
 pub const HelperState = struct {
     kind: HelperKind,
     underlying: *Object,
@@ -395,6 +411,10 @@ pub const NativeId = enum {
     proxy_ctor, // new Proxy(target, handler)
     proxy_revocable, // Proxy.revocable(target, handler)
     proxy_revoke, // the revoker returned by Proxy.revocable (clears target/handler)
+    // §22.2 RegExp — the constructor, the prototype accessor getters, and toString.
+    regexp_ctor, // new RegExp(pattern, flags) / RegExp(...)
+    regexp_proto_getter, // get RegExp.prototype.<source|flags|global|ignoreCase|...> (native_name selects)
+    regexp_to_string, // RegExp.prototype.toString
     promise_ctor, // new Promise(executor)
     promise_then, // Promise.prototype.then
     promise_catch, // Promise.prototype.catch
