@@ -111,6 +111,11 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         proto_get.prototype = function_proto;
         proto_set.prototype = function_proto;
         try op.defineAccessorEx("__proto__", proto_get, proto_set, false);
+        // §B.2.2.2–.5 legacy accessor helpers (non-enumerable, like every other prototype method).
+        try defineMethod(arena, op, "__defineGetter__", .object_legacy_accessor, "__defineGetter__");
+        try defineMethod(arena, op, "__defineSetter__", .object_legacy_accessor, "__defineSetter__");
+        try defineMethod(arena, op, "__lookupGetter__", .object_legacy_accessor, "__lookupGetter__");
+        try defineMethod(arena, op, "__lookupSetter__", .object_legacy_accessor, "__lookupSetter__");
     }
     try defineMethod(arena, object_fn, "defineProperty", .object_define_property, "defineProperty");
     try defineMethod(arena, object_fn, "defineProperties", .object_define_properties, "defineProperties");

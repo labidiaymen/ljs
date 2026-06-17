@@ -6524,6 +6524,58 @@ pub const Interpreter = struct {
         return self.objectGetPrototypeOf(&.{this_val});
     }
 
+    /// §B.2.2.2–.5 the legacy accessor helpers on Object.prototype: `__defineGetter__`/`__defineSetter__`
+    /// install an enumerable, configurable accessor; `__lookupGetter__`/`__lookupSetter__` walk the
+    /// prototype chain for an own accessor with the requested get/set (a data property → undefined).
+    fn objectLegacyAccessor(self: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
+        const eql = std.mem.eql;
+        const o = switch (try self.toObjectForArrayLike(this_val)) { // §B.2.2.x step 1: ToObject(this)
+            .obj => |obj| obj,
+            .abrupt => |c| return c,
+        };
+        const key_arg: Value = if (args.len > 0) args[0] else .undefined;
+        const is_get = eql(u8, name, "__defineGetter__") or eql(u8, name, "__lookupGetter__");
+
+        if (eql(u8, name, "__defineGetter__") or eql(u8, name, "__defineSetter__")) {
+            const fnv: Value = if (args.len > 1) args[1] else .undefined;
+            if (fnv != .object or !isCallable(fnv.object)) {
+                return self.throwError("TypeError", "Object.prototype.__define[GS]etter__: Expecting function");
+            }
+            const desc: object_mod.Descriptor = if (is_get)
+                .{ .get = fnv.object, .enumerable = true, .configurable = true }
+            else
+                .{ .set = fnv.object, .enumerable = true, .configurable = true };
+            const pk = try self.toPropertyKey(key_arg);
+            if (pk.isAbrupt()) return pk.completion;
+            const ok = if (pk.symbol) |sym| try o.defineSymbolProperty(sym, desc) else try o.defineProperty(pk.key, desc);
+            if (!ok) return self.throwError("TypeError", "Cannot define accessor");
+            return .{ .normal = .undefined };
+        }
+
+        // __lookupGetter__ / __lookupSetter__: walk the prototype chain for an own accessor.
+        const pk = try self.toPropertyKey(key_arg);
+        if (pk.isAbrupt()) return pk.completion;
+        var cur: ?*Object = o;
+        while (cur) |c| : (cur = c.prototype) {
+            const pv: ?object_mod.PropertyValue = if (pk.symbol) |sym| blk: {
+                for (c.symbol_props.items) |sp| {
+                    if (sp.key == sym) break :blk sp.pv;
+                }
+                break :blk null;
+            } else (if (c.properties.get(pk.key)) |p| p else null);
+            if (pv) |found| {
+                switch (found.payload) {
+                    .accessor => |a| {
+                        const fnp = if (is_get) a.get else a.set;
+                        return .{ .normal = if (fnp) |f| .{ .object = f } else .undefined };
+                    },
+                    .data => return .{ .normal = .undefined }, // a data property shadows → no accessor
+                }
+            }
+        }
+        return .{ .normal = .undefined };
+    }
+
     /// §B.2.2.1.2 set Object.prototype.__proto__ — O = RequireObjectCoercible(this). A value that is
     /// neither Object nor null is a no-op (NOT a throw). A non-Object `this` is a no-op. Otherwise
     /// O.[[SetPrototypeOf]](value) (may throw on a non-extensible/cyclic change). Returns undefined.
@@ -7689,6 +7741,7 @@ pub const Interpreter = struct {
             .object_group_by => return self.objectGroupBy(args),
             .object_proto_getter => return self.objectProtoGet(this_val),
             .object_proto_setter => return self.objectProtoSet(this_val, args),
+            .object_legacy_accessor => return self.objectLegacyAccessor(func.native_name, this_val, args),
             .object_get_prototype_of => return self.objectGetPrototypeOf(args),
             .object_set_prototype_of => return self.objectSetPrototypeOf(args),
             .object_is => return .{ .normal = .{ .boolean = ops.sameValue(if (args.len > 0) args[0] else .undefined, if (args.len > 1) args[1] else .undefined) } },

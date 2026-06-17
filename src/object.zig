@@ -308,6 +308,8 @@ pub const NativeId = enum {
     object_group_by, // Object.groupBy (§20.1.2.11)
     object_proto_getter, // §B.2.2.1.1 get Object.prototype.__proto__
     object_proto_setter, // §B.2.2.1.2 set Object.prototype.__proto__
+    // §B.2.2.2–.5 legacy accessor-definition methods on Object.prototype. `native_name` selects.
+    object_legacy_accessor, // __defineGetter__ / __defineSetter__ / __lookupGetter__ / __lookupSetter__
     object_get_prototype_of, // Object.getPrototypeOf (§20.1.2.12)
     object_set_prototype_of, // Object.setPrototypeOf (§20.1.2.22)
     object_is, // Object.is (§20.1.2.14)
