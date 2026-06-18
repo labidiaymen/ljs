@@ -1949,6 +1949,10 @@ pub const Interpreter = struct {
     /// OrdinaryCreateFromConstructor), while the BODY still runs `ctor`. `new_target` must be a
     /// constructor (the caller validates IsConstructor).
     pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_target: *Object) EvalError!Completion {
+        // §10.5.13 [[Construct]] of a Proxy exotic — route through the `construct` trap (or forward to
+        // the target). The target must itself be a constructor (validated when the trap is absent by
+        // the recursive constructNT; with a trap, the proxy is callable+constructable iff the target is).
+        if (ctor.proxy) |pd| return builtin_proxy.proxyConstruct(self, pd, args, new_target);
         // §15.3: arrow functions have no [[Construct]] — `new (() => {})` is a TypeError.
         if (ctor.call) |fd| {
             if (fd.is_arrow) return self.throwError("TypeError", "value is not a constructor");
@@ -2903,6 +2907,10 @@ pub const Interpreter = struct {
         // sibling/native/bound/generator dispatch. Installed below for the non-arrow ordinary body path.
         const pending_new_target = self.pending_new_target;
         self.pending_new_target = .undefined;
+        // §10.5.12 [[Call]] of a Proxy exotic — route through the `apply` trap (or forward to the
+        // target). A proxy is marked `kind == .function` when its target is callable, so it reaches
+        // here; the `o.proxy` check precedes every ordinary-call path.
+        if (func.proxy) |pd| return builtin_proxy.apply(self, pd, args, this_val);
         // §15.7.14: a class constructor's [[Call]] always throws — only [[Construct]] (a preceding
         // `construct` that handed off [[NewTarget]] via `pending_new_target`) runs its body. An
         // undefined hand-off ⇒ this is a plain [[Call]] (direct OR via call/apply/bind), so reject it
@@ -3435,6 +3443,17 @@ pub const Interpreter = struct {
 
     /// §10.1.8 [[Get]]. Property access on null/undefined throws (§13.3); other primitives
     /// have no own properties in M1 (no boxing yet) → undefined.
+    /// The first Proxy on `o`'s prototype chain (excluding `o` itself), or null. Used so an ordinary
+    /// [[Get]]/[[HasProperty]] miss on the C-level chain still fires a Proxy proto's trap. Cheap: the
+    /// chain is short and this is only consulted on a miss (the same chain `getProp` already walked).
+    fn protoProxy(o: *Object) ?*object_mod.ProxyData {
+        var p: ?*Object = o.prototype;
+        while (p) |cur| : (p = cur.prototype) {
+            if (cur.proxy) |pd| return pd;
+        }
+        return null;
+    }
+
     pub fn getProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
         switch (base) {
             .object => |o| {
@@ -3472,7 +3491,12 @@ pub const Interpreter = struct {
                 }
                 // §10.1.8.1 OrdinaryGet — locate the property (data or accessor) on the chain.
                 // Data-property fast path: a single descriptor read, no accessor branch.
-                const loc = o.getProp(key) orelse return .{ .normal = .undefined };
+                const loc = o.getProp(key) orelse {
+                    // §10.1.8.1 step 3: the property is absent on the ordinary chain. If a Proxy sits on
+                    // the prototype chain, its [[Get]] trap must fire (with `this`=base). Walk to it.
+                    if (protoProxy(o)) |pp| return builtin_proxy.get(self, pp, .{ .string = key }, base);
+                    return .{ .normal = .undefined };
+                };
                 switch (loc.pv.payload) {
                     .data => |v| return .{ .normal = v },
                     .accessor => |a| {
@@ -3570,6 +3594,12 @@ pub const Interpreter = struct {
     pub fn setProperty(self: *Interpreter, base: Value, key: []const u8, value: Value) EvalError!Completion {
         switch (base) {
             .object => |o| {
+                if (o.proxy) |pd| { // §10.5.9 [[Set]] (P, V, Receiver = base)
+                    const c = try builtin_proxy.set(self, pd, .{ .string = key }, value, base);
+                    if (c.isAbrupt()) return c;
+                    if (!c.normal.boolean and self.strict) return self.throwError("TypeError", "proxy [[Set]] returned false");
+                    return .{ .normal = value };
+                }
                 if (o.kind == .array) {
                     if (std.mem.eql(u8, key, "length")) {
                         // §23.1.4.1 ArraySetLength — ToUint32; a non-integral / >2^32-1 value is a
@@ -3626,6 +3656,17 @@ pub const Interpreter = struct {
                     // data property blocks creating a shadowing own property) → [[Set]] returns false.
                     if (!loc.pv.writable) {
                         if (self.strict) return self.throwError("TypeError", "Cannot assign to read only property");
+                        return .{ .normal = value };
+                    }
+                }
+                // §10.1.9.2 step 2: no own descriptor and `key` absent from the ordinary chain — if a
+                // Proxy sits on the prototype chain, its [[Set]] trap runs with Receiver = base. (Only
+                // when `o` has no own property for `key`: an own write stays on `o` below.)
+                if (o.properties.get(key) == null and !(o.kind == .array and parseIndex(key) != null and o.arrayHas(parseIndex(key).?))) {
+                    if (protoProxy(o)) |pp| {
+                        const c = try builtin_proxy.set(self, pp, .{ .string = key }, value, base);
+                        if (c.isAbrupt()) return c;
+                        if (!c.normal.boolean and self.strict) return self.throwError("TypeError", "proxy [[Set]] returned false");
                         return .{ .normal = value };
                     }
                 }
@@ -3688,7 +3729,7 @@ pub const Interpreter = struct {
     /// when the key is/ToPrimitive's to a Symbol). Used by read-then-write member operations (compound
     /// assignment, `++`/`--`) so a side-effecting `key.toString` runs EXACTLY ONCE — the resulting
     /// primitive is then passed to both `getPropertyV` and `setPropertyV` (which no-op on a primitive).
-    fn coercePropertyKey(self: *Interpreter, key: Value) EvalError!Completion {
+    pub fn coercePropertyKey(self: *Interpreter, key: Value) EvalError!Completion {
         if (key != .object) return .{ .normal = key };
         const pc = try self.toPrimitive(key, .string);
         if (pc.isAbrupt()) return pc;
@@ -3702,7 +3743,10 @@ pub const Interpreter = struct {
         switch (base) {
             .object => |o| {
                 if (o.proxy) |pd| return builtin_proxy.get(self, pd, .{ .symbol = key }, base); // §28.2.5.4 [[Get]]
-                const loc = o.getSymbolProp(key) orelse return .{ .normal = .undefined };
+                const loc = o.getSymbolProp(key) orelse {
+                    if (protoProxy(o)) |pp| return builtin_proxy.get(self, pp, .{ .symbol = key }, base);
+                    return .{ .normal = .undefined };
+                };
                 switch (loc.pv.payload) {
                     .data => |v| return .{ .normal = v },
                     .accessor => |a| {
@@ -3735,11 +3779,25 @@ pub const Interpreter = struct {
     fn setSymbolProperty(self: *Interpreter, base: Value, key: *Symbol, value: Value) EvalError!Completion {
         switch (base) {
             .object => |o| {
+                if (o.proxy) |pd| { // §10.5.9 [[Set]] for a Symbol key
+                    const c = try builtin_proxy.set(self, pd, .{ .symbol = key }, value, base);
+                    if (c.isAbrupt()) return c;
+                    if (!c.normal.boolean and self.strict) return self.throwError("TypeError", "proxy [[Set]] returned false");
+                    return .{ .normal = value };
+                }
                 if (o.getSymbolProp(key)) |loc| {
                     if (loc.pv.payload == .accessor) {
                         const setter = loc.pv.payload.accessor.set orelse return .{ .normal = value };
                         const sc = try self.callFunction(setter, &.{value}, base);
                         if (sc.isAbrupt()) return sc;
+                        return .{ .normal = value };
+                    }
+                }
+                if (ownSymbol(o, key) == null) {
+                    if (protoProxy(o)) |pp| { // §10.1.9.2: Proxy on the proto chain handles the [[Set]]
+                        const c = try builtin_proxy.set(self, pp, .{ .symbol = key }, value, base);
+                        if (c.isAbrupt()) return c;
+                        if (!c.normal.boolean and self.strict) return self.throwError("TypeError", "proxy [[Set]] returned false");
                         return .{ .normal = value };
                     }
                 }
@@ -6182,7 +6240,10 @@ pub const Interpreter = struct {
                 const pk = try self.toPropertyKey(kc.normal);
                 if (pk.isAbrupt()) return pk.completion;
                 if (pk.symbol) |sym| {
-                    if (oc.normal == .object) return self.finishStrictDelete(.{ .normal = .{ .boolean = oc.normal.object.deleteSymbol(sym) } });
+                    if (oc.normal == .object) {
+                        if (oc.normal.object.proxy) |pd| return self.finishStrictDelete(try builtin_proxy.deleteProperty(self, pd, .{ .symbol = sym }));
+                        return self.finishStrictDelete(.{ .normal = .{ .boolean = oc.normal.object.deleteSymbol(sym) } });
+                    }
                     if (oc.normal == .undefined or oc.normal == .null) return self.throwError("TypeError", "Cannot convert undefined or null to object");
                     return .{ .normal = .{ .boolean = true } };
                 }
@@ -6224,6 +6285,7 @@ pub const Interpreter = struct {
     pub fn deleteProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
         switch (base) {
             .object => |o| {
+                if (o.proxy) |pd| return builtin_proxy.deleteProperty(self, pd, .{ .string = key }); // §10.5.10 [[Delete]]
                 if (o.kind == .array) {
                     if (parseIndex(key)) |i| {
                         // §10.4.2.1: delete an index → a true hole (dense slot recorded in `holes`,
@@ -6253,6 +6315,176 @@ pub const Interpreter = struct {
         }
     }
 
+    /// Result of a boolean-returning ordinary internal method (define/setProto/preventExt): a
+    /// success boolean, or an abrupt Completion (a Proxy trap throw). Named so the two key-typed
+    /// `ordinaryDefineOwnProperty*` overloads share one return type (unifiable in a `switch`).
+    pub const BoolOrAbrupt = union(enum) { ok: bool, abrupt: Completion };
+    pub const PVOrAbrupt = union(enum) { pv: ?object_mod.PropertyValue, abrupt: Completion };
+
+    // ── §10.1 Ordinary internal methods on a target *Object (used by the Proxy forwarding path and
+    //    by the proxy-aware Object/Reflect routing). Each is Array/String-exotic aware and proxy-aware:
+    //    when the target is itself a Proxy these route through its handler trap. ─────────────────────
+
+    /// §10.1.5 / §10.4.2.1 [[GetOwnProperty]] for a string key → the stored attributes (data/accessor),
+    /// or null when absent. Array indices / `length` and String-exotic indices yield synthetic
+    /// descriptors. Routes through the proxy trap when `o` is a Proxy.
+    pub fn ordinaryGetOwnProperty(self: *Interpreter, o: *Object, key: []const u8) EvalError!PVOrAbrupt {
+        if (o.proxy) |pd| {
+            const c = try builtin_proxy.getOwnProperty(self, pd, .{ .string = key });
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            // The trap path returns a descriptor object (or undefined); convert back to a PropertyValue.
+            return .{ .pv = try descriptorObjectToPV(self, c.normal) };
+        }
+        if (o.kind == .array) {
+            if (std.mem.eql(u8, key, "length")) return .{ .pv = .{ .payload = .{ .data = .{ .number = @floatFromInt(o.arrayLen()) } }, .writable = o.array_length_writable, .enumerable = false, .configurable = false } };
+            if (parseIndex(key)) |i| {
+                if (o.properties.getPtr(key)) |pv| return .{ .pv = pv.* };
+                if (o.arrayHas(i)) return .{ .pv = .{ .payload = .{ .data = o.arrayGet(i) }, .writable = !o.array_frozen, .enumerable = true, .configurable = !o.array_frozen } };
+                return .{ .pv = null };
+            }
+        }
+        if (o.primitive != null and o.primitive.? == .string and o.properties.getPtr(key) == null) {
+            const sv = o.primitive.?.string;
+            if (std.mem.eql(u8, key, "length")) return .{ .pv = .{ .payload = .{ .data = .{ .number = @floatFromInt(sutf16.utf16Length(sv)) } }, .writable = false, .enumerable = false, .configurable = false } };
+            if (parseIndex(key)) |i| {
+                if (sutf16.isAscii(sv)) {
+                    if (i < sv.len) return .{ .pv = .{ .payload = .{ .data = .{ .string = sv[i .. i + 1] } }, .writable = false, .enumerable = true, .configurable = false } };
+                } else if (sutf16.codeUnitAt(sv, i) != null) {
+                    return .{ .pv = .{ .payload = .{ .data = .{ .string = try sutf16.charAtAlloc(self.arena, sv, i) } }, .writable = false, .enumerable = true, .configurable = false } };
+                }
+            }
+        }
+        if (o.properties.getPtr(key)) |pv| return .{ .pv = pv.* };
+        return .{ .pv = null };
+    }
+
+    /// §10.1.5 [[GetOwnProperty]] for a Symbol key → stored attributes or null. Proxy-aware.
+    pub fn ordinaryGetOwnPropertySymbol(self: *Interpreter, o: *Object, key: *Symbol) EvalError!PVOrAbrupt {
+        if (o.proxy) |pd| {
+            const c = try builtin_proxy.getOwnProperty(self, pd, .{ .symbol = key });
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            return .{ .pv = try descriptorObjectToPV(self, c.normal) };
+        }
+        for (o.symbol_props.items) |sp| {
+            if (sp.key == key) return .{ .pv = sp.pv };
+        }
+        return .{ .pv = null };
+    }
+
+    /// Convert a descriptor OBJECT (as returned by a proxy `getOwnPropertyDescriptor` trap, already
+    /// ToPropertyDescriptor-completed by the trap path) back into a stored PropertyValue. `undefined`
+    /// → null (property absent). Used so descriptor-level callers see a uniform shape.
+    fn descriptorObjectToPV(self: *Interpreter, v: Value) EvalError!?object_mod.PropertyValue {
+        _ = self;
+        if (v != .object) return null;
+        const d = v.object;
+        const has_get = d.properties.get("get") != null;
+        const has_set = d.properties.get("set") != null;
+        const enumerable = if (d.get("enumerable")) |e| toBoolean(e) else false;
+        const configurable = if (d.get("configurable")) |c| toBoolean(c) else false;
+        if (has_get or has_set) {
+            const g = if (d.get("get")) |gv| (if (gv == .object) gv.object else null) else null;
+            const s = if (d.get("set")) |sv| (if (sv == .object) sv.object else null) else null;
+            return .{ .payload = .{ .accessor = .{ .get = g, .set = s } }, .enumerable = enumerable, .configurable = configurable };
+        }
+        const val = if (d.get("value")) |vv| vv else Value.undefined;
+        const writable = if (d.get("writable")) |w| toBoolean(w) else false;
+        return .{ .payload = .{ .data = val }, .writable = writable, .enumerable = enumerable, .configurable = configurable };
+    }
+
+    /// §10.1.6 / §10.4.2.1 [[DefineOwnProperty]] → boolean. Proxy-aware; Array-index aware. For an
+    /// ordinary object, delegates to `Object.defineProperty`. (Array `length` keeps the store path.)
+    pub fn ordinaryDefineOwnProperty(self: *Interpreter, o: *Object, key: []const u8, d: object_mod.Descriptor) EvalError!BoolOrAbrupt {
+        if (o.proxy) |pd| {
+            const c = try builtin_proxy.defineProperty(self, pd, .{ .string = key }, d);
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            return .{ .ok = c.normal.boolean };
+        }
+        if (o.kind == .array and !std.mem.eql(u8, key, "length")) {
+            if (builtin_object.arrayIndex(key)) |idx| {
+                const adc = try builtin_object.arrayDefineIndex(self, o, idx, key, d);
+                return .{ .ok = !adc.isAbrupt() };
+            }
+        }
+        const ok = try o.defineProperty(key, d);
+        return .{ .ok = ok };
+    }
+
+    pub fn ordinaryDefineOwnPropertySymbol(self: *Interpreter, o: *Object, key: *Symbol, d: object_mod.Descriptor) EvalError!BoolOrAbrupt {
+        if (o.proxy) |pd| {
+            const c = try builtin_proxy.defineProperty(self, pd, .{ .symbol = key }, d);
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            return .{ .ok = c.normal.boolean };
+        }
+        const ok = try o.defineSymbol(key, d);
+        return .{ .ok = ok };
+    }
+
+    /// §10.1.1 [[GetPrototypeOf]] → the prototype (object or null). Proxy-aware.
+    pub fn ordinaryGetPrototypeOf(self: *Interpreter, o: *Object) EvalError!union(enum) { proto: ?*Object, abrupt: Completion } {
+        if (o.proxy) |pd| {
+            const c = try builtin_proxy.getPrototypeOf(self, pd);
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            return .{ .proto = if (c.normal == .object) c.normal.object else null };
+        }
+        return .{ .proto = o.prototype };
+    }
+
+    /// §10.1.2 [[SetPrototypeOf]] → boolean. Proxy-aware.
+    pub fn ordinarySetPrototypeOf(self: *Interpreter, o: *Object, proto: ?*Object) EvalError!BoolOrAbrupt {
+        if (o.proxy) |pd| {
+            const c = try builtin_proxy.setPrototypeOf(self, pd, proto);
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            return .{ .ok = c.normal.boolean };
+        }
+        if (o.prototype == proto) return .{ .ok = true };
+        if (!o.extensible) return .{ .ok = false };
+        o.prototype = proto;
+        return .{ .ok = true };
+    }
+
+    /// §10.1.3 [[IsExtensible]] → boolean. Proxy-aware.
+    pub fn ordinaryIsExtensible(self: *Interpreter, o: *Object) EvalError!union(enum) { ext: bool, abrupt: Completion } {
+        if (o.proxy) |pd| {
+            const c = try builtin_proxy.isExtensible(self, pd);
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            return .{ .ext = c.normal.boolean };
+        }
+        return .{ .ext = o.extensible };
+    }
+
+    /// §10.1.4 [[PreventExtensions]] → boolean. Proxy-aware.
+    pub fn ordinaryPreventExtensions(self: *Interpreter, o: *Object) EvalError!BoolOrAbrupt {
+        if (o.proxy) |pd| {
+            const c = try builtin_proxy.preventExtensions(self, pd);
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            return .{ .ok = c.normal.boolean };
+        }
+        o.extensible = false;
+        return .{ .ok = true };
+    }
+
+    /// §10.1.11 [[OwnPropertyKeys]] → the own keys as an allocated `[]Value` (strings then symbols for
+    /// an ordinary object; for an Array: indices, `length`, string keys, symbols). Proxy-aware.
+    pub fn ordinaryOwnKeys(self: *Interpreter, o: *Object) EvalError!union(enum) { keys: []Value, abrupt: Completion } {
+        if (o.proxy) |pd| {
+            const c = try builtin_proxy.ownKeys(self, pd);
+            if (c.isAbrupt()) return .{ .abrupt = c };
+            // The trap path returns an Array of keys; flatten to a slice.
+            const arr = c.normal.object;
+            return .{ .keys = try self.arena.dupe(Value, arr.elements.items[0..arr.arrayLen()]) };
+        }
+        var list: std.ArrayListUnmanaged(Value) = .empty;
+        if (o.kind == .array) {
+            for (try o.arrayIndices(self.arena)) |i| try list.append(self.arena, .{ .string = try numberToString(self.arena, @floatFromInt(i)) });
+            try list.append(self.arena, .{ .string = "length" });
+        }
+        var pit = o.properties.iterator();
+        while (pit.next()) |entry| try list.append(self.arena, .{ .string = entry.key_ptr.* });
+        for (o.symbol_props.items) |sp| try list.append(self.arena, .{ .symbol = sp.key });
+        return .{ .keys = try list.toOwnedSlice(self.arena) };
+    }
+
     fn evalBinary(self: *Interpreter, op: ast.BinaryOp, ln: *const ast.Node, rn: *const ast.Node, env: *Environment) EvalError!Completion {
         const lc = try self.evalExpr(ln, env);
         if (lc.isAbrupt()) return lc;
@@ -6268,14 +6500,26 @@ pub const Interpreter = struct {
             return self.applyNumericOrStringOp(op, l, r),
             .in_op => { // §13.10.2 `key in obj`
                 if (r != .object) return self.throwError("TypeError", "Cannot use 'in' operator to search in a non-object");
+                if (r.object.proxy != null) { // §10.5.7 [[HasProperty]] via the proxy trap (key may be a Symbol)
+                    const pk = try self.coercePropertyKey(l);
+                    if (pk.isAbrupt()) return pk;
+                    return self.hasPropertyVC(r, pk.normal);
+                }
                 const key = try self.toString(l);
                 const o = r.object;
                 const has = blk: {
                     if (o.kind == .array) {
                         if (std.mem.eql(u8, key, "length")) break :blk true;
-                        if (parseIndex(key)) |i| break :blk o.arrayHas(i);
+                        if (parseIndex(key)) |i| if (o.arrayHas(i)) break :blk true;
                     }
-                    break :blk o.get(key) != null;
+                    if (o.getProp(key) != null) break :blk true;
+                    // §13.10.1 step 5.b: a Proxy on the prototype chain handles the rest via its trap.
+                    if (protoProxy(o)) |pp| {
+                        const c = try builtin_proxy.has(self, pp, .{ .string = key });
+                        if (c.isAbrupt()) return c;
+                        break :blk c.normal.boolean;
+                    }
+                    break :blk false;
                 };
                 return .{ .normal = .{ .boolean = has } };
             },
@@ -6760,7 +7004,7 @@ pub const Interpreter = struct {
 
     /// §7.3.23 own ENUMERABLE string keys of `value` — a thin wrapper kept on the Interpreter so JSON
     /// and other built-ins reach the helper now living in builtin_object.
-    pub fn ownEnumerableKeys(self: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!void {
+    pub fn ownEnumerableKeys(self: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!?Completion {
         return builtin_object.ownEnumerableKeys(self, value, out);
     }
 
@@ -6784,15 +7028,52 @@ pub const Interpreter = struct {
     }
 
     /// §7.3.12 HasProperty for a Value key (string or symbol) — proto-chain walk (the `in` semantics).
+    /// §7.3.12 HasProperty as a Completion (so a Proxy `has` trap that throws/revokes can propagate).
+    /// Use this wherever the result feeds a JS-observable operation (`in`, `Reflect.has`).
+    pub fn hasPropertyVC(self: *Interpreter, base: Value, key: Value) EvalError!Completion {
+        if (base == .object) {
+            const o = base.object;
+            if (o.proxy) |pd| return builtin_proxy.has(self, pd, key);
+            // §10.1.7 OrdinaryHasProperty: own check, then delegate to a Proxy on the proto chain.
+            const own = if (key == .symbol) o.getSymbolProp(key.symbol) != null else ownHasString(o, key.string);
+            if (own) return .{ .normal = .{ .boolean = true } };
+            if (protoProxy(o)) |pp| return builtin_proxy.has(self, pp, key);
+        }
+        const b = try self.hasPropertyV(base, key);
+        return .{ .normal = .{ .boolean = b } };
+    }
+
+    fn ownSymbol(o: *Object, key: *Symbol) ?Value {
+        for (o.symbol_props.items) |sp| if (sp.key == key) return .undefined;
+        return null;
+    }
+
+    fn ownHasString(o: *Object, ks: []const u8) bool {
+        if (o.kind == .array) {
+            if (std.mem.eql(u8, ks, "length")) return true;
+            if (parseIndex(ks)) |i| if (o.arrayHas(i)) return true;
+        }
+        return o.properties.get(ks) != null;
+    }
+
     pub fn hasPropertyV(self: *Interpreter, base: Value, key: Value) EvalError!bool {
         const o = base.object;
+        if (o.proxy) |pd| { // §10.5.7 [[HasProperty]] — non-throwing callers only (forwarding chains).
+            const c = try builtin_proxy.has(self, pd, key);
+            return if (c == .normal) c.normal.boolean else false;
+        }
         if (key == .symbol) return o.getSymbolProp(key.symbol) != null;
         const ks = try self.toPropertyKeyString(key);
         if (o.kind == .array) {
             if (std.mem.eql(u8, ks, "length")) return true;
             if (parseIndex(ks)) |i| if (o.arrayHas(i)) return true;
         }
-        return o.get(ks) != null;
+        if (o.get(ks) != null) return true;
+        if (protoProxy(o)) |pp| {
+            const c = try builtin_proxy.has(self, pp, key);
+            return if (c == .normal) c.normal.boolean else false;
+        }
+        return false;
     }
 
     // ── §20.2.3 Function.prototype methods ──────────────────────────────────
@@ -8084,6 +8365,9 @@ fn isUriPreserved(c: u8, kind: Interpreter.UriKind) bool {
 /// `kind == .function` covers all three). Used by the Promise machinery (executor / handlers / thenable
 /// `then` must be callable).
 pub fn isCallable(obj: *Object) bool {
+    // §10.5: a Proxy has a [[Call]] iff its target does. A revoked proxy keeps whatever it had at
+    // creation (IsCallable reads the slot presence, not revocation — revocation throws on invocation).
+    if (obj.proxy) |pd| return isCallable(pd.target);
     return obj.kind == .function;
 }
 
@@ -8092,6 +8376,8 @@ pub fn isCallable(obj: *Object) bool {
 /// methods/statics (a native with no AST body that is not one of the genuine built-in constructors)
 /// are NOT constructors. Ordinary functions / bound functions / classes ARE.
 pub fn isConstructor(obj: *Object) bool {
+    // §10.5: a Proxy has a [[Construct]] iff its target is a constructor.
+    if (obj.proxy) |pd| return isConstructor(pd.target);
     if (obj.kind != .function) return false;
     if (obj.call) |fd| {
         if (fd.is_arrow) return false; // arrows + methods/generators handled by the caller's body checks

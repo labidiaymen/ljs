@@ -284,7 +284,7 @@ fn internalize(it: *Interpreter, holder: *Object, name: []const u8, reviver: *Ob
             }
         } else {
             var keys: std.ArrayListUnmanaged(Value) = .empty;
-            try it.ownEnumerableKeys(val, &keys);
+            if (try it.ownEnumerableKeys(val, &keys)) |abrupt| return abrupt;
             for (keys.items) |kv| {
                 const key = kv.string;
                 const ec = try internalize(it, o, key, reviver);
@@ -414,7 +414,7 @@ fn serializeObject(s: *Stringifier, o: *Object) EvalError!Completion {
     if (s.prop_list) |pl| {
         for (pl) |k| try keys.append(it.arena, .{ .string = k });
     } else {
-        try it.ownEnumerableKeys(.{ .object = o }, &keys);
+        if (try it.ownEnumerableKeys(.{ .object = o }, &keys)) |abrupt| return abrupt;
     }
 
     var parts: std.ArrayListUnmanaged([]const u8) = .empty;

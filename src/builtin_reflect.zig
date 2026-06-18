@@ -11,6 +11,7 @@ const Completion = @import("completion.zig").Completion;
 const object_mod = @import("object.zig");
 const Object = object_mod.Object;
 const builtin_object = @import("builtin_object.zig");
+const proxy = @import("builtin_proxy.zig");
 const ops = @import("abstract_ops.zig");
 const numberToString = ops.numberToString;
 const sameRef = interp.sameRef;
@@ -66,27 +67,34 @@ pub fn reflectMethod(it: *Interpreter, name: []const u8, args: []const Value) Ev
     }
     // §28.1.9 Reflect.has ( target, propertyKey ) → the `in` operation (proto-chain walk).
     if (std.mem.eql(u8, name, "has")) {
-        const has = try it.hasPropertyV(arg0, arg1);
-        return .{ .normal = .{ .boolean = has } };
+        const pk = try it.coercePropertyKey(arg1); // §7.1.19 ToPropertyKey before [[HasProperty]]
+        if (pk.isAbrupt()) return pk;
+        return it.hasPropertyVC(arg0, pk.normal);
     }
     // §28.1.4 Reflect.deleteProperty ( target, propertyKey ) → boolean.
     if (std.mem.eql(u8, name, "deleteProperty")) {
         if (arg1 == .symbol) {
+            if (target.proxy) |pd| return proxy.deleteProperty(it, pd, arg1);
             const ok = target.deleteSymbol(arg1.symbol);
             return .{ .normal = .{ .boolean = ok } };
         }
         const key = try it.toPropertyKeyString(arg1);
+        // §10.5.10: the string path's deleteProperty already routes proxies.
         const c = try it.deleteProperty(arg0, key);
         return c;
     }
     // §28.1.11 Reflect.ownKeys ( target ) → own string keys (Array indices, then string props),
     // then own symbol keys, as an Array.
     if (std.mem.eql(u8, name, "ownKeys")) {
+        if (target.proxy) |pd| return proxy.ownKeys(it, pd); // §10.5.11 [[OwnPropertyKeys]]
         return reflectOwnKeys(it, target);
     }
     // §28.1.8 Reflect.getPrototypeOf ( target ) — the [[Prototype]] (object or null).
     if (std.mem.eql(u8, name, "getPrototypeOf")) {
-        return .{ .normal = if (target.prototype) |p| .{ .object = p } else .null };
+        return switch (try it.ordinaryGetPrototypeOf(target)) {
+            .proto => |p| .{ .normal = if (p) |pp| .{ .object = pp } else .null },
+            .abrupt => |c| c,
+        };
     }
     // §28.1.14 Reflect.setPrototypeOf ( target, proto ) → boolean (false on a rejected change).
     if (std.mem.eql(u8, name, "setPrototypeOf")) {
@@ -95,19 +103,24 @@ pub fn reflectMethod(it: *Interpreter, name: []const u8, args: []const Value) Ev
             .object => |p| p,
             else => return it.throwError("TypeError", "Reflect.setPrototypeOf called with an invalid prototype"),
         };
-        if (target.prototype == new_proto) return .{ .normal = .{ .boolean = true } };
-        if (!target.extensible) return .{ .normal = .{ .boolean = false } }; // §10.4.7.1: reject, don't throw
-        target.prototype = new_proto;
-        return .{ .normal = .{ .boolean = true } };
+        return switch (try it.ordinarySetPrototypeOf(target, new_proto)) {
+            .ok => |ok| .{ .normal = .{ .boolean = ok } },
+            .abrupt => |c| c,
+        };
     }
     // §28.1.10 Reflect.isExtensible ( target ) → boolean.
     if (std.mem.eql(u8, name, "isExtensible")) {
-        return .{ .normal = .{ .boolean = target.extensible } };
+        return switch (try it.ordinaryIsExtensible(target)) {
+            .ext => |x| .{ .normal = .{ .boolean = x } },
+            .abrupt => |c| c,
+        };
     }
-    // §28.1.12 Reflect.preventExtensions ( target ) → boolean (always succeeds here).
+    // §28.1.12 Reflect.preventExtensions ( target ) → boolean.
     if (std.mem.eql(u8, name, "preventExtensions")) {
-        target.extensible = false;
-        return .{ .normal = .{ .boolean = true } };
+        return switch (try it.ordinaryPreventExtensions(target)) {
+            .ok => |ok| .{ .normal = .{ .boolean = ok } },
+            .abrupt => |c| c,
+        };
     }
     // §28.1.3 Reflect.defineProperty ( target, propertyKey, attributes ) → boolean (NO throw on a
     // failed define — returns false, unlike Object.defineProperty).
@@ -117,27 +130,25 @@ pub fn reflectMethod(it: *Interpreter, name: []const u8, args: []const Value) Ev
             .abrupt => |c| return c,
             .desc => |d| {
                 if (arg1 == .symbol) {
-                    const ok = try target.defineSymbol(arg1.symbol, d);
-                    return .{ .normal = .{ .boolean = ok } };
+                    return switch (try it.ordinaryDefineOwnPropertySymbol(target, arg1.symbol, d)) {
+                        .ok => |ok| .{ .normal = .{ .boolean = ok } },
+                        .abrupt => |c| c,
+                    };
                 }
                 const key = try it.toPropertyKeyString(arg1);
-                // §10.4.2.1 Array exotic — route integer indices through the array-aware define so they
-                // write the element store / grow [[Length]] (mirrors Object.defineProperty). A rejected
-                // define throws TypeError inside the helper; for Reflect that surfaces as `false`. (Array
-                // `length` keeps the ordinary store-backed path here — its RangeError must still propagate.)
-                if (target.kind == .array and !std.mem.eql(u8, key, "length")) {
-                    if (builtin_object.arrayIndex(key)) |idx| {
-                        const adc = try builtin_object.arrayDefineIndex(it, target, idx, key, d);
-                        return .{ .normal = .{ .boolean = !adc.isAbrupt() } };
-                    }
-                }
-                const ok = try target.defineProperty(key, d);
-                return .{ .normal = .{ .boolean = ok } };
+                return switch (try it.ordinaryDefineOwnProperty(target, key, d)) {
+                    .ok => |ok| .{ .normal = .{ .boolean = ok } },
+                    .abrupt => |c| c,
+                };
             },
         }
     }
     // §28.1.7 Reflect.getOwnPropertyDescriptor ( target, propertyKey ) → descriptor object or undefined.
     if (std.mem.eql(u8, name, "getOwnPropertyDescriptor")) {
+        if (target.proxy) |pd| { // §10.5.5 [[GetOwnProperty]] via the trap
+            const kv: Value = if (arg1 == .symbol) arg1 else .{ .string = try it.toPropertyKeyString(arg1) };
+            return proxy.getOwnProperty(it, pd, kv);
+        }
         if (arg1 == .symbol) {
             for (target.symbol_props.items) |*sp| {
                 if (sp.key == arg1.symbol) return builtin_object.fromPropertyValue(it, sp.pv);
@@ -157,8 +168,9 @@ pub fn toPropertyKeyString(it: *Interpreter, key: Value) EvalError![]const u8 {
 
 /// §28.1.6 [[Get]] with an explicit receiver — locate `key` (string or symbol) on `target`'s chain;
 /// a data property returns its value, an accessor invokes its getter with `this` = receiver.
-fn reflectGet(it: *Interpreter, target: Value, key: Value, receiver: Value) EvalError!Completion {
+pub fn reflectGet(it: *Interpreter, target: Value, key: Value, receiver: Value) EvalError!Completion {
     const o = target.object;
+    if (o.proxy) |pd| return proxy.get(it, pd, key, receiver); // §10.5.8 [[Get]]
     if (key == .symbol) {
         const loc = o.getSymbolProp(key.symbol) orelse return it.getSymbolProperty(target, key.symbol);
         switch (loc.pv.payload) {
@@ -185,8 +197,9 @@ fn reflectGet(it: *Interpreter, target: Value, key: Value, receiver: Value) Eval
 /// §28.1.13 [[Set]] with an explicit receiver → boolean. An inherited/own accessor invokes its
 /// setter with `this` = receiver; a data write defines/overwrites on the target (M-subset: the
 /// receiver-divergent OrdinarySet redirection is the common receiver == target model).
-fn reflectSet(it: *Interpreter, target: Value, key: Value, value: Value, receiver: Value) EvalError!Completion {
+pub fn reflectSet(it: *Interpreter, target: Value, key: Value, value: Value, receiver: Value) EvalError!Completion {
     const o = target.object;
+    if (o.proxy) |pd| return proxy.set(it, pd, key, value, receiver); // §10.5.9 [[Set]] → boolean
     // §28.1.13 step 4: a receiver was either not supplied (= target) or differs from target. When it
     // differs, §10.1.9 OrdinarySet redirects a DATA write to the receiver (an accessor still fires the
     // setter with `this` = receiver). `same_receiver` ⇒ the ordinary write-to-target fast path applies.
@@ -233,9 +246,27 @@ fn reflectSet(it: *Interpreter, target: Value, key: Value, value: Value, receive
 /// the RECEIVER's own descriptor. An accessor or non-writable own data property on the receiver rejects
 /// (→ false); otherwise define/overwrite a data property on the receiver. A non-Object receiver → false.
 fn setOnReceiverStr(it: *Interpreter, receiver: Value, key: []const u8, value: Value) EvalError!Completion {
-    _ = it;
     if (receiver != .object) return .{ .normal = .{ .boolean = false } };
     const r = receiver.object;
+    if (r.proxy != null) {
+        // §10.1.9.2 step 3.b–f: the receiver's own [[GetOwnProperty]] / [[DefineOwnProperty]] route
+        // through the proxy traps. Reject an accessor / non-writable existing data prop; else define.
+        const cur = switch (try it.ordinaryGetOwnProperty(r, key)) {
+            .pv => |pv| pv,
+            .abrupt => |c| return c,
+        };
+        if (cur) |pv| {
+            if (pv.payload == .accessor or !pv.writable) return .{ .normal = .{ .boolean = false } };
+            return switch (try it.ordinaryDefineOwnProperty(r, key, .{ .value = value, .has_value = true })) {
+                .ok => |ok| .{ .normal = .{ .boolean = ok } },
+                .abrupt => |c| c,
+            };
+        }
+        return switch (try it.ordinaryDefineOwnProperty(r, key, .{ .value = value, .has_value = true, .writable = true, .enumerable = true, .configurable = true })) {
+            .ok => |ok| .{ .normal = .{ .boolean = ok } },
+            .abrupt => |c| c,
+        };
+    }
     if (r.properties.get(key)) |pv| {
         // §10.1.9.2 step 3.e: an existing receiver property — reject an accessor / non-writable data;
         // otherwise overwrite just the [[Value]] (existing attributes preserved).
@@ -251,9 +282,25 @@ fn setOnReceiverStr(it: *Interpreter, receiver: Value, key: []const u8, value: V
 
 /// §10.1.9.2 for a Symbol key when Receiver ≠ target — the symbol-store analogue of `setOnReceiverStr`.
 fn setOnReceiverSym(it: *Interpreter, receiver: Value, key: *@import("value.zig").Symbol, value: Value) EvalError!Completion {
-    _ = it;
     if (receiver != .object) return .{ .normal = .{ .boolean = false } };
     const r = receiver.object;
+    if (r.proxy != null) {
+        const cur = switch (try it.ordinaryGetOwnPropertySymbol(r, key)) {
+            .pv => |pv| pv,
+            .abrupt => |c| return c,
+        };
+        if (cur) |pv| {
+            if (pv.payload == .accessor or !pv.writable) return .{ .normal = .{ .boolean = false } };
+            return switch (try it.ordinaryDefineOwnPropertySymbol(r, key, .{ .value = value, .has_value = true })) {
+                .ok => |ok| .{ .normal = .{ .boolean = ok } },
+                .abrupt => |c| c,
+            };
+        }
+        return switch (try it.ordinaryDefineOwnPropertySymbol(r, key, .{ .value = value, .has_value = true, .writable = true, .enumerable = true, .configurable = true })) {
+            .ok => |ok| .{ .normal = .{ .boolean = ok } },
+            .abrupt => |c| c,
+        };
+    }
     if (r.getSymbolProp(key)) |loc| {
         if (loc.holder == r) {
             if (loc.pv.payload == .accessor) return .{ .normal = .{ .boolean = false } };

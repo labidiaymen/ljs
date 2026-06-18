@@ -126,6 +126,10 @@ pub const Object = struct {
     /// §28.2 Proxy state — present iff this object is a Proxy exotic. Every internal method routes
     /// through its handler trap (or forwards to the target). Null for every other object (zero cost).
     proxy: ?*ProxyData = null,
+    /// §28.2.2.1.1 the captured Proxy a `proxy_revoke` native closes over (set ONLY on that revoker
+    /// function — never on a real Proxy). Kept separate from `proxy` so the revoker stays an ordinary
+    /// callable function and is not mistaken for a Proxy exotic. Null for every other object.
+    revoke_target: ?*ProxyData = null,
     /// §22.2 RegExp state — present iff this object is a RegExp instance. Null otherwise (zero cost).
     regexp: ?*RegExpData = null,
     /// §27.5 Generator state — present iff this object is a Generator (made by calling a `function*`).
@@ -392,6 +396,9 @@ pub const Object = struct {
             .aggregate_error_ctor => 2,
             .suppressed_error_ctor => 3,
             .symbol_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor => 0,
+            .proxy_ctor => 2, // §28.2.1.1 Proxy ( target, handler )
+            .proxy_revocable => 2, // §28.2.2.1 Proxy.revocable ( target, handler )
+            .proxy_revoke => 0, // §28.2.2.1.1 the revoke function takes no arguments
             // ── Object statics / prototype (each its own id) ──
             .object_define_property => 3,
             .object_assign, .object_create, .object_define_properties, .object_get_own_property_descriptor, .object_is, .object_set_prototype_of, .object_has_own, .object_group_by => 2,

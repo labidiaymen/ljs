@@ -12,6 +12,7 @@ const Value = @import("value.zig").Value;
 const Completion = @import("completion.zig").Completion;
 const ops = @import("abstract_ops.zig");
 const object_mod = @import("object.zig");
+const proxy = @import("builtin_proxy.zig");
 const Object = object_mod.Object;
 
 const Symbol = @import("value.zig").Symbol;
@@ -32,6 +33,17 @@ pub fn objectDefineProperty(it: *Interpreter, args: []const Value) EvalError!Com
     switch (r) {
         .abrupt => |c| return c,
         .desc => |d| {
+            if (o.object.proxy != null) { // §10.5.6 [[DefineOwnProperty]] via the trap
+                const dr = if (sym_key) |sym|
+                    try it.ordinaryDefineOwnPropertySymbol(o.object, sym, d)
+                else
+                    try it.ordinaryDefineOwnProperty(o.object, str_key, d);
+                switch (dr) {
+                    .ok => |ok| if (!ok) return it.throwError("TypeError", "Cannot redefine property"),
+                    .abrupt => |c| return c,
+                }
+                return .{ .normal = o };
+            }
             if (sym_key) |sym| {
                 const ok = try o.object.defineSymbolProperty(sym, d);
                 if (!ok) return it.throwError("TypeError", "Cannot redefine property");
@@ -267,6 +279,10 @@ pub fn objectGetOwnPropertyDescriptor(it: *Interpreter, args: []const Value) Eva
     // §20.1.2.8 step 2: ToPropertyKey(P) — a Symbol key reads the symbol-keyed store.
     const pk = try it.toPropertyKey(if (args.len > 1) args[1] else .undefined);
     if (pk.isAbrupt()) return pk.completion;
+    if (o.object.proxy) |pd| { // §10.5.5 [[GetOwnProperty]] via the trap
+        const kv: Value = if (pk.symbol) |sym| .{ .symbol = sym } else .{ .string = pk.key };
+        return proxy.getOwnProperty(it, pd, kv);
+    }
     if (pk.symbol) |sym| {
         for (o.object.symbol_props.items) |sp| {
             if (sp.key == sym) return fromPropertyValue(it, sp.pv);
@@ -335,6 +351,15 @@ pub fn objectGetOwnPropertyNames(it: *Interpreter, args: []const Value) EvalErro
     const arr = try Object.createArray(it.arena, it.arrayProto());
     switch (o) {
         .object => |obj| {
+            if (obj.proxy != null) { // §10.5.11 → keep only string keys
+                const keys = switch (try it.ordinaryOwnKeys(obj)) {
+                    .keys => |k| k,
+                    .abrupt => |c| return c,
+                };
+                for (keys) |k| if (k == .string) try arr.elements.append(it.arena, k);
+                arr.array_length = arr.elements.items.len;
+                return .{ .normal = .{ .object = arr } };
+            }
             if (obj.kind == .array) {
                 for (try obj.arrayIndices(it.arena)) |i| {
                     try arr.elements.append(it.arena, .{ .string = try numberToString(it.arena, @floatFromInt(i)) });
@@ -391,7 +416,7 @@ pub fn objectKeysValuesEntries(it: *Interpreter, args: []const Value, kind: KveK
     if (o == .undefined or o == .null) return it.throwError("TypeError", "Cannot convert undefined or null to object");
     const out = try Object.createArray(it.arena, it.arrayProto());
     var keys: std.ArrayListUnmanaged(Value) = .empty;
-    try it.ownEnumerableKeys(o, &keys);
+    if (try it.ownEnumerableKeys(o, &keys)) |abrupt| return abrupt;
     for (keys.items) |k| {
         switch (kind) {
             .keys => try out.elements.append(it.arena, k),
@@ -415,9 +440,28 @@ pub fn objectKeysValuesEntries(it: *Interpreter, args: []const Value, kind: KveK
 /// §7.3.23 EnumerableOwnPropertyNames (key-collection half) — the OWN enumerable string keys of a
 /// value (no prototype walk): Array indices (numeric order), ordinary own enumerable string keys,
 /// or a primitive String's character indices. Used by Object.keys/values/entries and Object.assign.
-pub fn ownEnumerableKeys(it: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!void {
+/// Returns null on success, or the abrupt Completion (a Proxy trap throw/revoke) to propagate.
+pub fn ownEnumerableKeys(it: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!?Completion {
     switch (value) {
         .object => |o| {
+            if (o.proxy != null) {
+                // §7.3.23: [[OwnPropertyKeys]] then keep only string keys whose [[GetOwnProperty]]
+                // descriptor is present and [[Enumerable]].
+                const keys = switch (try it.ordinaryOwnKeys(o)) {
+                    .keys => |k| k,
+                    .abrupt => |c| return c,
+                };
+                for (keys) |k| {
+                    if (k != .string) continue;
+                    switch (try it.ordinaryGetOwnProperty(o, k.string)) {
+                        .pv => |pv| if (pv) |p| {
+                            if (p.enumerable) try out.append(it.arena, k);
+                        },
+                        .abrupt => |c| return c,
+                    }
+                }
+                return null;
+            }
             if (o.kind == .array) {
                 for (try o.arrayIndices(it.arena)) |i| {
                     try out.append(it.arena, .{ .string = try numberToString(it.arena, @floatFromInt(i)) });
@@ -434,6 +478,7 @@ pub fn ownEnumerableKeys(it: *Interpreter, value: Value, out: *std.ArrayListUnma
         },
         else => {}, // number/boolean ToObject → no own enumerable string keys (M-subset)
     }
+    return null;
 }
 
 /// §20.1.2.2 Object.create ( O, Properties ) — a new ordinary object with [[Prototype]] = O (an
@@ -463,7 +508,7 @@ pub fn objectAssign(it: *Interpreter, args: []const Value) EvalError!Completion 
     if (args.len > 1) for (args[1..]) |source| {
         if (source == .undefined or source == .null) continue; // §20.1.2.1 step 4.a: skip nullish
         var keys: std.ArrayListUnmanaged(Value) = .empty;
-        try it.ownEnumerableKeys(source, &keys);
+        if (try it.ownEnumerableKeys(source, &keys)) |abrupt| return abrupt;
         for (keys.items) |k| {
             const vc = try it.getProperty(source, k.string);
             if (vc.isAbrupt()) return vc;
@@ -570,6 +615,15 @@ pub fn objectGetOwnPropertySymbols(it: *Interpreter, args: []const Value) EvalEr
     if (o == .undefined or o == .null) return it.throwError("TypeError", "Cannot convert undefined or null to object");
     const arr = try Object.createArray(it.arena, it.arrayProto());
     if (o == .object) {
+        if (o.object.proxy != null) { // §10.5.11 → keep only symbol keys
+            const keys = switch (try it.ordinaryOwnKeys(o.object)) {
+                .keys => |k| k,
+                .abrupt => |c| return c,
+            };
+            for (keys) |k| if (k == .symbol) try arr.elements.append(it.arena, k);
+            arr.array_length = arr.elements.items.len;
+            return .{ .normal = .{ .object = arr } };
+        }
         for (o.object.symbol_props.items) |sp| {
             try arr.elements.append(it.arena, .{ .symbol = sp.key });
         }
@@ -694,7 +748,10 @@ pub fn objectProtoSet(it: *Interpreter, this_val: Value, args: []const Value) Ev
 pub fn objectGetPrototypeOf(it: *Interpreter, args: []const Value) EvalError!Completion {
     const o = if (args.len > 0) args[0] else .undefined;
     switch (o) {
-        .object => |obj| return .{ .normal = if (obj.prototype) |p| .{ .object = p } else .null },
+        .object => |obj| return switch (try it.ordinaryGetPrototypeOf(obj)) { // §10.5.1 proxy-aware
+            .proto => |p| .{ .normal = if (p) |pp| .{ .object = pp } else .null },
+            .abrupt => |c| c,
+        },
         .string => return .{ .normal = if (it.stringProto()) |p| .{ .object = p } else .null },
         .undefined, .null => return it.throwError("TypeError", "Cannot convert undefined or null to object"),
         else => return .{ .normal = .null }, // number/boolean: M-subset (no boxed wrapper proto)
@@ -715,9 +772,10 @@ pub fn objectSetPrototypeOf(it: *Interpreter, args: []const Value) EvalError!Com
     };
     if (o != .object) return .{ .normal = o }; // primitive: no internal slot to set (M-subset)
     const obj = o.object;
-    if (obj.prototype == new_proto) return .{ .normal = o }; // §10.4.7.1 step 4: same proto → ok
-    if (!obj.extensible) return it.throwError("TypeError", "#<Object> is not extensible");
-    obj.prototype = new_proto;
+    switch (try it.ordinarySetPrototypeOf(obj, new_proto)) { // §10.5.2 proxy-aware
+        .ok => |ok| if (!ok) return it.throwError("TypeError", "#<Object> is not extensible"),
+        .abrupt => |c| return c,
+    }
     return .{ .normal = o };
 }
 
@@ -726,9 +784,42 @@ const IntegrityOp = enum { freeze, seal, prevent };
 /// §20.1.2.7/.21/.20 Object.freeze / seal / preventExtensions — apply the integrity level to O and
 /// return O. A non-object argument is returned unchanged (§20.1.2.7 step 1).
 pub fn objectSetIntegrity(it: *Interpreter, args: []const Value, op: IntegrityOp) EvalError!Completion {
-    _ = it;
     const o = if (args.len > 0) args[0] else .undefined;
     if (o != .object) return .{ .normal = o };
+    if (o.object.proxy != null) {
+        // §7.3.15 SetIntegrityLevel via the proxy's internal methods: PreventExtensions, then for
+        // each own key DefineOwnProperty making it non-configurable (sealed) / also non-writable
+        // for data props (frozen). §20.1.2.7/.21 throw on a failed PreventExtensions.
+        const ok = switch (try it.ordinaryPreventExtensions(o.object)) {
+            .ok => |x| x,
+            .abrupt => |c| return c,
+        };
+        if (!ok) return it.throwError("TypeError", "Object.preventExtensions failed");
+        if (op == .prevent) return .{ .normal = o };
+        const keys = switch (try it.ordinaryOwnKeys(o.object)) {
+            .keys => |k| k,
+            .abrupt => |c| return c,
+        };
+        for (keys) |k| {
+            const d: object_mod.Descriptor = if (op == .freeze) blk: {
+                // Frozen: a data property also becomes non-writable. Read its current shape to know
+                // whether it is an accessor (no [[Writable]]).
+                const cur = try proxyOwnPV(it, o.object, k);
+                if (cur.isAbrupt()) return cur.abrupt;
+                const is_accessor = if (cur.pv) |pv| pv.payload == .accessor else false;
+                break :blk if (is_accessor) .{ .configurable = false } else .{ .configurable = false, .writable = false };
+            } else .{ .configurable = false };
+            const dr = switch (k) {
+                .symbol => |s| try it.ordinaryDefineOwnPropertySymbol(o.object, s, d),
+                else => try it.ordinaryDefineOwnProperty(o.object, k.string, d),
+            };
+            switch (dr) {
+                .ok => |dok| if (!dok) return it.throwError("TypeError", "Object.freeze/seal failed to redefine a property"),
+                .abrupt => |c| return c,
+            }
+        }
+        return .{ .normal = o };
+    }
     switch (op) {
         .freeze => o.object.freezeObject(),
         .seal => o.object.sealObject(),
@@ -737,16 +828,59 @@ pub fn objectSetIntegrity(it: *Interpreter, args: []const Value, op: IntegrityOp
     return .{ .normal = o };
 }
 
+const ProxyPV = union(enum) {
+    pv: ?object_mod.PropertyValue,
+    abrupt: Completion,
+    fn isAbrupt(s: ProxyPV) bool {
+        return s == .abrupt;
+    }
+};
+
+fn proxyOwnPV(it: *Interpreter, o: *Object, key: Value) EvalError!ProxyPV {
+    switch (key) {
+        .symbol => |s| return switch (try it.ordinaryGetOwnPropertySymbol(o, s)) {
+            .pv => |pv| .{ .pv = pv },
+            .abrupt => |c| .{ .abrupt = c },
+        },
+        else => return switch (try it.ordinaryGetOwnProperty(o, key.string)) {
+            .pv => |pv| .{ .pv = pv },
+            .abrupt => |c| .{ .abrupt = c },
+        },
+    }
+}
+
 const IntegrityTest = enum { frozen, sealed, extensible };
 
 /// §20.1.2.16/.17/.15 Object.isFrozen / isSealed / isExtensible. A non-object argument is treated
 /// as already frozen/sealed (true) and not extensible (false) per the spec's primitive handling.
 pub fn objectTestIntegrity(it: *Interpreter, args: []const Value, t: IntegrityTest) EvalError!Completion {
-    _ = it;
     const o = if (args.len > 0) args[0] else .undefined;
     if (o != .object) {
         // §20.1.2.15 step 2 / §20.1.2.16-17: a primitive is non-extensible and (vacuously) frozen+sealed.
         return .{ .normal = .{ .boolean = t != .extensible } };
+    }
+    if (o.object.proxy != null) {
+        const ext = switch (try it.ordinaryIsExtensible(o.object)) { // §10.5.3
+            .ext => |x| x,
+            .abrupt => |c| return c,
+        };
+        if (t == .extensible) return .{ .normal = .{ .boolean = ext } };
+        // §7.3.16 TestIntegrityLevel: an extensible target is neither frozen nor sealed; otherwise
+        // every own property must be non-configurable (frozen additionally: every data prop non-writable).
+        if (ext) return .{ .normal = .{ .boolean = false } };
+        const keys = switch (try it.ordinaryOwnKeys(o.object)) {
+            .keys => |k| k,
+            .abrupt => |c| return c,
+        };
+        for (keys) |k| {
+            const cur = try proxyOwnPV(it, o.object, k);
+            if (cur.isAbrupt()) return cur.abrupt;
+            if (cur.pv) |pv| {
+                if (pv.configurable) return .{ .normal = .{ .boolean = false } };
+                if (t == .frozen and pv.payload == .data and pv.writable) return .{ .normal = .{ .boolean = false } };
+            }
+        }
+        return .{ .normal = .{ .boolean = true } };
     }
     const r = switch (t) {
         .frozen => o.object.isFrozenObject(),
