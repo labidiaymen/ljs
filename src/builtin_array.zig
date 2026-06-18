@@ -755,15 +755,26 @@ const CompareResult = union(enum) { order: i32, abrupt: Completion };
 /// §23.1.3.30.1 SortCompare: with a comparator → its sign; else ToString ascending.
 fn compare(it: *Interpreter, comparefn: Value, x: Value, y: Value) EvalError!CompareResult {
     if (comparefn == .object) {
+        // §23.1.3.30.1 step 4: v = ? ToNumber(? Call(comparefn, undefined, « x, y »)). ToNumber is the
+        // THROWING form — a comparator returning a Symbol/BigInt is a TypeError (observable), not a silent
+        // coercion. A returned NaN → treated as +0 (order 0).
         const r = try it.callFunction(comparefn.object, &.{ x, y }, .undefined);
         if (r.isAbrupt()) return .{ .abrupt = r };
-        const n = ops.toNumber(r.normal);
+        const nc = try it.toNumberThrowing(r.normal);
+        if (nc.isAbrupt()) return .{ .abrupt = nc };
+        const n = nc.normal.number;
         if (std.math.isNan(n)) return .{ .order = 0 };
         return .{ .order = if (n < 0) @as(i32, -1) else if (n > 0) @as(i32, 1) else 0 };
     }
-    const xs = try it.toString(x);
-    const ys = try it.toString(y);
-    return .{ .order = switch (std.mem.order(u8, xs, ys)) {
+    // §23.1.3.30.1 steps 5-7 (no comparator): xString = ? ToString(x); yString = ? ToString(y). ToString
+    // is the FULL form — an object element runs ToPrimitive(string) (its `toString`/`valueOf`), and a
+    // Symbol element throws a TypeError. The shortcut `it.toString` would stringify every object as the
+    // literal "[object Object]" and silently coerce Symbols, both of which mis-order / mis-throw.
+    const xc = try it.toStringThrowing(x);
+    if (xc.isAbrupt()) return .{ .abrupt = xc };
+    const yc = try it.toStringThrowing(y);
+    if (yc.isAbrupt()) return .{ .abrupt = yc };
+    return .{ .order = switch (std.mem.order(u8, xc.normal.string, yc.normal.string)) {
         .lt => -1,
         .eq => 0,
         .gt => 1,
