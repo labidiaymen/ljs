@@ -57,11 +57,12 @@ const TA = struct {
             .obj = o,
             .elem = ta.elem,
             .bytes = live,
-            // §10.4.5.1: a resizable ArrayBuffer may have shrunk (during argument coercion's ToInteger,
-            // which can run user `valueOf`) below the stored `array_length`. Clamp the observed length to
-            // what the LIVE slice can hold so every length-derived byte range stays in bounds — for a
+            // §10.4.5.11 TypedArrayLength: for a length-TRACKING view (resizable buffer, no explicit
+            // length) the length is recomputed from the LIVE buffer; for a fixed view the stored
+            // `array_length` is clamped to what the live slice holds (crash-safe; a resizable buffer may
+            // have shrunk below the stored length during argument coercion's user `valueOf`). For a
             // non-resizable buffer this is exactly `array_length` (no behavior change).
-            .length = if (live) |b| @min(ta.array_length, b.len / ta.elem.bytesPerElement()) else 0,
+            .length = if (detached) 0 else tarray.liveLength(ta.tracks_length, ta.array_length, ta.byte_offset, buf.?.bytes.len, ta.elem.bytesPerElement()),
         };
     }
 
@@ -187,8 +188,10 @@ fn constructFromBuffer(it: *Interpreter, new_obj: *Object, elem: ElemType, buf: 
         array_len = (buffer_len - offset) / bpe;
     }
 
+    // §10.4.5 a view over a RESIZABLE buffer with NO explicit length tracks the live buffer length.
+    const tracks = (explicit_len == null) and (ab.max_byte_length != null);
     new_obj.kind = .typed_array;
-    new_obj.typed_array = .{ .buffer = buf, .byte_offset = offset, .array_length = array_len, .elem = elem };
+    new_obj.typed_array = .{ .buffer = buf, .byte_offset = offset, .array_length = array_len, .elem = elem, .tracks_length = tracks };
     return .{ .normal = .{ .object = new_obj } };
 }
 
@@ -288,9 +291,11 @@ pub fn getter(it: *Interpreter, name: []const u8, this_val: Value) EvalError!Com
         // §23.2.3.2 get buffer — the [[ViewedArrayBuffer]] (even when detached).
         return .{ .normal = .{ .object = ta.buffer } };
     }
+    // §10.4.5.11 the LIVE length (tracking views follow the resized buffer; fixed views stay clamped).
+    const live_len: usize = if (detached) 0 else tarray.liveLength(ta.tracks_length, ta.array_length, ta.byte_offset, ta.buffer.array_buffer.?.bytes.len, ta.elem.bytesPerElement());
     if (std.mem.eql(u8, name, "byteLength")) {
-        // §23.2.3.3 — 0 when detached, else array_length * bpe.
-        const n: usize = if (detached) 0 else ta.array_length * ta.elem.bytesPerElement();
+        // §23.2.3.3 — 0 when detached, else liveLength * bpe.
+        const n: usize = live_len * ta.elem.bytesPerElement();
         return .{ .normal = .{ .number = @floatFromInt(n) } };
     }
     if (std.mem.eql(u8, name, "byteOffset")) {
@@ -299,9 +304,8 @@ pub fn getter(it: *Interpreter, name: []const u8, this_val: Value) EvalError!Com
         return .{ .normal = .{ .number = @floatFromInt(n) } };
     }
     if (std.mem.eql(u8, name, "length")) {
-        // §23.2.3.21 — 0 when detached, else [[ArrayLength]].
-        const n: usize = if (detached) 0 else ta.array_length;
-        return .{ .normal = .{ .number = @floatFromInt(n) } };
+        // §23.2.3.21 — 0 when detached, else the live length.
+        return .{ .normal = .{ .number = @floatFromInt(live_len) } };
     }
     return .{ .normal = .undefined };
 }

@@ -71,6 +71,23 @@ pub const ElemType = enum {
     }
 };
 
+/// §10.4.5.11 TypedArrayLength / §25.3 GetViewByteLength — the LIVE element count of a view, computed
+/// from the (possibly resized) backing buffer. For a length-TRACKING view (`tracks` true — created over
+/// a resizable buffer with no explicit length), the length is recomputed from the live bytes:
+/// `floor((buffer_byte_len - byte_offset) / bpe)`, or 0 if the offset is past the buffer's end. For a
+/// fixed (non-tracking) view, the stored `stored_len` is CLAMPED to what the live bytes can hold — the
+/// existing crash-safe behavior (a resizable buffer that shrank below an explicit-length view reads as
+/// out of bounds). `bpe` is the element byte size (1 for a DataView byte length). Pure — no allocation.
+pub fn liveLength(tracks: bool, stored_len: usize, byte_offset: usize, buffer_byte_len: usize, bpe: usize) usize {
+    if (tracks) {
+        if (byte_offset >= buffer_byte_len) return 0;
+        return (buffer_byte_len - byte_offset) / bpe;
+    }
+    // Fixed view: clamp the stored length to the live slice (byte_offset may sit past a shrunk buffer).
+    const avail = buffer_byte_len - @min(byte_offset, buffer_byte_len);
+    return @min(stored_len, avail / bpe);
+}
+
 /// §23.2.5.13 GetValueFromBuffer (isTypedArray = true ⇒ native endianness). Read the element at logical
 /// `index` (an element count, NOT a byte offset) from `bytes`, returning the JS Value: a Number for the
 /// nine numeric types, a BigInt (allocated in `arena`) for `i64`/`u64`. The caller guarantees the slice

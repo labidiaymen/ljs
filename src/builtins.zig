@@ -674,6 +674,9 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         // §25.1.6.7/.x ArrayBuffer.prototype.slice (length 2) / resize (length 1).
         try defineMethodLen(arena, ap, "slice", .array_buffer_method, "slice", 2); // §25.1.6.7
         try defineMethodLen(arena, ap, "resize", .array_buffer_method, "resize", 1); // §25.1.6.x (resizable)
+        // §25.1.6.x ArrayBuffer.prototype.transfer (length 0) / transferToImmutable (length 0).
+        try defineMethodLen(arena, ap, "transfer", .array_buffer_method, "transfer", 0);
+        try defineMethodLen(arena, ap, "transferToImmutable", .array_buffer_method, "transferToImmutable", 0);
         // §25.1.6.6 ArrayBuffer.prototype[Symbol.toStringTag] = "ArrayBuffer" (non-writable/non-enum/configurable).
         if (tag_sym) |s| try ap.defineSymbolData(s, .{ .string = "ArrayBuffer" }, false, false, true);
     };

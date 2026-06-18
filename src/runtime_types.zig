@@ -139,6 +139,10 @@ pub const ArrayBufferData = struct {
     bytes: []u8,
     detached: bool = false,
     max_byte_length: ?usize = null,
+    /// §25.1.6.x [[ArrayBufferIsImmutable]] — produced by `transferToImmutable`. An immutable buffer
+    /// is fixed-length and rejects `resize` / `transfer` (TypeError). Always false for an ordinary or
+    /// resizable buffer.
+    immutable: bool = false,
 };
 
 /// §23.2.5 Integer-Indexed (TypedArray) exotic internal slots ([[ViewedArrayBuffer]] / [[ByteOffset]] /
@@ -151,6 +155,10 @@ pub const TypedArrayData = struct {
     byte_offset: usize,
     array_length: usize,
     elem: ElemType,
+    /// §10.4.5 [[ArrayLength]] = auto — set true when the view was created over a RESIZABLE
+    /// ArrayBuffer with NO explicit length: the observable length then TRACKS the live buffer
+    /// (grows/shrinks with `resize`). False for a fixed-length view (the stored `array_length`).
+    tracks_length: bool = false,
 };
 
 /// §25.3.5 DataView internal slots ([[ViewedArrayBuffer]] / [[ByteOffset]] / [[ByteLength]]). Present
@@ -160,6 +168,10 @@ pub const DataViewData = struct {
     buffer: *Object,
     byte_offset: usize,
     byte_length: usize,
+    /// §25.3 [[ByteLength]] = auto — set true when the DataView was created over a RESIZABLE
+    /// ArrayBuffer with NO explicit byteLength: the observable byteLength then TRACKS the live buffer.
+    /// False for a fixed-length view (the stored `byte_length`).
+    tracks_length: bool = false,
 };
 
 /// §27.2.6 [[PromiseState]] — a Promise is pending until settled, then fulfilled or rejected (once).

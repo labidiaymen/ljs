@@ -129,10 +129,13 @@ pub fn getter(it: *Interpreter, name: []const u8, this_val: Value) EvalError!Com
     return .{ .normal = .undefined };
 }
 
-/// §25.1.6.x ArrayBuffer.prototype methods — `native_name` selects `slice` / `resize`.
+/// §25.1.6.x ArrayBuffer.prototype methods — `native_name` selects `slice` / `resize` / `transfer` /
+/// `transferToImmutable`.
 pub fn method(it: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
     if (std.mem.eql(u8, name, "slice")) return slice(it, this_val, args);
     if (std.mem.eql(u8, name, "resize")) return resize(it, this_val, args);
+    if (std.mem.eql(u8, name, "transfer")) return transfer(it, this_val, args, false);
+    if (std.mem.eql(u8, name, "transferToImmutable")) return transfer(it, this_val, args, true);
     return it.throwError("TypeError", "Unknown ArrayBuffer.prototype method");
 }
 
@@ -229,6 +232,10 @@ pub fn resize(it: *Interpreter, this_val: Value, args: []const Value) EvalError!
         return it.throwError("TypeError", "ArrayBuffer.prototype.resize called on a non-ArrayBuffer");
     }
     const self_obj = this_val.object;
+    // §25.1.6.x an immutable buffer (from transferToImmutable) is fixed-length and never resizable.
+    if (self_obj.array_buffer.?.immutable) {
+        return it.throwError("TypeError", "ArrayBuffer.prototype.resize: buffer is immutable");
+    }
     const max = self_obj.array_buffer.?.max_byte_length orelse {
         return it.throwError("TypeError", "ArrayBuffer.prototype.resize: buffer is not resizable");
     };
@@ -258,6 +265,55 @@ pub fn resize(it: *Interpreter, this_val: Value, args: []const Value) EvalError!
     if (new_len > keep) @memset(fresh[keep..], 0);
     self_obj.array_buffer.?.bytes = fresh;
     return .{ .normal = .undefined };
+}
+
+/// §25.1.6.x ArrayBuffer.prototype.transfer ( [ newLength ] ) / transferToImmutable ( ) — the shared
+/// ArrayBufferCopyAndDetach. Move the source's data into a FRESH buffer (resizable iff the source was,
+/// carrying its `maxByteLength` — but `transferToImmutable` always produces a fixed, IMMUTABLE buffer),
+/// copy `min(oldByteLength, newLength)` bytes, zero-fill any growth, then DETACH the source. A detached
+/// or immutable source → TypeError. `newLength` (transfer only) defaults to the source's byteLength.
+fn transfer(it: *Interpreter, this_val: Value, args: []const Value, to_immutable: bool) EvalError!Completion {
+    if (this_val != .object or this_val.object.kind != .array_buffer) {
+        return it.throwError("TypeError", "ArrayBuffer.prototype.transfer called on a non-ArrayBuffer");
+    }
+    const self_obj = this_val.object;
+    const ab = self_obj.array_buffer.?;
+    // §25.1.6.x step 2: a detached source → TypeError (also an already-immutable source, which can
+    // never be transferred again — its data was moved out).
+    if (ab.detached) return it.throwError("TypeError", "Cannot transfer a detached ArrayBuffer");
+    if (ab.immutable) return it.throwError("TypeError", "Cannot transfer an immutable ArrayBuffer");
+
+    const old_len = ab.bytes.len;
+    // §25.1.6.x: newLength = (transfer with an arg) ToIndex(newLength); else the source byteLength.
+    // transferToImmutable takes no newLength (always the source byteLength).
+    var new_len: usize = old_len;
+    if (!to_immutable and args.len > 0 and args[0] != .undefined) {
+        const ic = try toIndex(it, args[0]);
+        new_len = switch (ic) {
+            .ok => |n| n,
+            .abrupt => |a| return a,
+        };
+    }
+    // §25.1.6.x: the detach check is re-run after the (observable) ToIndex.
+    if (self_obj.array_buffer.?.detached) return it.throwError("TypeError", "Source detached during transfer");
+
+    // §25.1.6.x: a transferred buffer is resizable iff the source was (and `transfer` keeps the cap);
+    // `transferToImmutable` is always fixed-length + immutable.
+    const new_max: ?usize = if (to_immutable) null else ab.max_byte_length;
+    const fresh = it.arena.alloc(u8, new_len) catch return it.throwError("RangeError", "ArrayBuffer.prototype.transfer: allocation failed");
+    const keep = @min(old_len, new_len);
+    @memcpy(fresh[0..keep], ab.bytes[0..keep]);
+    if (new_len > keep) @memset(fresh[keep..], 0);
+
+    const out = try Object.create(it.arena, arrayBufferProto(it));
+    out.kind = .array_buffer;
+    out.array_buffer = .{ .bytes = fresh, .detached = false, .max_byte_length = new_max, .immutable = to_immutable };
+
+    // §25.1.3.3 DetachArrayBuffer(source): [[ArrayBufferData]] := null, byteLength → 0. The old block is
+    // arena-owned (freed at realm teardown), so we just drop the reference (an empty live slice).
+    self_obj.array_buffer.?.detached = true;
+    self_obj.array_buffer.?.bytes = &.{};
+    return .{ .normal = .{ .object = out } };
 }
 
 /// §7.3.22-ish RelativeIndex(n, len): a negative `n` is relative to the end (max(len+n, 0)); a

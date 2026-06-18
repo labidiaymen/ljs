@@ -21,6 +21,14 @@ const Object = object_mod.Object;
 const bigint = @import("bigint.zig");
 const builtin_bigint = @import("builtin_bigint.zig");
 const abstract_ops = @import("abstract_ops.zig");
+const tarray = @import("typed_array.zig");
+
+/// §25.3 GetViewByteLength — the LIVE byte length of a DataView, computed from the (possibly resized)
+/// backing buffer. Tracking views (resizable buffer, no explicit length) follow the live buffer; fixed
+/// views clamp the stored `byte_length` to what the live bytes hold (crash-safe). `bpe` is 1 (bytes).
+fn liveByteLength(dv: object_mod.DataViewData, buffer_byte_len: usize) usize {
+    return tarray.liveLength(dv.tracks_length, dv.byte_length, dv.byte_offset, buffer_byte_len, 1);
+}
 
 /// %DataView.prototype% — the [[Prototype]] of every DataView instance. Null in a realm-less eval.
 fn dataViewProto(it: *Interpreter) ?*Object {
@@ -81,9 +89,11 @@ pub fn construct(it: *Interpreter, this_val: Value, args: []const Value) EvalErr
     // §25.3.2.1 steps 10–14: build the exotic on the pre-created instance (subclassing-safe — the
     // instance already carries new_target.prototype). A re-check of detachment is unnecessary: no user
     // code ran between the check above and here.
+    // §25.3 a DataView over a RESIZABLE buffer with NO explicit byteLength tracks the live buffer.
+    const tracks = (length_arg == .undefined) and (ab.max_byte_length != null);
     const obj: *Object = if (this_val == .object) this_val.object else try Object.create(it.arena, dataViewProto(it));
     obj.kind = .data_view;
-    obj.data_view = .{ .buffer = buffer, .byte_offset = offset, .byte_length = view_byte_length };
+    obj.data_view = .{ .buffer = buffer, .byte_offset = offset, .byte_length = view_byte_length, .tracks_length = tracks };
     return .{ .normal = .{ .object = obj } };
 }
 
@@ -105,7 +115,8 @@ pub fn getter(it: *Interpreter, name: []const u8, this_val: Value) EvalError!Com
     if (std.mem.eql(u8, name, "byteLength")) {
         // §25.3.4.2 step 6: a detached buffer → TypeError.
         if (detached) return it.throwError("TypeError", "Cannot read byteLength of a DataView on a detached buffer");
-        return .{ .normal = .{ .number = @floatFromInt(dv.byte_length) } };
+        // §25.3.4.2 — the LIVE byte length (a tracking view follows the resized buffer).
+        return .{ .normal = .{ .number = @floatFromInt(liveByteLength(dv, dv.buffer.array_buffer.?.bytes.len)) } };
     }
     if (std.mem.eql(u8, name, "byteOffset")) {
         // §25.3.4.3 step 6: a detached buffer → TypeError.
@@ -179,7 +190,9 @@ fn getValue(it: *Interpreter, view: View, this_val: Value, args: []const Value) 
     // §25.3.4 step 5–6: detach check + bounds check (must follow the observable ToIndex).
     const ab = dv.buffer.array_buffer.?;
     if (ab.detached) return it.throwError("TypeError", "Cannot read from a DataView on a detached buffer");
-    if (get_index + view.size > dv.byte_length) {
+    // §25.3.4 GetViewByteLength — bound against the LIVE byte length (a tracking view follows the
+    // resized buffer; a fixed view that the buffer shrank below reads out of bounds).
+    if (get_index + view.size > liveByteLength(dv, ab.bytes.len)) {
         return it.throwError("RangeError", "DataView access is out of bounds");
     }
 
@@ -229,7 +242,8 @@ fn setValue(it: *Interpreter, view: View, this_val: Value, args: []const Value) 
     // §25.3.4 step 9–10: detach check + bounds check.
     const ab = dv.buffer.array_buffer.?;
     if (ab.detached) return it.throwError("TypeError", "Cannot write to a DataView on a detached buffer");
-    if (get_index + view.size > dv.byte_length) {
+    // §25.3.4 SetViewValue — bound against the LIVE byte length (see getValue).
+    if (get_index + view.size > liveByteLength(dv, ab.bytes.len)) {
         return it.throwError("RangeError", "DataView access is out of bounds");
     }
 

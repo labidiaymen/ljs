@@ -829,7 +829,10 @@ pub fn typedArrayGet(self: *Interpreter, o: *Object, n: f64) EvalError!Value {
     const buf = ta.buffer.array_buffer orelse return .undefined;
     if (buf.detached) return .undefined; // §10.4.5.1 step 1: a detached buffer → invalid index
     if (n != @floor(n) or std.math.signbit(n) and n == 0) return .undefined; // not integral, or -0
-    if (n < 0 or n >= @as(f64, @floatFromInt(ta.array_length))) return .undefined; // out of bounds
+    // §10.4.5.1: bound against the LIVE length (tracking views follow the resized buffer; fixed views
+    // are clamped to what the live bytes hold), not the stored `array_length`.
+    const live_len = tarray.liveLength(ta.tracks_length, ta.array_length, ta.byte_offset, buf.bytes.len, ta.elem.bytesPerElement());
+    if (n < 0 or n >= @as(f64, @floatFromInt(live_len))) return .undefined; // out of bounds
     const i: usize = @intFromFloat(n);
     // Clamp byteOffset: a resizable buffer may have shrunk below it, so `bytes[byte_offset..]` itself
     // would be out of range; an empty live slice makes getElement's bounds guard return undefined.
@@ -859,7 +862,9 @@ pub fn typedArraySet(self: *Interpreter, o: *Object, n: f64, value: Value) EvalE
     const buf = ta.buffer.array_buffer orelse return null;
     if (buf.detached) return null;
     if (n != @floor(n) or (std.math.signbit(n) and n == 0)) return null;
-    if (n < 0 or n >= @as(f64, @floatFromInt(ta.array_length))) return null;
+    // §10.4.5.1: bound against the LIVE length (see typedArrayGet).
+    const live_len = tarray.liveLength(ta.tracks_length, ta.array_length, ta.byte_offset, buf.bytes.len, ta.elem.bytesPerElement());
+    if (n < 0 or n >= @as(f64, @floatFromInt(live_len))) return null;
     const i: usize = @intFromFloat(n);
     // Clamp byteOffset (see typedArrayGet): a shrunk resizable buffer may sit below it; the empty live
     // slice makes setElement's bounds guard a no-op.
