@@ -21,6 +21,10 @@ pub const IterState = struct {
     /// §24.1.5.1 the Map/Set being iterated, or null for an array/string iterator. The `cursor` then
     /// indexes the collection's `entries` (skipping tombstones); `kind` selects key/value/entry.
     collection: ?*Object = null,
+    /// §23.2.5.1 the TypedArray being iterated (CreateArrayIterator over an integer-indexed exotic), or
+    /// null otherwise. The `cursor` indexes elements; a read past the (possibly shrunk) length ends the
+    /// iteration. Distinct from `array` because element access goes through the typed-array codec.
+    typed_array: ?*Object = null,
     /// §23.1.5.1 array-iterator kind: `.value` (Array.prototype.values / [Symbol.iterator]),
     /// `.key` (.keys → indices), `.entry` (.entries → `[index, value]` pairs).
     kind: IterKind = .value,

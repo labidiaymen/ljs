@@ -688,6 +688,92 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try defineConstructorBackref(array_buffer_fn); // §25.1.6.2 ArrayBuffer.prototype.constructor === ArrayBuffer
     try env.declare("ArrayBuffer", .{ .object = array_buffer_fn }, true, true);
 
+    // §23.2 TypedArray (spec 083 Phase 2-B) — the %TypedArray% abstract super-constructor, the 11
+    // concrete constructors, the shared prototype getters/methods, and the from/of/Symbol.species
+    // statics. The concrete prototypes inherit %TypedArray%.prototype; the concrete constructors inherit
+    // the %TypedArray% constructor (so subclass-style static inheritance works). Construction is handled
+    // in `constructNT`; a plain call (no new) throws.
+    {
+        const ElemType = @import("typed_array.zig").ElemType;
+        // %TypedArray% — the abstract intrinsic constructor (direct construction throws). It is callable
+        // (NativeId .typed_array_abstract_ctor) so `Object.getPrototypeOf(Int8Array) === %TypedArray%`.
+        const ta_abstract = try Object.createNative(arena, .typed_array_abstract_ctor, "TypedArray");
+        ta_abstract.prototype = function_proto; // §23.2 %TypedArray% → %Function.prototype%
+        const ta_proto: *Object = blk: {
+            const pv = ta_abstract.get("prototype") orelse unreachable;
+            break :blk pv.object;
+        };
+        ta_proto.prototype = object_proto; // §23.2.3 %TypedArray%.prototype → %Object.prototype%
+
+        // §23.2.3 prototype getters (accessor, no setter, non-enumerable).
+        const ta_getters = [_][]const u8{ "buffer", "byteLength", "byteOffset", "length" };
+        for (ta_getters) |gn| {
+            const g = try Object.createNative(arena, .typed_array_proto_getter, gn);
+            g.prototype = function_proto;
+            try g.defineData("name", .{ .string = try std.fmt.allocPrint(arena, "get {s}", .{gn}) }, false, false, true);
+            try ta_proto.defineAccessorEx(gn, g, null, false);
+        }
+        // §23.2.3.38 get %TypedArray%.prototype[Symbol.toStringTag].
+        if (tag_sym) |s| {
+            const g = try Object.createNative(arena, .typed_array_proto_getter, "toStringTag");
+            g.prototype = function_proto;
+            try g.defineData("name", .{ .string = "get [Symbol.toStringTag]" }, false, false, true);
+            try ta_proto.defineSymbolAccessorEx(s, g, null, false);
+        }
+
+        // §23.2.3 prototype methods (non-enumerable). `values` doubles as [Symbol.iterator].
+        const ta_methods = [_][]const u8{
+            "at",          "copyWithin",     "entries",    "every",         "fill",    "filter",
+            "find",        "findIndex",      "findLast",   "findLastIndex", "forEach", "includes",
+            "indexOf",     "join",           "keys",       "lastIndexOf",   "map",     "reduce",
+            "reduceRight", "reverse",        "set",        "slice",         "some",    "sort",
+            "subarray",    "toLocaleString", "toReversed", "toSorted",      "with",
+        };
+        for (ta_methods) |mn| try defineMethod(arena, ta_proto, mn, .typed_array_method, mn);
+        // §23.2.3.36 values + §23.2.3.40 [Symbol.iterator] (same function object).
+        const ta_values = try Object.createNative(arena, .typed_array_method, "values");
+        ta_values.prototype = function_proto;
+        try ta_values.defineData("name", .{ .string = "values" }, false, false, true);
+        try ta_proto.defineData("values", .{ .object = ta_values }, true, false, true);
+        if (iter_sym2) |s| try ta_proto.defineSymbolData(s, .{ .object = ta_values }, true, false, true);
+        // §23.2.3.37 %TypedArray%.prototype.toString === %Array.prototype.toString%.
+        if (env.lookup("Array")) |ab| if (ab.value == .object) {
+            if (ab.value.object.get("prototype")) |app| if (app == .object) {
+                if (app.object.get("toString")) |ts| try ta_proto.defineData("toString", ts, true, false, true);
+            };
+        };
+
+        // §23.2.2 statics on the %TypedArray% constructor: from / of / get [Symbol.species].
+        try defineMethod(arena, ta_abstract, "from", .typed_array_static, "from");
+        try defineMethod(arena, ta_abstract, "of", .typed_array_static, "of");
+        if (species_sym) |s| {
+            const sg = try Object.createNative(arena, .typed_array_static, "species");
+            sg.prototype = function_proto;
+            try sg.defineData("name", .{ .string = "get [Symbol.species]" }, false, false, true);
+            try ta_abstract.defineSymbolAccessorEx(s, sg, null, false);
+        }
+        try defineConstructorBackref(ta_abstract); // §23.2.3.5 %TypedArray%.prototype.constructor === %TypedArray%
+
+        // The 11 concrete constructors. Each: ctor.[[Prototype]] = %TypedArray%; proto.[[Prototype]] =
+        // %TypedArray%.prototype; BYTES_PER_ELEMENT on both ctor and proto; constructor backref.
+        for (@import("builtin_typedarray.zig").all_elems) |elem| {
+            const cname = elem.constructorName();
+            const cfn = try Object.createNative(arena, .typed_array_ctor, cname);
+            cfn.native_name = cname; // selects the element type at construction
+            cfn.prototype = ta_abstract; // §23.2.6 each concrete ctor inherits %TypedArray%
+            const bpe: f64 = @floatFromInt(elem.bytesPerElement());
+            try cfn.defineData("BYTES_PER_ELEMENT", .{ .number = bpe }, false, false, false); // §23.2.6.2
+            if (cfn.get("prototype")) |pv| if (pv == .object) {
+                const cp = pv.object;
+                cp.prototype = ta_proto; // §23.2.6.3 <Type>Array.prototype → %TypedArray%.prototype
+                try cp.defineData("BYTES_PER_ELEMENT", .{ .number = bpe }, false, false, false); // §23.2.7.3
+            };
+            try defineConstructorBackref(cfn); // §23.2.7.2 <Type>Array.prototype.constructor === <Type>Array
+            try env.declare(cname, .{ .object = cfn }, true, true);
+        }
+        _ = ElemType;
+    }
+
     // §25.5 JSON — a namespace ordinary object (NOT callable / NOT a constructor; proto =
     // %Object.prototype%) holding `parse`/`stringify` and [Symbol.toStringTag] = "JSON".
     const json_obj = try Object.create(arena, object_proto);

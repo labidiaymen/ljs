@@ -22,14 +22,14 @@
 - [ ] T2A.3 GATE + integrate.
 
 ### 2-B TypedArray (×11 + %TypedArray%) — `src/builtin_typedarray.zig`
-- [ ] T2B.1 `%TypedArray%` abstract super + the 11 concrete constructors; `BYTES_PER_ELEMENT`
+- [x] T2B.1 `%TypedArray%` abstract super + the 11 concrete constructors; `BYTES_PER_ELEMENT`
   (instance + ctor); reject `%TypedArray%()` direct construction.
-- [ ] T2B.2 Construction overloads: length / typed-array / arraybuffer(+offset,+len) / array-like+iterable.
-- [ ] T2B.3 Getters `buffer`/`byteLength`/`byteOffset`/`length`/`[Symbol.toStringTag]`.
-- [ ] T2B.4 Prototype methods (at, copyWithin, entries, every, fill, filter, find*, forEach, includes,
+- [x] T2B.2 Construction overloads: length / typed-array / arraybuffer(+offset,+len) / array-like+iterable.
+- [x] T2B.3 Getters `buffer`/`byteLength`/`byteOffset`/`length`/`[Symbol.toStringTag]`.
+- [x] T2B.4 Prototype methods (at, copyWithin, entries, every, fill, filter, find*, forEach, includes,
   indexOf, join, keys, lastIndexOf, map, reduce, reduceRight, reverse, set, slice, some, sort,
   subarray, toLocaleString, toReversed, toSorted, values, with, `[Symbol.iterator]`, toString).
-- [ ] T2B.5 Statics `from`/`of` + `Symbol.species`.
+- [x] T2B.5 Statics `from`/`of` + `Symbol.species`.
 - [ ] T2B.6 GATE + integrate.
 
 ### 2-C DataView — `src/builtin_dataview.zig`

@@ -6,6 +6,7 @@ const Completion = @import("completion.zig").Completion;
 const object_mod = @import("object.zig");
 const Object = object_mod.Object;
 const ops = @import("abstract_ops.zig");
+const tarray = @import("typed_array.zig");
 const builtin_collection = @import("builtin_collection.zig");
 const interpreter = @import("interpreter.zig");
 const Interpreter = interpreter.Interpreter;
@@ -434,6 +435,29 @@ pub fn iteratorNext(self: *Interpreter, this_val: Value) EvalError!Completion {
                     const pair = try Object.createArray(self.arena, self.arrayProto());
                     try pair.elements.append(self.arena, .{ .number = @floatFromInt(idx) });
                     try pair.elements.append(self.arena, arr.arrayGet(idx));
+                    break :blk .{ .object = pair };
+                },
+            };
+            st.cursor += 1;
+            done = false;
+        }
+    } else if (st.typed_array) |ta_obj| {
+        // §23.2.5.1 CreateArrayIterator over an integer-indexed exotic. Read live: a detached buffer
+        // (or a cursor past the current length) ends the iteration; element access uses the codec.
+        const ta = ta_obj.typed_array.?;
+        const buf = ta.buffer.array_buffer;
+        const len: usize = if (buf == null or buf.?.detached) 0 else ta.array_length;
+        if (st.cursor < len) {
+            const idx = st.cursor;
+            const elem_v = try tarray.getElement(ta.elem, buf.?.bytes[ta.byte_offset..], idx, self.arena);
+            value = switch (st.kind) {
+                .value => elem_v,
+                .key => .{ .number = @floatFromInt(idx) },
+                .entry => blk: {
+                    const pair = try Object.createArray(self.arena, self.arrayProto());
+                    try pair.elements.append(self.arena, .{ .number = @floatFromInt(idx) });
+                    try pair.elements.append(self.arena, elem_v);
+                    pair.array_length = 2;
                     break :blk .{ .object = pair };
                 },
             };

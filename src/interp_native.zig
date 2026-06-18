@@ -22,6 +22,7 @@ const builtin_bigint = @import("builtin_bigint.zig");
 const builtin_proxy = @import("builtin_proxy.zig");
 const builtin_regexp = @import("builtin_regexp.zig");
 const builtin_arraybuffer = @import("builtin_arraybuffer.zig");
+const builtin_typedarray = @import("builtin_typedarray.zig");
 const interpreter = @import("interpreter.zig");
 const Interpreter = interpreter.Interpreter;
 const EvalError = interpreter.EvalError;
@@ -366,6 +367,14 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .array_buffer_proto_getter => return builtin_arraybuffer.getter(self, func.native_name, this_val), // §25.1.6
         .array_buffer_method => return builtin_arraybuffer.method(self, func.native_name, this_val, args), // §25.1.6.7 slice / resize
         .array_buffer_static => return builtin_arraybuffer.static(self, func.native_name, args), // §25.1.4.1 isView
+        // §23.2 TypedArray (spec 083 Phase 2-B). A concrete `<Type>Array(...)` plain call (no new) throws
+        // (§23.2.5.1 step 1); the abstract %TypedArray%() always throws (§23.2.1.1). Construction is in
+        // constructNT. The prototype getters / methods / statics dispatch by `native_name`.
+        .typed_array_ctor => return self.throwError("TypeError", "Constructor TypedArray requires 'new'"),
+        .typed_array_abstract_ctor => return builtin_typedarray.constructAbstract(self),
+        .typed_array_proto_getter => return builtin_typedarray.getter(self, func.native_name, this_val),
+        .typed_array_method => return builtin_typedarray.method(self, func.native_name, this_val, args),
+        .typed_array_static => return builtin_typedarray.static(self, func.native_name, this_val, args),
         .collection_size => return interp_collection.collectionSize(self, func.native_name, this_val),
         .collection_iterator => {
             // `native_name` is "<home>:<which>" — <home> ("map"/"set") brands the receiver, <which>
@@ -659,9 +668,11 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .proxy_ctor, .proxy_revocable, .proxy_revoke => unreachable, // handled in the first switch
         .regexp_ctor, .regexp_proto_getter, .regexp_to_string, .regexp_exec, .regexp_test => unreachable, // handled in the first switch
         .array_buffer_ctor, .array_buffer_proto_getter, .array_buffer_method, .array_buffer_static => unreachable, // §25.1 handled in the first switch
-        // §23.2/§25.3 ids RESERVED for Phase 2-B/2-C (spec 083) — registered nowhere yet, so a
-        // call cannot reach here; the arms exist only to keep this dispatch exhaustive.
-        .typed_array_ctor, .typed_array_abstract_ctor, .typed_array_proto_getter, .typed_array_method, .typed_array_static, .data_view_ctor, .data_view_proto_getter, .data_view_method => return self.throwError("TypeError", "not yet implemented"),
+        // §23.2 TypedArray (spec 083 Phase 2-B) — handled in the first switch.
+        .typed_array_ctor, .typed_array_abstract_ctor, .typed_array_proto_getter, .typed_array_method, .typed_array_static => unreachable,
+        // §25.3 DataView ids RESERVED for the sibling DataView agent (spec 083 Phase 2-C) — not yet
+        // integrated; the arm keeps this dispatch exhaustive until 2-C lands.
+        .data_view_ctor, .data_view_proto_getter, .data_view_method => return self.throwError("TypeError", "not yet implemented"),
         .json_parse, .json_stringify => unreachable, // handled in the first switch
         .iterator_helper, .iterator_helper_next, .iterator_from, .iterator_ctor => unreachable, // handled in the first switch
         .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch

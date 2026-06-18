@@ -818,7 +818,7 @@ fn canonicalNumericIndex(self: *Interpreter, key: []const u8) ?f64 {
 /// §10.4.5.4 [[Get]] for a TypedArray integer-indexed key. `n` is the CanonicalNumericIndexString value.
 /// IsValidIntegerIndex (§10.4.5.1): not detached, integral, not -0, and `0 <= n < array_length`. A valid
 /// index reads the element via the codec; any out-of-bounds / invalid / detached read yields `undefined`.
-fn typedArrayGet(self: *Interpreter, o: *Object, n: f64) EvalError!Value {
+pub fn typedArrayGet(self: *Interpreter, o: *Object, n: f64) EvalError!Value {
     const ta = o.typed_array.?;
     const buf = ta.buffer.array_buffer orelse return .undefined;
     if (buf.detached) return .undefined; // §10.4.5.1 step 1: a detached buffer → invalid index
@@ -833,7 +833,7 @@ fn typedArrayGet(self: *Interpreter, o: *Object, n: f64) EvalError!Value {
 /// ToBigInt for a bigint-content array) — observably, even for an out-of-bounds index (§10.4.5.16
 /// IntegerIndexedElementSet) — but the byte write happens only for a valid in-bounds index; an invalid
 /// or detached write is a silent no-op. Returns the abrupt completion if coercion throws, else null.
-fn typedArraySet(self: *Interpreter, o: *Object, n: f64, value: Value) EvalError!?Completion {
+pub fn typedArraySet(self: *Interpreter, o: *Object, n: f64, value: Value) EvalError!?Completion {
     const ta = o.typed_array.?;
     // §10.4.5.16 step 1-2: coerce the value per the array's content type FIRST (always observable).
     var num: f64 = 0;
