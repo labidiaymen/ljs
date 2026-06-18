@@ -3,9 +3,10 @@
 A JavaScript engine written from scratch in [Zig](https://ziglang.org) — **spec-first**, optimized
 for correctness and Test262 conformance, with a measured (not deferred) performance story.
 
-> **Status:** tree-walk interpreter passing **90.9% of Test262 `language/`** (40,414 / 44,475).
-> The standard built-in library (`built-ins/`) is in progress. A learning-grade, in-progress
-> engine — not a drop-in Node replacement.
+> **Status (Test262, harness metric):**
+> `language/` **90.9%** (40,414 / 44,475) · `built-ins/` **45.0%** (21,155 / 46,981) ·
+> **combined 67.3%** (61,569 / 91,456). The standard built-in library is where the remaining work
+> is. A learning-grade, in-progress engine — not a drop-in Node replacement.
 
 Built with **Spec-Driven Development** ([Spec Kit](https://github.com/github/spec-kit)): every
 operation cites an [ECMA-262](https://tc39.es/ecma262/) clause, conformance is judged by the
@@ -67,9 +68,11 @@ Numbers are the standard Test262 harness metric (with `--harness-dir`). Only the
 tests, the `baseline/*.json` passing-set snapshots, and the `specs/` SDD docs are in git; the
 corpus is reproducible from `test262.pin`.
 
-The largest remaining `built-ins/` gaps are big *separate* engines — `Temporal`, `Intl`,
-`TypedArray`/`ArrayBuffer`/`DataView`/`Atomics`, `Date` — alongside method-family gaps in the core
-prototypes.
+**Current (verified):** `language/` **90.9%** (40,414 / 44,475) · `built-ins/` **45.0%**
+(21,155 / 46,981). The remaining `language/` ~9% is mostly runtime edge cases and a few
+module-evaluation / early-error details. The largest `built-ins/` gaps are big *separate* engines —
+`Temporal`, `Intl`, `TypedArray`/`ArrayBuffer`/`DataView`/`Atomics`, `Date` — alongside
+method-family gaps in the core prototypes (`Object`/`Array`/`String`/`Iterator`).
 
 ## Architecture
 
