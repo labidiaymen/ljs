@@ -338,6 +338,50 @@ pub const Object = struct {
         self.array_length = self.elements.items.len;
     }
 
+    /// §6.1.7 a canonical *array index*: a String that is the canonical numeric form of an integer in
+    /// the range [0, 2^32 − 1). Canonical means `ToString(ToNumber(key)) === key`, so leading zeros
+    /// (`"00"`, `"007"`), signs, whitespace, and fractions (`"1.0"`) are NOT array indices — they keep
+    /// ordinary (insertion-order) key status. Returns the index, else null.
+    pub fn canonicalArrayIndex(key: []const u8) ?u32 {
+        if (key.len == 0) return null;
+        // "0" is the only key that may start with '0'.
+        if (key[0] == '0') return if (key.len == 1) 0 else null;
+        for (key) |c| if (c < '0' or c > '9') return null;
+        const n = std.fmt.parseInt(u64, key, 10) catch return null;
+        if (n >= 0xFFFF_FFFF) return null; // 2^32 − 1 is the exclusive upper bound (the max length)
+        return @intCast(n);
+    }
+
+    /// §10.1.11.1 OrdinaryOwnPropertyKeys ordering for the ordinary (non-exotic) string-keyed
+    /// `properties` store: integer-index keys first in ascending numeric order, then the remaining
+    /// string keys in insertion (creation) order. The `properties` ArrayHashMap already preserves
+    /// insertion order, but integer keys written out of order (e.g. `o[2]=…; o[0]=…`) must still
+    /// enumerate ascending. Returns the keys in spec order; caller owns the slice (in `arena`).
+    pub fn orderedStringKeys(self: *const Object, arena: std.mem.Allocator) std.mem.Allocator.Error![][]const u8 {
+        const keys = self.properties.keys();
+        // Partition into integer-index keys (with their numeric value) and the rest (insertion order).
+        var indices: std.ArrayListUnmanaged(struct { key: []const u8, n: u32 }) = .empty;
+        var rest: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (keys) |k| {
+            if (canonicalArrayIndex(k)) |n| {
+                try indices.append(arena, .{ .key = k, .n = n });
+            } else {
+                try rest.append(arena, k);
+            }
+        }
+        if (indices.items.len == 0) return rest.items; // common fast path: no integer keys
+        std.mem.sort(@TypeOf(indices.items[0]), indices.items, {}, struct {
+            fn lt(_: void, a: @TypeOf(indices.items[0]), b: @TypeOf(indices.items[0])) bool {
+                return a.n < b.n;
+            }
+        }.lt);
+        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        try out.ensureTotalCapacity(arena, indices.items.len + rest.items.len);
+        for (indices.items) |e| out.appendAssumeCapacity(e.key);
+        for (rest.items) |k| out.appendAssumeCapacity(k);
+        return out.items;
+    }
+
     /// §10.4.2.x own integer-index keys in ascending numeric order: the dense prefix `0..dense_len`
     /// then any sparse indices, sorted. Used by reflection (getOwnPropertyNames / for-in / Object.keys).
     /// Caller owns the returned slice (allocated in `arena`).

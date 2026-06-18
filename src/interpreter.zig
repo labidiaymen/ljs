@@ -1195,12 +1195,14 @@ pub const Interpreter = struct {
                             try out.append(self.arena, .{ .string = key });
                         }
                     }
-                    var it = o.properties.iterator();
-                    while (it.next()) |entry| {
-                        const key = entry.key_ptr.*;
+                    // §10.1.11.1 OrdinaryOwnPropertyKeys order: integer-index keys ascending, then
+                    // the rest in insertion order (the ArrayHashMap iterator alone yields pure
+                    // insertion order, which mis-orders out-of-order integer keys like `o[2]=…;o[0]=…`).
+                    for (try o.orderedStringKeys(self.arena)) |key| {
                         if (seen.contains(key)) continue;
                         try seen.put(self.arena, key, {}); // a shadowed name is skipped even if non-enumerable here
-                        if (!entry.value_ptr.enumerable) continue; // §14.7.5: only enumerable own keys
+                        const pv = o.properties.get(key) orelse continue;
+                        if (!pv.enumerable) continue; // §14.7.5: only enumerable own keys
                         try out.append(self.arena, .{ .string = key });
                     }
                     obj = o.prototype;
@@ -2160,7 +2162,7 @@ pub const Interpreter = struct {
                     // independent own props.
                     const sc = try self.evalExpr(p.value, env);
                     if (sc.isAbrupt()) return sc;
-                    try self.copyDataProperties(obj, sc.normal);
+                    if (try self.copyDataProperties(obj, sc.normal)) |abrupt| return abrupt;
                 },
                 .get, .set => {
                     const key = try self.propKey(p, env);
@@ -2288,36 +2290,74 @@ pub const Interpreter = struct {
         return null;
     }
 
-    /// §7.3.25 CopyDataProperties — copy `source`'s own enumerable data properties into `target`
-    /// (invoking getters to read the values). Null/undefined sources are no-ops. Used by object
-    /// spread `{...source}`.
-    fn copyDataProperties(self: *Interpreter, target: *Object, source: Value) EvalError!void {
+    /// §7.3.25 CopyDataProperties — copy `source`'s own enumerable properties (string AND symbol
+    /// keyed) into `target` in [[OwnPropertyKeys]] order (integer indices ascending, then strings in
+    /// insertion order, then symbols), reading each via [[Get]] so getters run. `excluded` holds
+    /// string keys to skip (the BindingRestProperty / AssignmentRestProperty exclusion set; symbol
+    /// keys are never excluded by a string rest). A throwing getter / abrupt [[OwnPropertyKeys]] (a
+    /// Proxy) propagates. The single primitive behind object spread `{...src}` and the two
+    /// destructuring rest forms (§14.3.3 BindingRestProperty / §13.15.5.4 AssignmentRestProperty).
+    /// Returns null on success, or the abrupt Completion (a throwing getter / Proxy trap) to propagate.
+    fn copyDataPropertiesExcluding(self: *Interpreter, target: *Object, source: Value, excluded: []const []const u8) EvalError!?Completion {
         switch (source) {
-            .undefined, .null => return,
+            .undefined, .null => return null,
             .object => |o| {
-                if (o.kind == .array) {
-                    for (o.elements.items, 0..) |el, i| {
-                        const k = try self.toString(.{ .number = @floatFromInt(i) });
-                        try target.set(k, el);
+                // §7.3.25 step 4: From = ToObject(source); keys = From.[[OwnPropertyKeys]]().
+                const keys = switch (try self.ordinaryOwnKeys(o)) {
+                    .keys => |k| k,
+                    .abrupt => |c| return c,
+                };
+                for (keys) |key| {
+                    switch (key) {
+                        .string => |ks| {
+                            // §7.3.25 step 5.a: skip keys in the exclusion set (string rest only).
+                            for (excluded) |ek| {
+                                if (std.mem.eql(u8, ek, ks)) break;
+                            } else {
+                                // Own + Enumerable check, then [[Get]] + CreateDataPropertyOrThrow.
+                                const desc = switch (try self.ordinaryGetOwnProperty(o, ks)) {
+                                    .pv => |pv| pv orelse continue,
+                                    .abrupt => |c| return c,
+                                };
+                                if (!desc.enumerable) continue;
+                                const gc = try self.getProperty(source, ks);
+                                if (gc.isAbrupt()) return gc;
+                                try target.set(ks, gc.normal);
+                            }
+                        },
+                        .symbol => |sym| {
+                            const desc = switch (try self.ordinaryGetOwnPropertySymbol(o, sym)) {
+                                .pv => |pv| pv orelse continue,
+                                .abrupt => |c| return c,
+                            };
+                            if (!desc.enumerable) continue;
+                            const gc = try self.getSymbolProperty(source, sym);
+                            if (gc.isAbrupt()) return gc;
+                            try target.setSymbol(sym, gc.normal);
+                        },
+                        else => {},
                     }
                 }
-                var it = o.properties.iterator();
-                while (it.next()) |entry| {
-                    if (!entry.value_ptr.enumerable) continue; // §7.3.25: own ENUMERABLE keys only
-                    const gc = try self.getProperty(source, entry.key_ptr.*);
-                    if (gc.isAbrupt()) return; // a throwing getter aborts copy (best-effort here)
-                    try target.set(entry.key_ptr.*, gc.normal);
-                }
+                return null;
             },
             .string => |s| {
-                // Strings spread their index properties + length (own enumerable: the indices).
-                for (0..s.len) |i| {
-                    const k = try self.toString(.{ .number = @floatFromInt(i) });
-                    try target.set(k, .{ .string = s[i .. i + 1] });
+                // §7.3.25: a primitive String boxes to enumerable character-index own properties.
+                for (0..sutf16.utf16Length(s)) |i| {
+                    const k = try numberToString(self.arena, @floatFromInt(i));
+                    for (excluded) |ek| {
+                        if (std.mem.eql(u8, ek, k)) break;
+                    } else try target.set(k, .{ .string = try sutf16.charAtAlloc(self.arena, s, i) });
                 }
+                return null;
             },
-            else => return,
+            else => return null,
         }
+    }
+
+    /// Object spread `{...source}` — §7.3.25 CopyDataProperties with no exclusions. Returns the abrupt
+    /// Completion (throwing getter / revoked Proxy) to propagate, else null.
+    fn copyDataProperties(self: *Interpreter, target: *Object, source: Value) EvalError!?Completion {
+        return self.copyDataPropertiesExcluding(target, source, &.{});
     }
 
     /// §13.3.9 Optional chain evaluation — a thin wrapper returning the chain's value (the receiver
@@ -3270,27 +3310,11 @@ pub const Interpreter = struct {
                     if (bc.isAbrupt()) return bc;
                 }
                 if (op.rest) |rest_name| {
-                    // §14.3.3 BindingRestProperty — own enumerable props not already destructured,
-                    // copied into a fresh ordinary object (reading via [[Get]], so getters run).
-                    const rest_obj = try Object.create(self.arena, null);
-                    if (value == .object) {
-                        var it = value.object.properties.iterator();
-                        while (it.next()) |entry| {
-                            const k = entry.key_ptr.*;
-                            var taken = false;
-                            for (excluded.items) |ek| {
-                                if (std.mem.eql(u8, ek, k)) {
-                                    taken = true;
-                                    break;
-                                }
-                            }
-                            if (!taken) {
-                                const gc = try self.getProperty(value, k);
-                                if (gc.isAbrupt()) return gc;
-                                try rest_obj.set(k, gc.normal);
-                            }
-                        }
-                    }
+                    // §14.3.3 BindingRestProperty — §7.3.25 CopyDataProperties of the own enumerable
+                    // (string + symbol) props not already destructured, in [[OwnPropertyKeys]] order,
+                    // into a fresh ordinary object (reading via [[Get]], so getters run).
+                    const rest_obj = try Object.create(self.arena, self.objectProto());
+                    if (try self.copyDataPropertiesExcluding(rest_obj, value, excluded.items)) |abrupt| return abrupt;
                     try env.declare(rest_name, .{ .object = rest_obj }, mutable, true);
                 }
                 return .{ .normal = .undefined };
@@ -3352,29 +3376,17 @@ pub const Interpreter = struct {
                 if (value == .undefined or value == .null) {
                     return self.throwError("TypeError", "Cannot destructure null or undefined");
                 }
+                // §13.15.5.4: the set of string keys bound by earlier properties is excluded from the
+                // rest. Each property's key (incl. a ComputedPropertyName) is evaluated ONCE in source
+                // order; record it here so a trailing `...rest` skips it (CopyDataProperties exclusion).
+                var excluded: std.ArrayList([]const u8) = .empty;
                 for (props) |p| {
                     if (p.kind == .spread) {
-                        // §13.15.5.4 AssignmentRestProperty — remaining own enumerable props not named
-                        // by an earlier property, copied into a fresh object (CopyDataProperties).
+                        // §13.15.5.4 AssignmentRestProperty — §7.3.25 CopyDataProperties of the remaining
+                        // own enumerable (string + symbol) props not named by an earlier property, in
+                        // [[OwnPropertyKeys]] order, into a fresh object.
                         const rest_obj = try Object.create(self.arena, self.objectProto());
-                        if (value == .object) {
-                            var it = value.object.properties.iterator();
-                            while (it.next()) |entry| {
-                                if (!entry.value_ptr.enumerable) continue;
-                                const k = entry.key_ptr.*;
-                                var taken = false;
-                                for (props) |q| {
-                                    if (q.kind == .init and std.mem.eql(u8, q.key, k)) {
-                                        taken = true;
-                                        break;
-                                    }
-                                }
-                                if (taken) continue;
-                                const gc = try self.getProperty(value, k);
-                                if (gc.isAbrupt()) return gc;
-                                try rest_obj.set(k, gc.normal);
-                            }
-                        }
+                        if (try self.copyDataPropertiesExcluding(rest_obj, value, excluded.items)) |abrupt| return abrupt;
                         const rc = try self.assignTargetNode(p.value, .{ .object = rest_obj }, env);
                         if (rc.isAbrupt()) return rc;
                         continue;
@@ -3383,6 +3395,8 @@ pub const Interpreter = struct {
                     // shorthand-with-default `{x = default}`.
                     const key = try self.propKey(p, env);
                     if (key.isAbrupt()) return key.completion;
+                    // A string key (not a symbol) excludes the rest copy (a symbol never collides).
+                    if (key.symbol == null) try excluded.append(self.arena, key.key);
                     const gc = try self.getProperty(value, key.key);
                     if (gc.isAbrupt()) return gc;
                     var v = gc.normal;
@@ -6508,8 +6522,9 @@ pub const Interpreter = struct {
             for (try o.arrayIndices(self.arena)) |i| try list.append(self.arena, .{ .string = try numberToString(self.arena, @floatFromInt(i)) });
             try list.append(self.arena, .{ .string = "length" });
         }
-        var pit = o.properties.iterator();
-        while (pit.next()) |entry| try list.append(self.arena, .{ .string = entry.key_ptr.* });
+        // §10.1.11.1: integer-index string keys ascending, then the rest in insertion order, then
+        // Symbol keys last. `orderedStringKeys` handles the index/insertion partition for the store.
+        for (try o.orderedStringKeys(self.arena)) |key| try list.append(self.arena, .{ .string = key });
         for (o.symbol_props.items) |sp| try list.append(self.arena, .{ .symbol = sp.key });
         return .{ .keys = try list.toOwnedSlice(self.arena) };
     }
