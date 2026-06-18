@@ -30,6 +30,10 @@ const builtins = @import("builtins.zig");
 const bigint = @import("bigint.zig");
 const Parser = @import("parser.zig").Parser;
 const module_mod = @import("module.zig");
+const interp_property = @import("interp_property.zig");
+const interp_module = @import("interp_module.zig");
+const interp_class = @import("interp_class.zig");
+const interp_iter = @import("interp_iter.zig");
 
 // ECMA-262 abstract operations live in abstract_ops.zig; alias them so call sites read naturally.
 const toNumber = ops.toNumber;
@@ -215,7 +219,7 @@ pub const Interpreter = struct {
         return last;
     }
 
-    fn tick(self: *Interpreter) EvalError!void {
+    pub fn tick(self: *Interpreter) EvalError!void {
         self.steps += 1;
         if (self.steps > self.step_limit) return EvalError.StepLimitExceeded;
     }
@@ -227,299 +231,12 @@ pub const Interpreter = struct {
     /// unresolvable / ambiguous import binding, §16.2.1.6.3 ResolveExport) is reported as an engine
     /// `throw` of a SyntaxError so the runner classifies a `negative: { phase: resolution }` test.
     pub fn runModule(self: *Interpreter, root: *module_mod.ModuleRecord, global: *Environment) EvalError!Completion {
-        self.strict = true;
-        // §9.4.1 module top-level `this` is undefined.
-        self.this_val = .undefined;
-        try self.linkModule(root, global);
-        const lc = try self.instantiateModule(root);
-        if (lc.isAbrupt()) return lc;
-        // §16.2.1.6 if the root module has top-level await ([[HasTLA]]), evaluate it asynchronously:
-        // its body runs on the async substrate and suspends at each `await`. The returned value is the
-        // module's evaluation promise, pending until the realm Job-queue drain (driven by the caller)
-        // resumes the body to its terminal completion (then fulfilled / rejected). The engine reads the
-        // settled promise state after the drain to surface the module's final result.
-        if (root.program.has_top_level_await) return self.runModuleAsync(root);
-        return self.evaluateModule(root);
-    }
-
-    /// §16.2.1.6 ExecuteAsyncModule — evaluate a top-level-await root module asynchronously. First
-    /// evaluate its dependencies synchronously (the documented single-awaiting-root scope), then spawn
-    /// an async body thread (reusing the §27.7 Generator substrate) that runs the module's top-level
-    /// statements; `await` suspends via the shared handoff. Returns the (pending) module promise; the
-    /// body resumes during the caller's Job drain, ultimately fulfilling/rejecting that promise.
-    fn runModuleAsync(self: *Interpreter, root: *module_mod.ModuleRecord) EvalError!Completion {
-        // Evaluate dependencies first (synchronously) so their bindings are live before the root runs.
-        for (root.deps) |dep| {
-            const c = try self.evaluateModule(dep);
-            if (c.isAbrupt()) return c;
-        }
-        const env = root.env.?;
-        const promise = try self.newPromise();
-        const gen = try self.arena.create(object_mod.Generator);
-        gen.* = .{
-            // SAFETY: a module-body Generator (`module_run` set) has no function object — `func` is
-            // never read on this path (`runGeneratorBody` returns at the `module_run` branch before
-            // touching `gen.func`, and the async-module body thread never calls the function-body code).
-            .func = undefined,
-            .args = &.{},
-            .this_val = .undefined,
-            .home_object = null,
-            .is_async = true,
-            .promise = promise,
-            .module_run = .{ .statements = root.program.statements, .env = env },
-        };
-        if (self.gen_registry) |reg| try reg.append(self.arena, gen);
-        gen.state = .executing;
-        gen.resume_kind = .next;
-        gen.sent_value = .undefined;
-        const t = std.Thread.spawn(.{}, asyncModuleBodyThread, .{ self, root, gen }) catch {
-            gen.state = .completed;
-            return self.throwError("RangeError", "Cannot spawn async module thread");
-        };
-        gen.thread = t;
-        gen.to_caller.waitUncancelable(self.io); // run to first await / completion
-        try self.settleAsyncTransfer(gen);
-        root.status = .evaluated;
-        return .{ .normal = .{ .object = promise } };
-    }
-
-    /// The async module-body thread (mirrors `asyncBodyThread`): a fresh body interpreter sharing the
-    /// realm, with `current_gen` set so top-level `await` reaches the handoff. Runs the module's
-    /// statements; on a normal terminal completion refreshes the module's namespace snapshot (post-eval
-    /// export values), then posts the terminal transfer (ret/throw) so the caller settles the module
-    /// promise. The settled promise state is the module's evaluation result the engine reads.
-    fn asyncModuleBodyThread(parent: *Interpreter, root: *module_mod.ModuleRecord, gen: *object_mod.Generator) void {
-        var body: Interpreter = .{
-            .arena = parent.arena,
-            .step_limit = parent.step_limit,
-            .globals = parent.globals,
-            .gen_registry = parent.gen_registry,
-            .job_queue = parent.job_queue,
-            .io = parent.io,
-            .current_gen = gen,
-            // Top-level-await module code may call the Test262 `$DONE` sink directly (the `[async]`
-            // module contract); the body thread needs the shared sink so that call is recorded.
-            .async_done = parent.async_done,
-        };
-        const comp = body.runGeneratorBody(gen) catch |e| blk: {
-            const kind: []const u8 = if (e == error.StepLimitExceeded) "RangeError" else "Error";
-            const msg: []const u8 = if (e == error.StepLimitExceeded) "step limit exceeded" else "out of memory";
-            const tc = body.throwError(kind, msg) catch break :blk Completion{ .throw = .undefined };
-            break :blk tc;
-        };
-        switch (comp) {
-            .normal, .ret => {
-                // Refresh the namespace snapshot with the final export values (a populate engine error
-                // becomes a throw transfer so it surfaces rather than being silently dropped).
-                if (root.namespace) |ns| {
-                    if (body.populateNamespace(root, ns)) |_| {
-                        gen.transfer_value = .undefined;
-                        gen.transfer_kind = .ret;
-                    } else |_| {
-                        const tc = body.throwError("Error", "module namespace finalization failed") catch Completion{ .throw = .undefined };
-                        gen.transfer_value = tc.throw;
-                        gen.transfer_kind = .throw;
-                    }
-                } else {
-                    gen.transfer_value = .undefined;
-                    gen.transfer_kind = .ret;
-                }
-            },
-            .throw => |v| {
-                gen.transfer_value = v;
-                gen.transfer_kind = .throw;
-            },
-            .brk, .cont => {
-                gen.transfer_value = .undefined;
-                gen.transfer_kind = .ret;
-            },
-        }
-        gen.to_caller.post(body.io);
-    }
-
-    /// §16.2.1.6.2 InnerModuleLinking — create each module's environment and hoist its top-level
-    /// declarations (depth-first over dependencies, once per module). Import bindings are created in a
-    /// SECOND pass (`instantiateModule`) once every module's environment exists.
-    fn linkModule(self: *Interpreter, m: *module_mod.ModuleRecord, global: *Environment) EvalError!void {
-        if (m.status != .unlinked) return;
-        m.status = .linking;
-        for (m.deps) |dep| try self.linkModule(dep, global);
-        const env = Environment.create(self.arena, global) catch return error.OutOfMemory;
-        env.is_var_scope = true; // a Module Environment Record is a var scope (hoist target).
-        m.env = env;
-        // §16.2.1.6.4 InitializeEnvironment (declaration step): hoist top-level lexical + var +
-        // function/class names as TDZ bindings (functions are instantiated when the body runs).
-        try self.hoistLexicalNames(m.program.statements, env);
-        try self.hoistVarNames(m.program.statements, env);
-        m.status = .linked;
-    }
-
-    /// §16.2.1.6.4 InitializeEnvironment (import step) — CreateImportBinding for each ImportEntry,
-    /// resolving the imported name in the (already-linked) source module. A namespace import binds the
-    /// source module's namespace object. Recurses over dependencies once (idempotent via status).
-    fn instantiateModule(self: *Interpreter, m: *module_mod.ModuleRecord) EvalError!Completion {
-        if (m.status == .evaluating or m.status == .evaluated or m.status == .unlinked) return .{ .normal = .undefined };
-        if (m.status == .linking) return .{ .normal = .undefined };
-        // Use `evaluating` transiently as an "imports-bound" guard to avoid re-entry on cycles.
-        m.status = .evaluating;
-        for (m.deps) |dep| {
-            const c = try self.instantiateModule(dep);
-            if (c.isAbrupt()) {
-                m.status = .linked;
-                return c;
-            }
-        }
-        const env = m.env.?;
-        for (m.program.import_entries) |ie| {
-            const src = m.depFor(ie.module_request) orelse {
-                m.status = .linked;
-                return self.throwError("SyntaxError", "unresolved module specifier");
-            };
-            if (std.mem.eql(u8, ie.import_name, "*")) {
-                const ns = try self.moduleNamespace(src);
-                env.declare(ie.local_name, .{ .object = ns }, false, true) catch return error.OutOfMemory;
-            } else {
-                // §16.2.1.6.3 ResolveExport: find the (module, local) the imported name denotes.
-                const rb = self.resolveExportBinding(src, ie.import_name) orelse {
-                    m.status = .linked;
-                    return self.throwError("SyntaxError", "the requested module does not provide an export");
-                };
-                const senv = rb.module.env orelse {
-                    m.status = .linked;
-                    return self.throwError("SyntaxError", "unresolved import");
-                };
-                env.declareImport(ie.local_name, senv, rb.local) catch return error.OutOfMemory;
-            }
-        }
-        m.status = .linked;
-        return .{ .normal = .undefined };
-    }
-
-    /// §16.2.1.6.3 ResolveExport result — the resolved binding's owning module + LOCAL name. For a
-    /// local export this is `(m, local)`; an indirect/star re-export hops to the defining module.
-    const ResolvedBinding = struct { module: *const module_mod.ModuleRecord, local: []const u8 };
-
-    /// One entry of the §16.2.1.6.3 resolveSet (a (module, exportName) pair already in flight) used to
-    /// break circular indirect/star re-export chains.
-    const ResolveVisit = struct { module: *const module_mod.ModuleRecord, name: []const u8 };
-
-    /// §16.2.1.6.3 ResolveExport — find the module + LOCAL binding name that an exported `name`
-    /// resolves to, following indirect (`export {a} from "m"`) and star (`export * from "m"`)
-    /// re-exports. A `resolveSet` breaks circular requests (a cyclic indirect re-export resolves to
-    /// null, not an infinite loop). Returns null if the name is not resolvable (or is ambiguous).
-    fn resolveExport(m: *const module_mod.ModuleRecord, name: []const u8, visited: *std.ArrayListUnmanaged(ResolveVisit), a: std.mem.Allocator) ?ResolvedBinding {
-        // §16.2.1.6.3 step 1: if (module, name) is already in the resolveSet, this is a circular
-        // request → return null (the caller treats it as "not provided here").
-        for (visited.items) |v| {
-            if (v.module == m and std.mem.eql(u8, v.name, name)) return null;
-        }
-        visited.append(a, .{ .module = m, .name = name }) catch return null;
-        // Direct local / indirect named exports.
-        for (m.program.export_entries) |e| {
-            const en = e.export_name orelse continue;
-            if (!std.mem.eql(u8, en, name)) continue;
-            if (e.module_request) |req| {
-                const dep = m.depFor(req) orelse return null;
-                const inner = e.import_name orelse return null;
-                return resolveExport(dep, inner, visited, a);
-            }
-            return .{ .module = m, .local = e.local_name orelse en };
-        }
-        // §16.2.1.6.3 star re-exports: search each `export * from "m"` for the name. The first
-        // resolution wins (ambiguity across stars is not distinguished in this minimal resolver).
-        for (m.program.export_entries) |e| {
-            if (e.export_name != null) continue;
-            const star = e.import_name orelse continue;
-            if (!std.mem.eql(u8, star, "*")) continue;
-            const req = e.module_request orelse continue;
-            const dep = m.depFor(req) orelse continue;
-            if (resolveExport(dep, name, visited, a)) |r| return r;
-        }
-        return null;
-    }
-
-    /// Resolve an exported `name` to the (module, local) binding it denotes — a thin wrapper over
-    /// `resolveExport` that owns the resolveSet. Used by import binding instantiation and namespaces.
-    fn resolveExportBinding(self: *Interpreter, m: *const module_mod.ModuleRecord, name: []const u8) ?ResolvedBinding {
-        var visited: std.ArrayListUnmanaged(ResolveVisit) = .empty;
-        return resolveExport(m, name, &visited, self.arena);
-    }
-
-    /// §16.2.1.6 InnerModuleEvaluation — evaluate dependencies first (once), then this module's body
-    /// in its environment with `this` = undefined, strict. Idempotent (a module evaluates once).
-    fn evaluateModule(self: *Interpreter, m: *module_mod.ModuleRecord) EvalError!Completion {
-        if (m.status == .evaluated or m.status == .evaluating) return .{ .normal = .undefined };
-        m.status = .evaluating;
-        for (m.deps) |dep| {
-            const c = try self.evaluateModule(dep);
-            if (c.isAbrupt()) {
-                m.status = .evaluated;
-                return c;
-            }
-        }
-        const env = m.env.?;
-        const saved_this = self.this_val;
-        const saved_strict = self.strict;
-        self.this_val = .undefined;
-        self.strict = true;
-        defer self.this_val = saved_this;
-        defer self.strict = saved_strict;
-        var last: Completion = .{ .normal = .undefined };
-        for (m.program.statements) |stmt| {
-            last = try self.evalStmt(stmt, env);
-            if (last.isAbrupt()) {
-                m.status = .evaluated;
-                return last;
-            }
-        }
-        m.status = .evaluated;
-        // After evaluation, refresh any namespace object already built for this module so its
-        // snapshot reflects the final export values.
-        if (m.namespace != null) try self.populateNamespace(m, m.namespace.?);
-        return last;
-    }
-
-    /// §10.4.6 build (and cache) the module namespace exotic object for `m`. Properties are the
-    /// module's exported names, reading the current binding values (snapshot refreshed post-eval).
-    fn moduleNamespace(self: *Interpreter, m: *module_mod.ModuleRecord) EvalError!*Object {
-        if (m.namespace) |ns| return ns;
-        const ns = Object.create(self.arena, null) catch return error.OutOfMemory;
-        m.namespace = ns;
-        try self.populateNamespace(m, ns);
-        return ns;
-    }
-
-    /// Fill a namespace object with the module's exported names → current values. Local exports read
-    /// the module env; `export * as ns` / re-exports resolve through the source module.
-    fn populateNamespace(self: *Interpreter, m: *module_mod.ModuleRecord, ns: *Object) EvalError!void {
-        for (m.program.export_entries) |e| {
-            const name = e.export_name orelse continue;
-            if (std.mem.eql(u8, name, "default") == false and e.import_name != null and std.mem.eql(u8, e.import_name.?, "*")) {
-                // `export * as sub from "m"` — value is the sub-module's namespace object.
-                const req = e.module_request orelse continue;
-                const dep = m.depFor(req) orelse continue;
-                const sub = try self.moduleNamespace(dep);
-                ns.defineData(name, .{ .object = sub }, true, true, false) catch return error.OutOfMemory;
-                continue;
-            }
-            const rb = self.resolveExportBinding(m, name) orelse continue;
-            const val = lookupModuleExport(rb.module, rb.local);
-            ns.defineData(name, val, true, true, false) catch return error.OutOfMemory;
-        }
-    }
-
-    /// Read the current value of a module's local binding (following an import alias), or undefined.
-    fn lookupModuleExport(m: *const module_mod.ModuleRecord, local: []const u8) Value {
-        const env = m.env orelse return .undefined;
-        const raw = env.lookupLocal(local) orelse return .undefined;
-        const b = Environment.resolveAlias(raw) orelse return .undefined;
-        if (!b.initialized) return .undefined;
-        return b.value;
+        return interp_module.runModule(self, root, global);
     }
 
     // ── statements ──────────────────────────────────────────────────────────
 
-    fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError!Completion {
+    pub fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError!Completion {
         try self.tick();
         // §14.13: the label(s) applying to THIS statement (set by an enclosing `labeled_stmt`) belong
         // to this statement alone — capture them and clear `pending_labels` so they don't leak into any
@@ -834,7 +551,7 @@ pub const Interpreter = struct {
     /// the scope's OWN top-level declarations are hoisted (nested blocks/loops/functions have their own
     /// scope + pass); `var`/`function` are not lexical (function declarations are separately created
     /// initialized). Names already present in `env` (the rare re-entry) are left untouched.
-    fn hoistLexicalNames(self: *Interpreter, stmts: []const ast.Stmt, env: *Environment) EvalError!void {
+    pub fn hoistLexicalNames(self: *Interpreter, stmts: []const ast.Stmt, env: *Environment) EvalError!void {
         for (stmts) |s| switch (s) {
             .declaration => |d| {
                 if (d.kind == .var_decl) continue; // §13.3.2 `var` is not a lexical (no TDZ here)
@@ -873,7 +590,7 @@ pub const Interpreter = struct {
     /// hoisted function of the same name is not clobbered). Mirrors the parser's `collectVarNames`.
     /// FunctionDeclarations are NOT collected (§14.2.2) — they are instantiated separately. Run once
     /// per Function/Script/eval entry, after `hoistLexicalNames`.
-    fn hoistVarNames(self: *Interpreter, stmts: []const ast.Stmt, scope: *Environment) EvalError!void {
+    pub fn hoistVarNames(self: *Interpreter, stmts: []const ast.Stmt, scope: *Environment) EvalError!void {
         for (stmts) |s| try self.hoistVarNamesStmt(s, scope);
     }
 
@@ -1390,7 +1107,7 @@ pub const Interpreter = struct {
 
     // ── expressions ─────────────────────────────────────────────────────────
 
-    fn evalExpr(self: *Interpreter, node: *const ast.Node, env: *Environment) EvalError!Completion {
+    pub fn evalExpr(self: *Interpreter, node: *const ast.Node, env: *Environment) EvalError!Completion {
         try self.tick();
         self.depth += 1;
         defer self.depth -= 1;
@@ -1756,60 +1473,21 @@ pub const Interpreter = struct {
     /// check). A private accessor invokes its getter with `this` = `base`; a getter-less accessor
     /// (set-only) is a TypeError on read.
     fn getPrivate(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
-        if (base != .object) return self.throwError("TypeError", "Cannot read private member from an object whose class did not declare it");
-        const o = base.object;
-        const pv = o.getPrivate(key) orelse
-            return self.throwError("TypeError", "Cannot read private member from an object whose class did not declare it");
-        switch (pv.payload) {
-            .data => |v| return .{ .normal = v },
-            .accessor => |a| {
-                const getter = a.get orelse return self.throwError("TypeError", "'#x' was defined without a getter");
-                return self.callFunction(getter, &.{}, base);
-            },
-        }
+        return interp_property.getPrivate(self, base, key);
     }
 
     /// §15.7 PrivateSet — write PrivateName `key` on `base`'s own private slot. The brand must exist
     /// (TypeError otherwise). A private field is writable; a private method is read-only (TypeError on
     /// assignment); a private accessor invokes its setter with `this` = `base` (set-less → TypeError).
     fn setPrivate(self: *Interpreter, base: Value, key: []const u8, value: Value) EvalError!Completion {
-        if (base != .object) return self.throwError("TypeError", "Cannot write private member to an object whose class did not declare it");
-        const o = base.object;
-        const pv = o.getPrivate(key) orelse
-            return self.throwError("TypeError", "Cannot write private member to an object whose class did not declare it");
-        switch (pv.payload) {
-            .data => |v| {
-                // A private METHOD slot holds a function and is not assignable; a private FIELD is.
-                if (v == .object and v.object.kind == .function and v.object.call != null and v.object.call.?.is_private_method) {
-                    return self.throwError("TypeError", "Cannot write to private method");
-                }
-                try o.setPrivate(key, value);
-                return .{ .normal = value };
-            },
-            .accessor => |a| {
-                const setter = a.set orelse return self.throwError("TypeError", "'#x' was defined without a setter");
-                const sc = try self.callFunction(setter, &.{value}, base);
-                if (sc.isAbrupt()) return sc;
-                return .{ .normal = value };
-            },
-        }
+        return interp_property.setPrivate(self, base, key, value);
     }
 
     /// §13.3.5 GetSuperBase + Get — resolve `super.<key>` against the active method's
     /// [[HomeObject]].[[Prototype]], invoking accessors with `this` = the current `this` (the
     /// receiver), NOT against `this`'s own properties. A missing home/proto yields `undefined`.
     fn getSuperProperty(self: *Interpreter, key: []const u8) EvalError!Completion {
-        const home = self.home_object orelse return .{ .normal = .undefined };
-        const base = home.prototype orelse return .{ .normal = .undefined };
-        const loc = base.getProp(key) orelse return .{ .normal = .undefined };
-        switch (loc.pv.payload) {
-            .data => |v| return .{ .normal = v },
-            // §10.2.x: a getter found on the super chain runs with `this` = the current receiver.
-            .accessor => |a| {
-                const getter = a.get orelse return .{ .normal = .undefined };
-                return self.callFunction(getter, &.{}, self.this_val);
-            },
-        }
+        return interp_property.getSuperProperty(self, key);
     }
 
     /// §13.3.5/§6.2.5.6 SuperProperty write — `super.x = v`. The reference's base is the home
@@ -1818,22 +1496,7 @@ pub const Interpreter = struct {
     /// written on the RECEIVER (the instance), not the prototype. (A non-writable data property on
     /// the super chain rejecting the write is an M-subset-deferred edge — see spec 060.)
     fn setSuperProperty(self: *Interpreter, key: []const u8, value: Value) EvalError!Completion {
-        if (self.home_object) |home| if (home.prototype) |base| {
-            if (base.getProp(key)) |loc| switch (loc.pv.payload) {
-                .accessor => |a| {
-                    const setter = a.set orelse {
-                        if (self.strict) return self.throwError("TypeError", "Cannot set property with only a getter");
-                        return .{ .normal = value };
-                    };
-                    const c = try self.callFunction(setter, &.{value}, self.this_val);
-                    if (c.isAbrupt()) return c;
-                    return .{ .normal = value };
-                },
-                .data => {},
-            };
-        };
-        // No accessor on the super chain → Set on the receiver (this), per OrdinarySet.
-        return self.setProperty(self.this_val, key, value);
+        return interp_property.setSuperProperty(self, key, value);
     }
 
     /// §13.3.7.1 SuperCall — invoke the superclass constructor with the current `this`. M-subset:
@@ -2211,11 +1874,7 @@ pub const Interpreter = struct {
     /// instance — so subclassing works and the wrapper's prototype methods recover the value. A plain
     /// call (no new_target) returns the primitive.
     fn wrapperResult(self: *Interpreter, prim: Value, this_val: Value) Completion {
-        if (self.native_new_target != .undefined and this_val == .object) {
-            this_val.object.primitive = prim;
-            return .{ .normal = this_val };
-        }
-        return .{ .normal = prim };
+        return interp_class.wrapperResult(self, prim, this_val);
     }
 
     /// §15.7.14: run a parent constructor `sup` on an existing `instance` (the `super(...)` /
@@ -2223,21 +1882,7 @@ pub const Interpreter = struct {
     /// before its body; a DERIVED parent runs its own body (which calls its own `super(...)`), so its
     /// fields are handled by that nested call. The parent's `home_object` is installed by callFunction.
     fn runParentCtor(self: *Interpreter, sup: *Object, args: []const Value, instance: *Object) EvalError!Completion {
-        if (sup.call) |sfd| {
-            if (!sfd.is_derived_ctor) {
-                const fc = try self.initInstanceFields(sfd, instance);
-                if (fc.isAbrupt()) return fc;
-            }
-        }
-        // §13.3.12: `new.target` propagates DOWN a `super(...)` chain unchanged — the parent constructor
-        // sees the SAME [[NewTarget]] as the derived class that invoked it (the original `new` target).
-        // The active `new_target` is that value (set when this derived ctor body / construct began).
-        // A `super(...)` is ALWAYS a [[Construct]], so signal that to `callFunction` (whose §15.7.14
-        // class-ctor [[Call]] guard keys on a non-undefined hand-off) even in the edge where the active
-        // new_target was lost — e.g. an arrow `() => super()` invoked from an iterator-return handler
-        // after the derived ctor body already left (the parent ctor `sup` is itself the fallback marker).
-        self.pending_new_target = if (self.new_target == .undefined) .{ .object = sup } else self.new_target;
-        return self.callFunction(sup, args, .{ .object = instance });
+        return interp_class.runParentCtor(self, sup, args, instance);
     }
 
     /// §15.7.14 InitializeInstanceElements — add this class's PrivateName brand (private fields /
@@ -2246,66 +1891,7 @@ pub const Interpreter = struct {
     /// the class's defining environment (so an initializer may reference the class name / outer
     /// bindings). A field with no initializer is created with value `undefined`.
     fn initInstanceFields(self: *Interpreter, fd: @import("object.zig").FunctionData, instance: *Object) EvalError!Completion {
-        // §15.7: install the private brand first — private methods/accessors are shared (recorded at
-        // class definition), and private fields' initializers run with `this` = the instance below.
-        const pc = try self.installPrivateElements(fd, instance);
-        if (pc.isAbrupt()) return pc;
-        if (fd.fields.len == 0) return .{ .normal = .undefined };
-        const field_env = try Environment.create(self.arena, fd.closure);
-        const saved_this = self.this_val;
-        self.this_val = .{ .object = instance };
-        defer self.this_val = saved_this;
-        // §13.3.5: a field initializer's [[HomeObject]] is the class's `.prototype` (the ctor's home),
-        // so `super.x` inside an initializer resolves against the superclass prototype.
-        const saved_home = self.home_object;
-        self.home_object = fd.home_object;
-        defer self.home_object = saved_home;
-        for (fd.fields) |field| {
-            var v: Value = .undefined;
-            if (field.init) |ie| {
-                const ic = try self.evalExpr(ie, field_env);
-                if (ic.isAbrupt()) return ic;
-                v = ic.normal;
-                // §15.7.10 / §8.4 NamedEvaluation: a field with an anonymous function/class initializer
-                // gets the field name (string key, or "[desc]" for a symbol-keyed field).
-                const fname = if (field.key_symbol) |sym| try self.symbolPropName(sym) else field.key;
-                try self.maybeSetAnonName(ie, v, fname);
-            }
-            if (field.key_symbol) |sym| try instance.setSymbol(sym, v) else try instance.set(field.key, v);
-        }
-        return .{ .normal = .undefined };
-    }
-
-    /// §15.7 install this class's instance PrivateName elements on `instance` (its brand): private
-    /// methods/accessors (shared function objects, copied/merged into the private slot) and private
-    /// fields (initializer run with `this` = the instance, in the class's defining scope). Done in
-    /// declaration order so a later field initializer may call an earlier private method.
-    fn installPrivateElements(self: *Interpreter, fd: @import("object.zig").FunctionData, instance: *Object) EvalError!Completion {
-        if (fd.private_elements.len == 0) return .{ .normal = .undefined };
-        const env = try Environment.create(self.arena, fd.closure);
-        const saved_this = self.this_val;
-        const saved_home = self.home_object;
-        self.this_val = .{ .object = instance };
-        self.home_object = fd.home_object; // the class `.prototype` (so `super.x` resolves)
-        defer self.this_val = saved_this;
-        defer self.home_object = saved_home;
-        for (fd.private_elements) |pe| {
-            switch (pe.kind) {
-                .method => try instance.setPrivate(pe.key, .{ .object = pe.func.? }),
-                .get => try instance.definePrivateAccessor(pe.key, pe.func.?, null),
-                .set => try instance.definePrivateAccessor(pe.key, null, pe.func.?),
-                .field => {
-                    var v: Value = .undefined;
-                    if (pe.init) |ie| {
-                        const ic = try self.evalExpr(ie, env);
-                        if (ic.isAbrupt()) return ic;
-                        v = ic.normal;
-                    }
-                    try instance.setPrivate(pe.key, v);
-                },
-            }
-        }
-        return .{ .normal = .undefined };
+        return interp_class.initInstanceFields(self, fd, instance);
     }
 
     /// §13.2.5 ObjectLiteral evaluation — a fresh ordinary object (proto-linked to Object.prototype
@@ -2424,31 +2010,6 @@ pub const Interpreter = struct {
         return .{ .key = try self.toString(v) };
     }
 
-    /// §15.7.14 resolve a ClassElement's PropertyName: a computed `[expr]` (evaluated in the class
-    /// scope at definition time, ToPropertyKey → ToString in the M-subset) or the static key parsed
-    /// earlier. Mirrors `propKey` for object-literal members.
-    fn classElementKey(self: *Interpreter, el: ast.ClassElement, env: *Environment) EvalError!KeyResult {
-        if (el.computed_key) |ck| {
-            const c = try self.evalExpr(ck, env);
-            if (c.isAbrupt()) return .{ .completion = c };
-            return self.toPropertyKey(c.normal); // §7.1.19 ToPropertyKey (Symbol stays; object → ToPrimitive)
-        }
-        return .{ .key = el.key };
-    }
-
-    /// §15.7.14 step 4 / §10.2.4: a STATIC class element keyed `"prototype"` (literal or a computed key
-    /// evaluating to the string `"prototype"`) is a TypeError — DefinePropertyOrThrow on the
-    /// constructor's non-configurable, non-writable `prototype` own property fails. A symbol key is
-    /// always distinct from the string `"prototype"`, and instance elements install on `.prototype`
-    /// (where `prototype` is a fine key), so neither is affected. Returns the abrupt completion to
-    /// propagate when this rule fires, else null.
-    fn staticPrototypeKeyError(self: *Interpreter, is_static: bool, key: KeyResult) EvalError!?Completion {
-        if (is_static and key.symbol == null and std.mem.eql(u8, key.key, "prototype")) {
-            return try self.throwError("TypeError", "Classes may not have a static property named 'prototype'");
-        }
-        return null;
-    }
-
     /// §7.3.25 CopyDataProperties — copy `source`'s own enumerable properties (string AND symbol
     /// keyed) into `target` in [[OwnPropertyKeys]] order (integer indices ascending, then strings in
     /// insertion order, then symbols), reading each via [[Get]] so getters run. `excluded` holds
@@ -2458,65 +2019,13 @@ pub const Interpreter = struct {
     /// destructuring rest forms (§14.3.3 BindingRestProperty / §13.15.5.4 AssignmentRestProperty).
     /// Returns null on success, or the abrupt Completion (a throwing getter / Proxy trap) to propagate.
     fn copyDataPropertiesExcluding(self: *Interpreter, target: *Object, source: Value, excluded: []const []const u8) EvalError!?Completion {
-        switch (source) {
-            .undefined, .null => return null,
-            .object => |o| {
-                // §7.3.25 step 4: From = ToObject(source); keys = From.[[OwnPropertyKeys]]().
-                const keys = switch (try self.ordinaryOwnKeys(o)) {
-                    .keys => |k| k,
-                    .abrupt => |c| return c,
-                };
-                for (keys) |key| {
-                    switch (key) {
-                        .string => |ks| {
-                            // §7.3.25 step 5.a: skip keys in the exclusion set (string rest only).
-                            for (excluded) |ek| {
-                                if (std.mem.eql(u8, ek, ks)) break;
-                            } else {
-                                // Own + Enumerable check, then [[Get]] + CreateDataPropertyOrThrow.
-                                const desc = switch (try self.ordinaryGetOwnProperty(o, ks)) {
-                                    .pv => |pv| pv orelse continue,
-                                    .abrupt => |c| return c,
-                                };
-                                if (!desc.enumerable) continue;
-                                const gc = try self.getProperty(source, ks);
-                                if (gc.isAbrupt()) return gc;
-                                try target.set(ks, gc.normal);
-                            }
-                        },
-                        .symbol => |sym| {
-                            const desc = switch (try self.ordinaryGetOwnPropertySymbol(o, sym)) {
-                                .pv => |pv| pv orelse continue,
-                                .abrupt => |c| return c,
-                            };
-                            if (!desc.enumerable) continue;
-                            const gc = try self.getSymbolProperty(source, sym);
-                            if (gc.isAbrupt()) return gc;
-                            try target.setSymbol(sym, gc.normal);
-                        },
-                        else => {},
-                    }
-                }
-                return null;
-            },
-            .string => |s| {
-                // §7.3.25: a primitive String boxes to enumerable character-index own properties.
-                for (0..sutf16.utf16Length(s)) |i| {
-                    const k = try numberToString(self.arena, @floatFromInt(i));
-                    for (excluded) |ek| {
-                        if (std.mem.eql(u8, ek, k)) break;
-                    } else try target.set(k, .{ .string = try sutf16.charAtAlloc(self.arena, s, i) });
-                }
-                return null;
-            },
-            else => return null,
-        }
+        return interp_property.copyDataPropertiesExcluding(self, target, source, excluded);
     }
 
     /// Object spread `{...source}` — §7.3.25 CopyDataProperties with no exclusions. Returns the abrupt
     /// Completion (throwing getter / revoked Proxy) to propagate, else null.
     fn copyDataProperties(self: *Interpreter, target: *Object, source: Value) EvalError!?Completion {
-        return self.copyDataPropertiesExcluding(target, source, &.{});
+        return interp_property.copyDataProperties(self, target, source);
     }
 
     /// §13.3.9 Optional chain evaluation — a thin wrapper returning the chain's value (the receiver
@@ -2597,275 +2106,13 @@ pub const Interpreter = struct {
     /// inheritance; `extends null` → `proto.[[Prototype]]` = null), and every method gets a
     /// [[HomeObject]] so `super.x` resolves; a derived constructor records its `super_ctor`.
     fn evalClass(self: *Interpreter, c: *const ast.Class, env: *Environment) EvalError!Completion {
-        // §15.7.14: a class is created in a new declarative scope that holds the (immutable) class
-        // binding for self-reference. Methods/field initializers close over this scope.
-        const class_env = try Environment.create(self.arena, env);
-        // §15.7.14 step 4: CreateImmutableBinding(className) as UNINITIALIZED (TDZ) BEFORE evaluating
-        // the heritage, so a self-reference in `extends` (`class x extends x {}`) is a ReferenceError.
-        // Re-declared as the initialized class object after the constructor is built (below).
-        if (c.name) |name| try class_env.declare(name, .undefined, false, false);
-
-        // §15.7.14 ClassHeritage: evaluate `extends LHS`. `super_ctor` is the parent constructor
-        // (null for `extends null` and for a non-derived class); `is_derived` is set by the presence
-        // of the heritage clause (so `extends null` is still a derived class with no parent ctor).
-        var super_ctor: ?*Object = null;
-        var super_proto: ?*Object = null; // the prototype to link the instance `.prototype` to
-        var super_proto_is_null = false; // `extends null` explicitly links to null
-        const is_derived = c.superclass != null;
-        if (c.superclass) |se| {
-            const sc = try self.evalExpr(se, class_env);
-            if (sc.isAbrupt()) return sc;
-            switch (sc.normal) {
-                .null => super_proto_is_null = true, // §15.7.14: `extends null`
-                .object => |so| {
-                    // §15.7.14: the superclass must be a constructor with an object/null `.prototype`.
-                    if (so.kind != .function) return self.throwError("TypeError", "Class extends value is not a constructor or null");
-                    super_ctor = so;
-                    // §15.7.14: protoParent = Get(superclass, "prototype"); it must be an Object or
-                    // null — a present primitive (number/string/undefined/…) is a TypeError. An object
-                    // links the derived prototype; null links to null (no parent prototype).
-                    if (so.get("prototype")) |pv| switch (pv) {
-                        .object => |po| super_proto = po,
-                        .null => {},
-                        else => return self.throwError("TypeError", "Class extends value does not have a valid prototype property"),
-                    };
-                },
-                else => return self.throwError("TypeError", "Class extends value is not a constructor or null"),
-            }
-        }
-
-        // Locate the explicit constructor (if any). Instance field records are collected during the
-        // definition-order installation pass below (their keys — including computed `[expr]` keys —
-        // are evaluated at class-definition time, §15.7.14 ClassElementEvaluation) and attached to the
-        // constructor's FunctionData afterward.
-        var ctor_fn: ?*const ast.Function = null;
-        for (c.elements) |el| {
-            if (el.kind == .constructor) ctor_fn = el.value.func;
-        }
-        var fields: std.ArrayListUnmanaged(@import("object.zig").FieldInit) = .empty;
-
-        // §15.7.14: build the constructor function object. Default constructor: a base class gets an
-        // empty body; a derived class's default constructor forwards its args to `super(...)` (handled
-        // by `is_derived_ctor` + an implicit super-call in evalNew when there's no explicit ctor body).
-        const ctor = try Object.createFunction(self.arena, .{
-            .params = if (ctor_fn) |f| f.params else &.{},
-            .rest = if (ctor_fn) |f| f.rest else null,
-            .body = if (ctor_fn) |f| f.body else &.{},
-            .closure = class_env,
-            .is_class_ctor = true,
-            .is_derived_ctor = is_derived,
-            .is_default_ctor = ctor_fn == null, // no explicit `constructor` → synthesized default
-            .super_ctor = super_ctor,
-            .strict = true, // §15.7: a class body (and thus its constructor) is always strict
-        });
-        ctor.prototype = self.functionProto(); // §20.2.3 default; a derived class overrides to Super below
-        // The constructor's `.prototype` object holds the instance methods.
-        const proto: *Object = blk: {
-            const pv = ctor.get("prototype") orelse break :blk try Object.create(self.arena, null);
-            break :blk if (pv == .object) pv.object else try Object.create(self.arena, null);
-        };
-        // §15.7.14: a class constructor's [[HomeObject]] is its `.prototype` (so `super.x` in the
-        // constructor resolves against `Super.prototype`); the ctor reads its own `super_ctor` for
-        // `super(...)` via `proto.constructor`.
-        if (ctor.call) |*fd| fd.home_object = proto;
-        // §15.7.14 step 13 / §10.2.4 MakeConstructor: a class constructor's `prototype` own property is
-        // { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false } (an ordinary function
-        // gets a writable one; `createFunction` defaulted to writable). Lock it here so a later
-        // `static prototype`/`static get ['prototype']` element hits DefinePropertyOrThrow on a
-        // non-configurable property and throws (§14.5 prototype-property; static-prototype tests).
-        try ctor.defineData("prototype", .{ .object = proto }, false, false, false);
-        // §15.7.14: the `constructor` own property of `.prototype` is non-enumerable (writable +
-        // configurable). `set` would make it enumerable, so define it explicitly.
-        try proto.defineData("constructor", .{ .object = ctor }, true, false, true);
-        // §20.2.4.1/.2: the constructor's `length` = ExpectedArgumentCount of its params; its `name`
-        // is the class name (or "" for an anonymous class expression — a NamedEvaluation site may
-        // rename it). §15.7.14 step 17/18 SetFunctionName/SetFunctionLength on the constructor.
-        try setFunctionLength(ctor, paramCount(ctor.call.?.params));
-        try self.setFunctionName(ctor, c.name orelse "", "");
-
-        // §15.7.14 link the prototype chains for inheritance.
-        if (is_derived) {
-            // `proto.[[Prototype]]` = `Super.prototype` (or null for `extends null` / a parent whose
-            // `.prototype` is not an object).
-            proto.prototype = if (super_proto_is_null) null else super_proto;
-            // `ctor.[[Prototype]]` = `Super` (static inheritance). For `extends null` there is no
-            // parent constructor, so static inheritance falls back to the default function proto chain.
-            ctor.prototype = super_ctor;
-        } else {
-            // §15.7.14 step 6.a: a base class (no `extends`) has `protoParent` = %Object.prototype%, so
-            // `C.prototype.[[Prototype]]` is `Object.prototype` (the freshly-created proto object that
-            // `createFunction` made has a null [[Prototype]] — relink it here).
-            proto.prototype = self.objectProto();
-        }
-
-        // §15.7.14 ClassElementEvaluation: walk the ClassBody in definition order, installing methods,
-        // accessors, and static fields, and collecting instance-field records. Instance members →
-        // `.prototype`, static members → the constructor object. A computed `[expr]` PropertyName is
-        // evaluated HERE (definition order, ToPropertyKey → ToString in the M-subset), so its
-        // side-effects interleave with the other elements. Each method/accessor's [[HomeObject]] is its
-        // install target (so `super.x` inside it looks up `home_object.[[Prototype]]`).
-        var private_elements: std.ArrayListUnmanaged(@import("object.zig").PrivateElement) = .empty;
-        for (c.elements) |el| {
-            switch (el.kind) {
-                .constructor => {}, // already the [[Call]] body
-                .static_block => {
-                    // §15.7.11: a ClassStaticBlock runs once at class definition with `this` = the
-                    // constructor, in a scope child of the class scope. Its [[HomeObject]] is the
-                    // constructor (so `super.x` resolves against `Super`).
-                    const block_env = try Environment.create(self.arena, class_env);
-                    block_env.is_var_scope = true; // §15.7.11: a ClassStaticBlock is its own VariableEnvironment
-                    try self.hoistVarNames(el.value.block, block_env);
-                    const saved_this = self.this_val;
-                    const saved_home = self.home_object;
-                    self.this_val = .{ .object = ctor };
-                    self.home_object = ctor;
-                    const bc = self.runBlockBody(el.value.block, block_env);
-                    self.this_val = saved_this;
-                    self.home_object = saved_home;
-                    const r = try bc;
-                    if (r.isAbrupt()) return r;
-                },
-                .method => {
-                    const target = if (el.is_static) ctor else proto;
-                    const fc = try self.evalFunctionExpr(el.value.func, class_env);
-                    if (fc.isAbrupt()) return fc;
-                    const f = fc.normal.object;
-                    // §9.2.5: a method's [[HomeObject]] is the object it is defined on.
-                    if (f.call) |*mfd| mfd.home_object = target;
-                    if (el.is_private) {
-                        // §15.7: a private method. Static → install on the ctor's private slot now;
-                        // instance → record for per-instance install (the brand is added on each `new`).
-                        if (f.call) |*mfd| mfd.is_private_method = true;
-                        // §15.7.14: a private method's name is `#m` (its key includes the `#`).
-                        try self.setFunctionName(f, el.key, "");
-                        if (el.is_static) {
-                            try ctor.setPrivate(el.key, fc.normal);
-                        } else {
-                            try private_elements.append(self.arena, .{ .key = el.key, .kind = .method, .func = f });
-                        }
-                    } else {
-                        const key = try self.classElementKey(el, class_env);
-                        if (key.isAbrupt()) return key.completion;
-                        if (try self.staticPrototypeKeyError(el.is_static, key)) |e| return e;
-                        // §15.7.14: a class method's `name` is its property key (symbol → "[desc]").
-                        try self.setFunctionName(f, if (key.symbol) |sym| try self.symbolPropName(sym) else key.key, "");
-                        // §15.7.x: class methods are NON-enumerable (writable + configurable). Define
-                        // explicitly (vs `set`, which would make it enumerable like an object method).
-                        if (key.symbol) |sym| {
-                            try target.defineSymbolData(sym, fc.normal, true, false, true);
-                        } else {
-                            try target.defineData(key.key, fc.normal, true, false, true);
-                        }
-                    }
-                },
-                .get, .set => {
-                    // §15.7 accessor (§13.2.5.6 model): merge a get/set pair for the same key into one
-                    // accessor property on `.prototype` (instance) or the constructor (static).
-                    const target = if (el.is_static) ctor else proto;
-                    const fc = try self.evalFunctionExpr(el.value.func, class_env);
-                    if (fc.isAbrupt()) return fc;
-                    const f = fc.normal.object;
-                    // §9.2.5: the accessor carries [[HomeObject]] too (so `super.x` works inside it).
-                    if (f.call) |*mfd| mfd.home_object = target;
-                    if (el.is_private) {
-                        // §15.7: a private accessor. Static → merge into the ctor's private slot now;
-                        // instance → record (merged per-instance at construction).
-                        // §15.7.14: a private accessor's name is "get #x" / "set #x".
-                        try self.setFunctionName(f, el.key, if (el.kind == .get) "get" else "set");
-                        if (el.is_static) {
-                            if (el.kind == .get) {
-                                try ctor.definePrivateAccessor(el.key, f, null);
-                            } else {
-                                try ctor.definePrivateAccessor(el.key, null, f);
-                            }
-                        } else {
-                            try private_elements.append(self.arena, .{
-                                .key = el.key,
-                                .kind = if (el.kind == .get) .get else .set,
-                                .func = f,
-                            });
-                        }
-                    } else {
-                        const key = try self.classElementKey(el, class_env);
-                        if (key.isAbrupt()) return key.completion;
-                        if (try self.staticPrototypeKeyError(el.is_static, key)) |e| return e;
-                        // §15.7.14: a class accessor's name is "get x" / "set x" (symbol → "[desc]").
-                        try self.setFunctionName(f, if (key.symbol) |sym| try self.symbolPropName(sym) else key.key, if (el.kind == .get) "get" else "set");
-                        const getter: ?*Object = if (el.kind == .get) f else null;
-                        const setter: ?*Object = if (el.kind == .set) f else null;
-                        // §15.7.x: class accessors are NON-enumerable (configurable). Define explicitly.
-                        if (key.symbol) |sym| {
-                            try target.defineSymbolAccessorEx(sym, getter, setter, false);
-                        } else {
-                            try target.defineAccessorEx(key.key, getter, setter, false);
-                        }
-                    }
-                },
-                .field => {
-                    if (el.is_private) {
-                        if (el.is_static) {
-                            // §15.7.14: a static private field initializes at class definition with
-                            // `this` = the constructor, into the ctor's private slot.
-                            var v: Value = .undefined;
-                            if (el.value.field_init) |ie| {
-                                const saved_this = self.this_val;
-                                self.this_val = .{ .object = ctor };
-                                const ic = try self.evalExpr(ie, class_env);
-                                self.this_val = saved_this;
-                                if (ic.isAbrupt()) return ic;
-                                v = ic.normal;
-                            }
-                            try ctor.setPrivate(el.key, v);
-                        } else {
-                            // §15.7.14: an instance private field — recorded; initializer runs per `new`.
-                            try private_elements.append(self.arena, .{ .key = el.key, .kind = .field, .init = el.value.field_init });
-                        }
-                        continue;
-                    }
-                    const key = try self.classElementKey(el, class_env);
-                    if (key.isAbrupt()) return key.completion;
-                    if (try self.staticPrototypeKeyError(el.is_static, key)) |e| return e;
-                    // §15.7.10: a field's name (string key, or "[desc]" for a symbol key) is the
-                    // NamedEvaluation name for an anonymous function/class initializer.
-                    const field_name = if (key.symbol) |sym| try self.symbolPropName(sym) else key.key;
-                    if (el.is_static) {
-                        // §15.7.14: a static field initializer runs at class definition with `this` =
-                        // the constructor object.
-                        var v: Value = .undefined;
-                        if (el.value.field_init) |ie| {
-                            const saved_this = self.this_val;
-                            self.this_val = .{ .object = ctor };
-                            const ic = try self.evalExpr(ie, class_env);
-                            self.this_val = saved_this;
-                            if (ic.isAbrupt()) return ic;
-                            v = ic.normal;
-                            try self.maybeSetAnonName(ie, v, field_name); // §8.4 NamedEvaluation
-                        }
-                        if (key.symbol) |sym| try ctor.setSymbol(sym, v) else try ctor.set(key.key, v);
-                    } else {
-                        // §15.7.14: the instance FieldDefinition's name is evaluated now (definition
-                        // order); the initializer is run per-instance by initInstanceFields.
-                        try fields.append(self.arena, .{ .key = key.key, .init = el.value.field_init, .key_symbol = key.symbol });
-                    }
-                },
-            }
-        }
-        // §15.7.14: stash the resolved instance-field + private-element records on the constructor.
-        if (ctor.call) |*fd| {
-            fd.fields = fields.items;
-            fd.private_elements = private_elements.items;
-        }
-
-        // §15.7.14: bind the class name immutably in the inner scope for self-reference.
-        if (c.name) |name| try class_env.declare(name, .{ .object = ctor }, false, true);
-
-        return .{ .normal = .{ .object = ctor } };
+        return interp_class.evalClass(self, c, env);
     }
 
     /// Run a sequence of statements (a static block / function body) in `env`, returning the first
     /// abrupt completion (a `throw` propagates; `return`/`break`/`continue` are not produced at the
     /// top of a static block body in the M-subset). Used by §15.7.11 ClassStaticBlock evaluation.
-    fn runBlockBody(self: *Interpreter, body: []const ast.Stmt, env: *Environment) EvalError!Completion {
+    pub fn runBlockBody(self: *Interpreter, body: []const ast.Stmt, env: *Environment) EvalError!Completion {
         for (body) |stmt| {
             const cmp = try self.evalStmt(stmt, env);
             if (cmp.isAbrupt()) {
@@ -2882,7 +2129,7 @@ pub const Interpreter = struct {
     /// before the first one with a default initializer, a destructuring BindingPattern, or the rest
     /// element. (A simple identifier param with no default counts; the first non-simple param or the
     /// rest element stops the count.) `rest` is never counted (only stops the leading run).
-    fn paramCount(params: []const ast.Param) f64 {
+    pub fn paramCount(params: []const ast.Param) f64 {
         var n: f64 = 0;
         for (params) |p| {
             if (p.default != null or p.pattern.* != .identifier) break;
@@ -2894,7 +2141,7 @@ pub const Interpreter = struct {
     /// §20.2.4.1 install the `length` own data property — `{ writable:false, enumerable:false,
     /// configurable:true }`. Created at function-object creation (outside hot loops, so the two
     /// inserts cost nothing in the bench).
-    fn setFunctionLength(obj: *Object, n: f64) std.mem.Allocator.Error!void {
+    pub fn setFunctionLength(obj: *Object, n: f64) std.mem.Allocator.Error!void {
         try obj.defineData("length", .{ .number = n }, false, false, true);
     }
 
@@ -2942,14 +2189,14 @@ pub const Interpreter = struct {
     /// §20.2.4.2 / §10.2.9 SetFunctionName — install the `name` own data property `{ writable:false,
     /// enumerable:false, configurable:true }`. `prefix` (when non-empty) is space-joined ahead of the
     /// name ("get"/"set"/"bound"). Names are interned in the realm arena so they outlive the call.
-    fn setFunctionName(self: *Interpreter, obj: *Object, name: []const u8, prefix: []const u8) std.mem.Allocator.Error!void {
+    pub fn setFunctionName(self: *Interpreter, obj: *Object, name: []const u8, prefix: []const u8) std.mem.Allocator.Error!void {
         const full = if (prefix.len == 0) name else try std.fmt.allocPrint(self.arena, "{s} {s}", .{ prefix, name });
         try obj.defineData("name", .{ .string = full }, false, false, true);
     }
 
     /// §10.2.9 SetFunctionName for a Symbol key — the name is `"[" + description + "]"`, or `""` when
     /// the symbol has no description (`[[Description]]` is undefined). Interned in the realm arena.
-    fn symbolPropName(self: *Interpreter, sym: *Symbol) std.mem.Allocator.Error![]const u8 {
+    pub fn symbolPropName(self: *Interpreter, sym: *Symbol) std.mem.Allocator.Error![]const u8 {
         const desc = sym.description orelse return "";
         return std.fmt.allocPrint(self.arena, "[{s}]", .{desc});
     }
@@ -2968,7 +2215,7 @@ pub const Interpreter = struct {
     /// binding/property name. Covers the common naming contexts: `var/let/const f = <anon>`,
     /// `f = <anon>` (identifier assignment), object-literal `{f: <anon>}`, and default initializers.
     /// A no-op for any non-anonymous-function value, so callers can apply it unconditionally.
-    fn maybeSetAnonName(self: *Interpreter, node: *const ast.Node, value: Value, name: []const u8) std.mem.Allocator.Error!void {
+    pub fn maybeSetAnonName(self: *Interpreter, node: *const ast.Node, value: Value, name: []const u8) std.mem.Allocator.Error!void {
         switch (node.*) {
             .function, .class_expr => {},
             else => return, // only an anonymous function/class literal is a NamedEvaluation site
@@ -2980,7 +2227,7 @@ pub const Interpreter = struct {
         try self.setFunctionName(obj, name, "");
     }
 
-    fn evalFunctionExpr(self: *Interpreter, f: *const ast.Function, env: *Environment) EvalError!Completion {
+    pub fn evalFunctionExpr(self: *Interpreter, f: *const ast.Function, env: *Environment) EvalError!Completion {
         // §15.2.5 InstantiateOrdinaryFunctionExpression: a NAMED FunctionExpression `function g(){…}`
         // binds its own name `g` in an inner DeclarativeEnvironment that is the function's [[Environment]]
         // — so the body (and parameter defaults) can self-reference / recurse via `g`, while `g` is NOT
@@ -3389,16 +2636,7 @@ pub const Interpreter = struct {
     /// TypeError (step 13.c). A BASE constructor ignores a non-object return (its `this` always wins),
     /// and non-derived functions return their value untouched.
     fn finishCtorReturn(self: *Interpreter, fd: object_mod.FunctionData, value: Value) EvalError!Completion {
-        if (fd.is_derived_ctor and value != .object) {
-            if (value == .undefined) {
-                if (self.this_init_cell) |c| if (!c.*)
-                    return self.throwError("ReferenceError", "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
-            } else {
-                // §10.2.2 step 13.c: a derived ctor returning a primitive (null/number/string/etc.) throws.
-                return self.throwError("TypeError", "Derived constructors may only return object or undefined");
-            }
-        }
-        return .{ .normal = value };
+        return interp_class.finishCtorReturn(self, fd, value);
     }
 
     /// Concatenate two argument slices into a freshly-allocated slice (`a ++ b`). Used by the bound
@@ -3698,7 +2936,7 @@ pub const Interpreter = struct {
     /// The first Proxy on `o`'s prototype chain (excluding `o` itself), or null. Used so an ordinary
     /// [[Get]]/[[HasProperty]] miss on the C-level chain still fires a Proxy proto's trap. Cheap: the
     /// chain is short and this is only consulted on a miss (the same chain `getProp` already walked).
-    fn protoProxy(o: *Object) ?*object_mod.ProxyData {
+    pub fn protoProxy(o: *Object) ?*object_mod.ProxyData {
         var p: ?*Object = o.prototype;
         while (p) |cur| : (p = cur.prototype) {
             if (cur.proxy) |pd| return pd;
@@ -3707,129 +2945,7 @@ pub const Interpreter = struct {
     }
 
     pub fn getProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
-        switch (base) {
-            .object => |o| {
-                if (o.proxy) |pd| return builtin_proxy.get(self, pd, .{ .string = key }, base); // §28.2.5.4 [[Get]]
-                if (o.kind == .array) {
-                    if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(o.arrayLen()) } };
-                    if (parseIndex(key)) |i| {
-                        return .{ .normal = o.arrayGet(i) };
-                    }
-                    // else fall through to the prototype chain (Array.prototype methods)
-                }
-                // §22.1.4.1/§10.4.3: a `new String(s)` wrapper is a String exotic — `.length` and the
-                // canonical integer indices [0, len) read the boxed [[StringData]] (own, ahead of the
-                // ordinary chain) so wrapper.length / wrapper[i] mirror the primitive (M-subset: byte
-                // model). A defined own data property still wins (none clobbers these read-only slots).
-                if (o.primitive != null and o.primitive.? == .string and o.getProp(key) == null) {
-                    const sv = o.primitive.?.string;
-                    if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(sutf16.utf16Length(sv)) } };
-                    if (parseIndex(key)) |i| {
-                        if (sutf16.isAscii(sv)) {
-                            if (i < sv.len) return .{ .normal = .{ .string = sv[i .. i + 1] } };
-                        } else if (sutf16.codeUnitAt(sv, i) != null) {
-                            return .{ .normal = .{ .string = try sutf16.charAtAlloc(self.arena, sv, i) } };
-                        }
-                    }
-                }
-                // §10.4.4.3: a MAPPED arguments index reads the LIVE parameter binding (the map takes
-                // precedence over the stored value, which may be stale after the parameter was reassigned).
-                if (o.mapped_params) |mp| {
-                    if (parseIndex(key)) |i| {
-                        if (i < mp.names.len and mp.names[i].len > 0) {
-                            if (mp.env.lookupLocal(mp.names[i])) |b| return .{ .normal = b.value };
-                        }
-                    }
-                }
-                // §10.1.8.1 OrdinaryGet — locate the property (data or accessor) on the chain.
-                // Data-property fast path: a single descriptor read, no accessor branch.
-                const loc = o.getProp(key) orelse {
-                    // §10.1.8.1 step 3: the property is absent on the ordinary chain. If a Proxy sits on
-                    // the prototype chain, its [[Get]] trap must fire (with `this`=base). Walk to it.
-                    if (protoProxy(o)) |pp| return builtin_proxy.get(self, pp, .{ .string = key }, base);
-                    return .{ .normal = .undefined };
-                };
-                switch (loc.pv.payload) {
-                    .data => |v| return .{ .normal = v },
-                    .accessor => |a| {
-                        // §10.2.x: invoke the getter with `this` = the original receiver (`base`).
-                        const getter = a.get orelse return .{ .normal = .undefined };
-                        return self.callFunction(getter, &.{}, base);
-                    },
-                }
-            },
-            .string => |s| {
-                // §22.1: transparent boxing — `.length`, integer index, or a String.prototype method.
-                // §6.1.4: `.length` and integer indices are UTF-16 code-unit quantities (ASCII fast path).
-                if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(sutf16.utf16Length(s)) } };
-                if (parseIndex(key)) |i| {
-                    if (sutf16.isAscii(s)) {
-                        return .{ .normal = if (i < s.len) .{ .string = s[i .. i + 1] } else .undefined };
-                    }
-                    return .{ .normal = if (sutf16.codeUnitAt(s, i) != null) .{ .string = try sutf16.charAtAlloc(self.arena, s, i) } else .undefined };
-                }
-                if (self.stringProto()) |proto| {
-                    if (proto.get(key)) |m| return .{ .normal = m };
-                }
-                return .{ .normal = .undefined };
-            },
-            .symbol => |sym| {
-                // §20.4: transparent boxing — `sym.toString`/`valueOf` resolve on Symbol.prototype, and
-                // `sym.description` (§20.4.3.2) reads the [[Description]] directly.
-                if (std.mem.eql(u8, key, "description")) {
-                    return .{ .normal = if (sym.description) |d| .{ .string = d } else .undefined };
-                }
-                if (self.globalProto("Symbol")) |proto| {
-                    if (proto.get(key)) |m| return .{ .normal = m };
-                }
-                return .{ .normal = .undefined };
-            },
-            .bigint => {
-                // §6.1.6.2: transparent boxing — `(1n).toString` / `valueOf` / `constructor` resolve on
-                // BigInt.prototype. (Accessors on the proto get `this` = the original primitive base.)
-                if (self.globalProto("BigInt")) |proto| {
-                    const loc = proto.getProp(key) orelse return .{ .normal = .undefined };
-                    switch (loc.pv.payload) {
-                        .data => |dv| return .{ .normal = dv },
-                        .accessor => |a| {
-                            const getter = a.get orelse return .{ .normal = .undefined };
-                            return self.callFunction(getter, &.{}, base);
-                        },
-                    }
-                }
-                return .{ .normal = .undefined };
-            },
-            .number => {
-                // §21.1.3: transparent boxing — `(255).toString` / `valueOf` / `toFixed` / `constructor`
-                // resolve on Number.prototype (accessors get `this` = the original primitive base).
-                if (self.globalProto("Number")) |proto| {
-                    const loc = proto.getProp(key) orelse return .{ .normal = .undefined };
-                    switch (loc.pv.payload) {
-                        .data => |dv| return .{ .normal = dv },
-                        .accessor => |a| {
-                            const getter = a.get orelse return .{ .normal = .undefined };
-                            return self.callFunction(getter, &.{}, base);
-                        },
-                    }
-                }
-                return .{ .normal = .undefined };
-            },
-            .boolean => {
-                // §20.3.3: transparent boxing — `(true).toString` / `valueOf` resolve on Boolean.prototype.
-                if (self.globalProto("Boolean")) |proto| {
-                    const loc = proto.getProp(key) orelse return .{ .normal = .undefined };
-                    switch (loc.pv.payload) {
-                        .data => |dv| return .{ .normal = dv },
-                        .accessor => |a| {
-                            const getter = a.get orelse return .{ .normal = .undefined };
-                            return self.callFunction(getter, &.{}, base);
-                        },
-                    }
-                }
-                return .{ .normal = .undefined };
-            },
-            .undefined, .null => return self.throwError("TypeError", "Cannot read properties of null or undefined"),
-        }
+        return interp_property.getProperty(self, base, key);
     }
 
     pub fn stringProto(self: *Interpreter) ?*Object {
@@ -3844,99 +2960,7 @@ pub const Interpreter = struct {
     }
 
     pub fn setProperty(self: *Interpreter, base: Value, key: []const u8, value: Value) EvalError!Completion {
-        switch (base) {
-            .object => |o| {
-                if (o.proxy) |pd| { // §10.5.9 [[Set]] (P, V, Receiver = base)
-                    const c = try builtin_proxy.set(self, pd, .{ .string = key }, value, base);
-                    if (c.isAbrupt()) return c;
-                    if (!c.normal.boolean and self.strict) return self.throwError("TypeError", "proxy [[Set]] returned false");
-                    return .{ .normal = value };
-                }
-                if (o.kind == .array) {
-                    if (std.mem.eql(u8, key, "length")) {
-                        // §23.1.4.1 ArraySetLength — ToUint32; a non-integral / >2^32-1 value is a
-                        // RangeError. No eager fill on a length increase (sparse): just record it.
-                        const n = toNumber(value);
-                        if (std.math.isNan(n) or n < 0 or n > 4294967295.0 or n != @floor(n)) {
-                            return self.throwError("RangeError", "Invalid array length");
-                        }
-                        const new_len: usize = @intFromFloat(n);
-                        // §10.4.2.4: a non-writable `length` (frozen array, or an explicit
-                        // defineProperty making it non-writable) rejects a CHANGE — TypeError in strict,
-                        // silent no-op in sloppy. A no-op assignment to the same value is allowed.
-                        if (!o.array_length_writable and new_len != o.arrayLen()) {
-                            if (self.strict) return self.throwError("TypeError", "Cannot assign to read only property 'length'");
-                            return .{ .normal = value };
-                        }
-                        try o.arraySetLen(new_len);
-                        return .{ .normal = value };
-                    }
-                    if (parseIndex(key)) |i| {
-                        // Hot path: an extensible, non-frozen array takes the raw dense/sparse set.
-                        if (o.extensible and !o.array_frozen) {
-                            try o.arraySet(o.arena, i, value);
-                            return .{ .normal = value };
-                        }
-                        // §10.1.9.2: a frozen array rejects any element write; a non-extensible array
-                        // rejects a NEW index (an existing index of a sealed array stays writable).
-                        const reject = o.array_frozen or !o.arrayHas(i);
-                        if (reject) {
-                            if (self.strict) return self.throwError("TypeError", "Cannot add/modify property on a non-extensible array");
-                            return .{ .normal = value };
-                        }
-                        try o.arraySet(o.arena, i, value);
-                        return .{ .normal = value };
-                    }
-                }
-                // §10.1.9.2 OrdinarySetWithOwnDescriptor — if `key` resolves to an accessor on the
-                // chain, invoke its setter with `this` = receiver; a getter-only accessor is a silent
-                // no-op (sloppy). A data property (own or inherited) → define/overwrite an own data
-                // property. The common case (absent or own data) stays a single `set`.
-                if (o.getProp(key)) |loc| {
-                    if (loc.pv.payload == .accessor) {
-                        const setter = loc.pv.payload.accessor.set orelse {
-                            // §10.1.9.2: a getter-only accessor (own or inherited) → [[Set]] returns false;
-                            // §6.2.5.6 PutValue throws in strict, silent no-op in sloppy.
-                            if (self.strict) return self.throwError("TypeError", "Cannot set property that has only a getter");
-                            return .{ .normal = value };
-                        };
-                        const sc = try self.callFunction(setter, &.{value}, base);
-                        if (sc.isAbrupt()) return sc;
-                        return .{ .normal = value };
-                    }
-                    // §10.1.9.2: a non-writable data property (own or inherited — an inherited non-writable
-                    // data property blocks creating a shadowing own property) → [[Set]] returns false.
-                    if (!loc.pv.writable) {
-                        if (self.strict) return self.throwError("TypeError", "Cannot assign to read only property");
-                        return .{ .normal = value };
-                    }
-                }
-                // §10.1.9.2 step 2: no own descriptor and `key` absent from the ordinary chain — if a
-                // Proxy sits on the prototype chain, its [[Set]] trap runs with Receiver = base. (Only
-                // when `o` has no own property for `key`: an own write stays on `o` below.)
-                if (o.properties.get(key) == null and !(o.kind == .array and parseIndex(key) != null and o.arrayHas(parseIndex(key).?))) {
-                    if (protoProxy(o)) |pp| {
-                        const c = try builtin_proxy.set(self, pp, .{ .string = key }, value, base);
-                        if (c.isAbrupt()) return c;
-                        if (!c.normal.boolean and self.strict) return self.throwError("TypeError", "proxy [[Set]] returned false");
-                        return .{ .normal = value };
-                    }
-                }
-                // §10.4.4.4: writing a MAPPED arguments index also writes the live parameter binding
-                // (and vice-versa — keeping `arguments[i]` and the parameter in sync).
-                if (o.mapped_params) |mp| {
-                    if (parseIndex(key)) |i| {
-                        if (i < mp.names.len and mp.names[i].len > 0) {
-                            if (mp.env.lookupLocal(mp.names[i])) |b| b.value = value;
-                        }
-                    }
-                }
-                try o.set(key, value);
-                return .{ .normal = value };
-            },
-            .undefined, .null => return self.throwError("TypeError", "Cannot set properties of null or undefined"),
-            else => return .{ .normal = value },
-        }
+        return interp_property.setProperty(self, base, key, value);
     }
 
     /// §13.3.3 / §7.1.19 ToPropertyKey-aware [[Get]] for a computed key (`a[k]`). A Symbol key routes
@@ -3944,37 +2968,13 @@ pub const Interpreter = struct {
     /// path (the hot path, unchanged). Keeps the string get fast — the symbol branch is taken only when
     /// the key actually IS a Symbol.
     fn getPropertyV(self: *Interpreter, base: Value, key: Value) EvalError!Completion {
-        if (key == .symbol) return self.getSymbolProperty(base, key.symbol);
-        // §6.2.5.5 GetValue: RequireObjectCoercible(base) precedes ToPropertyKey — a null/undefined base
-        // throws a TypeError *before* the key is coerced (so a throwing `key.toString` never runs).
-        if (base == .undefined or base == .null) return self.throwError("TypeError", "Cannot read properties of null or undefined");
-        // §7.1.19 ToPropertyKey: an object key is ToPrimitive(string)'d first (so `o[fn]` uses the
-        // function's `toString`, matching `String(fn)`); the result may itself be a Symbol.
-        if (key == .object) {
-            const pc = try self.toPrimitive(key, .string);
-            if (pc.isAbrupt()) return pc;
-            if (pc.normal == .symbol) return self.getSymbolProperty(base, pc.normal.symbol);
-            return self.getProperty(base, try self.toString(pc.normal));
-        }
-        return self.getProperty(base, try self.toString(key));
+        return interp_property.getPropertyV(self, base, key);
     }
 
     /// §13.3.3 ToPropertyKey-aware [[Set]] for a computed key (`a[k] = v`). Symbol → symbol store; else
     /// ToString + the ordinary string path.
     fn setPropertyV(self: *Interpreter, base: Value, key: Value, value: Value) EvalError!Completion {
-        if (key == .symbol) return self.setSymbolProperty(base, key.symbol, value);
-        // §6.2.5.6 PutValue: RequireObjectCoercible(base) precedes ToPropertyKey — a null/undefined base
-        // throws a TypeError *before* the key is coerced (so a throwing `key.toString` never runs).
-        if (base == .undefined or base == .null) return self.throwError("TypeError", "Cannot set properties of null or undefined");
-        // §7.1.19 ToPropertyKey: ToPrimitive(string) an object key first (so `o[fn] = v` keys by the
-        // function's `toString`, matching `String(fn)`); the primitive may be a Symbol.
-        if (key == .object) {
-            const pc = try self.toPrimitive(key, .string);
-            if (pc.isAbrupt()) return pc;
-            if (pc.normal == .symbol) return self.setSymbolProperty(base, pc.normal.symbol, value);
-            return self.setProperty(base, try self.toString(pc.normal), value);
-        }
-        return self.setProperty(base, try self.toString(key), value);
+        return interp_property.setPropertyV(self, base, key, value);
     }
 
     /// §7.1.19 ToPropertyKey, returning the coerced key as a primitive Value (a String, or a Symbol
@@ -3982,83 +2982,19 @@ pub const Interpreter = struct {
     /// assignment, `++`/`--`) so a side-effecting `key.toString` runs EXACTLY ONCE — the resulting
     /// primitive is then passed to both `getPropertyV` and `setPropertyV` (which no-op on a primitive).
     pub fn coercePropertyKey(self: *Interpreter, key: Value) EvalError!Completion {
-        if (key != .object) return .{ .normal = key };
-        const pc = try self.toPrimitive(key, .string);
-        if (pc.isAbrupt()) return pc;
-        if (pc.normal == .symbol) return .{ .normal = pc.normal };
-        return .{ .normal = .{ .string = try self.toString(pc.normal) } };
+        return interp_property.coercePropertyKey(self, key);
     }
 
     /// §10.1.8 [[Get]] for a Symbol key — own/inherited symbol property (data or accessor). A primitive
     /// base with no symbol slot yields undefined; null/undefined throws (matching the string path).
     pub fn getSymbolProperty(self: *Interpreter, base: Value, key: *Symbol) EvalError!Completion {
-        switch (base) {
-            .object => |o| {
-                if (o.proxy) |pd| return builtin_proxy.get(self, pd, .{ .symbol = key }, base); // §28.2.5.4 [[Get]]
-                const loc = o.getSymbolProp(key) orelse {
-                    if (protoProxy(o)) |pp| return builtin_proxy.get(self, pp, .{ .symbol = key }, base);
-                    return .{ .normal = .undefined };
-                };
-                switch (loc.pv.payload) {
-                    .data => |v| return .{ .normal = v },
-                    .accessor => |a| {
-                        const getter = a.get orelse return .{ .normal = .undefined };
-                        return self.callFunction(getter, &.{}, base);
-                    },
-                }
-            },
-            .string => {
-                // §22.1: a primitive String boxes to String.prototype for symbol keys too (so
-                // `"ab"[Symbol.iterator]` resolves the iterator method).
-                if (self.stringProto()) |proto| {
-                    if (proto.getSymbolProp(key)) |loc| switch (loc.pv.payload) {
-                        .data => |v| return .{ .normal = v },
-                        .accessor => |a| {
-                            const getter = a.get orelse return .{ .normal = .undefined };
-                            return self.callFunction(getter, &.{}, base);
-                        },
-                    };
-                }
-                return .{ .normal = .undefined };
-            },
-            .undefined, .null => return self.throwError("TypeError", "Cannot read properties of null or undefined"),
-            else => return .{ .normal = .undefined },
-        }
+        return interp_property.getSymbolProperty(self, base, key);
     }
 
     /// §10.1.9 [[Set]] for a Symbol key — invoke an inherited setter if present, else define an own
     /// symbol data property. Setting on null/undefined throws; on other primitives is a no-op.
     fn setSymbolProperty(self: *Interpreter, base: Value, key: *Symbol, value: Value) EvalError!Completion {
-        switch (base) {
-            .object => |o| {
-                if (o.proxy) |pd| { // §10.5.9 [[Set]] for a Symbol key
-                    const c = try builtin_proxy.set(self, pd, .{ .symbol = key }, value, base);
-                    if (c.isAbrupt()) return c;
-                    if (!c.normal.boolean and self.strict) return self.throwError("TypeError", "proxy [[Set]] returned false");
-                    return .{ .normal = value };
-                }
-                if (o.getSymbolProp(key)) |loc| {
-                    if (loc.pv.payload == .accessor) {
-                        const setter = loc.pv.payload.accessor.set orelse return .{ .normal = value };
-                        const sc = try self.callFunction(setter, &.{value}, base);
-                        if (sc.isAbrupt()) return sc;
-                        return .{ .normal = value };
-                    }
-                }
-                if (ownSymbol(o, key) == null) {
-                    if (protoProxy(o)) |pp| { // §10.1.9.2: Proxy on the proto chain handles the [[Set]]
-                        const c = try builtin_proxy.set(self, pp, .{ .symbol = key }, value, base);
-                        if (c.isAbrupt()) return c;
-                        if (!c.normal.boolean and self.strict) return self.throwError("TypeError", "proxy [[Set]] returned false");
-                        return .{ .normal = value };
-                    }
-                }
-                try o.setSymbol(key, value);
-                return .{ .normal = value };
-            },
-            .undefined, .null => return self.throwError("TypeError", "Cannot set properties of null or undefined"),
-            else => return .{ .normal = value },
-        }
+        return interp_property.setSymbolProperty(self, base, key, value);
     }
 
     // ── §7.1.1 ToPrimitive ───────────────────────────────────────────────────
@@ -4558,41 +3494,21 @@ pub const Interpreter = struct {
     /// The realm's well-known `Symbol.iterator` identity (the same value held on the `Symbol`
     /// constructor), used by GetIterator. Null only in a realm-less unit-test eval (no `Symbol`).
     pub fn wellKnownIterator(self: *Interpreter) ?*Symbol {
-        const g = self.globals orelse return null;
-        const b = g.lookup("Symbol") orelse return null;
-        if (b.value != .object) return null;
-        const pv = b.value.object.get("iterator") orelse return null;
-        return if (pv == .symbol) pv.symbol else null;
+        return interp_iter.wellKnownIterator(self);
     }
 
-    const IterResult = union(enum) { iterator: *Object, abrupt: Completion };
+    pub const IterResult = union(enum) { iterator: *Object, abrupt: Completion };
 
     /// §7.4.2 GetIterator ( obj ) — read `obj[Symbol.iterator]`, call it with `this` = obj, and
     /// require the result to be an object (the iterator). Returns the iterator object, or an abrupt
     /// completion (TypeError) if the value is not iterable. Null `iter_sym` (realm-less) → not iterable.
     fn getIterator(self: *Interpreter, obj: Value) EvalError!IterResult {
-        const iter_sym = self.wellKnownIterator() orelse
-            return .{ .abrupt = try self.throwError("TypeError", "value is not iterable") };
-        const mc = try self.getSymbolProperty(obj, iter_sym);
-        if (mc.isAbrupt()) return .{ .abrupt = mc };
-        if (mc.normal != .object or mc.normal.object.kind != .function) {
-            return .{ .abrupt = try self.throwError("TypeError", "value is not iterable") };
-        }
-        const rc = try self.callFunction(mc.normal.object, &.{}, obj);
-        if (rc.isAbrupt()) return .{ .abrupt = rc };
-        if (rc.normal != .object) {
-            return .{ .abrupt = try self.throwError("TypeError", "Result of the Symbol.iterator method is not an object") };
-        }
-        return .{ .iterator = rc.normal.object };
+        return interp_iter.getIterator(self, obj);
     }
 
     /// The realm's well-known `Symbol.asyncIterator` identity (held on the `Symbol` constructor).
     fn wellKnownAsyncIterator(self: *Interpreter) ?*Symbol {
-        const g = self.globals orelse return null;
-        const b = g.lookup("Symbol") orelse return null;
-        if (b.value != .object) return null;
-        const pv = b.value.object.get("asyncIterator") orelse return null;
-        return if (pv == .symbol) pv.symbol else null;
+        return interp_iter.wellKnownAsyncIterator(self);
     }
 
     /// §7.4.3 GetIterator ( obj, async ) — read `obj[Symbol.asyncIterator]`; if present, call it (the
@@ -4600,31 +3516,7 @@ pub const Interpreter = struct {
     /// and wrap it in an AsyncFromSyncIterator (§27.1.4.1 CreateAsyncFromSyncIterator) so `for await`
     /// can drive a sync iterable. A value with neither → TypeError.
     fn getAsyncIterator(self: *Interpreter, obj: Value) EvalError!IterResult {
-        if (self.wellKnownAsyncIterator()) |async_sym| {
-            const mc = try self.getSymbolProperty(obj, async_sym);
-            if (mc.isAbrupt()) return .{ .abrupt = mc };
-            if (mc.normal == .object and mc.normal.object.kind == .function) {
-                const rc = try self.callFunction(mc.normal.object, &.{}, obj);
-                if (rc.isAbrupt()) return .{ .abrupt = rc };
-                if (rc.normal != .object) {
-                    return .{ .abrupt = try self.throwError("TypeError", "Result of Symbol.asyncIterator is not an object") };
-                }
-                return .{ .iterator = rc.normal.object };
-            }
-            // §7.4.3 step 1.b.i: an undefined/null [Symbol.asyncIterator] (or absent) → use the sync path.
-            if (mc.normal != .undefined and mc.normal != .null) {
-                return .{ .abrupt = try self.throwError("TypeError", "Symbol.asyncIterator is not callable") };
-            }
-        }
-        // §27.1.4.1 CreateAsyncFromSyncIterator: get the SYNC iterator, wrap it.
-        const sync = try self.getIterator(obj);
-        const sync_iter: *Object = switch (sync) {
-            .abrupt => |c| return .{ .abrupt = c },
-            .iterator => |it| it,
-        };
-        const wrapper = try Object.create(self.arena, self.asyncFromSyncProto());
-        wrapper.async_from_sync = sync_iter;
-        return .{ .iterator = wrapper };
+        return interp_iter.getAsyncIterator(self, obj);
     }
 
     pub const StepResult = union(enum) { value: Value, done, abrupt: Completion };
@@ -4633,35 +3525,14 @@ pub const Interpreter = struct {
     /// and return its `value` (or `.done` when `done` is truthy). An abrupt completion from `next` (or
     /// a non-object result) propagates as `.abrupt`.
     fn iteratorStep(self: *Interpreter, iterator: *Object) EvalError!StepResult {
-        const nc = try self.getProperty(.{ .object = iterator }, "next");
-        if (nc.isAbrupt()) return .{ .abrupt = nc };
-        if (nc.normal != .object or nc.normal.object.kind != .function) {
-            return .{ .abrupt = try self.throwError("TypeError", "iterator.next is not a function") };
-        }
-        const rc = try self.callFunction(nc.normal.object, &.{}, .{ .object = iterator });
-        if (rc.isAbrupt()) return .{ .abrupt = rc };
-        if (rc.normal != .object) {
-            return .{ .abrupt = try self.throwError("TypeError", "Iterator result is not an object") };
-        }
-        const result = rc.normal.object;
-        const dc = try self.getProperty(.{ .object = result }, "done");
-        if (dc.isAbrupt()) return .{ .abrupt = dc };
-        if (toBoolean(dc.normal)) return .done;
-        const vc = try self.getProperty(.{ .object = result }, "value");
-        if (vc.isAbrupt()) return .{ .abrupt = vc };
-        return .{ .value = vc.normal };
+        return interp_iter.iteratorStep(self, iterator);
     }
 
     /// §7.4.11 IteratorClose ( iterator, completion ) — best-effort: call `iterator.return()` if it
     /// exists, ignoring its result (the original completion is what matters). Called on an early exit
     /// from a for-of loop (`break`/`return`/`throw`). A missing/non-callable `return` is a no-op.
     pub fn iteratorClose(self: *Interpreter, iterator: *Object) EvalError!void {
-        const rc = try self.getProperty(.{ .object = iterator }, "return");
-        if (rc.isAbrupt()) return; // swallow — don't mask the original completion
-        if (rc.normal != .object or rc.normal.object.kind != .function) return;
-        // A throwing `return()` is swallowed (the original completion wins, §7.4.11 step 4); but an
-        // engine error (OOM / step-limit) still propagates via `try`.
-        _ = try self.callFunction(rc.normal.object, &.{}, .{ .object = iterator });
+        return interp_iter.iteratorClose(self, iterator);
     }
 
     /// §7.4.11 IteratorClose for a NORMAL (non-throw) incoming completion — the iterator is being
@@ -4671,15 +3542,7 @@ pub const Interpreter = struct {
     /// completion to propagate. GetMethod semantics: undefined/null `return` → no-op; non-callable →
     /// TypeError (§7.3.10).
     fn iteratorCloseChecked(self: *Interpreter, iterator: *Object) EvalError!Completion {
-        const rc = try self.getProperty(.{ .object = iterator }, "return");
-        if (rc.isAbrupt()) return rc; // a throwing `return` getter propagates
-        if (rc.normal == .undefined or rc.normal == .null) return .{ .normal = .undefined };
-        if (rc.normal != .object or rc.normal.object.kind != .function)
-            return self.throwError("TypeError", "iterator 'return' is not a function");
-        const res = try self.callFunction(rc.normal.object, &.{}, .{ .object = iterator });
-        if (res.isAbrupt()) return res; // §7.4.11 step 5: a thrown `return()` propagates
-        if (res.normal != .object) return self.throwError("TypeError", "iterator 'return' result is not an object"); // step 6
-        return .{ .normal = .undefined };
+        return interp_iter.iteratorCloseChecked(self, iterator);
     }
 
     /// §7.4.1 GetIterator + drain — materialize an iterable `value` into a slice of its yielded values
@@ -4687,40 +3550,7 @@ pub const Interpreter = struct {
     /// whole sequence up front). Arrays/Strings have native iterators (fast), but ANY object with a
     /// `[Symbol.iterator]` returning a `next`-having object works. A non-iterable → abrupt TypeError.
     pub fn iterateToList(self: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!Completion {
-        // Fast path: an Array iterates its `elements` directly (skips the per-element next() call),
-        // preserving the hot spread/destructuring path. Strings keep their native code-unit walk.
-        if (value == .object and value.object.kind == .array) {
-            const arr = value.object;
-            const len = arr.arrayLen();
-            if (len == arr.elements.items.len) {
-                for (arr.elements.items) |el| try out.append(self.arena, el); // pure dense (hot path)
-            } else {
-                var i: usize = 0; // sparse tail: holes spread as `undefined` (§13.2.4)
-                while (i < len) : (i += 1) try out.append(self.arena, arr.arrayGet(i));
-            }
-            return .{ .normal = .undefined };
-        }
-        if (value == .string) {
-            const s = value.string;
-            for (0..s.len) |i| try out.append(self.arena, .{ .string = s[i .. i + 1] });
-            return .{ .normal = .undefined };
-        }
-        const git = try self.getIterator(value);
-        switch (git) {
-            .abrupt => |c| return c,
-            .iterator => |iterator| {
-                while (true) {
-                    try self.tick(); // §reliability: a genuinely infinite iterable fails via the watchdog, never hangs
-                    const step = try self.iteratorStep(iterator);
-                    switch (step) {
-                        .abrupt => |c| return c,
-                        .done => break,
-                        .value => |v| try out.append(self.arena, v),
-                    }
-                }
-                return .{ .normal = .undefined };
-            },
-        }
+        return interp_iter.iterateToList(self, value, out);
     }
 
     /// §8.5.2 IteratorBindingInitialization / §13.15.5.3 IteratorDestructuringAssignmentEvaluation —
@@ -5108,7 +3938,7 @@ pub const Interpreter = struct {
         return false;
     }
 
-    fn runGeneratorBody(self: *Interpreter, gen: *object_mod.Generator) EvalError!Completion {
+    pub fn runGeneratorBody(self: *Interpreter, gen: *object_mod.Generator) EvalError!Completion {
         // §16.2.1.6 ExecuteAsyncModule: a top-level-await module body has no function object — run the
         // module's top-level StatementList in its (already linked + hoisted) Module Environment Record,
         // strict, with `this` = undefined. `await` suspends via the shared async handoff; the terminal
@@ -5422,7 +4252,7 @@ pub const Interpreter = struct {
 
     /// §27.2.3.1 CreatePromise / NewPromiseCapability — a fresh pending Promise object (proto =
     /// %PromisePrototype%) with empty reaction lists.
-    fn newPromise(self: *Interpreter) EvalError!*Object {
+    pub fn newPromise(self: *Interpreter) EvalError!*Object {
         const obj = try Object.create(self.arena, self.promiseProto());
         const pd = try self.arena.create(object_mod.PromiseData);
         pd.* = .{};
@@ -5691,7 +4521,7 @@ pub const Interpreter = struct {
     /// After an async body handoff: an `await` transfer (kind `.yield`) registers fulfill/reject
     /// reactions on the awaited promise that will resume the body; a terminal `.ret`/`.throw` resolves
     /// /rejects the function's promise and joins the thread (§27.7.5.2).
-    fn settleAsyncTransfer(self: *Interpreter, gen: *object_mod.Generator) EvalError!void {
+    pub fn settleAsyncTransfer(self: *Interpreter, gen: *object_mod.Generator) EvalError!void {
         switch (gen.transfer_kind) {
             .yield => {
                 // §27.7.5.3 Await: `transfer_value` is the AWAITED value. Wrap it via PromiseResolve and
@@ -5936,7 +4766,7 @@ pub const Interpreter = struct {
     }
 
     /// %AsyncFromSyncIteratorPrototype% — the proto of an AsyncFromSyncIterator wrapper object.
-    fn asyncFromSyncProto(self: *Interpreter) ?*Object {
+    pub fn asyncFromSyncProto(self: *Interpreter) ?*Object {
         const g = self.globals orelse return null;
         const b = g.lookup("%AsyncFromSyncIteratorPrototype%") orelse return null;
         return if (b.value == .object) b.value.object else null;
@@ -6596,36 +5426,7 @@ pub const Interpreter = struct {
     /// own property is NOT deleted and yields `false` (so `delete` on a sealed/frozen property reports
     /// correctly); an absent property yields `true`. On a primitive base, deletion is a no-op → true.
     pub fn deleteProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
-        switch (base) {
-            .object => |o| {
-                if (o.proxy) |pd| return builtin_proxy.deleteProperty(self, pd, .{ .string = key }); // §10.5.10 [[Delete]]
-                if (o.kind == .array) {
-                    if (parseIndex(key)) |i| {
-                        // §10.4.2.1: delete an index → a true hole (dense slot recorded in `holes`,
-                        // sparse entry removed). The slot reads `undefined` and is absent thereafter.
-                        try o.arrayDelete(i);
-                        // Drop any stale string-keyed entry for this index left by a generic
-                        // `Object.defineProperty(arr, i, …)` so the index is no longer an own property.
-                        if (o.properties.count() != 0) _ = o.properties.orderedRemove(key);
-                        return .{ .normal = .{ .boolean = true } };
-                    }
-                }
-                if (o.properties.get(key)) |pv| {
-                    if (!pv.configurable) return .{ .normal = .{ .boolean = false } }; // §10.1.10.1 step 4
-                    _ = o.properties.orderedRemove(key); // ordered delete preserves the remaining keys' order
-                    // §10.4.4.4: deleting a MAPPED arguments index also removes it from the [[ParameterMap]],
-                    // so a later read no longer aliases the (still-live) parameter binding.
-                    if (o.mapped_params) |mp| {
-                        if (parseIndex(key)) |i| if (i < mp.names.len) {
-                            mp.names[i] = "";
-                        };
-                    }
-                }
-                return .{ .normal = .{ .boolean = true } };
-            },
-            .undefined, .null => return self.throwError("TypeError", "Cannot convert undefined or null to object"),
-            else => return .{ .normal = .{ .boolean = true } },
-        }
+        return interp_property.deleteProperty(self, base, key);
     }
 
     /// Result of a boolean-returning ordinary internal method (define/setProto/preventExt): a
@@ -6633,6 +5434,13 @@ pub const Interpreter = struct {
     /// `ordinaryDefineOwnProperty*` overloads share one return type (unifiable in a `switch`).
     pub const BoolOrAbrupt = union(enum) { ok: bool, abrupt: Completion };
     pub const PVOrAbrupt = union(enum) { pv: ?object_mod.PropertyValue, abrupt: Completion };
+    /// Result of [[GetPrototypeOf]] — the prototype (object or null), or an abrupt Completion (a
+    /// Proxy `getPrototypeOf` trap throw). Named so interpreter.zig + interp_property.zig agree on type.
+    pub const ProtoOrAbrupt = union(enum) { proto: ?*Object, abrupt: Completion };
+    /// Result of [[IsExtensible]] — a boolean, or an abrupt Completion (a Proxy trap throw).
+    pub const ExtOrAbrupt = union(enum) { ext: bool, abrupt: Completion };
+    /// Result of [[OwnPropertyKeys]] — the own keys slice, or an abrupt Completion (a Proxy trap throw).
+    pub const KeysOrAbrupt = union(enum) { keys: []Value, abrupt: Completion };
 
     // ── §10.1 Ordinary internal methods on a target *Object (used by the Proxy forwarding path and
     //    by the proxy-aware Object/Reflect routing). Each is Array/String-exotic aware and proxy-aware:
@@ -6642,161 +5450,48 @@ pub const Interpreter = struct {
     /// or null when absent. Array indices / `length` and String-exotic indices yield synthetic
     /// descriptors. Routes through the proxy trap when `o` is a Proxy.
     pub fn ordinaryGetOwnProperty(self: *Interpreter, o: *Object, key: []const u8) EvalError!PVOrAbrupt {
-        if (o.proxy) |pd| {
-            const c = try builtin_proxy.getOwnProperty(self, pd, .{ .string = key });
-            if (c.isAbrupt()) return .{ .abrupt = c };
-            // The trap path returns a descriptor object (or undefined); convert back to a PropertyValue.
-            return .{ .pv = try descriptorObjectToPV(self, c.normal) };
-        }
-        if (o.kind == .array) {
-            if (std.mem.eql(u8, key, "length")) return .{ .pv = .{ .payload = .{ .data = .{ .number = @floatFromInt(o.arrayLen()) } }, .writable = o.array_length_writable, .enumerable = false, .configurable = false } };
-            if (parseIndex(key)) |i| {
-                if (o.properties.getPtr(key)) |pv| return .{ .pv = pv.* };
-                if (o.arrayHas(i)) return .{ .pv = .{ .payload = .{ .data = o.arrayGet(i) }, .writable = !o.array_frozen, .enumerable = true, .configurable = !o.array_frozen } };
-                return .{ .pv = null };
-            }
-        }
-        if (o.primitive != null and o.primitive.? == .string and o.properties.getPtr(key) == null) {
-            const sv = o.primitive.?.string;
-            if (std.mem.eql(u8, key, "length")) return .{ .pv = .{ .payload = .{ .data = .{ .number = @floatFromInt(sutf16.utf16Length(sv)) } }, .writable = false, .enumerable = false, .configurable = false } };
-            if (parseIndex(key)) |i| {
-                if (sutf16.isAscii(sv)) {
-                    if (i < sv.len) return .{ .pv = .{ .payload = .{ .data = .{ .string = sv[i .. i + 1] } }, .writable = false, .enumerable = true, .configurable = false } };
-                } else if (sutf16.codeUnitAt(sv, i) != null) {
-                    return .{ .pv = .{ .payload = .{ .data = .{ .string = try sutf16.charAtAlloc(self.arena, sv, i) } }, .writable = false, .enumerable = true, .configurable = false } };
-                }
-            }
-        }
-        if (o.properties.getPtr(key)) |pv| return .{ .pv = pv.* };
-        return .{ .pv = null };
+        return interp_property.ordinaryGetOwnProperty(self, o, key);
     }
 
     /// §10.1.5 [[GetOwnProperty]] for a Symbol key → stored attributes or null. Proxy-aware.
     pub fn ordinaryGetOwnPropertySymbol(self: *Interpreter, o: *Object, key: *Symbol) EvalError!PVOrAbrupt {
-        if (o.proxy) |pd| {
-            const c = try builtin_proxy.getOwnProperty(self, pd, .{ .symbol = key });
-            if (c.isAbrupt()) return .{ .abrupt = c };
-            return .{ .pv = try descriptorObjectToPV(self, c.normal) };
-        }
-        for (o.symbol_props.items) |sp| {
-            if (sp.key == key) return .{ .pv = sp.pv };
-        }
-        return .{ .pv = null };
-    }
-
-    /// Convert a descriptor OBJECT (as returned by a proxy `getOwnPropertyDescriptor` trap, already
-    /// ToPropertyDescriptor-completed by the trap path) back into a stored PropertyValue. `undefined`
-    /// → null (property absent). Used so descriptor-level callers see a uniform shape.
-    fn descriptorObjectToPV(self: *Interpreter, v: Value) EvalError!?object_mod.PropertyValue {
-        _ = self;
-        if (v != .object) return null;
-        const d = v.object;
-        const has_get = d.properties.get("get") != null;
-        const has_set = d.properties.get("set") != null;
-        const enumerable = if (d.get("enumerable")) |e| toBoolean(e) else false;
-        const configurable = if (d.get("configurable")) |c| toBoolean(c) else false;
-        if (has_get or has_set) {
-            const g = if (d.get("get")) |gv| (if (gv == .object) gv.object else null) else null;
-            const s = if (d.get("set")) |sv| (if (sv == .object) sv.object else null) else null;
-            return .{ .payload = .{ .accessor = .{ .get = g, .set = s } }, .enumerable = enumerable, .configurable = configurable };
-        }
-        const val = if (d.get("value")) |vv| vv else Value.undefined;
-        const writable = if (d.get("writable")) |w| toBoolean(w) else false;
-        return .{ .payload = .{ .data = val }, .writable = writable, .enumerable = enumerable, .configurable = configurable };
+        return interp_property.ordinaryGetOwnPropertySymbol(self, o, key);
     }
 
     /// §10.1.6 / §10.4.2.1 [[DefineOwnProperty]] → boolean. Proxy-aware; Array-index aware. For an
     /// ordinary object, delegates to `Object.defineProperty`. (Array `length` keeps the store path.)
     pub fn ordinaryDefineOwnProperty(self: *Interpreter, o: *Object, key: []const u8, d: object_mod.Descriptor) EvalError!BoolOrAbrupt {
-        if (o.proxy) |pd| {
-            const c = try builtin_proxy.defineProperty(self, pd, .{ .string = key }, d);
-            if (c.isAbrupt()) return .{ .abrupt = c };
-            return .{ .ok = c.normal.boolean };
-        }
-        if (o.kind == .array and !std.mem.eql(u8, key, "length")) {
-            if (builtin_object.arrayIndex(key)) |idx| {
-                const adc = try builtin_object.arrayDefineIndex(self, o, idx, key, d);
-                return .{ .ok = !adc.isAbrupt() };
-            }
-        }
-        const ok = try o.defineProperty(key, d);
-        return .{ .ok = ok };
+        return interp_property.ordinaryDefineOwnProperty(self, o, key, d);
     }
 
     pub fn ordinaryDefineOwnPropertySymbol(self: *Interpreter, o: *Object, key: *Symbol, d: object_mod.Descriptor) EvalError!BoolOrAbrupt {
-        if (o.proxy) |pd| {
-            const c = try builtin_proxy.defineProperty(self, pd, .{ .symbol = key }, d);
-            if (c.isAbrupt()) return .{ .abrupt = c };
-            return .{ .ok = c.normal.boolean };
-        }
-        const ok = try o.defineSymbol(key, d);
-        return .{ .ok = ok };
+        return interp_property.ordinaryDefineOwnPropertySymbol(self, o, key, d);
     }
 
     /// §10.1.1 [[GetPrototypeOf]] → the prototype (object or null). Proxy-aware.
-    pub fn ordinaryGetPrototypeOf(self: *Interpreter, o: *Object) EvalError!union(enum) { proto: ?*Object, abrupt: Completion } {
-        if (o.proxy) |pd| {
-            const c = try builtin_proxy.getPrototypeOf(self, pd);
-            if (c.isAbrupt()) return .{ .abrupt = c };
-            return .{ .proto = if (c.normal == .object) c.normal.object else null };
-        }
-        return .{ .proto = o.prototype };
+    pub fn ordinaryGetPrototypeOf(self: *Interpreter, o: *Object) EvalError!ProtoOrAbrupt {
+        return interp_property.ordinaryGetPrototypeOf(self, o);
     }
 
     /// §10.1.2 [[SetPrototypeOf]] → boolean. Proxy-aware.
     pub fn ordinarySetPrototypeOf(self: *Interpreter, o: *Object, proto: ?*Object) EvalError!BoolOrAbrupt {
-        if (o.proxy) |pd| {
-            const c = try builtin_proxy.setPrototypeOf(self, pd, proto);
-            if (c.isAbrupt()) return .{ .abrupt = c };
-            return .{ .ok = c.normal.boolean };
-        }
-        if (o.prototype == proto) return .{ .ok = true };
-        if (!o.extensible) return .{ .ok = false };
-        o.prototype = proto;
-        return .{ .ok = true };
+        return interp_property.ordinarySetPrototypeOf(self, o, proto);
     }
 
     /// §10.1.3 [[IsExtensible]] → boolean. Proxy-aware.
-    pub fn ordinaryIsExtensible(self: *Interpreter, o: *Object) EvalError!union(enum) { ext: bool, abrupt: Completion } {
-        if (o.proxy) |pd| {
-            const c = try builtin_proxy.isExtensible(self, pd);
-            if (c.isAbrupt()) return .{ .abrupt = c };
-            return .{ .ext = c.normal.boolean };
-        }
-        return .{ .ext = o.extensible };
+    pub fn ordinaryIsExtensible(self: *Interpreter, o: *Object) EvalError!ExtOrAbrupt {
+        return interp_property.ordinaryIsExtensible(self, o);
     }
 
     /// §10.1.4 [[PreventExtensions]] → boolean. Proxy-aware.
     pub fn ordinaryPreventExtensions(self: *Interpreter, o: *Object) EvalError!BoolOrAbrupt {
-        if (o.proxy) |pd| {
-            const c = try builtin_proxy.preventExtensions(self, pd);
-            if (c.isAbrupt()) return .{ .abrupt = c };
-            return .{ .ok = c.normal.boolean };
-        }
-        o.extensible = false;
-        return .{ .ok = true };
+        return interp_property.ordinaryPreventExtensions(self, o);
     }
 
     /// §10.1.11 [[OwnPropertyKeys]] → the own keys as an allocated `[]Value` (strings then symbols for
     /// an ordinary object; for an Array: indices, `length`, string keys, symbols). Proxy-aware.
-    pub fn ordinaryOwnKeys(self: *Interpreter, o: *Object) EvalError!union(enum) { keys: []Value, abrupt: Completion } {
-        if (o.proxy) |pd| {
-            const c = try builtin_proxy.ownKeys(self, pd);
-            if (c.isAbrupt()) return .{ .abrupt = c };
-            // The trap path returns an Array of keys; flatten to a slice.
-            const arr = c.normal.object;
-            return .{ .keys = try self.arena.dupe(Value, arr.elements.items[0..arr.arrayLen()]) };
-        }
-        var list: std.ArrayListUnmanaged(Value) = .empty;
-        if (o.kind == .array) {
-            for (try o.arrayIndices(self.arena)) |i| try list.append(self.arena, .{ .string = try numberToString(self.arena, @floatFromInt(i)) });
-            try list.append(self.arena, .{ .string = "length" });
-        }
-        // §10.1.11.1: integer-index string keys ascending, then the rest in insertion order, then
-        // Symbol keys last. `orderedStringKeys` handles the index/insertion partition for the store.
-        for (try o.orderedStringKeys(self.arena)) |key| try list.append(self.arena, .{ .string = key });
-        for (o.symbol_props.items) |sp| try list.append(self.arena, .{ .symbol = sp.key });
-        return .{ .keys = try list.toOwnedSlice(self.arena) };
+    pub fn ordinaryOwnKeys(self: *Interpreter, o: *Object) EvalError!KeysOrAbrupt {
+        return interp_property.ordinaryOwnKeys(self, o);
     }
 
     fn evalBinary(self: *Interpreter, op: ast.BinaryOp, ln: *const ast.Node, rn: *const ast.Node, env: *Environment) EvalError!Completion {
@@ -7345,49 +6040,11 @@ pub const Interpreter = struct {
     /// §7.3.12 HasProperty as a Completion (so a Proxy `has` trap that throws/revokes can propagate).
     /// Use this wherever the result feeds a JS-observable operation (`in`, `Reflect.has`).
     pub fn hasPropertyVC(self: *Interpreter, base: Value, key: Value) EvalError!Completion {
-        if (base == .object) {
-            const o = base.object;
-            if (o.proxy) |pd| return builtin_proxy.has(self, pd, key);
-            // §10.1.7 OrdinaryHasProperty: own check, then delegate to a Proxy on the proto chain.
-            const own = if (key == .symbol) o.getSymbolProp(key.symbol) != null else ownHasString(o, key.string);
-            if (own) return .{ .normal = .{ .boolean = true } };
-            if (protoProxy(o)) |pp| return builtin_proxy.has(self, pp, key);
-        }
-        const b = try self.hasPropertyV(base, key);
-        return .{ .normal = .{ .boolean = b } };
-    }
-
-    fn ownSymbol(o: *Object, key: *Symbol) ?Value {
-        for (o.symbol_props.items) |sp| if (sp.key == key) return .undefined;
-        return null;
-    }
-
-    fn ownHasString(o: *Object, ks: []const u8) bool {
-        if (o.kind == .array) {
-            if (std.mem.eql(u8, ks, "length")) return true;
-            if (parseIndex(ks)) |i| if (o.arrayHas(i)) return true;
-        }
-        return o.properties.get(ks) != null;
+        return interp_property.hasPropertyVC(self, base, key);
     }
 
     pub fn hasPropertyV(self: *Interpreter, base: Value, key: Value) EvalError!bool {
-        const o = base.object;
-        if (o.proxy) |pd| { // §10.5.7 [[HasProperty]] — non-throwing callers only (forwarding chains).
-            const c = try builtin_proxy.has(self, pd, key);
-            return if (c == .normal) c.normal.boolean else false;
-        }
-        if (key == .symbol) return o.getSymbolProp(key.symbol) != null;
-        const ks = try self.toPropertyKeyString(key);
-        if (o.kind == .array) {
-            if (std.mem.eql(u8, ks, "length")) return true;
-            if (parseIndex(ks)) |i| if (o.arrayHas(i)) return true;
-        }
-        if (o.get(ks) != null) return true;
-        if (protoProxy(o)) |pp| {
-            const c = try builtin_proxy.has(self, pp, key);
-            return if (c == .normal) c.normal.boolean else false;
-        }
-        return false;
+        return interp_property.hasPropertyV(self, base, key);
     }
 
     // ── §20.2.3 Function.prototype methods ──────────────────────────────────
