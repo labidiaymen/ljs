@@ -559,9 +559,26 @@ pub const Interpreter = struct {
                         if (pc.isAbrupt()) return pc;
                     }
                     // §10.2.11: a `var` binds into the nearest VariableEnvironment (where `hoistVarNames`
-                    // instantiated it) — or the current scope if lexically inside a `with`; let/const/using
-                    // bind in the current scope. The fast path skips pattern matching for an identifier.
+                    // instantiated it); let/const/using bind in the current scope. When lexically inside a
+                    // `with`, a `var x = e` initializer is the AssignmentExpression `x = e` evaluated in the
+                    // running context (§14.3.2.3 step 4) — its PutValue must consult the with object's
+                    // object Environment Record (so it writes to a shadowing property of the binding object),
+                    // NOT a fresh binding in the throwaway with-env. The `var` name itself was already
+                    // hoisted into the real VariableEnvironment by `hoistVarNames`.
                     const is_var = d.kind == .var_decl;
+                    if (is_var and dec.target.* == .identifier and dec.init != null and
+                        self.with_depth > 0 and varInWithReach(env))
+                    {
+                        // §14.3.2.3 / §13.3.1.1: when lexically inside a `with`, `var x = e` is the
+                        // AssignmentExpression `x = e` — its PutValue(ResolveBinding("x"), v) must consult
+                        // the with object's object Environment Record (writing to a shadowing property of the
+                        // binding object), then fall through to the hoisted binding in the VariableEnvironment.
+                        // (A bare `var x;` stays a no-op; pattern targets keep the var-target binding path —
+                        // a `var`-pattern inside a `with` is vanishingly rare in practice.)
+                        const ac = try self.putWithAwareIdentifier(dec.target.identifier, v, env);
+                        if (ac.isAbrupt()) return ac;
+                        continue;
+                    }
                     const target_env = if (is_var) varInitTarget(env) else env;
                     if (dec.target.* == .identifier) {
                         if (is_var) {
@@ -930,6 +947,31 @@ pub const Interpreter = struct {
         }
     }
 
+    /// True iff a `with` object Environment Record sits between `env` and the nearest
+    /// VariableEnvironment — i.e. a `var x = e` initializer's PutValue could resolve `x` through a
+    /// binding object (§14.3.2.3). Only then do we route the var initializer through `assignToTarget`.
+    fn varInWithReach(env: *Environment) bool {
+        var e: *Environment = env;
+        while (true) {
+            if (e.with_object != null) return true;
+            if (e.is_var_scope) return false;
+            e = e.parent orelse return false;
+        }
+    }
+
+    /// Does `env`'s lexical chain (to the root) contain a `with` object Environment Record? Used at
+    /// function-call setup to re-arm the dynamic `with_depth` gate for a closure captured inside a
+    /// `with` — its free names must resolve through the captured binding object(s) even though the
+    /// `with` statement is no longer on the dynamic stack (§9.1.2.2 / §13.11.7).
+    fn envHasWith(env: *Environment) bool {
+        var e: ?*Environment = env;
+        while (e) |cur| {
+            if (cur.with_object != null) return true;
+            e = cur.parent;
+        }
+        return false;
+    }
+
     fn runBlock(self: *Interpreter, stmts: []const ast.Stmt, env: *Environment) EvalError!Completion {
         var last: Completion = .{ .normal = .undefined };
         for (stmts) |s| {
@@ -1224,27 +1266,34 @@ pub const Interpreter = struct {
         return .{ .normal = value };
     }
 
-    /// §6.2.5.6 PutValue — write `value` through the AssignmentTarget `node` (identifier / `a.b` /
-    /// `a[k]`). Mirrors the `assign`/`assign_member`/`assign_index` evaluation paths.
-    fn assignToTarget(self: *Interpreter, node: *const ast.Node, value: Value, env: *Environment) EvalError!Completion {
-        switch (node.*) {
-            .identifier => |name| {
-                if (self.with_depth > 0) switch (self.resolveIdRef(env, name)) {
-                    .with_object => |o| return self.setProperty(.{ .object = o }, name, value),
-                    .binding => |b| {
-                        if (!b.initialized) return self.throwError("ReferenceError", name); // §13.x TDZ
-                        if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
-                        b.value = value;
-                        return .{ .normal = value };
-                    },
-                    .unresolved => return self.assignUnresolved(name, value),
-                };
-                const b = env.lookup(name) orelse return self.assignUnresolved(name, value);
-                if (!b.initialized) return self.throwError("ReferenceError", name); // §13.x PutValue to a TDZ binding
+    /// §6.2.5.6 PutValue for an identifier reference — the with-aware ResolveBinding + SetMutableBinding
+    /// used by AssignmentExpression, compound/update assignment, and `var x = e` initializers inside a
+    /// `with`. When `with_depth > 0` the reference is resolved through any enclosing `with` object's
+    /// object Environment Record (HasBinding consults HasProperty over the proto chain) before falling
+    /// back to lexical bindings; an unresolved write creates/sets a global per §6.2.5.6 step 5.b.
+    fn putWithAwareIdentifier(self: *Interpreter, name: []const u8, value: Value, env: *Environment) EvalError!Completion {
+        if (self.with_depth > 0) switch (self.resolveIdRef(env, name)) {
+            .with_object => |o| return self.setProperty(.{ .object = o }, name, value),
+            .binding => |b| {
+                if (!b.initialized) return self.throwError("ReferenceError", name); // §13.x TDZ
                 if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
                 b.value = value;
                 return .{ .normal = value };
             },
+            .unresolved => return self.assignUnresolved(name, value),
+        };
+        const b = env.lookup(name) orelse return self.assignUnresolved(name, value);
+        if (!b.initialized) return self.throwError("ReferenceError", name); // §13.x PutValue to a TDZ binding
+        if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
+        b.value = value;
+        return .{ .normal = value };
+    }
+
+    /// §6.2.5.6 PutValue — write `value` through the AssignmentTarget `node` (identifier / `a.b` /
+    /// `a[k]`). Mirrors the `assign`/`assign_member`/`assign_index` evaluation paths.
+    fn assignToTarget(self: *Interpreter, node: *const ast.Node, value: Value, env: *Environment) EvalError!Completion {
+        switch (node.*) {
+            .identifier => |name| return self.putWithAwareIdentifier(name, value, env),
             .member => |m| {
                 const oc = try self.evalExpr(m.object, env);
                 if (oc.isAbrupt()) return oc;
@@ -1360,9 +1409,17 @@ pub const Interpreter = struct {
                         if (!b.initialized) return self.throwError("ReferenceError", name);
                         return .{ .normal = b.value };
                     },
-                    .unresolved => return self.throwError("ReferenceError", name),
+                    // §9.1.1.4.6 GetBindingValue: a name absent from the declarative chain still resolves
+                    // against the global object record (a `this.x = …`-installed global), else ReferenceError.
+                    .unresolved => {
+                        if (self.globalObjectHas(name)) return self.getProperty(.{ .object = self.globalObject().? }, name);
+                        return self.throwError("ReferenceError", name);
+                    },
                 };
-                const raw = env.lookup(name) orelse return self.throwError("ReferenceError", name);
+                const raw = env.lookup(name) orelse {
+                    if (self.globalObjectHas(name)) return self.getProperty(.{ .object = self.globalObject().? }, name);
+                    return self.throwError("ReferenceError", name);
+                };
                 // §16.2.1.6 resolve an import alias through to the exporting module's live binding cell.
                 const b = Environment.resolveAlias(raw) orelse return self.throwError("ReferenceError", name);
                 if (!b.initialized) return self.throwError("ReferenceError", name); // TDZ (staged; see declaration note)
@@ -3058,6 +3115,24 @@ pub const Interpreter = struct {
         return null;
     }
 
+    /// The reified global object (the realm's `%GlobalThis%`) as an `*Object`, or null.
+    fn globalObject(self: *Interpreter) ?*Object {
+        if (self.globals) |g| if (g.lookup("%GlobalThis%")) |b| if (b.value == .object) return b.value.object;
+        return null;
+    }
+
+    /// §9.1.1.4.1 GlobalEnvironmentRecord.HasBinding object-record half: does the global *object*
+    /// (own or inherited) expose `name`? ljs keeps the global namespace in TWO views — a declarative
+    /// Environment (where `var`/`let`/function declarations live) and the reified global object (where
+    /// `this.x = …` / `Object.defineProperty(globalThis, …)` land). A bare identifier that misses the
+    /// declarative chain must still resolve against the object record (§9.1.1.4.6/.11). The `%…%`
+    /// realm sentinels live only in the declarative env, never as global-object properties, so they
+    /// can't leak here.
+    fn globalObjectHas(self: *Interpreter, name: []const u8) bool {
+        const go = self.globalObject() orelse return false;
+        return go.get(name) != null; // §10.1.7 [[HasProperty]] over the proto chain
+    }
+
     /// §10.4.4.6 the realm's unique %ThrowTypeError% intrinsic, or null in a realm-less context.
     fn throwTypeErrorIntrinsic(self: *Interpreter) ?*Object {
         if (self.globals) |g| if (g.lookup("%ThrowTypeError%")) |b| if (b.value == .object) return b.value.object;
@@ -3126,6 +3201,15 @@ pub const Interpreter = struct {
         const fd = func.call orelse return self.throwError("TypeError", "value is not a function");
         const call_env = try Environment.create(self.arena, fd.closure);
         call_env.is_var_scope = true; // §10.2.11: a FunctionBody is a VariableEnvironment (var hoist target)
+        // §9.1.2.2 a function CLOSED OVER a `with` resolves its free names through the captured object
+        // Environment Record(s) even when the `with` statement is no longer dynamically on the stack
+        // (the with-scope is lexical, in `fd.closure`). `with_depth` is the dynamic gate for the
+        // with-aware resolution path, so bump it for the body's duration when the closure chain crosses
+        // a `with` (cheap `envHasWith` walk, only on call setup). The overwhelming non-`with` case is a
+        // no-op (depth unchanged → fast declarative resolution).
+        const saved_with_depth = self.with_depth;
+        if (self.with_depth == 0 and envHasWith(fd.closure)) self.with_depth = 1;
+        defer self.with_depth = saved_with_depth;
         // §10.2.11 FunctionDeclarationInstantiation: the `this` / [[HomeObject]] / [[NewTarget]] bindings
         // are established BEFORE parameter initialization, so a default-parameter initializer (`m(x =
         // super.k)`, `f(p = this.q)`, `C(t = new.target)`) sees the correct method context. Installed
@@ -6323,9 +6407,13 @@ pub const Interpreter = struct {
     fn evalUnary(self: *Interpreter, op: ast.UnaryOp, operand: *const ast.Node, env: *Environment) EvalError!Completion {
         if (op == .typeof_) {
             // §13.5.3: typeof of an *unresolved* identifier is "undefined" — it must NOT throw
-            // (this is how assert.js probes `typeof JSON !== "undefined"`).
+            // (this is how assert.js probes `typeof JSON !== "undefined"`). A name is unresolved only
+            // when it misses the declarative chain, any enclosing `with` object, AND the global object
+            // record; otherwise fall through to evaluate it (and report its real type).
             if (operand.* == .identifier and env.lookup(operand.identifier) == null) {
-                return .{ .normal = .{ .string = "undefined" } };
+                const nm = operand.identifier;
+                const in_with = self.with_depth > 0 and self.resolveIdRef(env, nm) != .unresolved;
+                if (!in_with and !self.globalObjectHas(nm)) return .{ .normal = .{ .string = "undefined" } };
             }
             const c = try self.evalExpr(operand, env);
             if (c.isAbrupt()) return c;
