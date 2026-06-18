@@ -121,6 +121,16 @@ pub fn reflectMethod(it: *Interpreter, name: []const u8, args: []const Value) Ev
                     return .{ .normal = .{ .boolean = ok } };
                 }
                 const key = try it.toPropertyKeyString(arg1);
+                // §10.4.2.1 Array exotic — route integer indices through the array-aware define so they
+                // write the element store / grow [[Length]] (mirrors Object.defineProperty). A rejected
+                // define throws TypeError inside the helper; for Reflect that surfaces as `false`. (Array
+                // `length` keeps the ordinary store-backed path here — its RangeError must still propagate.)
+                if (target.kind == .array and !std.mem.eql(u8, key, "length")) {
+                    if (builtin_object.arrayIndex(key)) |idx| {
+                        const adc = try builtin_object.arrayDefineIndex(it, target, idx, key, d);
+                        return .{ .normal = .{ .boolean = !adc.isAbrupt() } };
+                    }
+                }
                 const ok = try target.defineProperty(key, d);
                 return .{ .normal = .{ .boolean = ok } };
             },
@@ -177,13 +187,25 @@ fn reflectGet(it: *Interpreter, target: Value, key: Value, receiver: Value) Eval
 /// receiver-divergent OrdinarySet redirection is the common receiver == target model).
 fn reflectSet(it: *Interpreter, target: Value, key: Value, value: Value, receiver: Value) EvalError!Completion {
     const o = target.object;
+    // §28.1.13 step 4: a receiver was either not supplied (= target) or differs from target. When it
+    // differs, §10.1.9 OrdinarySet redirects a DATA write to the receiver (an accessor still fires the
+    // setter with `this` = receiver). `same_receiver` ⇒ the ordinary write-to-target fast path applies.
+    const same_receiver = receiver == .object and receiver.object == o;
     if (key == .symbol) {
-        if (o.getSymbolProp(key.symbol)) |loc| if (loc.pv.payload == .accessor) {
-            const setter = loc.pv.payload.accessor.set orelse return .{ .normal = .{ .boolean = false } };
-            const sc = try it.callFunction(setter, &.{value}, receiver);
-            if (sc.isAbrupt()) return sc;
-            return .{ .normal = .{ .boolean = true } };
-        };
+        if (o.getSymbolProp(key.symbol)) |loc| {
+            if (loc.pv.payload == .accessor) {
+                const setter = loc.pv.payload.accessor.set orelse return .{ .normal = .{ .boolean = false } };
+                const sc = try it.callFunction(setter, &.{value}, receiver);
+                if (sc.isAbrupt()) return sc;
+                return .{ .normal = .{ .boolean = true } };
+            }
+            // own data property
+            if (loc.holder == o and !loc.pv.writable) return .{ .normal = .{ .boolean = false } };
+            if (!same_receiver) return setOnReceiverSym(it, receiver, key.symbol, value);
+        } else if (!same_receiver) {
+            // target has no own prop; with a distinct receiver the create happens on the receiver.
+            return setOnReceiverSym(it, receiver, key.symbol, value);
+        }
         if (!o.extensible and o.getSymbolProp(key.symbol) == null) return .{ .normal = .{ .boolean = false } };
         try o.setSymbol(key.symbol, value);
         return .{ .normal = .{ .boolean = true } };
@@ -198,10 +220,50 @@ fn reflectSet(it: *Interpreter, target: Value, key: Value, value: Value, receive
             return .{ .normal = .{ .boolean = true } };
         }
         if (loc.holder == o and !loc.pv.writable) return .{ .normal = .{ .boolean = false } };
+        if (!same_receiver) return setOnReceiverStr(it, receiver, ks, value);
+    } else if (!same_receiver) {
+        return setOnReceiverStr(it, receiver, ks, value);
     }
     const sc = try it.setProperty(target, ks, value);
     if (sc.isAbrupt()) return sc;
     return .{ .normal = .{ .boolean = true } };
+}
+
+/// §10.1.9.2 OrdinarySetWithOwnDescriptor steps 3.e–f for a string key when Receiver ≠ target: consult
+/// the RECEIVER's own descriptor. An accessor or non-writable own data property on the receiver rejects
+/// (→ false); otherwise define/overwrite a data property on the receiver. A non-Object receiver → false.
+fn setOnReceiverStr(it: *Interpreter, receiver: Value, key: []const u8, value: Value) EvalError!Completion {
+    _ = it;
+    if (receiver != .object) return .{ .normal = .{ .boolean = false } };
+    const r = receiver.object;
+    if (r.properties.get(key)) |pv| {
+        // §10.1.9.2 step 3.e: an existing receiver property — reject an accessor / non-writable data;
+        // otherwise overwrite just the [[Value]] (existing attributes preserved).
+        if (pv.payload == .accessor) return .{ .normal = .{ .boolean = false } };
+        if (!pv.writable) return .{ .normal = .{ .boolean = false } };
+        const ok = try r.defineProperty(key, .{ .value = value, .has_value = true });
+        return .{ .normal = .{ .boolean = ok } };
+    }
+    // §10.1.9.2 step 3.f: CreateDataProperty(receiver, key, value) — all attributes true.
+    const ok = try r.defineProperty(key, .{ .value = value, .has_value = true, .writable = true, .enumerable = true, .configurable = true });
+    return .{ .normal = .{ .boolean = ok } };
+}
+
+/// §10.1.9.2 for a Symbol key when Receiver ≠ target — the symbol-store analogue of `setOnReceiverStr`.
+fn setOnReceiverSym(it: *Interpreter, receiver: Value, key: *@import("value.zig").Symbol, value: Value) EvalError!Completion {
+    _ = it;
+    if (receiver != .object) return .{ .normal = .{ .boolean = false } };
+    const r = receiver.object;
+    if (r.getSymbolProp(key)) |loc| {
+        if (loc.holder == r) {
+            if (loc.pv.payload == .accessor) return .{ .normal = .{ .boolean = false } };
+            if (!loc.pv.writable) return .{ .normal = .{ .boolean = false } };
+            const ok = try r.defineSymbol(key, .{ .value = value, .has_value = true });
+            return .{ .normal = .{ .boolean = ok } };
+        }
+    }
+    const ok = try r.defineSymbol(key, .{ .value = value, .has_value = true, .writable = true, .enumerable = true, .configurable = true });
+    return .{ .normal = .{ .boolean = ok } };
 }
 
 /// §28.1.11 Reflect.ownKeys — own string keys (Array indices in numeric order, then `length` for an

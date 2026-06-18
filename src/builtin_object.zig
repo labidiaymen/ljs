@@ -39,13 +39,18 @@ pub fn objectDefineProperty(it: *Interpreter, args: []const Value) EvalError!Com
             }
             // §10.4.2.1 Array exotic [[DefineOwnProperty]] — `length` is synthetic (the real value
             // lives in `array_length`, with a separate `[[Writable]]`), so it needs the ArraySetLength
-            // path. Integer indices fall through to the ordinary define (the M-subset stores
-            // non-default-attribute indices in the property map; a plain value define is shadowed by
-            // the dense slot a later [[Set]] writes — see specs/043).
-            if (o.object.kind == .array and std.mem.eql(u8, str_key, "length")) {
-                const adc = try arrayDefineLength(it, o.object, d);
-                if (adc.isAbrupt()) return adc;
-                return .{ .normal = o };
+            // path; an integer index writes the element store (and grows [[Length]]) via arrayDefineIndex.
+            if (o.object.kind == .array) {
+                if (std.mem.eql(u8, str_key, "length")) {
+                    const adc = try arrayDefineLength(it, o.object, d);
+                    if (adc.isAbrupt()) return adc;
+                    return .{ .normal = o };
+                }
+                if (arrayIndex(str_key)) |i| {
+                    const adc = try arrayDefineIndex(it, o.object, i, str_key, d);
+                    if (adc.isAbrupt()) return adc;
+                    return .{ .normal = o };
+                }
             }
             const ok = try o.object.defineProperty(str_key, d);
             if (!ok) return it.throwError("TypeError", "Cannot redefine property");
@@ -99,6 +104,108 @@ pub fn arrayDefineLength(it: *Interpreter, arr: *Object, d: object_mod.Descripto
     return .{ .normal = .undefined };
 }
 
+/// §10.4.2 IsArrayIndex — a canonical numeric string key `< 2^32-1`. Stricter than `parseIndex`:
+/// it rejects non-canonical forms (leading zeros, etc.) and the max-uint32 sentinel (which is an
+/// ordinary property, never an element). Returns the index or null.
+pub fn arrayIndex(key: []const u8) ?usize {
+    const i = parseIndex(key) orelse return null;
+    if (i >= 4294967295) return null; // 2^32-1 is not an array index
+    // canonical: ToString(i) must equal key (rejects "01", "+1", " 1", …)
+    var buf: [10]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch return null;
+    if (!std.mem.eql(u8, s, key)) return null;
+    return i;
+}
+
+/// §10.4.2.1 Array exotic [[DefineOwnProperty]] for an integer index P. Implements ArraySetLength's
+/// sibling: validate against the current element (via ValidateAndApply on a synthetic descriptor for
+/// the existing slot), grow [[Length]] (rejecting when length is non-writable and P ≥ length), and
+/// write the value to the dense/sparse element store. The M-subset element store represents the
+/// default index attributes (writable/enumerable/configurable = true); a descriptor that would make
+/// the index non-writable / non-configurable / an accessor is recorded so a frozen array's elements
+/// stay non-writable, but per-index attribute *divergence* beyond the global `array_frozen` flag is
+/// approximated. Returns abrupt (TypeError) when the (re)definition must be rejected.
+pub fn arrayDefineIndex(it: *Interpreter, arr: *Object, i: usize, key: []const u8, d: object_mod.Descriptor) EvalError!Completion {
+    // An index may currently live in the dense element store (default attributes, or non-writable when
+    // the array is frozen) OR in the ordinary property map (a prior non-default / accessor define). These
+    // two stores are mutually exclusive for a given index; resolve which one holds it.
+    const in_map: ?object_mod.PropertyValue = arr.properties.get(key);
+    const in_dense = arr.arrayHas(i);
+    const present = in_map != null or in_dense;
+    const len = arr.arrayLen();
+
+    // §10.4.2.1 step 3.b: a new index at/after a non-writable length is rejected.
+    if (!present and i >= len and !arr.array_length_writable) {
+        return it.throwError("TypeError", "Cannot add array index past a non-writable length");
+    }
+    // §10.1.6.3 step 2.a: a new index on a non-extensible array is rejected.
+    if (!present and !arr.extensible) {
+        return it.throwError("TypeError", "Cannot define property, object is not extensible");
+    }
+
+    // §10.1.6.3 ValidateAndApplyPropertyDescriptor against the current index descriptor.
+    if (in_map != null) {
+        // The map holds the full current attribute set — delegate to the shared validator + merge.
+        const ok = try arr.defineProperty(key, d);
+        if (!ok) return it.throwError("TypeError", "Cannot redefine property");
+        // Keep [[Length]] in sync (the index was already counted, but be defensive on grow).
+        if (i + 1 > arr.array_length) arr.array_length = i + 1;
+        return .{ .normal = .undefined };
+    }
+    if (in_dense) {
+        // A dense slot is a writable/enumerable/configurable data property — unless the array is frozen
+        // (then its elements are non-writable + non-configurable). §10.1.6.3 redefinition guards.
+        const cur_writable = !arr.array_frozen;
+        const cur_configurable = !arr.array_frozen;
+        const cur_value = arr.arrayGet(i);
+        if (!cur_configurable) {
+            if (d.configurable orelse false) return it.throwError("TypeError", "Cannot redefine property");
+            if (d.enumerable) |e| if (!e) return it.throwError("TypeError", "Cannot redefine property");
+            if (d.isAccessor()) return it.throwError("TypeError", "Cannot redefine property");
+            if (!cur_writable) {
+                if (d.writable orelse false) return it.throwError("TypeError", "Cannot redefine property");
+                if (d.has_value) {
+                    if (!ops.sameValue(cur_value, d.value.?)) return it.throwError("TypeError", "Cannot redefine property");
+                }
+            }
+        }
+    }
+
+    // §6.2.6.1 representable by the dense element store iff a data descriptor whose (merged) attributes
+    // are the element-store defaults (writable/enumerable/configurable = true) on a non-frozen array.
+    const wants_default =
+        !d.isAccessor() and
+        (d.writable orelse true) and
+        (d.enumerable orelse true) and
+        (d.configurable orelse true) and
+        !arr.array_frozen;
+
+    if (wants_default) {
+        const v: Value = if (d.has_value) d.value.? else if (in_dense) arr.arrayGet(i) else .undefined;
+        try arr.arraySet(it.arena, i, v);
+        if (i + 1 > arr.array_length) arr.array_length = i + 1;
+        return .{ .normal = .undefined };
+    }
+
+    // Non-default attributes / accessor: store in the ordinary property map so getOwnPropertyDescriptor,
+    // Object.keys (enumerability), and integrity reflect the requested attributes. The dense store cannot
+    // express per-index attributes, so the index lives ONLY in the map here (it is not in the dense store:
+    // a prior dense slot can't coexist because the validation above ran on the dense descriptor and any
+    // value mismatch is a configurable redefinition that supersedes it). `key` is the arena-owned
+    // canonical key string the caller computed (the property map stores the slice as-is).
+    const ok = try arr.defineProperty(key, d);
+    if (!ok) return it.throwError("TypeError", "Cannot redefine property");
+    // If a dense slot existed for this index (a default-attribute value being demoted to non-default
+    // attributes), remove it so the index is not double-counted by the dense enumeration paths — the
+    // map entry is now the single source of truth.
+    if (in_dense) try arr.arrayDelete(i);
+    // §10.4.2.1 step 3.h: [[Length]] still grows to include the index, but the dense store is NOT written
+    // (that would double-count the index in enumeration). Reading `arr[i]` via the interpreter's
+    // dense-only index path is an accepted M-subset gap for non-default-attribute indices.
+    if (i + 1 > arr.array_length) arr.array_length = i + 1;
+    return .{ .normal = .undefined };
+}
+
 /// §20.1.2.5 Object.defineProperties ( O, Properties ) — DefinePropertiesHelper over each own
 /// enumerable key of `Properties`.
 pub fn objectDefineProperties(it: *Interpreter, args: []const Value) EvalError!Completion {
@@ -116,8 +223,18 @@ pub fn objectDefineProperties(it: *Interpreter, args: []const Value) EvalError!C
         switch (r) {
             .abrupt => |c| return c,
             .desc => |d| {
-                const ok = try o.object.defineProperty(key, d);
-                if (!ok) return it.throwError("TypeError", "Cannot redefine property");
+                // §20.1.2.5 step 5.b DefineOwnProperty — Array exotic: route `length` and integer
+                // indices through the §10.4.2.1 path (ordinary string keys use the plain define).
+                if (o.object.kind == .array and std.mem.eql(u8, key, "length")) {
+                    const adc = try arrayDefineLength(it, o.object, d);
+                    if (adc.isAbrupt()) return adc;
+                } else if (o.object.kind == .array and arrayIndex(key) != null) {
+                    const adc = try arrayDefineIndex(it, o.object, arrayIndex(key).?, key, d);
+                    if (adc.isAbrupt()) return adc;
+                } else {
+                    const ok = try o.object.defineProperty(key, d);
+                    if (!ok) return it.throwError("TypeError", "Cannot redefine property");
+                }
             },
         }
     }
@@ -161,7 +278,9 @@ pub fn objectGetOwnPropertyDescriptor(it: *Interpreter, args: []const Value) Eva
     if (o.object.kind == .array) {
         if (std.mem.eql(u8, key, "length"))
             return fromDataDescriptor(it, .{ .number = @floatFromInt(o.object.arrayLen()) }, o.object.array_length_writable, false, false);
-        if (parseIndex(key)) |i| {
+        if (arrayIndex(key)) |i| {
+            // A non-default index define stored explicit attributes in the property map — those win.
+            if (o.object.properties.get(key)) |pv| return fromPropertyValue(it, pv);
             if (o.object.arrayHas(i))
                 // §10.4.2: an array index is writable/enumerable/configurable unless the array is
                 // frozen (then its elements are non-writable + non-configurable).
