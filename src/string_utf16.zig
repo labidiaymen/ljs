@@ -108,6 +108,58 @@ pub fn charAtAlloc(arena: std.mem.Allocator, s: []const u8, idx: usize) std.mem.
     return arena.dupe(u8, enc);
 }
 
+/// The byte offset of UTF-16 code-unit index `cu`, clamped to `s.len`. If `cu` falls on the LOW
+/// half of an astral pair (mid-character), returns the byte offset of that astral char's start
+/// (callers that need exact mid-pair slicing use `substringByCodeUnits`). ASCII fast path: min(cu,len).
+pub fn byteIndex(s: []const u8, cu: usize) usize {
+    if (isAscii(s)) return @min(cu, s.len);
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < s.len) {
+        if (n >= cu) return i;
+        const d = decodeAt(s, i);
+        n += if (d.cp >= 0x10000) @as(usize, 2) else 1;
+        i += d.len;
+    }
+    return s.len;
+}
+
+/// The UTF-16 code-unit index at byte offset `byte` (number of code units fully before it). ASCII
+/// fast path: `byte`. Used to convert a byte-search result back to a code-unit position.
+pub fn codeUnitIndex(s: []const u8, byte: usize) usize {
+    if (isAscii(s)) return byte;
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < s.len and i < byte) {
+        const d = decodeAt(s, i);
+        n += if (d.cp >= 0x10000) @as(usize, 2) else 1;
+        i += d.len;
+    }
+    return n;
+}
+
+/// The substring of `s` spanning code-unit indices [a, b) (a ≤ b assumed; clamped to length),
+/// allocated in `arena`. Iterates code units and re-encodes (so a boundary falling MID-astral
+/// correctly yields a lone surrogate). ASCII fast path slices the bytes directly.
+pub fn substringByCodeUnits(arena: std.mem.Allocator, s: []const u8, a: usize, b: usize) std.mem.Allocator.Error![]const u8 {
+    if (isAscii(s)) {
+        const lo = @min(a, s.len);
+        const hi = @min(b, s.len);
+        return if (lo >= hi) "" else s[lo..hi];
+    }
+    if (a >= b) return "";
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var cu: usize = a;
+    while (cu < b) : (cu += 1) {
+        const unit = codeUnitAt(s, cu) orelse break;
+        var buf: [3]u8 = undefined;
+        try out.appendSlice(arena, codeUnitToWtf8(unit, &buf));
+    }
+    // A boundary landing on a full surrogate pair re-canonicalizes to the astral 4-byte form
+    // (so `"a😀b".slice(1,3) === "😀"`); a half-pair stays a lone surrogate.
+    return canonicalizeSurrogates(arena, out.items);
+}
+
 /// Combine adjacent WTF-8 surrogate-pair encodings — a 3-byte high surrogate (ED A0..AF xx)
 /// immediately followed by a 3-byte low surrogate (ED B0..BF xx) — into the canonical 4-byte UTF-8
 /// astral scalar. Applied where a string is built from CODE UNITS (lexer `\u` escapes,

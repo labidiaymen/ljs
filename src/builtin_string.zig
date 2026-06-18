@@ -173,8 +173,8 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
         return str(out);
     }
     if (eql(u8, name, "slice")) {
-        // §22.1.3.21: relative indices (negative from end), no swap.
-        const len_f: f64 = @floatFromInt(s.len);
+        // §22.1.3.21: relative UTF-16 code-unit indices (negative from end), no swap (§6.1.4).
+        const len_f: f64 = @floatFromInt(sutf16.utf16Length(s));
         const a = switch (try relArg(it, args, 0, 0, len_f)) {
             .abrupt => |c| return c,
             .value => |v| v,
@@ -184,27 +184,28 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
             .value => |v| v,
         };
         if (a >= b) return str("");
-        return str(s[a..b]);
+        return str(try sutf16.substringByCodeUnits(it.arena, s, a, b));
     }
     if (eql(u8, name, "substring")) {
-        // §22.1.3.27: indices clamped to [0, len], then swapped so lo<=hi.
+        // §22.1.3.27: code-unit indices clamped to [0, len], then swapped so lo<=hi.
+        const ulen = sutf16.utf16Length(s);
         const a = switch (try intArg(it, args, 0, 0)) {
             .abrupt => |c| return c,
-            .value => |v| clampPos(v, s.len),
+            .value => |v| clampPos(v, ulen),
         };
-        const b = switch (try intArg(it, args, 1, @floatFromInt(s.len))) {
+        const b = switch (try intArg(it, args, 1, @floatFromInt(ulen))) {
             .abrupt => |c| return c,
-            .value => |v| clampPos(v, s.len),
+            .value => |v| clampPos(v, ulen),
         };
-        return str(s[@min(a, b)..@max(a, b)]);
+        return str(try sutf16.substringByCodeUnits(it.arena, s, @min(a, b), @max(a, b)));
     }
     if (eql(u8, name, "substr")) {
-        // Annex B §B.2.2.1 String.prototype.substr(start, length).
+        // Annex B §B.2.2.1 String.prototype.substr(start, length) — code-unit semantics.
         const start_f = switch (try intArg(it, args, 0, 0)) {
             .abrupt => |c| return c,
             .value => |v| v,
         };
-        const len_f: f64 = @floatFromInt(s.len);
+        const len_f: f64 = @floatFromInt(sutf16.utf16Length(s));
         // length defaults to +Infinity (the rest of the string).
         const length_f = switch (try intArgInf(it, args, 1)) {
             .abrupt => |c| return c,
@@ -215,7 +216,7 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
         if (count <= 0) return str("");
         const lo: usize = @intFromFloat(a);
         const hi: usize = @intFromFloat(a + count);
-        return str(s[lo..hi]);
+        return str(try sutf16.substringByCodeUnits(it.arena, s, lo, hi));
     }
     if (eql(u8, name, "concat")) {
         // §22.1.3.5: ToString each argument and append.

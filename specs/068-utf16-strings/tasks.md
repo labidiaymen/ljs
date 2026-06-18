@@ -16,4 +16,9 @@ description: "Task list for the UTF-16 strings EPIC (068) — phased; M80 = Phas
 - [x] canonicalizeSurrogates helper (combine adjacent surrogate-pair WTF-8 → astral 4-byte).
 - [x] String.fromCharCode / fromCodePoint apply it; lexer string-literal escapes apply it.
 
-## Later phases (M82+): see spec.md — index-methods (slice/indexOf/split/...), iteration/misc, regex.
+## Phase 3 (M84) — substring family — DONE
+- [x] string_utf16 helpers: byteIndex / codeUnitIndex / substringByCodeUnits (re-canonicalizes
+  whole surrogate pairs back to astral; ASCII fast path).
+- [x] builtin_string slice / substring / substr → code-unit indices.
+
+## Later phases (M85+): see spec.md
