@@ -4,10 +4,33 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const lex = @import("lexer.zig");
-const bigint = @import("bigint.zig");
-const regex_engine = @import("builtin_regexp_engine.zig");
+const parse_validate = @import("parse_validate.zig");
+const parse_expr = @import("parse_expr.zig");
+const parse_class = @import("parse_class.zig");
 
 pub const ParseError = error{ UnexpectedToken, UnexpectedEof } || lex.LexError;
+
+// ── Aliases for early-error / scope-validation helpers extracted to parse_validate.zig.
+// Keeps every retained call site (`isEvalOrArguments(…)`, `validateScope(…)`, …) unchanged.
+const isEvalOrArguments = parse_validate.isEvalOrArguments;
+const isEscapedReservedIdent = parse_validate.isEscapedReservedIdent;
+const isStrictReservedBindingName = parse_validate.isStrictReservedBindingName;
+const patternHasStrictReserved = parse_validate.patternHasStrictReserved;
+const isSimpleAssignTarget = parse_validate.isSimpleAssignTarget;
+const paramsHaveStrictReserved = parse_validate.paramsHaveStrictReserved;
+const paramsHaveYield = parse_validate.paramsHaveYield;
+const bodyVarDeclaresName = parse_validate.bodyVarDeclaresName;
+const isSimpleParameterList = parse_validate.isSimpleParameterList;
+const hasDuplicateBoundNames = parse_validate.hasDuplicateBoundNames;
+const paramsConflictWithBodyLexical = parse_validate.paramsConflictWithBodyLexical;
+const isIdentifierNameToken = parse_validate.isIdentifierNameToken;
+const isValidBindingName = parse_validate.isValidBindingName;
+const boundDeclNames = parse_validate.boundDeclNames;
+const bodyHasUseStrict = parse_validate.bodyHasUseStrict;
+const validateScope = parse_validate.validateScope;
+const directivePrologueIsStrict = parse_validate.directivePrologueIsStrict;
+const isKeywordName = parse_validate.isKeywordName;
+const NameSet = parse_validate.NameSet;
 
 pub const Parser = struct {
     tokens: []const lex.Token,
@@ -136,6 +159,9 @@ pub const Parser = struct {
     /// a Syntax Error even inside a block-bearing switch — but a `{}`-wrapped clause body re-allows it.)
     using_allowed: bool = false,
 
+    pub const ParamList = struct { params: []const ast.Param, rest: ?*const ast.Pattern };
+    pub const PropName = struct { key: []const u8, computed: ?*const ast.Node = null, is_ident: bool = false, had_escape: bool = false };
+
     /// `mode == .strict` starts the whole Script in strict context (the Test262 runner runs each
     /// test in both modes, expecting the engine to honor `RunMode`). An explicit `"use strict"`
     /// directive prologue is detected independently in `parseProgram`.
@@ -177,34 +203,34 @@ pub const Parser = struct {
         return p.parseModuleProgram();
     }
 
-    fn peek(self: *Parser) lex.Token {
+    pub fn peek(self: *Parser) lex.Token {
         return self.tokens[self.idx];
     }
 
-    fn advance(self: *Parser) lex.Token {
+    pub fn advance(self: *Parser) lex.Token {
         const t = self.tokens[self.idx];
         if (self.idx + 1 < self.tokens.len) self.idx += 1;
         return t;
     }
 
-    fn expect(self: *Parser, kind: lex.TokenKind) ParseError!lex.Token {
+    pub fn expect(self: *Parser, kind: lex.TokenKind) ParseError!lex.Token {
         if (self.peek().kind != kind) return ParseError.UnexpectedToken;
         return self.advance();
     }
 
-    fn alloc(self: *Parser, node: ast.Node) ParseError!*const ast.Node {
+    pub fn alloc(self: *Parser, node: ast.Node) ParseError!*const ast.Node {
         const p = try self.arena.create(ast.Node);
         p.* = node;
         return p;
     }
 
-    fn allocStmt(self: *Parser, stmt: ast.Stmt) ParseError!*const ast.Stmt {
+    pub fn allocStmt(self: *Parser, stmt: ast.Stmt) ParseError!*const ast.Stmt {
         const p = try self.arena.create(ast.Stmt);
         p.* = stmt;
         return p;
     }
 
-    fn allocPattern(self: *Parser, pat: ast.Pattern) ParseError!*const ast.Pattern {
+    pub fn allocPattern(self: *Parser, pat: ast.Pattern) ParseError!*const ast.Pattern {
         const p = try self.arena.create(ast.Pattern);
         p.* = pat;
         return p;
@@ -214,14 +240,14 @@ pub const Parser = struct {
     /// literal contents, `${ … }`) is `[+In]` — the relational `in` is a normal operator there even
     /// inside a for-header's first clause. These wrappers clear `no_in` for the inner parse and restore
     /// it, so `for ((a in b);;)` / `for (a[b in c];;)` keep `in` while `for (a in b)` is a for-in head.
-    fn parseAssignmentInBrackets(self: *Parser) ParseError!*const ast.Node {
+    pub fn parseAssignmentInBrackets(self: *Parser) ParseError!*const ast.Node {
         const saved = self.no_in;
         self.no_in = false;
         defer self.no_in = saved;
         return self.parseAssignment();
     }
 
-    fn parseExpressionInBrackets(self: *Parser) ParseError!*const ast.Node {
+    pub fn parseExpressionInBrackets(self: *Parser) ParseError!*const ast.Node {
         const saved = self.no_in;
         self.no_in = false;
         defer self.no_in = saved;
@@ -230,7 +256,7 @@ pub const Parser = struct {
 
     /// §13.3.3 BindingPattern — a binding identifier, an ArrayBindingPattern `[ … ]`, or an
     /// ObjectBindingPattern `{ … }`. Used by both declarations (§14.3) and parameters (§15.1).
-    fn parsePattern(self: *Parser) ParseError!*const ast.Pattern {
+    pub fn parsePattern(self: *Parser) ParseError!*const ast.Pattern {
         switch (self.peek().kind) {
             .lbracket => return self.parseArrayPattern(),
             .lbrace => return self.parseObjectPattern(),
@@ -254,7 +280,7 @@ pub const Parser = struct {
 
     /// §13.3.3 ArrayBindingPattern `[a, , b = 1, ...rest]` — elisions are holes, each element may
     /// carry a `= default`, and an optional trailing `...rest` (itself a pattern).
-    fn parseArrayPattern(self: *Parser) ParseError!*const ast.Pattern {
+    pub fn parseArrayPattern(self: *Parser) ParseError!*const ast.Pattern {
         _ = try self.expect(.lbracket);
         var elements: std.ArrayList(ast.BindingElement) = .empty;
         var rest: ?*const ast.Pattern = null;
@@ -289,7 +315,7 @@ pub const Parser = struct {
     /// §13.3.3 / §14.3.3 ObjectBindingPattern `{x, y: a, z = 1, ...rest}` — shorthand `{x}` binds
     /// `x`, `key: target` renames, `= default` applies when the property is undefined, and an
     /// optional `...rest` (identifier) collects the remaining own enumerable properties.
-    fn parseObjectPattern(self: *Parser) ParseError!*const ast.Pattern {
+    pub fn parseObjectPattern(self: *Parser) ParseError!*const ast.Pattern {
         _ = try self.expect(.lbrace);
         var props: std.ArrayList(ast.ObjectBindingProperty) = .empty;
         var rest: ?[]const u8 = null;
@@ -341,7 +367,7 @@ pub const Parser = struct {
 
     /// §13.2.8 Template literal: split raw inner text into cooked quasis + expression sources,
     /// sub-parsing each `${...}`. quasis.len == exprs.len + 1.
-    fn parseTemplate(self: *Parser, raw: []const u8) ParseError!*const ast.Node {
+    pub fn parseTemplate(self: *Parser, raw: []const u8) ParseError!*const ast.Node {
         var quasis: std.ArrayList([]const u8) = .empty;
         var exprs: std.ArrayList(*const ast.Node) = .empty;
         var cooked: std.ArrayList(u8) = .empty;
@@ -389,7 +415,7 @@ pub const Parser = struct {
 
     /// §13.3.5 `new Callee(args)`. Callee is a member expression (no call); the argument list
     /// binds to the `new`, so `new a.b.C(x)` constructs `a.b.C`.
-    fn parseNew(self: *Parser) ParseError!*const ast.Node {
+    pub fn parseNew(self: *Parser) ParseError!*const ast.Node {
         _ = self.advance(); // new
         // §13.3.12 NewTarget MetaProperty `new` `.` `target`. The only MetaProperty in the grammar is
         // `new.target`: after the `.`, the IdentifierName must be exactly `target` (no escapes), else a
@@ -449,7 +475,7 @@ pub const Parser = struct {
     /// use `parseAssignment` (NOT the spread-capable element parser): §13.3.10 forbids `...spread`
     /// (a Forbidden Extension), an empty `import()` (AssignmentExpression is not optional), and a
     /// third argument (at most two). A trailing comma after either argument is allowed.
-    fn parseImportCall(self: *Parser) ParseError!*const ast.Node {
+    pub fn parseImportCall(self: *Parser) ParseError!*const ast.Node {
         _ = self.advance(); // import
         _ = try self.expect(.lparen);
         // §13.3.10: no argument is a SyntaxError; a leading spread is a Forbidden Extension.
@@ -471,7 +497,7 @@ pub const Parser = struct {
         return self.alloc(.{ .import_call = .{ .specifier = specifier, .options = options } });
     }
 
-    fn parseIf(self: *Parser) ParseError!ast.Stmt {
+    pub fn parseIf(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // if
         _ = try self.expect(.lparen);
         const cond = try self.parseAssignment();
@@ -487,7 +513,7 @@ pub const Parser = struct {
 
     /// §14.11 `with ( Expression ) Statement`. §14.11.1 Early Error: a WithStatement in strict
     /// mode code is a SyntaxError.
-    fn parseWith(self: *Parser) ParseError!ast.Stmt {
+    pub fn parseWith(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // with
         if (self.strict) return ParseError.UnexpectedToken;
         _ = try self.expect(.lparen);
@@ -497,7 +523,7 @@ pub const Parser = struct {
         return .{ .with_stmt = .{ .object = object, .body = body } };
     }
 
-    fn parseWhile(self: *Parser) ParseError!ast.Stmt {
+    pub fn parseWhile(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // while
         _ = try self.expect(.lparen);
         const cond = try self.parseAssignment();
@@ -511,7 +537,7 @@ pub const Parser = struct {
     /// §14.7.2 `do Statement while ( Expression ) ;`. The trailing `;` is ASI-optional via the
     /// special rule in §14.7.2 (the `;` is auto-inserted regardless of a line terminator), so we
     /// consume an explicit `;` if present but never require it.
-    fn parseDoWhile(self: *Parser) ParseError!ast.Stmt {
+    pub fn parseDoWhile(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // do
         const body = blk: {
             self.iteration_depth += 1;
@@ -528,14 +554,14 @@ pub const Parser = struct {
 
     /// §14.7.5 contextual `of`: lexed as an identifier with lexeme `"of"`. Recognized only in a
     /// for-header (here) as the for-of marker — everywhere else `of` is an ordinary identifier.
-    fn peekIsOf(self: *Parser) bool {
+    pub fn peekIsOf(self: *Parser) bool {
         const t = self.peek();
         // §12.7.1: a contextual keyword spelled with a Unicode escape is NOT the keyword (`of`
         // is the identifier `of`, never the for-of marker) — terminal symbols must appear verbatim.
         return t.kind == .identifier and !t.had_escape and std.mem.eql(u8, t.lexeme, "of");
     }
 
-    fn parseFor(self: *Parser) ParseError!ast.Stmt {
+    pub fn parseFor(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // for
         // §14.7.5 `for await (LHS of EXPR) BODY` — the optional `await` (contextual identifier, no
         // LineTerminator restriction needed since `for` already consumed) marks an async for-of. It is
@@ -711,7 +737,7 @@ pub const Parser = struct {
     /// for-in / for-of statement. for-of's operand is an AssignmentExpression (§14.7.5: `of` takes an
     /// AssignmentExpression — `for (x of a, b)` is a SyntaxError); for-in's operand is a full
     /// Expression (`for (x in a, b)` is legal). The operand is `[+In]` (the suppression was only the head).
-    fn finishForInOf(self: *Parser, head: ast.ForHead, is_of: bool, is_await: bool) ParseError!ast.Stmt {
+    pub fn finishForInOf(self: *Parser, head: ast.ForHead, is_of: bool, is_await: bool) ParseError!ast.Stmt {
         const right = if (is_of) try self.parseAssignment() else try self.parseExpression();
         _ = try self.expect(.rparen);
         self.iteration_depth += 1;
@@ -729,7 +755,7 @@ pub const Parser = struct {
         return .{ .for_in_stmt = .{ .head = head, .right = right, .body = body } };
     }
 
-    fn parseSwitch(self: *Parser) ParseError!ast.Stmt {
+    pub fn parseSwitch(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // switch
         _ = try self.expect(.lparen);
         const disc = try self.parseAssignment();
@@ -768,7 +794,7 @@ pub const Parser = struct {
         return .{ .switch_stmt = .{ .discriminant = disc, .cases = cases.items } };
     }
 
-    fn parseTry(self: *Parser) ParseError!ast.Stmt {
+    pub fn parseTry(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // try
         const block = try self.parseBlock();
         var catch_param: ?*const ast.Pattern = null;
@@ -802,7 +828,7 @@ pub const Parser = struct {
 
     // ── statements ──────────────────────────────────────────────────────────
 
-    fn parseProgram(self: *Parser) ParseError!ast.Program {
+    pub fn parseProgram(self: *Parser) ParseError!ast.Program {
         // §11.2.1 / §15.1.1: a Script is strict if it carries a "use strict" directive prologue.
         // Detect it on the token stream before parsing statements so the §13.x Early Errors below
         // fire for the whole Script. (`self.strict` may already be true from a strict `RunMode`.)
@@ -823,7 +849,7 @@ pub const Parser = struct {
     /// the top level. Each `export <decl>` emits BOTH the inner declaration statement (so the binding
     /// is created/evaluated normally) AND an ExportEntry; `import`/re-export `from` declarations emit
     /// entries + requested modules but no executable statement.
-    fn parseModuleProgram(self: *Parser) ParseError!ast.Program {
+    pub fn parseModuleProgram(self: *Parser) ParseError!ast.Program {
         var stmts: std.ArrayList(ast.Stmt) = .empty;
         while (self.peek().kind != .eof) {
             switch (self.peek().kind) {
@@ -859,7 +885,7 @@ pub const Parser = struct {
     }
 
     /// Record a RequestedModule specifier (de-duplicated, source order; §16.2.1.6 [[RequestedModules]]).
-    fn addRequestedModule(self: *Parser, spec: []const u8) ParseError!void {
+    pub fn addRequestedModule(self: *Parser, spec: []const u8) ParseError!void {
         for (self.requested_modules.items) |m| if (std.mem.eql(u8, m, spec)) return;
         try self.requested_modules.append(self.arena, spec);
     }
@@ -867,7 +893,7 @@ pub const Parser = struct {
     /// §16.2.2 ImportDeclaration. Forms: `import "m";` (side-effect), `import d from "m";`,
     /// `import * as ns from "m";`, `import { a, b as c } from "m";`, and the default+named/namespace
     /// combinations (`import d, { … } from "m"`, `import d, * as ns from "m"`).
-    fn parseImportDeclaration(self: *Parser) ParseError!void {
+    pub fn parseImportDeclaration(self: *Parser) ParseError!void {
         _ = self.advance(); // import
         // `import "module";` — side-effect import, no bindings.
         if (self.peek().kind == .string) {
@@ -909,7 +935,7 @@ pub const Parser = struct {
 
     /// Back-fill the `module_request` of every import entry staged for the current declaration (those
     /// with an empty request) once the `from "spec"` clause is read, and record the requested module.
-    fn fillPendingImportRequests(self: *Parser, spec: []const u8) ParseError!void {
+    pub fn fillPendingImportRequests(self: *Parser, spec: []const u8) ParseError!void {
         for (self.import_entries.items) |*e| {
             if (e.module_request.len == 0) e.module_request = spec;
         }
@@ -919,7 +945,7 @@ pub const Parser = struct {
     /// §16.2.2 NamedImports `{ a, b as c }` — each ImportSpecifier introduces a local binding for an
     /// imported name (`a` ⇒ import `a` as `a`; `b as c` ⇒ import `b` as `c`). An IdentifierName (not
     /// just IdentifierReference) is a valid imported name; the local is a BindingIdentifier.
-    fn parseNamedImports(self: *Parser) ParseError!void {
+    pub fn parseNamedImports(self: *Parser) ParseError!void {
         _ = try self.expect(.lbrace);
         while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
             const imported = try self.moduleExportName(); // IdentifierName or StringLiteral
@@ -941,7 +967,7 @@ pub const Parser = struct {
     /// §16.2.3 ExportDeclaration. Returns the inner declaration statement to also emit (for
     /// `export var/let/const/function/class` and `export default <decl/expr>`), or null for the
     /// binding-list / re-export forms (which emit only entries).
-    fn parseExportDeclaration(self: *Parser) ParseError!?ast.Stmt {
+    pub fn parseExportDeclaration(self: *Parser) ParseError!?ast.Stmt {
         _ = self.advance(); // export
         switch (self.peek().kind) {
             .star => {
@@ -1027,7 +1053,7 @@ pub const Parser = struct {
     /// `local_name` is that name); an anonymous one binds the synthetic `*default*`. An
     /// AssignmentExpression default lowers to `let *default* = <expr>;`. Returns the inner statement
     /// plus the LOCAL binding name the default export entry should reference.
-    fn parseExportDefault(self: *Parser) ParseError!DefaultDecl {
+    pub fn parseExportDefault(self: *Parser) ParseError!DefaultDecl {
         switch (self.peek().kind) {
             .kw_function => {
                 _ = self.advance();
@@ -1055,7 +1081,7 @@ pub const Parser = struct {
     }
 
     /// Ensure an exported-default function has a binding name (`*default*` when anonymous).
-    fn namedOrDefault(self: *Parser, f: *const ast.Function) ParseError!*const ast.Function {
+    pub fn namedOrDefault(self: *Parser, f: *const ast.Function) ParseError!*const ast.Function {
         if (f.name != null) return f;
         const nf = try self.arena.create(ast.Function);
         nf.* = f.*;
@@ -1064,7 +1090,7 @@ pub const Parser = struct {
     }
 
     /// `export default <AssignmentExpression>;` → `let *default* = <expr>;`.
-    fn exportDefaultExpr(self: *Parser) ParseError!DefaultDecl {
+    pub fn exportDefaultExpr(self: *Parser) ParseError!DefaultDecl {
         const expr = try self.parseAssignment();
         self.consumeSemicolon();
         const pat = try self.allocPattern(.{ .identifier = "*default*" });
@@ -1077,7 +1103,7 @@ pub const Parser = struct {
 
     /// §16.2.3 ExportsList `{ a, b as c }` — each ExportSpecifier maps a local name (or, with
     /// `from`, a source import name) to an exported module name.
-    fn parseExportSpecifiers(self: *Parser) ParseError![]const ExportSpec {
+    pub fn parseExportSpecifiers(self: *Parser) ParseError![]const ExportSpec {
         _ = try self.expect(.lbrace);
         var out: std.ArrayList(ExportSpec) = .empty;
         while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
@@ -1095,13 +1121,13 @@ pub const Parser = struct {
     }
 
     /// §16.2.2 `from "ModuleSpecifier"`.
-    fn parseFromClause(self: *Parser) ParseError![]const u8 {
+    pub fn parseFromClause(self: *Parser) ParseError![]const u8 {
         try self.expectContextual("from");
         return (try self.expect(.string)).string_value;
     }
 
     /// §16.2.3 ModuleExportName : IdentifierName | StringLiteral. Returns the name text.
-    fn moduleExportName(self: *Parser) ParseError![]const u8 {
+    pub fn moduleExportName(self: *Parser) ParseError![]const u8 {
         const t = self.peek();
         if (t.kind == .string) {
             _ = self.advance();
@@ -1116,7 +1142,7 @@ pub const Parser = struct {
 
     /// An import-clause BindingIdentifier. §16.2.2 / §16.2.1.5: `eval` / `arguments` are forbidden as
     /// imported binding names, and a reserved word is rejected.
-    fn importBindingName(self: *Parser) ParseError![]const u8 {
+    pub fn importBindingName(self: *Parser) ParseError![]const u8 {
         if (self.peek().kind != .identifier) return ParseError.UnexpectedToken;
         if (isEscapedReservedIdent(self.peek())) return ParseError.UnexpectedToken;
         const nm = self.advance().lexeme;
@@ -1125,17 +1151,17 @@ pub const Parser = struct {
         return nm;
     }
 
-    fn isContextual(self: *Parser, word: []const u8) bool {
+    pub fn isContextual(self: *Parser, word: []const u8) bool {
         const t = self.peek();
         return t.kind == .identifier and !t.had_escape and std.mem.eql(u8, t.lexeme, word);
     }
 
-    fn expectContextual(self: *Parser, word: []const u8) ParseError!void {
+    pub fn expectContextual(self: *Parser, word: []const u8) ParseError!void {
         if (!self.isContextual(word)) return ParseError.UnexpectedToken;
         _ = self.advance();
     }
 
-    fn consumeSemicolon(self: *Parser) void {
+    pub fn consumeSemicolon(self: *Parser) void {
         if (self.peek().kind == .semicolon) _ = self.advance();
     }
 
@@ -1144,7 +1170,7 @@ pub const Parser = struct {
     ///   • Each ExportedBinding (a LOCAL export's referenced name) must be declared at the module top
     ///     level (a VarDeclaredName or LexicallyDeclaredName) — an `export { x }` / `export default`
     ///     referencing an undeclared name is a SyntaxError.
-    fn validateModuleEarlyErrors(self: *Parser, stmts: []const ast.Stmt) ParseError!void {
+    pub fn validateModuleEarlyErrors(self: *Parser, stmts: []const ast.Stmt) ParseError!void {
         // Collect the module's top-level declared names (var + lexical + function/class + the
         // synthetic `*default*` for `export default`).
         var declared: std.StringHashMapUnmanaged(void) = .empty;
@@ -1168,7 +1194,7 @@ pub const Parser = struct {
         }
     }
 
-    fn parseStmt(self: *Parser) ParseError!ast.Stmt {
+    pub fn parseStmt(self: *Parser) ParseError!ast.Stmt {
         // §13.2.5.1: any CoverInitializedName created while parsing this statement must be discharged
         // (refined to an AssignmentPattern) by the time the statement is fully parsed; an undischarged
         // residue means it escaped as a real value (`({x = 1});`) — a SyntaxError. Snapshot the count
@@ -1192,7 +1218,7 @@ pub const Parser = struct {
     /// only as the body of an `if`/`else` — `loop_body` (the body of an iteration statement) forbids it
     /// there too (`do function f(){} while(0)` / `while(0) function f(){}` are SyntaxErrors). The
     /// Annex B B.3.4 `if` positives live under `annexB/`.
-    fn parseSubStmt(self: *Parser, loop_body: bool) ParseError!ast.Stmt {
+    pub fn parseSubStmt(self: *Parser, loop_body: bool) ParseError!ast.Stmt {
         switch (self.peek().kind) {
             .kw_const, .kw_class => return ParseError.UnexpectedToken,
             .kw_let => {
@@ -1234,7 +1260,7 @@ pub const Parser = struct {
         return self.parseStmt();
     }
 
-    fn parseStmtInner(self: *Parser) ParseError!ast.Stmt {
+    pub fn parseStmtInner(self: *Parser) ParseError!ast.Stmt {
         switch (self.peek().kind) {
             // §14.4 EmptyStatement : `;` — a no-op. Represented as an empty Block (zero statements),
             // which the interpreter runs as a no-op without allocating a scope (`blockNeedsScope`
@@ -1346,7 +1372,7 @@ pub const Parser = struct {
         }
     }
 
-    fn hasLabel(self: *Parser, list: []const []const u8, name: []const u8) bool {
+    pub fn hasLabel(self: *Parser, list: []const []const u8, name: []const u8) bool {
         _ = self;
         for (list) |l| if (std.mem.eql(u8, l, name)) return true;
         return false;
@@ -1361,7 +1387,7 @@ pub const Parser = struct {
         switch_depth: usize,
     };
 
-    fn enterControlScope(self: *Parser) ControlScope {
+    pub fn enterControlScope(self: *Parser) ControlScope {
         const saved = ControlScope{
             .labels = self.labels,
             .iteration_labels = self.iteration_labels,
@@ -1375,7 +1401,7 @@ pub const Parser = struct {
         return saved;
     }
 
-    fn exitControlScope(self: *Parser, saved: ControlScope) void {
+    pub fn exitControlScope(self: *Parser, saved: ControlScope) void {
         self.labels = saved.labels;
         self.iteration_labels = saved.iteration_labels;
         self.iteration_depth = saved.iteration_depth;
@@ -1384,7 +1410,7 @@ pub const Parser = struct {
 
     /// Does `kind` begin an IterationStatement (§14.7)? A label that (transitively) prefixes one of
     /// these is a valid `continue` target; a label prefixing anything else is `break`-only.
-    fn tokenStartsIterationStmt(kind: lex.TokenKind) bool {
+    pub fn tokenStartsIterationStmt(kind: lex.TokenKind) bool {
         return switch (kind) {
             .kw_while, .kw_do, .kw_for => true,
             else => false,
@@ -1396,7 +1422,7 @@ pub const Parser = struct {
     /// (a label may not be re-declared within its own LabelledStatement — duplicate-label SyntaxError),
     /// records which labels prefix an iteration statement (for `continue label` validity), then parses
     /// the LabelledItem as a substatement and wraps it in nested `labeled_stmt` nodes (outermost first).
-    fn parseLabeled(self: *Parser, sub_position: bool) ParseError!ast.Stmt {
+    pub fn parseLabeled(self: *Parser, sub_position: bool) ParseError!ast.Stmt {
         const labels_before = self.labels.items.len;
         const iter_labels_before = self.iteration_labels.items.len;
         defer self.labels.shrinkRetainingCapacity(labels_before);
@@ -1452,537 +1478,35 @@ pub const Parser = struct {
         return wrapped.*;
     }
 
-    /// §15.2 / §15.5 / §15.8: `[async] function [*] [name] (params) { body }` — shared by declarations
-    /// and expressions. The current token is the one AFTER `function` (the caller consumed any `async`
-    /// and the `function` keyword); a leading `*` (§15.5 Generator / §15.6 AsyncGenerator) is consumed
-    /// here and flips the generator context for the body. `is_async` (§15.8) flips the await context.
-    fn parseFunction(self: *Parser, is_async: bool) ParseError!*const ast.Function {
-        const enclosing_strict = self.strict;
-        defer self.strict = enclosing_strict; // §11.2.2: never un-strict an inner scope on the way out
-        // §13.3.5/§13.3.7: an ordinary FunctionDeclaration/Expression has its OWN [[HomeObject]] (none)
-        // and is not a constructor — `super` does NOT cross into it from an enclosing method. (Arrows
-        // DO inherit `super` lexically, like `this`; `finishArrow` deliberately keeps these flags.)
-        const saved_in_method = self.in_method;
-        const saved_in_derived = self.in_derived_ctor;
-        const saved_in_static = self.in_static_block;
-        const saved_in_generator = self.in_generator;
-        const saved_in_async = self.in_async;
-        const saved_in_function = self.in_function;
-        defer self.in_method = saved_in_method;
-        defer self.in_derived_ctor = saved_in_derived;
-        defer self.in_static_block = saved_in_static;
-        defer self.in_generator = saved_in_generator;
-        defer self.in_async = saved_in_async;
-        defer self.in_function = saved_in_function;
-        self.in_method = false;
-        self.in_derived_ctor = false;
-        self.in_static_block = false; // §15.7.11: a nested ordinary function un-reserves `await`
-        self.in_function = true; // §13.3.12: a function body is a NewTarget context (`new.target` legal)
-        // §15.5: a leading `*` marks a generator. `yield` is the §14.4 operator only inside ITS body;
-        // an ordinary nested function un-sets `in_generator` (yield does not cross into it).
-        const is_generator = self.peek().kind == .star;
-        if (is_generator) _ = self.advance();
-        // §15.5/§15.8: the BODY parses with `[+Yield]`/`[+Await]`, but the FormalParameters are
-        // restricted — a `yield`/`await` operator in a default is a §15.5.1/§15.8.1 SyntaxError. We keep
-        // `in_generator`/`in_async` false across the name + params (so `yield`/`await` as an operator
-        // there does not parse), set them for the body only, and explicitly reject `yield`/`await` as
-        // the function's name / a param BindingIdentifier below.
-        self.in_generator = false;
-        self.in_async = false;
-        var name: ?[]const u8 = null;
-        if (self.peek().kind == .identifier) {
-            // §12.7.1: an escaped ReservedWord is not a valid function-name BindingIdentifier.
-            if (isEscapedReservedIdent(self.peek())) return ParseError.UnexpectedToken;
-            name = self.advance().lexeme;
-        }
-        // §13.1.1: a strict function's name (BindingIdentifier) may not be `eval`/`arguments`/a
-        // future-reserved word. Checked against the *enclosing* strictness (the name is declared
-        // in the outer scope).
-        if (enclosing_strict) if (name) |nm| if (isStrictReservedBindingName(nm)) return ParseError.UnexpectedToken;
-        // §15.5.1: a generator's BindingIdentifier may not be `yield`, and (in a generator) `yield` may
-        // not be a parameter BindingIdentifier (`function* g(yield){}` / `function* yield(){}`).
-        if (is_generator) if (name) |nm| if (std.mem.eql(u8, nm, "yield")) return ParseError.UnexpectedToken;
-        // §15.8.1: an async function's BindingIdentifier may not be `await`, and `await` may not be an
-        // async function's parameter BindingIdentifier (`async function await(){}` / `async function
-        // f(await){}`). The name is bound in the enclosing scope; the `[+Await]` of the surrounding
-        // context (an async fn nested in another) also forbids it — but the function's own asyncness
-        // is sufficient to reject its name/params.
-        if (is_async) if (name) |nm| if (std.mem.eql(u8, nm, "await")) return ParseError.UnexpectedToken;
-        const pl = try self.parseParams();
-        if (is_generator and paramsHaveYield(pl)) return ParseError.UnexpectedToken;
-        // §15.8.1: an async function's FormalParameters may not bind `await` (`async function f(await){}`)
-        // nor contain an AwaitExpression (the params parse `~Await`, so `await x` there is the identifier
-        // `await` applied to `x` — a syntax error on its own — but `await` as a binding name is the case
-        // we must reject explicitly).
-        if (is_async and paramsHaveAwait(pl)) return ParseError.UnexpectedToken;
-        // §15.5.1: a GeneratorDeclaration/Expression has UniqueFormalParameters — no duplicate bound
-        // names, in EVERY mode (not only strict), so `function*(x = 0, x){}` is a SyntaxError sloppy too.
-        if (is_generator and hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
-        // §15.8.1 / §15.6.1: an AsyncFunction/AsyncGenerator also has UniqueFormalParameters.
-        if (is_async and hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
-        // §11.2.2 lexical inheritance: the body is strict if the enclosing scope is, OR it carries
-        // its own "use strict" prologue. Prescan the body tokens (current token is `{`) so the
-        // param/body Early Errors below see the function's own strictness.
-        const body_strict = enclosing_strict or
-            (self.peek().kind == .lbrace and directivePrologueIsStrict(self.tokens[self.idx + 1 ..]));
-        // §13.1.1 / §15.1.1: in strict, the parameter BindingIdentifiers may not be reserved and
-        // must be unique. (Arrows/methods already enforce uniqueness in every mode.)
-        if (body_strict) {
-            if (paramsHaveStrictReserved(pl)) return ParseError.UnexpectedToken;
-            if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
-        }
-        self.strict = body_strict;
-        self.in_generator = is_generator; // §15.5: the GeneratorBody parses with `[+Yield]`
-        self.in_async = is_async; // §15.8: the AsyncFunctionBody parses with `[+Await]`
-        // §14.13/§14.8/§14.9: labels and the iteration/switch nest do NOT cross a function boundary —
-        // the body starts with a fresh, empty label scope (`break`/`continue` can't target an outer
-        // loop). Saved/restored around the body parse.
-        const ctrl = self.enterControlScope();
-        defer self.exitControlScope(ctrl);
-        const body = try self.parseBlock();
-        // §15.1.1 Early Error: a "use strict" directive is forbidden when the parameter list is
-        // non-simple (has defaults, patterns, or a rest element).
-        if (!isSimpleParameterList(pl) and bodyHasUseStrict(body)) return ParseError.UnexpectedToken;
-        // §15.8.1 / §15.6.1 Early Error: for an AsyncFunction / AsyncGenerator, a BoundName of the
-        // FormalParameters may not also occur in the LexicallyDeclaredNames of the body
-        // (`async function f(bar){ let bar; }`). (Ordinary/generator functions have the same rule but
-        // are tracked separately as pre-existing cuts; methods already enforce it.)
-        if (is_async and paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
-        const f = try self.arena.create(ast.Function);
-        f.* = .{ .name = name, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = is_generator, .is_async = is_async, .strict = body_strict };
-        return f;
+    pub fn parseFunction(self: *Parser, is_async: bool) ParseError!*const ast.Function {
+        return parse_class.parseFunction(self, is_async);
     }
-
-    /// §15.7 ClassDeclaration / ClassExpression. The current token is `class`. A declaration requires
-    /// a binding name; an expression's name is optional. The ClassBody parses in STRICT context
-    /// (§15.7 — classes are always strict), lexically inherited like a function body.
-    /// `extends LeftHandSideExpression` is parsed (so heritage syntax doesn't parse-reject); the
-    /// superclass link + `super` are wired in Cycle 2.
-    fn parseClass(self: *Parser, is_declaration: bool, allow_anonymous: bool) ParseError!*const ast.Class {
-        _ = self.advance(); // class
-        var name: ?[]const u8 = null;
-        // §15.7: a class name is a BindingIdentifier. `extends`/`{` end the (optional) name.
-        if (self.peek().kind == .identifier) {
-            // §12.7.1: an escaped ReservedWord is not a valid class-name BindingIdentifier.
-            if (isEscapedReservedIdent(self.peek())) return ParseError.UnexpectedToken;
-            // §13.1.1: a class name may not be a strict-reserved word — and a class body is always
-            // strict, so this holds in every mode.
-            if (isStrictReservedBindingName(self.peek().lexeme)) return ParseError.UnexpectedToken;
-            // §15.7.11: `await` is reserved inside a static block — `class await {}` there is invalid.
-            if (self.in_static_block and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
-            name = self.advance().lexeme;
-        } else if (is_declaration and !allow_anonymous) {
-            // A ClassDeclaration requires a name (the anonymous form is only a ClassExpression /
-            // `export default`); reject `class { }` in statement position.
-            return ParseError.UnexpectedToken;
-        }
-
-        // §15.7 ClassHeritage : `extends` LeftHandSideExpression (optional).
-        var superclass: ?*const ast.Node = null;
-        if (self.peek().kind == .kw_extends) {
-            _ = self.advance();
-            // LeftHandSideExpression — `parsePostfix` covers `A`, `a.b`, `f()`, member/call chains.
-            superclass = try self.parsePostfix();
-        }
-
-        // §15.7 ClassBody parses in strict context; restore on the way out. The ClassBody is also a
-        // PrivateName scope (`#x` is parseable here, a SyntaxError outside); inherited by nested bodies.
-        const enclosing_strict = self.strict;
-        const enclosing_in_class = self.in_class_body;
-        defer self.strict = enclosing_strict;
-        defer self.in_class_body = enclosing_in_class;
-        self.strict = true;
-        self.in_class_body = true;
-
-        const is_derived = superclass != null; // §15.7.14: `extends`-bearing class → derived ctors
-
-        _ = try self.expect(.lbrace);
-        // §15.7.1 AllPrivateNamesValid: pre-scan this ClassBody's PrivateBoundNames and add them to the
-        // in-scope set (so references — including forward references to a name declared later in the
-        // body — resolve). Remember the count to truncate on exit (the names leave scope with the body).
-        const private_base = self.private_names.items.len;
-        defer self.private_names.shrinkRetainingCapacity(private_base);
-        try self.collectClassPrivateNames();
-
-        var elements: std.ArrayList(ast.ClassElement) = .empty;
-        while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
-            // §15.7 ClassElement : `;` — an empty element is allowed and ignored.
-            if (self.peek().kind == .semicolon) {
-                _ = self.advance();
-                continue;
-            }
-            try elements.append(self.arena, try self.parseClassElement(is_derived));
-        }
-        _ = try self.expect(.rbrace);
-
-        // §15.7.1 Early Error: a ClassBody may declare at most one `constructor` method.
-        var seen_ctor = false;
-        for (elements.items) |el| {
-            if (el.kind == .constructor) {
-                if (seen_ctor) return ParseError.UnexpectedToken;
-                seen_ctor = true;
-            }
-        }
-        // §15.7.1 Early Error: PrivateBoundIdentifiers of a ClassBody must be unique — EXCEPT a
-        // `get`/`set` accessor pair may share a name, and a static + non-static of the same name still
-        // clash. A method/field/accessor named `#constructor` is forbidden (`#x` can't be the ctor).
-        if (try hasDuplicatePrivateNames(self.arena, elements.items)) return ParseError.UnexpectedToken;
-
-        const c = try self.arena.create(ast.Class);
-        c.* = .{ .name = name, .superclass = superclass, .elements = elements.items };
-        return c;
+    pub fn parseClass(self: *Parser, is_declaration: bool, allow_anonymous: bool) ParseError!*const ast.Class {
+        return parse_class.parseClass(self, is_declaration, allow_anonymous);
     }
-
-    /// §15.7.1 PrivateBoundNames — without consuming input, scan the current ClassBody (from the token
-    /// after its `{`, which is where `self.idx` sits) and append each private member NAME to
-    /// `self.private_names`. A PrivateIdentifier is a *declaration* (a class-element name) when it
-    /// appears at the class-body top level (brace-depth 0 relative to the body, and not inside a `(`
-    /// param list or `[` computed key) — i.e. as a `#x`, `static #x`, or `get/set #x` element key.
-    /// PrivateIdentifiers inside element bodies / initializers (brace-depth > 0) are references, not
-    /// declarations, so they are skipped. A nested class's body (`{ … }` inside this one) is also at
-    /// depth > 0, so its own private names are collected when that class is parsed (and shadow-stack via
-    /// the recursion). Does not validate — duplicate detection happens after the real parse.
-    fn collectClassPrivateNames(self: *Parser) ParseError!void {
-        var i = self.idx;
-        var depth: usize = 0; // nesting of {} ( ) [ ] relative to the class body
-        while (i < self.tokens.len) : (i += 1) {
-            const k = self.tokens[i].kind;
-            switch (k) {
-                .lbrace, .lparen, .lbracket => depth += 1,
-                .rbrace, .rparen, .rbracket => {
-                    if (depth == 0) return; // hit the class body's closing `}`
-                    depth -= 1;
-                },
-                .private_identifier => {
-                    // A declaration is a private name at the class-body top level (depth 0) that is in
-                    // element-NAME position — i.e. NOT a member reference `this.#x` (preceded by `.`)
-                    // and NOT a brand-check `#x in obj` (followed by `in`). A field initializer like
-                    // `f = this.#x` / `f = #x in o` also sits at depth 0, so these guards distinguish a
-                    // reference from a declared element name.
-                    const prev_is_dot = i > 0 and self.tokens[i - 1].kind == .dot;
-                    const next_is_in = i + 1 < self.tokens.len and self.tokens[i + 1].kind == .kw_in;
-                    if (depth == 0 and !prev_is_dot and !next_is_in) {
-                        try self.private_names.append(self.arena, self.tokens[i].lexeme);
-                    }
-                },
-                .eof => return,
-                else => {},
-            }
-        }
+    pub fn collectClassPrivateNames(self: *Parser) ParseError!void {
+        return parse_class.collectClassPrivateNames(self);
     }
-
-    /// §15.7.1 AllPrivateNamesValid — is the PrivateName `name` (`#` included) declared by some
-    /// enclosing ClassBody currently in scope?
-    fn privateNameDeclared(self: *Parser, name: []const u8) bool {
-        for (self.private_names.items) |n| if (std.mem.eql(u8, n, name)) return true;
-        return false;
+    pub fn privateNameDeclared(self: *Parser, name: []const u8) bool {
+        return parse_class.privateNameDeclared(self, name);
     }
-
-    /// §15.7 ClassElement — a method `m(){…}`, a `constructor(){…}`, a `static` method, a field
-    /// `x = init;` / `x;` (instance or static), a §15.7.11 `static { … }` initialization block, or a
-    /// PrivateName member `#x` / `#m(){}` / `get #x(){}` (Cycle 4). Still parse-rejected (preserve the
-    /// negatives): generators (`* m`) and `async` methods (a separate future milestone).
-    fn parseClassElement(self: *Parser, is_derived: bool) ParseError!ast.ClassElement {
-        // §15.7 `static` modifier (contextual): it is a modifier only when followed by something that
-        // begins a (non-static) element name. `static(){}`/`static = 1`/`static;`/`static }` use the
-        // identifier `static` as the element key instead.
-        var is_static = false;
-        if (self.peek().kind == .identifier and !self.peek().had_escape and std.mem.eql(u8, self.peek().lexeme, "static")) {
-            const next = self.tokens[self.idx + 1].kind;
-            switch (next) {
-                // `static` as a key, not a modifier.
-                .lparen, .assign, .semicolon, .rbrace => {},
-                // §15.7.11 ClassStaticBlock `static { … }` — a block that runs once at class
-                // definition with `this` = the constructor. Parsed in a method-like context: it has a
-                // [[HomeObject]] (so `super.x` is allowed), but `super(...)`/`arguments`/`await`/`yield`
-                // restrictions apply (we model the common subset — `super.x` ok, `super()` rejected).
-                .lbrace => {
-                    _ = self.advance(); // `static`
-                    return self.parseStaticBlock();
-                },
-                else => {
-                    is_static = true;
-                    _ = self.advance(); // consume `static`
-                },
-            }
-        }
-
-        // §15.7 GeneratorMethod `* m(){…}` / §15.8 AsyncMethod `async m(){…}` / §15.6 AsyncGeneratorMethod
-        // `async * m(){…}` — a leading `*` marks a generator method (§15.5); a leading `async` (no
-        // LineTerminator before the name) marks an async method, optionally followed by `*` for an
-        // async generator. Accessors `get`/`set` (handled just below), computed names `[expr]`, and
-        // PrivateName members `#x` (handled below) land too. `get`/`set`/`async` are only a modifier
-        // when followed by something that begins a property name (else they are an ordinary element
-        // key, e.g. `get(){}` / `get = 1` / `get;` / `async(){}` / `async;`).
-        var is_generator_method = false;
-        var is_async_method = false;
-        // §15.8: `async` is the modifier only when (no LineTerminator before the next token AND) the
-        // next token begins a property name or is `*`. `async \n m(){}` is the field `async` then a
-        // method `m` (ASI), so a LineTerminator un-sets the modifier.
-        if (self.peek().kind == .identifier and !self.peek().had_escape and std.mem.eql(u8, self.peek().lexeme, "async") and
-            !self.tokens[self.idx + 1].newline_before and
-            (startsAccessorName(self.tokens[self.idx + 1].kind) or self.tokens[self.idx + 1].kind == .star))
-        {
-            is_async_method = true;
-            _ = self.advance(); // consume `async`
-        }
-        switch (self.peek().kind) {
-            .star => {
-                is_generator_method = true;
-                _ = self.advance(); // consume `*`
-            },
-            .identifier => {
-                const w = self.peek().lexeme;
-                // §15.7 `get x(){…}` / `set x(v){…}` accessor (instance or static). A `get`/`set`
-                // followed by a PrivateIdentifier is a PRIVATE accessor `get #x(){…}`. (Not reachable
-                // when `is_async_method` — `async get(){}` is an async method named `get`.) §12.7.1: an
-                // escaped `get`/`set` is the plain identifier, never the accessor modifier.
-                if (!is_async_method and !self.peek().had_escape and (std.mem.eql(u8, w, "get") or std.mem.eql(u8, w, "set")) and
-                    startsAccessorName(self.tokens[self.idx + 1].kind))
-                {
-                    return self.parseClassAccessor(is_static, std.mem.eql(u8, w, "get"));
-                }
-            },
-            else => {},
-        }
-
-        // §15.7 a PrivateName member: a `#x` field/method/accessor. The leading `get`/`set` accessor
-        // case is handled above (it flows through parseClassAccessor, which reads the `#name`).
-        const is_private = self.peek().kind == .private_identifier;
-
-        // Parse the element's PropertyName: an identifier/string/number/`[computed]`, OR a `#name`
-        // PrivateIdentifier (Cycle 4). A private name is never computed and never `prototype`.
-        const pn = if (is_private) try self.parsePrivateName() else try self.parsePropertyName();
-
-        const is_literal = pn.computed == null; // a static (non-computed) PropName we can name-check
-
-        if (self.peek().kind == .lparen) {
-            // §15.7 MethodDefinition `m(params){…}` — instance (on `.prototype`) or static method, or
-            // a PRIVATE method `#m(){…}` (installed in the private slot). §15.7.1 Early Error: a
-            // `static` method may not be named `prototype`. A private method named `#constructor` is a
-            // SyntaxError (handled in parsePrivateName) and a private name is never the class ctor.
-            if (is_static and is_literal and !is_private and std.mem.eql(u8, pn.key, "prototype")) return ParseError.UnexpectedToken;
-            // §15.7: a non-static, non-private method named `constructor` is the class constructor —
-            // but a GENERATOR or ASYNC method named `constructor` is a §15.7.1 SyntaxError (a
-            // constructor is never a generator/async), and a `static *prototype` was already rejected.
-            const is_ctor = !is_generator_method and !is_async_method and !is_static and is_literal and !is_private and std.mem.eql(u8, pn.key, "constructor");
-            if ((is_generator_method or is_async_method) and is_literal and !is_private and !is_static and std.mem.eql(u8, pn.key, "constructor")) return ParseError.UnexpectedToken;
-            // §13.3.5/§13.3.7: every MethodDefinition body has a [[HomeObject]] (`super.x` allowed);
-            // `super(...)` is allowed only in a DERIVED class's `constructor`. Saved/restored so the
-            // flags don't leak to the next element (or, via the defers, to anything after the body).
-            const saved_in_method = self.in_method;
-            const saved_in_derived = self.in_derived_ctor;
-            const saved_in_generator = self.in_generator;
-            const saved_in_async = self.in_async;
-            defer self.in_method = saved_in_method;
-            defer self.in_derived_ctor = saved_in_derived;
-            defer self.in_generator = saved_in_generator;
-            defer self.in_async = saved_in_async;
-            self.in_method = true;
-            self.in_derived_ctor = is_ctor and is_derived;
-            // §15.5/§15.8: a generator/async method's BODY parses with `[+Yield]`/`[+Await]`; its
-            // FormalParameters do NOT (a `yield`/`await` operator in a default is a §15.5.1/§15.8.1
-            // SyntaxError, and `yield`/`await` may not be a param BindingIdentifier). An ordinary method
-            // un-sets both (they are not operators there even inside an enclosing generator/async fn).
-            self.in_generator = false;
-            self.in_async = false;
-            const pl = try self.parseParams();
-            if (is_generator_method and paramsHaveYield(pl)) return ParseError.UnexpectedToken;
-            if (is_async_method and paramsHaveAwait(pl)) return ParseError.UnexpectedToken;
-            self.in_generator = is_generator_method;
-            self.in_async = is_async_method;
-            var body_strict: bool = false;
-            const body = try self.parseMethodBody(pl, &body_strict);
-            // §15.7 / §13.2.5.1 UniqueFormalParameters — a method's parameters have no duplicates.
-            if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
-            // §14.3.1 / §15.5.1: a method's params may not collide with its body's LexicallyDeclaredNames.
-            if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
-            const f = try self.arena.create(ast.Function);
-            f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = is_generator_method, .is_async = is_async_method, .is_method = true, .strict = body_strict };
-            return .{
-                .kind = if (is_ctor) .constructor else .method,
-                .is_static = is_static,
-                .is_private = is_private,
-                .key = pn.key,
-                .computed_key = pn.computed,
-                .value = .{ .func = f },
-            };
-        }
-        // A leading `*` or `async` with no following method body (`* x;` / `async x = 1`) is a
-        // SyntaxError — a generator / async element must be a method (have a `(params)` body).
-        if (is_generator_method or is_async_method) return ParseError.UnexpectedToken;
-
-        // §15.7 FieldDefinition `x = Initializer ;` or bare `x ;` (ASI). An optional `= expr`.
-        // §15.7.1 Early Errors on the field's PropName: it may not be `constructor`; a `static` field
-        // may not be named `prototype`. (A private field `#x` skips these — `#constructor` is rejected
-        // in parsePrivateName, and `#prototype` is a legal private name.)
-        if (is_literal and !is_private) {
-            if (std.mem.eql(u8, pn.key, "constructor")) return ParseError.UnexpectedToken;
-            if (is_static and std.mem.eql(u8, pn.key, "prototype")) return ParseError.UnexpectedToken;
-        }
-        var field_init: ?*const ast.Node = null;
-        if (self.peek().kind == .assign) {
-            _ = self.advance();
-            // §13.3.5: a FieldDefinition Initializer has a [[HomeObject]] (so `super.x` is allowed),
-            // but it is NOT a constructor (so `super(...)` is a SyntaxError here). Save/restore.
-            const saved_in_method = self.in_method;
-            const saved_in_derived = self.in_derived_ctor;
-            const saved_in_function = self.in_function;
-            self.in_method = true;
-            self.in_derived_ctor = false;
-            self.in_function = true; // §13.3.12: `new.target` in a field initializer yields `undefined`
-            field_init = try self.parseAssignment();
-            self.in_method = saved_in_method;
-            self.in_derived_ctor = saved_in_derived;
-            self.in_function = saved_in_function;
-            // §15.7.1 Early Error: a FieldDefinition Initializer may not contain `arguments`
-            // (ContainsArguments) — `x = arguments` / `[k] = f(arguments)` are SyntaxErrors.
-            if (containsArguments(field_init.?)) return ParseError.UnexpectedToken;
-        }
-        // §15.7 ClassElement grammar: a FieldDefinition is terminated by `;` (consumed) or ASI — a
-        // `}` or a LineTerminator before the next token. Two fields on one line (`x y`, `x = 1 m(){}`)
-        // with no `;` and no newline is a SyntaxError (no ASI here).
-        if (self.peek().kind == .semicolon) {
-            _ = self.advance();
-        } else if (self.peek().kind != .rbrace and !self.peek().newline_before) {
-            return ParseError.UnexpectedToken;
-        }
-        return .{
-            .kind = .field,
-            .is_static = is_static,
-            .is_private = is_private,
-            .key = pn.key,
-            .computed_key = pn.computed,
-            .value = .{ .field_init = field_init },
-        };
+    pub fn parseClassElement(self: *Parser, is_derived: bool) ParseError!ast.ClassElement {
+        return parse_class.parseClassElement(self, is_derived);
     }
-
-    /// §15.7.11 ClassStaticBlock `static { … }` — the leading `static` has been consumed; the current
-    /// token is `{`. The block body parses in a method-like context: strict (the whole class body is),
-    /// with a [[HomeObject]] so `super.x` is allowed but `super(...)` is not (it is not a constructor).
-    fn parseStaticBlock(self: *Parser) ParseError!ast.ClassElement {
-        const saved_in_method = self.in_method;
-        const saved_in_derived = self.in_derived_ctor;
-        const saved_in_static = self.in_static_block;
-        const saved_in_async = self.in_async;
-        const saved_in_generator = self.in_generator;
-        const saved_in_function = self.in_function;
-        defer self.in_method = saved_in_method;
-        defer self.in_derived_ctor = saved_in_derived;
-        defer self.in_static_block = saved_in_static;
-        defer self.in_async = saved_in_async;
-        defer self.in_generator = saved_in_generator;
-        defer self.in_function = saved_in_function;
-        self.in_method = true;
-        self.in_derived_ctor = false;
-        self.in_function = true; // §13.3.12: `new.target` is legal in a static block (yields `undefined`)
-        // §15.7.11: a ClassStaticBlock is NOT an async/generator context — `await`/`yield` are not
-        // operators here. `await` is RESERVED (a binding/reference is a SyntaxError, via `in_static_block`)
-        // and `ContainsAwait` of the block is a Syntax Error, so an `await`-led form must not parse as
-        // the operator even when the block is nested in an async function. Reset both context flags.
-        self.in_async = false;
-        self.in_generator = false;
-        self.in_static_block = true; // §15.7.11: `await` is reserved inside the block
-        const ctrl = self.enterControlScope(); // §14.13: a static block starts a fresh label scope
-        defer self.exitControlScope(ctrl);
-        const body = try self.parseBlock();
-        return .{ .kind = .static_block, .is_static = true, .value = .{ .block = body } };
+    pub fn parseStaticBlock(self: *Parser) ParseError!ast.ClassElement {
+        return parse_class.parseStaticBlock(self);
     }
-
-    /// §15.7 MethodDefinition `get PropName(){…}` / `set PropName(v){…}` in a class body (the leading
-    /// `get`/`set` token has NOT yet been consumed; `is_get` selects which). Mirrors the object-literal
-    /// accessor path (§13.2.5.6): the accessor arity Early Errors, [[HomeObject]] context for `super`,
-    /// and the §15.7.1 name restrictions (`constructor` may not be an accessor; a `static` accessor may
-    /// not be named `prototype`). Computed keys `get [expr](){…}` are supported (key in `computed_key`).
-    fn parseClassAccessor(self: *Parser, is_static: bool, is_get: bool) ParseError!ast.ClassElement {
-        _ = self.advance(); // consume `get` / `set`
-        // A PRIVATE accessor `get #x(){…}` (Cycle 4): the name is a PrivateIdentifier (`#constructor`
-        // is rejected in parsePrivateName); a private accessor skips the `constructor`/`prototype`
-        // name restrictions (those names are legal as private names).
-        const is_private = self.peek().kind == .private_identifier;
-        const pn = if (is_private) try self.parsePrivateName() else try self.parsePropertyName();
-        const is_literal = pn.computed == null;
-        // §15.7.1 Early Errors: `constructor` may not be a getter/setter; a `static` accessor named
-        // `prototype` is forbidden.
-        if (is_literal and !is_private) {
-            if (!is_static and std.mem.eql(u8, pn.key, "constructor")) return ParseError.UnexpectedToken;
-            if (is_static and std.mem.eql(u8, pn.key, "prototype")) return ParseError.UnexpectedToken;
-        }
-        // §13.3.5: an accessor body has a [[HomeObject]] (so `super.x` is allowed) but is not a
-        // constructor (so `super(...)` is a SyntaxError). Save/restore so the flags don't leak.
-        const saved_in_method = self.in_method;
-        const saved_in_derived = self.in_derived_ctor;
-        defer self.in_method = saved_in_method;
-        defer self.in_derived_ctor = saved_in_derived;
-        self.in_method = true;
-        self.in_derived_ctor = false;
-        const pl = try self.parseParams();
-        // §13.2.5.1 accessor arity Early Errors: a getter takes no parameters; a setter takes exactly
-        // one (a default is allowed, a rest element is not).
-        if (is_get) {
-            if (pl.params.len != 0 or pl.rest != null) return ParseError.UnexpectedToken;
-        } else {
-            if (pl.params.len != 1 or pl.rest != null) return ParseError.UnexpectedToken;
-        }
-        var body_strict: bool = false;
-        const body = try self.parseMethodBody(pl, &body_strict);
-        if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
-        const f = try self.arena.create(ast.Function);
-        f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_method = true, .strict = body_strict };
-        return .{
-            .kind = if (is_get) .get else .set,
-            .is_static = is_static,
-            .is_private = is_private,
-            .key = pn.key,
-            .computed_key = pn.computed,
-            .value = .{ .func = f },
-        };
+    pub fn parseClassAccessor(self: *Parser, is_static: bool, is_get: bool) ParseError!ast.ClassElement {
+        return parse_class.parseClassAccessor(self, is_static, is_get);
     }
-
-    /// §15.7 parse a PrivateIdentifier `#name` as a class-element name. The current token is a
-    /// `private_identifier` (lexeme includes the `#`). §15.7.1 Early Error: `#constructor` may not be
-    /// used as a private member name. Returns a PropName whose `key` is the `#name` (never computed).
-    fn parsePrivateName(self: *Parser) ParseError!PropName {
-        const t = self.advance();
-        std.debug.assert(t.kind == .private_identifier);
-        if (std.mem.eql(u8, t.lexeme, "#constructor")) return ParseError.UnexpectedToken;
-        return .{ .key = t.lexeme };
+    pub fn parsePrivateName(self: *Parser) ParseError!PropName {
+        return parse_class.parsePrivateName(self);
     }
-
-    const ParamList = struct { params: []const ast.Param, rest: ?*const ast.Pattern };
-
-    /// §15.1 FormalParameters — each parameter is a binding pattern with an optional `= default`;
-    /// an optional trailing `...rest` (itself a pattern) collects the leftover arguments.
-    fn parseParams(self: *Parser) ParseError!ParamList {
-        _ = try self.expect(.lparen);
-        var params: std.ArrayList(ast.Param) = .empty;
-        var rest: ?*const ast.Pattern = null;
-        while (self.peek().kind != .rparen and self.peek().kind != .eof) {
-            if (self.peek().kind == .ellipsis) { // §15.1 rest parameter (must be last)
-                _ = self.advance();
-                rest = try self.parsePattern();
-                break;
-            }
-            const pattern = try self.parsePattern();
-            var default: ?*const ast.Node = null;
-            if (self.peek().kind == .assign) { // §15.1 default value `a = expr`
-                _ = self.advance();
-                default = try self.parseAssignment();
-            }
-            try params.append(self.arena, .{ .pattern = pattern, .default = default });
-            if (self.peek().kind == .comma) {
-                _ = self.advance();
-                continue;
-            }
-            break;
-        }
-        _ = try self.expect(.rparen);
-        return .{ .params = params.items, .rest = rest };
+    pub fn parseParams(self: *Parser) ParseError!ParamList {
+        return parse_class.parseParams(self);
     }
-
-    /// §13.3.6 Arguments `( … )` — a comma-separated list of (possibly spread) AssignmentExpressions.
     /// Assumes the current token is `(`; consumes through the matching `)`.
-    fn parseArgs(self: *Parser) ParseError![]const *const ast.Node {
+    pub fn parseArgs(self: *Parser) ParseError![]const *const ast.Node {
         const saved_no_in = self.no_in; // §14.7.5 `[~In]` reset — arg list is `[+In]`
         self.no_in = false;
         defer self.no_in = saved_no_in;
@@ -2002,7 +1526,7 @@ pub const Parser = struct {
 
     /// §13.3.2 MemberExpression `.` IdentifierName — the name after a `.`/`?.` is an IdentifierName,
     /// so reserved words are valid here (`a.if`, `a?.return`). Returns the name lexeme.
-    fn expectPropertyName(self: *Parser) ParseError![]const u8 {
+    pub fn expectPropertyName(self: *Parser) ParseError![]const u8 {
         const t = self.peek();
         if (t.kind == .identifier or isKeywordName(t.kind)) {
             _ = self.advance();
@@ -2012,7 +1536,7 @@ pub const Parser = struct {
     }
 
     /// An argument or array element that may be a spread `...expr`.
-    fn parseSpreadable(self: *Parser) ParseError!*const ast.Node {
+    pub fn parseSpreadable(self: *Parser) ParseError!*const ast.Node {
         const saved_no_in = self.no_in; // §14.7.5 `[~In]` reset — array element / arg is `[+In]`
         self.no_in = false;
         defer self.no_in = saved_no_in;
@@ -2023,7 +1547,7 @@ pub const Parser = struct {
         return self.parseAssignment();
     }
 
-    fn parseBlock(self: *Parser) ParseError![]const ast.Stmt {
+    pub fn parseBlock(self: *Parser) ParseError![]const ast.Stmt {
         _ = try self.expect(.lbrace);
         // §14.3.1.1: a Block (also a FunctionBody / GeneratorBody / AsyncFunctionBody / try/catch/
         // finally body / ClassStaticBlockBody — all of which parse through here) is a UsingDeclaration
@@ -2039,7 +1563,7 @@ pub const Parser = struct {
         return stmts.items;
     }
 
-    fn parseDecl(self: *Parser) ParseError!ast.Stmt {
+    pub fn parseDecl(self: *Parser) ParseError!ast.Stmt {
         const kind: ast.DeclKind = switch (self.advance().kind) {
             .kw_var => .var_decl,
             .kw_let => .let_decl,
@@ -2081,7 +1605,7 @@ pub const Parser = struct {
     /// BindingPattern target or a missing Initializer is a SyntaxError), and the bound name may not be
     /// `let`. `for_head` (set by `parseFor`) skips both the trailing `;` and the initializer-required
     /// check (a for-of head has no `= init`, and the for-header's own logic consumes the terminator).
-    fn parseUsingDecl(self: *Parser, kind: ast.DeclKind, for_head: bool) ParseError!ast.Stmt {
+    pub fn parseUsingDecl(self: *Parser, kind: ast.DeclKind, for_head: bool) ParseError!ast.Stmt {
         // §14.3.1.1: a UsingDeclaration is a Syntax Error at the top level of a Script.
         if (!self.using_allowed and !for_head) return ParseError.UnexpectedToken;
         // §16.2.1.6 [[HasTLA]]: an `await using` at module top level awaits at scope disposal, making
@@ -2122,13 +1646,13 @@ pub const Parser = struct {
     /// §15.3 ArrowFunction. Builds a `function` node flagged `is_arrow`. An expression body is
     /// normalized to a single `return expr` statement; a `{ … }` body is a normal block.
     /// `params`/`rest` come from the already-parsed (or about-to-parse) formal list.
-    fn finishArrow(self: *Parser, pl: ParamList) ParseError!*const ast.Node {
+    pub fn finishArrow(self: *Parser, pl: ParamList) ParseError!*const ast.Node {
         return self.finishArrowAsync(pl, false);
     }
 
     /// §15.3 / §15.8 ArrowFunction / AsyncArrowFunction. `is_async` flags an async arrow (`async x =>`,
     /// `async (a) =>`), whose body parses with `[+Await]` (and whose `=>` was preceded by `async`).
-    fn finishArrowAsync(self: *Parser, pl: ParamList, is_async: bool) ParseError!*const ast.Node {
+    pub fn finishArrowAsync(self: *Parser, pl: ParamList, is_async: bool) ParseError!*const ast.Node {
         const enclosing_strict = self.strict;
         const saved_in_async = self.in_async;
         const saved_in_static = self.in_static_block;
@@ -2191,13 +1715,13 @@ pub const Parser = struct {
     /// `()`/`[]`/`{}`) and report whether the token after it is `=>`. Used to disambiguate the
     /// arrow cover-grammar `( … ) =>` from a parenthesized expression without backtracking the
     /// real parse. Does not mutate parser state.
-    fn parenIsArrowHead(self: *Parser) bool {
+    pub fn parenIsArrowHead(self: *Parser) bool {
         return self.parenIsArrowHeadAt(self.idx);
     }
 
     /// As `parenIsArrowHead`, but the `(` is at the given token index (used for `async ( … ) =>`,
     /// where the `(` sits one past `async`). Returns true iff the token after the matching `)` is `=>`.
-    fn parenIsArrowHeadAt(self: *Parser, start: usize) bool {
+    pub fn parenIsArrowHeadAt(self: *Parser, start: usize) bool {
         var i = start; // on the '('
         var depth: usize = 0;
         while (i < self.tokens.len) : (i += 1) {
@@ -2223,7 +1747,7 @@ pub const Parser = struct {
     /// intervening LineTerminator — else ASI ends an expression statement `using`). `in_for` excludes
     /// `of` (`for (using of …)` is the for-of of an identifier `using`, not a using-decl of `of`).
     /// An escaped `using` is NOT the keyword (§12.7.1 — terminals appear verbatim).
-    fn atUsingDeclStart(self: *Parser, in_for: bool) bool {
+    pub fn atUsingDeclStart(self: *Parser, in_for: bool) bool {
         const t = self.peek();
         if (t.kind != .identifier or t.had_escape or !std.mem.eql(u8, t.lexeme, "using")) return false;
         if (self.idx + 1 >= self.tokens.len) return false;
@@ -2245,7 +1769,7 @@ pub const Parser = struct {
     /// `await [no LineTerminator here] using [no LineTerminator here] BindingIdentifier …`? Only inside
     /// an async context (`in_async`) is `await` a keyword. The `using` must follow on the same line, and
     /// `using` must in turn be followed by a same-line BindingIdentifier.
-    fn atAwaitUsingDeclStart(self: *Parser, in_for: bool) bool {
+    pub fn atAwaitUsingDeclStart(self: *Parser, in_for: bool) bool {
         _ = in_for;
         if (!self.in_async) return false;
         const t = self.peek();
@@ -2265,7 +1789,7 @@ pub const Parser = struct {
     /// `async [no LineTerminator here] function …`? `async` is the modifier only when `function`
     /// follows on the SAME line (no intervening LineTerminator — else ASI splits it). The `function`
     /// keyword must immediately follow `async`.
-    fn atAsyncFunctionStart(self: *Parser) bool {
+    pub fn atAsyncFunctionStart(self: *Parser) bool {
         // Structural recognition only — escape-ness is checked by the caller (§12.7.1: `async`
         // [no LT] `function` IS the AsyncFunction production even when escaped; the escape is an
         // Early Error, not a re-parse as an identifier).
@@ -2282,7 +1806,7 @@ pub const Parser = struct {
     /// production) AND the following form is an arrow head or `function`. A trailing `=>` after the
     /// matching `)` distinguishes `async (a, b) => …` from a call `async(a, b)`.
     const AsyncHead = enum { arrow_ident, arrow_paren, function_expr };
-    fn atAsyncArrowOrFunction(self: *Parser) ?AsyncHead {
+    pub fn atAsyncArrowOrFunction(self: *Parser) ?AsyncHead {
         // Structural recognition only — escape-ness checked by the caller (§12.7.1 Early Error).
         if (self.peek().kind != .identifier or !std.mem.eql(u8, self.peek().lexeme, "async")) return null;
         if (self.idx + 1 >= self.tokens.len) return null;
@@ -2312,2306 +1836,61 @@ pub const Parser = struct {
     /// object properties, parameters, or declarators (those keep using `parseAssignment` /
     /// `parseSpreadable`). The arrow cover-grammar is unaffected: `parseAssignment` still fires its
     /// `( … ) =>` lookahead first, so `(a, b) => …` parses as params while `(a, b)` is a sequence.
-    fn parseExpression(self: *Parser) ParseError!*const ast.Node {
-        var left = try self.parseAssignment();
-        while (self.peek().kind == .comma) {
-            _ = self.advance();
-            const right = try self.parseAssignment();
-            left = try self.alloc(.{ .comma = .{ .left = left, .right = right } });
-        }
-        return left;
+    pub inline fn parseExpression(self: *Parser) ParseError!*const ast.Node {
+        return parse_expr.parseExpression(self);
     }
-
-    /// §13.15 Assignment (right-associative). Only identifier targets in M1 Cycle A.
-    fn parseAssignment(self: *Parser) ParseError!*const ast.Node {
-        // §14.4 YieldExpression — `AssignmentExpression : [+Yield] YieldExpression`. Inside a generator
-        // body `yield` is always the operator (never an IdentifierReference). Parsed here at the
-        // assignment level (its operand is itself an AssignmentExpression, giving `yield` its very low,
-        // right-associative precedence: `yield a + b` ≡ `yield (a + b)`, `x = yield y` ≡ `x = (yield y)`).
-        if (self.in_generator and self.peek().kind == .identifier and std.mem.eql(u8, self.peek().lexeme, "yield")) {
-            return self.parseYield();
-        }
-        // §15.8 AwaitExpression `await UnaryExpression` — inside an async context `await` is the
-        // operator. Parsed via `parseUnary` (UnaryExpression precedence); routed there so it composes
-        // with the rest of the precedence climb (`await a + b` ≡ `(await a) + b`). Handled at the
-        // assignment level only as a quick gate for the async-arrow / ordinary fallthrough — the actual
-        // node is built in `parseUnary`, so we just fall through to the precedence path below.
-        // §15.8 async arrow / async function expression (cover grammar, before the ordinary arrow):
-        //   • `async [no LT] Identifier =>` — a single-parameter async arrow.
-        //   • `async [no LT] ( … ) =>` — a parenthesized async arrow.
-        //   • `async [no LT] function …` — an async function expression.
-        // `async` is the modifier ONLY with no LineTerminator before the following token (else ASI /
-        // `async` is an identifier). Distinguished from a CALL `async(x)` by the trailing `=>`.
-        if (self.atAsyncArrowOrFunction()) |kind| {
-            // §12.7.1 Early Error: the `async` of an async arrow / async function expression is a
-            // terminal symbol and must not contain a Unicode escape (`async function …`).
-            if (self.peek().had_escape) return ParseError.UnexpectedToken;
-            switch (kind) {
-                .arrow_ident => {
-                    _ = self.advance(); // `async`
-                    // §15.8.1: `async await => …` — `await` may not be an async arrow's param BindingIdentifier.
-                    if (std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
-                    // §12.7.1: an escaped ReservedWord is not a valid arrow-param BindingIdentifier.
-                    if (isEscapedReservedIdent(self.peek())) return ParseError.UnexpectedToken;
-                    const pat = try self.allocPattern(.{ .identifier = self.advance().lexeme });
-                    const params = try self.arena.alloc(ast.Param, 1);
-                    params[0] = .{ .pattern = pat, .default = null };
-                    return self.finishArrowAsync(.{ .params = params, .rest = null }, true);
-                },
-                .arrow_paren => {
-                    _ = self.advance(); // `async`
-                    const saved_in_async = self.in_async;
-                    defer self.in_async = saved_in_async;
-                    // §15.8: an AsyncArrowFunction's CoverCallExpressionAndAsyncArrowHead parses its
-                    // formals with `[+Await]` — so `await` is reserved as a BindingIdentifier inside them
-                    // (including in a nested arrow's params, `async(a = (await) => {}) => {}`), and an
-                    // `await` operator there becomes an `await_expr`. §15.8.1 then rejects any params that
-                    // bind/contain `await` (`paramsHaveAwait`, which catches both the identifier and the node).
-                    self.in_async = true;
-                    const pl = try self.parseParams();
-                    if (paramsHaveAwait(pl)) return ParseError.UnexpectedToken;
-                    return self.finishArrowAsync(pl, true);
-                },
-                .function_expr => {
-                    _ = self.advance(); // `async`
-                    _ = self.advance(); // `function`
-                    return self.alloc(.{ .function = try self.parseFunction(true) });
-                },
-            }
-        }
-        // §15.3 ArrowFunction (cover grammar, checked before the precedence climb):
-        //   • `Identifier =>` — a single un-parenthesized parameter.
-        //   • `( … ) =>` — a parenthesized formal list (lookahead to the matching `)`).
-        if (self.peek().kind == .identifier and self.idx + 1 < self.tokens.len and
-            self.tokens[self.idx + 1].kind == .fat_arrow)
-        {
-            // §15.7.11: `await` is reserved as a BindingIdentifier inside a static block (`await => …`).
-            if (self.in_static_block and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
-            // §15.8.1: inside an async context `await` may not be an arrow's param BindingIdentifier.
-            if (self.in_async and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
-            // §12.7.1: an escaped ReservedWord is not a valid arrow-param BindingIdentifier.
-            if (isEscapedReservedIdent(self.peek())) return ParseError.UnexpectedToken;
-            const pat = try self.allocPattern(.{ .identifier = self.advance().lexeme });
-            const params = try self.arena.alloc(ast.Param, 1);
-            params[0] = .{ .pattern = pat, .default = null };
-            return self.finishArrow(.{ .params = params, .rest = null });
-        }
-        if (self.peek().kind == .lparen and self.parenIsArrowHead()) {
-            const pl = try self.parseParams();
-            return self.finishArrow(pl);
-        }
-        const left = try self.parseConditional();
-        const op = self.peek().kind;
-        // §13.15.2 LogicalAssignment (`&&=`/`||=`/`??=`) — short-circuit, NOT a binary desugar.
-        // The target node is kept intact (identifier / member / index) so the interpreter can
-        // evaluate the reference exactly once before deciding whether to evaluate the RHS.
-        if (logicalAssignOp(op)) |lop| {
-            switch (left.*) {
-                .identifier => |n| {
-                    // §13.15.1 Early Error: in strict, the assignment target may not be `eval`/`arguments`.
-                    if (self.strict and isEvalOrArguments(n)) return ParseError.UnexpectedToken;
-                },
-                .member, .index, .private_member, .super_member => {},
-                else => return ParseError.UnexpectedToken, // §13.15.1 invalid assignment target
-            }
-            _ = self.advance();
-            const value = try self.parseAssignment();
-            return self.alloc(.{ .logical_assign = .{ .op = lop, .target = left, .value = value } });
-        }
-        // §13.15.5 DestructuringAssignment (cover grammar): an ArrayLiteral / ObjectLiteral followed by
-        // `=` is REFINED to an AssignmentPattern. Only the plain `=` form (not compound `+=` etc.) takes
-        // a pattern target (§13.15.1: a compound assignment requires a simple LeftHandSideExpression).
-        // §13.15.1: a PARENTHESIZED literal `({}) = 1` / `([a]) = 1` has AssignmentTargetType *invalid*
-        // (the parens make it a ParenthesizedExpression, not the AssignmentPattern cover grammar), so it
-        // is NOT refined — it falls through to the ordinary-assignment path, which rejects it.
-        if (op == .assign and !self.last_was_paren and (left.* == .array_literal or left.* == .object_literal)) {
-            try self.validateAssignmentPattern(left); // §13.15.1 AssignmentTargetType refinement
-            _ = self.advance();
-            const value = try self.parseAssignment();
-            return self.alloc(.{ .assign_pattern = .{ .target = left, .value = value } });
-        }
-        if (op == .assign or compoundBinOp(op) != null) {
-            // §13.15.1 Early Error: in strict, the assignment target may not be `eval`/`arguments`.
-            if (self.strict) switch (left.*) {
-                .identifier => |n| if (isEvalOrArguments(n)) return ParseError.UnexpectedToken,
-                else => {},
-            };
-            // §13.15.1: the target of a (compound or plain) assignment must be a simple
-            // LeftHandSideExpression — identifier / member / index / private member.
-            switch (left.*) {
-                .identifier, .member, .index, .private_member, .super_member => {},
-                else => if (compoundBinOp(op) != null) return ParseError.UnexpectedToken,
-            }
-            _ = self.advance();
-            const rhs = try self.parseAssignment();
-            // §13.15.2 compound assignment `target op= v` is kept INTACT as `compound_assign` (the
-            // reference is evaluated once at runtime — see ast.compound_assign), NOT desugared to
-            // `target = target op v` (which would re-evaluate a side-effecting base/key).
-            if (compoundBinOp(op)) |bop| {
-                return self.alloc(.{ .compound_assign = .{ .op = bop, .target = left, .value = rhs } });
-            }
-            switch (left.*) {
-                .identifier => |n| return self.alloc(.{ .assign = .{ .name = n, .value = rhs } }),
-                .member => |m| return self.alloc(.{ .assign_member = .{ .object = m.object, .name = m.name, .value = rhs } }),
-                .index => |ix| return self.alloc(.{ .assign_index = .{ .object = ix.object, .key = ix.key, .value = rhs } }),
-                .private_member => |pm| return self.alloc(.{ .private_assign = .{ .object = pm.object, .name = pm.name, .value = rhs } }),
-                .super_member => |sm| return self.alloc(.{ .super_assign = .{ .name = sm.name, .key = sm.key, .value = rhs } }),
-                else => return ParseError.UnexpectedToken, // invalid assignment target
-            }
-        }
-        return left;
+    pub inline fn parseAssignment(self: *Parser) ParseError!*const ast.Node {
+        return parse_expr.parseAssignment(self);
     }
-
-    /// §14.4 YieldExpression — the current token is the `yield` identifier (caller verified
-    /// `in_generator`). Forms: `yield` (bare → yields undefined), `yield AssignmentExpression`, and
-    /// `yield* AssignmentExpression` (delegation, parsed here; full §15.5.5 semantics are Cycle 2).
-    /// Restricted production: a LineTerminator after `yield` forces the bare form (ASI), and `yield`
-    /// followed by a token that cannot start an expression (`)`, `]`, `}`, `,`, `;`, `:`, eof) is bare.
-    fn parseYield(self: *Parser) ParseError!*const ast.Node {
-        _ = self.advance(); // yield
-        // §14.4 `yield [no LineTerminator here] * AssignmentExpression` — delegation. The `*` IS part of
-        // the restricted production: a newline before it forces a bare `yield` (so `yield\n* 1` is NOT
-        // `yield*` — the leftover `* 1` then fails to parse, a SyntaxError, matching the spec).
-        if (self.peek().kind == .star and !self.peek().newline_before) {
-            _ = self.advance();
-            const arg = try self.parseAssignment();
-            return self.alloc(.{ .yield_expr = .{ .argument = arg, .delegate = true } });
-        }
-        // §14.4 restricted production: `yield [no LineTerminator here] AssignmentExpression`. A newline,
-        // or a token that cannot begin an AssignmentExpression, makes this a bare `yield`.
-        const nxt = self.peek();
-        if (nxt.newline_before or !startsYieldArgument(nxt.kind)) {
-            return self.alloc(.{ .yield_expr = .{ .argument = null, .delegate = false } });
-        }
-        const arg = try self.parseAssignment();
-        return self.alloc(.{ .yield_expr = .{ .argument = arg, .delegate = false } });
+    pub fn parseYield(self: *Parser) ParseError!*const ast.Node {
+        return parse_expr.parseYield(self);
     }
-
-    /// §13.15.1 / §13.15.5.1 — refine an ArrayLiteral / ObjectLiteral (the cover grammar) into an
-    /// AssignmentPattern: validate that every leaf is a valid destructuring assignment target. A leaf
-    /// may be a plain assignment target (identifier / member `a.b` / index `a[k]` / `a.#x`), a nested
-    /// array/object literal pattern (recurse), or — carrying a `= default` — an `assign`/`assign_*`
-    /// node whose own target the same rules apply to. Holes (elision) and the trailing `...rest` are
-    /// allowed in array patterns; object-property *values* and rest are validated likewise. A
-    /// non-assignable leaf (`[1] = x`, `[a()] = x`, `({a: 1} = x)`) is a §13.15.1 SyntaxError.
-    fn validateAssignmentPattern(self: *Parser, node: *const ast.Node) ParseError!void {
-        switch (node.*) {
-            .array_literal => |elems| {
-                for (elems, 0..) |el, i| {
-                    if (el.* == .elision) continue; // hole — no target
-                    if (el.* == .spread) {
-                        // §13.15.5.1 AssignmentRestElement — it must be the LAST element (a following
-                        // element or a trailing comma `[...x,]`, which the parser marks with a trailing
-                        // elision, makes it non-last → SyntaxError) and may NOT carry a default
-                        // (`[...x = 1]` — the parser folds the `= 1` into an `assign*` node).
-                        if (i != elems.len - 1) return ParseError.UnexpectedToken;
-                        switch (el.spread.*) {
-                            .assign, .assign_member, .assign_index, .private_assign => return ParseError.UnexpectedToken,
-                            // §13.15.5.1: AssignmentRestElement is a DestructuringAssignmentTarget — a
-                            // nested array/object pattern is allowed (`[...[a, b]] = x`).
-                            else => try self.validateAssignmentTarget(el.spread),
-                        }
-                        continue;
-                    }
-                    try self.validateAssignmentTarget(el);
-                }
-            },
-            .object_literal => |props| {
-                // §13.15.1: a duplicate `__proto__:` is ALLOWED in an ObjectAssignment pattern — this
-                // refinement legitimizes it, so discharge the §B.3.1 obligation recorded at parse time
-                // (one per `__proto__:` property beyond the first in THIS literal).
-                var proto_seen: usize = 0;
-                for (props) |p| if (p.is_proto) {
-                    proto_seen += 1;
-                    if (proto_seen > 1 and self.proto_dup > 0) self.proto_dup -= 1;
-                };
-                for (props, 0..) |p, i| {
-                    // §13.2.5.1: this property's CoverInitializedName (if any) is now legitimized by
-                    // the refinement — discharge the obligation recorded at parse time.
-                    if (p.default != null and self.cover_init > 0) self.cover_init -= 1;
-                    switch (p.kind) {
-                        // §13.15.5.1: an object AssignmentPattern admits only `key: target`,
-                        // shorthand `{x}`, CoverInitializedName `{x = d}`, and `...rest`. Accessors /
-                        // methods are not valid pattern properties.
-                        .init => try self.validateAssignmentTarget(p.value),
-                        .spread => {
-                            // §13.15.5.1 AssignmentRestProperty — must be the LAST property
-                            // (`{...rest, b}` is a SyntaxError) and a simple DestructuringAssignmentTarget
-                            // (NOT a nested pattern / default — the rest target is an LHS reference).
-                            if (i != props.len - 1) return ParseError.UnexpectedToken;
-                            switch (p.value.*) {
-                                .identifier, .member, .index, .private_member => {},
-                                else => return ParseError.UnexpectedToken,
-                            }
-                        },
-                        .get, .set => return ParseError.UnexpectedToken,
-                    }
-                }
-            },
-            else => try self.validateAssignmentTarget(node),
-        }
+    pub fn validateAssignmentPattern(self: *Parser, node: *const ast.Node) ParseError!void {
+        return parse_expr.validateAssignmentPattern(self, node);
     }
-
-    /// Validate one destructuring assignment TARGET (§13.15.5.1 DestructuringAssignmentTarget): a
-    /// simple assignment reference (identifier / member / index / private member), a node carrying a
-    /// `= default` (`assign`/`assign_member`/`assign_index`/`private_assign`, produced by the literal
-    /// parser's right-recursive `=`), or a nested array/object literal pattern (recurse).
-    fn validateAssignmentTarget(self: *Parser, node: *const ast.Node) ParseError!void {
-        switch (node.*) {
-            .identifier => |n| {
-                // §13.15.1: in strict, a DestructuringAssignmentTarget IdentifierReference may not be
-                // `eval`/`arguments` NOR a strict future-reserved word (`let`/`static`/`implements`/…).
-                // Non-escaped reserved words are lexed as keyword tokens and never reach here; this fires
-                // for an escaped spelling (`{ let } = o`, §12.7.1) — IdentifierReference ≠ ReservedWord.
-                if (self.strict and isStrictReservedBindingName(n)) return ParseError.UnexpectedToken;
-            },
-            .member, .index, .private_member => {},
-            // A `target = default` element/property (the literal parser folded the `=` into an
-            // assignment node). The DEFAULT side is an ordinary expression; only the TARGET recurses.
-            .assign => |a| {
-                if (self.strict and isStrictReservedBindingName(a.name)) return ParseError.UnexpectedToken;
-            },
-            .assign_member, .assign_index, .private_assign => {},
-            // Nested pattern `[{a}, [b]] = …` — the element is itself a literal to refine.
-            .array_literal, .object_literal => try self.validateAssignmentPattern(node),
-            else => return ParseError.UnexpectedToken, // §13.15.1 invalid assignment target
-        }
+    pub fn validateAssignmentTarget(self: *Parser, node: *const ast.Node) ParseError!void {
+        return parse_expr.validateAssignmentTarget(self, node);
     }
-
-    /// §13.14 Conditional `cond ? then : otherwise` (above assignment, right-associative branches).
-    fn parseConditional(self: *Parser) ParseError!*const ast.Node {
-        const cond = try self.parseShortCircuit();
-        if (self.peek().kind == .question) {
-            _ = self.advance();
-            const then = try self.parseAssignment();
-            _ = try self.expect(.colon);
-            const otherwise = try self.parseAssignment();
-            return self.alloc(.{ .conditional = .{ .cond = cond, .then = then, .otherwise = otherwise } });
-        }
-        return cond;
+    pub inline fn parseConditional(self: *Parser) ParseError!*const ast.Node {
+        return parse_expr.parseConditional(self);
     }
-
-    /// §13.13 ShortCircuitExpression — the top of the binary tower: either a LogicalORExpression
-    /// (`||`/`&&` chain) or a CoalesceExpression (`??` chain). §13.13.1 Early Error: the two may not
-    /// be mixed without parentheses (`a ?? b || c`, `a && b ?? c`, … are SyntaxErrors). We parse the
-    /// head at the BitwiseOR level (prec ≥ 3, below `&&`/`||`/`??`), then dispatch on the operator.
-    fn parseShortCircuit(self: *Parser) ParseError!*const ast.Node {
-        const head_paren = blk: {
-            const h = try self.parseExpr(3);
-            break :blk .{ .node = h, .paren = self.last_was_paren };
-        };
-        const head = head_paren.node;
-        if (self.peek().kind == .question_question) {
-            // CoalesceExpression : CoalesceExpressionHead `??` BitwiseORExpression.
-            // The head must not be an un-parenthesized `||`/`&&` (it can't be — parseExpr(3) stops
-            // below them — but a parenthesized one is fine and already collapsed).
-            var left = head;
-            while (self.peek().kind == .question_question) {
-                _ = self.advance();
-                const right = try self.parseExpr(3);
-                const right_paren = self.last_was_paren;
-                // §13.13.1: a `??` operand may not itself be an un-parenthesized `||`/`&&`.
-                if (!right_paren and (self.peek().kind == .pipe_pipe or self.peek().kind == .amp_amp)) {
-                    return ParseError.UnexpectedToken;
-                }
-                left = try self.alloc(.{ .logical = .{ .op = .coalesce, .left = left, .right = right } });
-            }
-            return left;
-        }
-        if (self.peek().kind == .pipe_pipe or self.peek().kind == .amp_amp) {
-            // LogicalORExpression — continue the climb from the head at the `||` level (prec 1).
-            const result = try self.parseExprFrom(head, 1);
-            // §13.13.1: a `||`/`&&` chain may not be followed by `??` without parentheses.
-            if (self.peek().kind == .question_question) return ParseError.UnexpectedToken;
-            return result;
-        }
-        return head;
+    pub inline fn parseShortCircuit(self: *Parser) ParseError!*const ast.Node {
+        return parse_expr.parseShortCircuit(self);
     }
-
-    /// Precedence-climbing for binary + logical operators. Higher number binds tighter.
-    /// Logical `||`/`&&` build short-circuiting `logical` nodes; everything else is `binary`.
-    fn parseExpr(self: *Parser, min_prec: u8) ParseError!*const ast.Node {
-        // §13.10.1 RelationalExpression : PrivateIdentifier `in` ShiftExpression — the ergonomic brand
-        // check `#x in obj`. A PrivateIdentifier may ONLY appear here as a primary (everywhere else it
-        // is a member name `obj.#x`); it must be immediately followed by `in`, inside a class body.
-        if (self.peek().kind == .private_identifier) {
-            if (!self.in_class_body) return ParseError.UnexpectedToken;
-            const name = self.advance().lexeme;
-            // §15.7.1 AllPrivateNamesValid: the brand-check name must resolve to a declared private name.
-            if (!self.privateNameDeclared(name)) return ParseError.UnexpectedToken;
-            if (self.peek().kind != .kw_in) return ParseError.UnexpectedToken;
-            _ = self.advance(); // `in`
-            // The RHS binds at the shift level (prec 8 — tighter than relational `in` at 7), so the
-            // brand check is the relational operator: `#x in a || b` parses as `(#x in a) || b`.
-            const rhs = try self.parseExpr(8);
-            const node = try self.alloc(.{ .private_in = .{ .name = name, .object = rhs } });
-            return self.parseExprFrom(node, min_prec);
-        }
-        const left = try self.parseUnary();
-        return self.parseExprFrom(left, min_prec);
+    pub inline fn parseExpr(self: *Parser, min_prec: u8) ParseError!*const ast.Node {
+        return parse_expr.parseExpr(self, min_prec);
     }
-
-    /// Continue the precedence climb from an already-parsed `left` operand.
-    fn parseExprFrom(self: *Parser, left_init: *const ast.Node, min_prec: u8) ParseError!*const ast.Node {
-        var left = left_init;
-        while (true) {
-            const k = self.peek().kind;
-            // §14.7.5 `[~In]`: in a for-header's first clause, `in` is not a relational operator — it
-            // marks the for-in head. Stop the climb so `parseFor` sees the `kw_in` itself.
-            if (self.no_in and k == .kw_in) break;
-            const prec = opPrecedence(k) orelse break;
-            if (prec < min_prec) break;
-            _ = self.advance();
-            // `**` is right-associative; everything else left-associative.
-            const right = try self.parseExpr(if (k == .star_star) prec else prec + 1);
-            left = switch (k) {
-                .pipe_pipe => try self.alloc(.{ .logical = .{ .op = .or_, .left = left, .right = right } }),
-                .amp_amp => try self.alloc(.{ .logical = .{ .op = .and_, .left = left, .right = right } }),
-                else => try self.alloc(.{ .binary = .{ .op = binaryOpFor(k).?, .left = left, .right = right } }),
-            };
-        }
-        return left;
+    pub inline fn parseExprFrom(self: *Parser, left_init: *const ast.Node, min_prec: u8) ParseError!*const ast.Node {
+        return parse_expr.parseExprFrom(self, left_init, min_prec);
     }
-
-    fn parseUnary(self: *Parser) ParseError!*const ast.Node {
-        self.last_was_paren = false; // reset; set by a parenthesized primary (§13.13.1 mix check)
-        // §15.8 AwaitExpression : `await` UnaryExpression — inside an async context `await` is the
-        // operator (at UnaryExpression precedence, so `await a.b()` awaits the call result and `await
-        // -x` awaits `-x`). Outside async, `await` is an ordinary identifier (handled in parsePrimary).
-        if (self.in_async and self.peek().kind == .identifier and !self.peek().had_escape and std.mem.eql(u8, self.peek().lexeme, "await")) {
-            _ = self.advance(); // await
-            // §16.2.1.6 [[HasTLA]]: an `await` at module top level (module goal, not inside a nested
-            // function) makes the module evaluate asynchronously.
-            if (self.is_module and !self.in_function) self.saw_top_level_await = true;
-            const operand = try self.parseUnary();
-            return self.alloc(.{ .await_expr = operand });
-        }
-        // §13.4.4/5 prefix ++ / --
-        if (self.peek().kind == .plus_plus or self.peek().kind == .minus_minus) {
-            const op: ast.UpdateOp = if (self.peek().kind == .plus_plus) .inc else .dec;
-            _ = self.advance();
-            const target = try self.parseUnary();
-            // §13.3.9.1 Early Error: `++a?.b` — a prefix-update operand may not be an OptionalChain.
-            if (target.* == .optional) return ParseError.UnexpectedToken;
-            // §13.4.1.1 Early Error: an UpdateExpression operand must be a simple assignment target; a
-            // (parenthesized) YieldExpression / AwaitExpression is not (`++(yield)` in a generator,
-            // `++(await x)` in an async function are SyntaxErrors).
-            if (target.* == .yield_expr or target.* == .await_expr) return ParseError.UnexpectedToken;
-            // §13.3.12.1 / §13.4.1.1: NewTarget has AssignmentTargetType `invalid` — `++new.target`
-            // (and the covered `++(new.target)`, parens already collapsed) is a SyntaxError.
-            if (target.* == .new_target) return ParseError.UnexpectedToken;
-            // §13.3.10 / §13.4.1.1: ImportCall has AssignmentTargetType `invalid` — `++import('')`
-            // (and `--import('')`) is a SyntaxError.
-            if (target.* == .import_call) return ParseError.UnexpectedToken;
-            // §13.4.1.1 Early Error: in strict, the operand of a prefix update may not be the
-            // reference `eval`/`arguments`.
-            if (self.strict) switch (target.*) {
-                .identifier => |n| if (isEvalOrArguments(n)) return ParseError.UnexpectedToken,
-                else => {},
-            };
-            return self.alloc(.{ .update = .{ .op = op, .prefix = true, .target = target } });
-        }
-        const uop: ?ast.UnaryOp = switch (self.peek().kind) {
-            .plus => .plus,
-            .minus => .minus,
-            .bang => .not,
-            .kw_typeof => .typeof_,
-            .kw_void => .void_, // §13.5.2
-            .kw_delete => .delete_, // §13.5.1
-            .bit_not => .bit_not,
-            else => null,
-        };
-        if (uop) |op| {
-            _ = self.advance();
-            const operand = try self.parseUnary();
-            // §13.5.1.1 Early Error: in strict, `delete` of an unqualified reference (a bare
-            // identifier — a direct UnresolvableReference / resolvable binding, not a property
-            // reference) is a SyntaxError. `delete obj.prop` / `delete obj[k]` stay legal.
-            if (op == .delete_ and self.strict and operand.* == .identifier) return ParseError.UnexpectedToken;
-            // §13.5.1.1 Early Error: `delete` of a private member reference (`delete this.#x`, even
-            // parenthesized `delete (this.#x)`) is ALWAYS a SyntaxError. A parenthesized operand is
-            // already collapsed to its inner node, so a direct `private_member` covers both forms.
-            if (op == .delete_ and operand.* == .private_member) return ParseError.UnexpectedToken;
-            return self.alloc(.{ .unary = .{ .op = op, .operand = operand } });
-        }
-        return self.parsePostfix();
+    pub inline fn parseUnary(self: *Parser) ParseError!*const ast.Node {
+        return parse_expr.parseUnary(self);
     }
-
-    /// §13.3 Member/Call postfix: `a.b`, `a[expr]`, `a(args)`, plus §13.3.9 OptionalChain
-    /// (`a?.b`, `a?.[k]`, `a?.(args)`). Left-associative, highest precedence. Once a `?.` appears,
-    /// the chain is "optional": every following `.`/`[]`/`()` is emitted as an `optional` node so a
-    /// nullish short-circuit propagates to the end of the chain (§13.3.9.1).
-    fn parsePostfix(self: *Parser) ParseError!*const ast.Node {
-        // §13.3 SuperProperty / SuperCall — `super` is never a standalone primary; it must be the
-        // base of `super.name`, `super[expr]`, or `super(args)`. Handle it here so the early errors
-        // (must be inside a method / derived constructor) fire and the form is captured directly.
-        if (self.peek().kind == .kw_super) {
-            const sup = try self.parseSuper();
-            return self.continuePostfix(sup, false);
-        }
-        const expr = try self.parsePrimary();
-        return self.continuePostfix(expr, false);
+    pub inline fn parsePostfix(self: *Parser) ParseError!*const ast.Node {
+        return parse_expr.parsePostfix(self);
     }
-
-    /// §13.3.7 SuperCall / §13.3.5 SuperProperty — current token is `super`. A `super(args)` is only
-    /// legal in a derived constructor; a `super.name` / `super[expr]` only inside a method (anything
-    /// with a [[HomeObject]]). A bare `super` (no following `(` / `.` / `[`) is a SyntaxError.
-    fn parseSuper(self: *Parser) ParseError!*const ast.Node {
-        _ = self.advance(); // super
-        switch (self.peek().kind) {
-            .lparen => {
-                // §13.3.7.1 Early Error: a SuperCall must appear within a derived-class constructor.
-                if (!self.in_derived_ctor) return ParseError.UnexpectedToken;
-                const args = try self.parseArgs();
-                return self.alloc(.{ .super_call = args });
-            },
-            .dot => {
-                // §13.3.5.1 Early Error: a SuperProperty must appear within a method ([[HomeObject]]).
-                if (!self.in_method) return ParseError.UnexpectedToken;
-                _ = self.advance();
-                const name = try self.expectPropertyName();
-                return self.alloc(.{ .super_member = .{ .name = name } });
-            },
-            .lbracket => {
-                if (!self.in_method) return ParseError.UnexpectedToken;
-                _ = self.advance();
-                const key = try self.parseAssignment();
-                _ = try self.expect(.rbracket);
-                return self.alloc(.{ .super_member = .{ .key = key } });
-            },
-            else => return ParseError.UnexpectedToken, // bare `super` is never a primary
-        }
+    pub fn parseSuper(self: *Parser) ParseError!*const ast.Node {
+        return parse_expr.parseSuper(self);
     }
-
-    /// Continue a Member/Call postfix chain from an already-parsed base (`expr`). Shared by the
-    /// ordinary-primary path and the `super.x` base. `in_chain` records whether a `?.` has appeared.
-    fn continuePostfix(self: *Parser, base: *const ast.Node, started_in_chain: bool) ParseError!*const ast.Node {
-        var expr = base;
-        var in_chain = started_in_chain; // have we seen a `?.` for the current chain root?
-        while (true) {
-            switch (self.peek().kind) {
-                .question_dot => {
-                    _ = self.advance();
-                    in_chain = true;
-                    switch (self.peek().kind) {
-                        .lbracket => { // ?.[ key ]
-                            _ = self.advance();
-                            const key = try self.parseAssignmentInBrackets();
-                            _ = try self.expect(.rbracket);
-                            expr = try self.alloc(.{ .optional = .{ .base = expr, .optional = true, .link = .{ .index = key } } });
-                        },
-                        .lparen => { // ?.( args )
-                            const args = try self.parseArgs();
-                            expr = try self.alloc(.{ .optional = .{ .base = expr, .optional = true, .link = .{ .call = args } } });
-                        },
-                        else => { // ?.name  (name is an IdentifierName — keywords allowed)
-                            const name = try self.expectPropertyName();
-                            expr = try self.alloc(.{ .optional = .{ .base = expr, .optional = true, .link = .{ .member = name } } });
-                        },
-                    }
-                },
-                .dot => {
-                    _ = self.advance();
-                    // §13.3.2 `obj.#x` — a private member access. The `#name` is only legal inside a
-                    // class body (§15.7); outside one it is a SyntaxError. A private reference does not
-                    // participate in optional chaining short-circuit semantics specially — we model it
-                    // as a `private_member` node (chained private access after `?.` is rare; reject it
-                    // to keep the brand-check semantics simple rather than mis-handle it).
-                    if (self.peek().kind == .private_identifier) {
-                        // §15.7.1: a private reference must be inside a class body AND resolve to a
-                        // declared private name (AllPrivateNamesValid) — else a SyntaxError.
-                        if (!self.in_class_body or in_chain) return ParseError.UnexpectedToken;
-                        const pname = self.advance().lexeme;
-                        if (!self.privateNameDeclared(pname)) return ParseError.UnexpectedToken;
-                        expr = try self.alloc(.{ .private_member = .{ .object = expr, .name = pname } });
-                        continue;
-                    }
-                    const name = try self.expectPropertyName();
-                    expr = if (in_chain)
-                        try self.alloc(.{ .optional = .{ .base = expr, .optional = false, .link = .{ .member = name } } })
-                    else
-                        try self.alloc(.{ .member = .{ .object = expr, .name = name } });
-                },
-                .lbracket => {
-                    _ = self.advance();
-                    const key = try self.parseAssignmentInBrackets();
-                    _ = try self.expect(.rbracket);
-                    expr = if (in_chain)
-                        try self.alloc(.{ .optional = .{ .base = expr, .optional = false, .link = .{ .index = key } } })
-                    else
-                        try self.alloc(.{ .index = .{ .object = expr, .key = key } });
-                },
-                .lparen => { // §13.3.6 call
-                    const args = try self.parseArgs();
-                    expr = if (in_chain)
-                        try self.alloc(.{ .optional = .{ .base = expr, .optional = false, .link = .{ .call = args } } })
-                    else
-                        try self.alloc(.{ .call = .{ .callee = expr, .args = args } });
-                },
-                else => break,
-            }
-        }
-        // §13.3.9.1 Early Error: `OptionalChain TemplateLiteral` is a SyntaxError — a tagged
-        // template may not be applied to an optional chain (`a?.fn\`x\``).
-        if (in_chain and self.peek().kind == .template) return ParseError.UnexpectedToken;
-        // §13.4.2/3 postfix ++ / -- . §13.3.9.1 Early Error: the operand of an UpdateExpression may
-        // not be an OptionalChain (`a?.b++` is a SyntaxError) — the chain result isn't a Reference.
-        // §13.4 restricted production: `LeftHandSideExpression [no LineTerminator here] ++ / --`. A
-        // LineTerminator before the operator (incl. the Unicode U+2028/U+2029) means it is NOT a
-        // postfix update — ASI ends the statement here and the `++`/`--` begins the next one.
-        if ((self.peek().kind == .plus_plus or self.peek().kind == .minus_minus) and !self.peek().newline_before) {
-            if (in_chain) return ParseError.UnexpectedToken;
-            // §13.4.1.1 Early Error: in strict, a postfix-update operand may not be the reference
-            // `eval`/`arguments`.
-            if (self.strict) switch (expr.*) {
-                .identifier => |n| if (isEvalOrArguments(n)) return ParseError.UnexpectedToken,
-                else => {},
-            };
-            // §13.4.1.1 Early Error: a (parenthesized) YieldExpression / AwaitExpression is not a
-            // simple assignment target — `(yield)++` in a generator, `(await x)++` in an async
-            // function are SyntaxErrors.
-            if (expr.* == .yield_expr or expr.* == .await_expr) return ParseError.UnexpectedToken;
-            // §13.3.12.1 / §13.4.1.1: NewTarget has AssignmentTargetType `invalid` — `new.target++`
-            // (and the covered `(new.target)++`) is a SyntaxError.
-            if (expr.* == .new_target) return ParseError.UnexpectedToken;
-            // §13.3.10 / §13.4.1.1: ImportCall has AssignmentTargetType `invalid` — `import('')++`
-            // (and `import('')--`) is a SyntaxError.
-            if (expr.* == .import_call) return ParseError.UnexpectedToken;
-            const op: ast.UpdateOp = if (self.peek().kind == .plus_plus) .inc else .dec;
-            _ = self.advance();
-            expr = try self.alloc(.{ .update = .{ .op = op, .prefix = false, .target = expr } });
-        }
-        return expr;
+    pub inline fn continuePostfix(self: *Parser, base: *const ast.Node, started_in_chain: bool) ParseError!*const ast.Node {
+        return parse_expr.continuePostfix(self, base, started_in_chain);
     }
-
-    /// Parse a method / accessor `{ FunctionBody }` (current token is `{`), handling strict-mode
-    /// context the same way `parseFunction` does: the body inherits the enclosing strictness OR its
-    /// own "use strict" prologue (§11.2.2), strict params may not be reserved/`eval`/`arguments`
-    /// (§13.1.1), and a "use strict" directive is forbidden with a non-simple param list (§15.1.1).
-    /// `strict_out` (when non-null) receives this method body's §11.2.2 strict-mode flag (inherited
-    /// strict, an own `"use strict"`, or — for a class member — the always-strict class body), so the
-    /// caller can record it on the `ast.Function` for runtime strict gating. (`self.strict` is restored
-    /// to the enclosing value on the way out, so it can't be read back at the creation site.)
-    fn parseMethodBody(self: *Parser, pl: ParamList, strict_out: ?*bool) ParseError![]const ast.Stmt {
-        // §13.3.5 SuperProperty: every MethodDefinition body (class OR object-literal method /
-        // accessor / generator / async method) has a [[HomeObject]], so `super.x` / `super[k]` is
-        // allowed. Class methods/accessors already set `in_method` at the call site (and the derived
-        // constructor sets `in_derived_ctor` for `super(...)`); object-literal methods do not, so set
-        // `in_method` here to cover them uniformly. `in_derived_ctor` is left untouched — it is set
-        // only by the derived-constructor caller, so `super(...)` stays a SyntaxError in object methods.
-        const saved_in_method = self.in_method;
-        defer self.in_method = saved_in_method;
-        self.in_method = true;
-        // §13.3.12: a method body is a NewTarget context (`new.target` is legal; it is `undefined`
-        // unless the method was invoked via `new`, which only happens for a class constructor).
-        const saved_in_function = self.in_function;
-        defer self.in_function = saved_in_function;
-        self.in_function = true;
-        const enclosing_strict = self.strict;
-        defer self.strict = enclosing_strict;
-        const body_strict = enclosing_strict or
-            (self.peek().kind == .lbrace and directivePrologueIsStrict(self.tokens[self.idx + 1 ..]));
-        if (strict_out) |p| p.* = body_strict;
-        if (body_strict and paramsHaveStrictReserved(pl)) return ParseError.UnexpectedToken;
-        self.strict = body_strict;
-        const ctrl = self.enterControlScope(); // §14.13: a method body starts a fresh label scope
-        defer self.exitControlScope(ctrl);
-        const body = try self.parseBlock();
-        if (!isSimpleParameterList(pl) and bodyHasUseStrict(body)) return ParseError.UnexpectedToken;
-        return body;
+    pub fn parseMethodBody(self: *Parser, pl: ParamList, strict_out: ?*bool) ParseError![]const ast.Stmt {
+        return parse_expr.parseMethodBody(self, pl, strict_out);
     }
-
-    /// §13.2.5 Object initializer `{ … }`. Supports every PropertyDefinition form:
-    ///   `k: v` · shorthand `{x}` (≡ `x: x`) · computed `[expr]: v` · method `m(){…}` ·
-    ///   accessors `get x(){…}` / `set x(v){…}` · spread `...expr`.
-    fn parseObjectLiteral(self: *Parser) ParseError!*const ast.Node {
-        _ = try self.expect(.lbrace);
-        var props: std.ArrayList(ast.Property) = .empty;
-        // §B.3.1 Early Error: at most ONE `__proto__:` colon-property (literal name, not computed) per
-        // object literal — a second is a SyntaxError. Counted as such proto-setter properties are added.
-        var proto_count: usize = 0;
-        while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
-            // §13.2.5 PropertyDefinition : `...AssignmentExpression` (object spread).
-            if (self.peek().kind == .ellipsis) {
-                _ = self.advance();
-                const src = try self.parseAssignmentInBrackets();
-                try props.append(self.arena, .{ .kind = .spread, .value = src });
-                if (self.peek().kind == .comma) {
-                    _ = self.advance();
-                    continue;
-                }
-                break;
-            }
-
-            // §13.2.5 GeneratorMethod `* m(){…}` / §15.8 AsyncMethod `async m(){…}` / §15.6
-            // AsyncGeneratorMethod `async * m(){…}` in an object literal — a leading `*` marks a
-            // generator method; a leading `async` (no LineTerminator before the name/`*`) marks an
-            // async method, optionally `*` for an async generator. `async` is the modifier only when
-            // followed by something that begins a property name or `*` (else `{async: 1}` / `{async}` /
-            // `{async(){}}` use the identifier `async`).
-            {
-                var om_is_async = false;
-                if (self.peek().kind == .identifier and !self.peek().had_escape and std.mem.eql(u8, self.peek().lexeme, "async") and
-                    !self.tokens[self.idx + 1].newline_before and
-                    (startsAccessorName(self.tokens[self.idx + 1].kind) or self.tokens[self.idx + 1].kind == .star))
-                {
-                    om_is_async = true;
-                    _ = self.advance(); // consume `async`
-                }
-                var om_is_gen = false;
-                if (self.peek().kind == .star) {
-                    om_is_gen = true;
-                    _ = self.advance(); // consume `*`
-                }
-                if (om_is_async or om_is_gen) {
-                    const name = try self.parsePropertyName();
-                    if (self.peek().kind != .lparen) return ParseError.UnexpectedToken; // a `*`/`async` element must be a method
-                    const saved_in_generator = self.in_generator;
-                    const saved_in_async = self.in_async;
-                    defer self.in_generator = saved_in_generator;
-                    defer self.in_async = saved_in_async;
-                    // §13.3.5: an object-literal generator/async method has a [[HomeObject]], so `super.x`
-                    // is allowed in BOTH its params (a default `m(x = super.k)`) and body. Set `in_method`
-                    // before `parseParams` (the body re-asserts it via `parseMethodBody`).
-                    const saved_om_in_method = self.in_method;
-                    defer self.in_method = saved_om_in_method;
-                    self.in_method = true;
-                    // §15.5/§15.8: the params parse `~Yield`/`~Await` (a `yield`/`await` operator there
-                    // is a §15.5.1/§15.8.1 SyntaxError), the body `+Yield`/`+Await`.
-                    self.in_generator = false;
-                    self.in_async = false;
-                    const pl = try self.parseParams();
-                    if (om_is_gen and paramsHaveYield(pl)) return ParseError.UnexpectedToken;
-                    if (om_is_async and paramsHaveAwait(pl)) return ParseError.UnexpectedToken;
-                    self.in_generator = om_is_gen;
-                    self.in_async = om_is_async;
-                    var body_strict: bool = false;
-                    const body = try self.parseMethodBody(pl, &body_strict);
-                    if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
-                    // §14.3.1 / §15.5.1: params may not collide with the body's LexicallyDeclaredNames.
-                    if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
-                    const f = try self.arena.create(ast.Function);
-                    f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_generator = om_is_gen, .is_async = om_is_async, .is_method = true, .strict = body_strict };
-                    const fnode = try self.alloc(.{ .function = f });
-                    try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = fnode });
-                    if (self.peek().kind == .comma) {
-                        _ = self.advance();
-                        continue;
-                    }
-                    break;
-                }
-            }
-
-            // §13.2.5.6 `get`/`set` accessor — only when the next token starts a property name (so
-            // `{get: 1}` and `{get(){}}` and `{get}` stay ordinary uses of the identifier `get`).
-            const w = self.peek();
-            if (w.kind == .identifier and !w.had_escape and (std.mem.eql(u8, w.lexeme, "get") or std.mem.eql(u8, w.lexeme, "set")) and
-                startsAccessorName(self.tokens[self.idx + 1].kind))
-            {
-                const is_get = std.mem.eql(u8, w.lexeme, "get");
-                _ = self.advance(); // get / set
-                const name = try self.parsePropertyName();
-                // §13.3.5: an object-literal accessor has a [[HomeObject]] — `super.x` is allowed in its
-                // params (a setter default `set x(v = super.k)`) and body. Set `in_method` before the
-                // params parse (the body re-asserts it in `parseMethodBody`).
-                const saved_acc_in_method = self.in_method;
-                defer self.in_method = saved_acc_in_method;
-                self.in_method = true;
-                const pl = try self.parseParams();
-                // §13.2.5.1 accessor arity Early Errors: a getter takes an empty parameter list
-                // (`get x()`); a setter takes exactly one PropertySetParameter (`set x(v)`). The
-                // setter parameter is a FormalParameter — a default initializer is allowed
-                // (`set x(v = 1)`), but a rest element is NOT (`set x(...v)` is a SyntaxError).
-                if (is_get) {
-                    if (pl.params.len != 0 or pl.rest != null) return ParseError.UnexpectedToken;
-                } else {
-                    if (pl.params.len != 1 or pl.rest != null) return ParseError.UnexpectedToken;
-                }
-                var body_strict: bool = false;
-                const body = try self.parseMethodBody(pl, &body_strict);
-                // §13.2.5.1 UniqueFormalParameters — a method/accessor's params have no duplicates.
-                if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
-                const f = try self.arena.create(ast.Function);
-                f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_method = true, .strict = body_strict };
-                const fnode = try self.alloc(.{ .function = f });
-                try props.append(self.arena, .{
-                    .kind = if (is_get) .get else .set,
-                    .key = name.key,
-                    .computed_key = name.computed,
-                    .value = fnode,
-                });
-                if (self.peek().kind == .comma) {
-                    _ = self.advance();
-                    continue;
-                }
-                break;
-            }
-
-            // Ordinary / shorthand / computed / method. First parse the property name.
-            const name = try self.parsePropertyName();
-
-            if (self.peek().kind == .lparen) {
-                // §13.2.5 MethodDefinition `m(args){…}` — sugar for `m: function(args){…}`. An ordinary
-                // method un-sets `in_generator` (yield is not the operator there, even inside an
-                // enclosing generator); restored after the body.
-                const saved_in_generator = self.in_generator;
-                defer self.in_generator = saved_in_generator;
-                self.in_generator = false;
-                // §13.3.5: an object-literal method has a [[HomeObject]] — `super.x` is allowed in its
-                // params (a default `m(x = super.k)`) and body. Set `in_method` before the params parse.
-                const saved_m_in_method = self.in_method;
-                defer self.in_method = saved_m_in_method;
-                self.in_method = true;
-                const pl = try self.parseParams();
-                var body_strict: bool = false;
-                const body = try self.parseMethodBody(pl, &body_strict);
-                // §13.2.5.1 UniqueFormalParameters — a method's parameters have no duplicates.
-                if (hasDuplicateBoundNames(pl)) return ParseError.UnexpectedToken;
-                // §14.3.1: params may not collide with the body's LexicallyDeclaredNames.
-                if (paramsConflictWithBodyLexical(pl, body)) return ParseError.UnexpectedToken;
-                const f = try self.arena.create(ast.Function);
-                f.* = .{ .name = null, .params = pl.params, .rest = pl.rest, .body = body, .is_method = true, .strict = body_strict };
-                const fnode = try self.alloc(.{ .function = f });
-                try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = fnode });
-            } else if (self.peek().kind == .colon) {
-                // PropertyDefinition : PropertyName `:` AssignmentExpression. A `key: target = init`
-                // tail is a legal AssignmentExpression value (`{a: b = 1}` ≡ `{a: (b = 1)}`), so
-                // `parseAssignment` already folds the `= init` into an `assign*` node — no separate
-                // default is needed here. When refined to an AssignmentPattern, `assignElement` strips
-                // that folded `= init` and applies it as the property's destructuring default.
-                _ = self.advance();
-                const value = try self.parseAssignmentInBrackets();
-                // §B.3.1: a colon property with a LITERAL (non-computed) PropertyName `__proto__`
-                // — `{__proto__: v}` (identifier) or `{"__proto__": v}` (string) — is the [[Prototype]]
-                // setter, not an own property. A computed `{["__proto__"]: v}` (name.computed != null)
-                // is excluded. Two such properties is a §B.3.1 Early Error (a SyntaxError).
-                const is_proto = name.computed == null and std.mem.eql(u8, name.key, "__proto__");
-                if (is_proto) {
-                    proto_count += 1;
-                    // A SECOND `__proto__:` is recorded as a deferred §B.3.1 Early Error — discharged
-                    // only if this literal is later refined to an ObjectAssignment pattern (where
-                    // duplicates are allowed); otherwise `parseStmt` reports the residue as a SyntaxError.
-                    if (proto_count > 1) self.proto_dup += 1;
-                }
-                try props.append(self.arena, .{ .key = name.key, .computed_key = name.computed, .value = value, .is_proto = is_proto });
-            } else {
-                // §13.2.5 IdentifierReference shorthand `{x}` ≡ `{x: x}`. Only valid for a plain
-                // (non-computed, non-string-keyed) identifier name; a computed/string key with no
-                // `:`/`(` is a SyntaxError.
-                if (name.computed != null or !name.is_ident) return ParseError.UnexpectedToken;
-                // §12.7.1 / §13.2.5: a shorthand `{x}` is an IdentifierReference (`Identifier ::
-                // IdentifierName but not ReservedWord`), so an escaped §12.7.2 ReservedWord shorthand
-                // (`({ with })`) is always a SyntaxError — in BOTH modes (the word is reserved
-                // unconditionally, unlike the strict-only `let`/`static` handled at refinement).
-                if (name.had_escape and lex.isReservedWord(name.key)) return ParseError.UnexpectedToken;
-                // §13.1.1 / §15.5.1 / §15.7.11: a shorthand IdentifierReference may not be a reserved
-                // word — `yield` in strict OR inside a generator body (`({ yield })` / `({ yield } = o)`
-                // in a `function*`), `await` inside a static block.
-                if ((self.strict or self.in_generator) and std.mem.eql(u8, name.key, "yield")) return ParseError.UnexpectedToken;
-                if (self.in_static_block and std.mem.eql(u8, name.key, "await")) return ParseError.UnexpectedToken;
-                // §13.2.5.1 CoverInitializedName `{x = default}`: legal ONLY as the cover grammar for an
-                // object AssignmentPattern. We parse it (recording the default) so `({x = 1} = o)` works;
-                // a literal that still carries it is a SyntaxError, enforced in `evalObjectLiteral`.
-                var default: ?*const ast.Node = null;
-                if (self.peek().kind == .assign) {
-                    _ = self.advance();
-                    default = try self.parseAssignmentInBrackets();
-                    self.cover_init += 1; // §13.2.5.1 CoverInitializedName — discharged only if refined
-                }
-                const ref = try self.alloc(.{ .identifier = name.key });
-                try props.append(self.arena, .{ .key = name.key, .value = ref, .default = default });
-            }
-
-            if (self.peek().kind == .comma) {
-                _ = self.advance();
-                continue;
-            }
-            break;
-        }
-        _ = try self.expect(.rbrace);
-        // §13.15.1: the literal itself is NOT a ParenthesizedExpression — clear any `last_was_paren`
-        // set by a parenthesized inner value/default (`{a: (b)}`, `{a = (1)}`), so the `=`/for-head
-        // cover-grammar refinement is not mis-rejected as a parenthesized target.
-        self.last_was_paren = false;
-        return self.alloc(.{ .object_literal = props.items });
+    pub fn parseObjectLiteral(self: *Parser) ParseError!*const ast.Node {
+        return parse_expr.parseObjectLiteral(self);
     }
-
-    const PropName = struct { key: []const u8, computed: ?*const ast.Node = null, is_ident: bool = false, had_escape: bool = false };
-
-    /// §13.2.5 PropertyName — a literal name (identifier / string / number) or a `[expr]`
-    /// ComputedPropertyName. `is_ident` flags a bare identifier (the only shorthand-eligible form).
-    fn parsePropertyName(self: *Parser) ParseError!PropName {
-        const t = self.peek();
-        switch (t.kind) {
-            .lbracket => {
-                _ = self.advance();
-                const expr = try self.parseAssignmentInBrackets();
-                _ = try self.expect(.rbracket);
-                return .{ .key = "", .computed = expr };
-            },
-            .identifier => {
-                _ = self.advance();
-                return .{ .key = t.lexeme, .is_ident = true, .had_escape = t.had_escape };
-            },
-            .string => {
-                // §12.9.4.1 Early Error: a legacy-octal escape in a string PropertyName is a strict-
-                // mode SyntaxError too (e.g. `"use strict"; ({"\1": 1})`).
-                if (self.strict and t.has_legacy_octal) return ParseError.UnexpectedToken;
-                _ = self.advance();
-                return .{ .key = t.string_value };
-            },
-            .number => {
-                _ = self.advance();
-                // §13.2.5 numeric property names are ToString'd: `{0.5: 1}` → key "0.5".
-                const n = self.parseNumericLiteral(t.lexeme) catch return ParseError.UnexpectedToken;
-                return .{ .key = try numericKey(self.arena, n) };
-            },
-            else => {
-                // Keywords are valid (non-shorthand) property names: `{if: 1}`, `{return(){}}`.
-                if (isKeywordName(t.kind)) {
-                    _ = self.advance();
-                    return .{ .key = t.lexeme };
-                }
-                return ParseError.UnexpectedToken;
-            },
-        }
+    pub fn parsePropertyName(self: *Parser) ParseError!PropName {
+        return parse_expr.parsePropertyName(self);
     }
-
-    /// §12.9.3 — the numeric value of a NumericLiteral lexeme: strip `_` separators, decode
-    /// `0x`/`0o`/`0b` by radix (accumulated into f64 to avoid u64 overflow), else parse as a decimal
-    /// (integer / fraction / exponent). (Legacy octal `0123` is treated as decimal — a documented
-    /// M-subset deviation; it is a strict-mode Early Error anyway.)
-    fn parseNumericLiteral(self: *Parser, lexeme: []const u8) ParseError!f64 {
-        if (!validNumericSeparators(lexeme)) return ParseError.UnexpectedToken; // §12.9.3 separator placement
-        // §12.9.3.1 Early Error: LegacyOctalIntegerLiteral / NonOctalDecimalIntegerLiteral (`0` followed
-        // by a decimal digit, e.g. `08`, `010`) is forbidden in strict mode.
-        if (self.strict and lexeme.len >= 2 and lexeme[0] == '0' and lexeme[1] >= '0' and lexeme[1] <= '9') {
-            return ParseError.UnexpectedToken;
-        }
-        var buf: std.ArrayList(u8) = .empty;
-        for (lexeme) |ch| if (ch != '_') try buf.append(self.arena, ch);
-        const s = buf.items;
-        if (s.len >= 2 and s[0] == '0') {
-            const radix: ?u8 = switch (s[1]) {
-                'x', 'X' => 16,
-                'o', 'O' => 8,
-                'b', 'B' => 2,
-                else => null,
-            };
-            if (radix) |r| {
-                if (s.len == 2) return ParseError.UnexpectedToken; // prefix with no digits
-                var v: f64 = 0;
-                for (s[2..]) |d| {
-                    const dv: u8 = switch (d) {
-                        '0'...'9' => d - '0',
-                        'a'...'f' => d - 'a' + 10,
-                        'A'...'F' => d - 'A' + 10,
-                        else => return ParseError.UnexpectedToken,
-                    };
-                    if (dv >= r) return ParseError.UnexpectedToken; // digit out of range for the radix
-                    v = v * @as(f64, @floatFromInt(r)) + @as(f64, @floatFromInt(dv));
-                }
-                return v;
-            }
-        }
-        return std.fmt.parseFloat(f64, s) catch ParseError.UnexpectedToken;
+    pub fn parseNumericLiteral(self: *Parser, lexeme: []const u8) ParseError!f64 {
+        return parse_expr.parseNumericLiteral(self, lexeme);
     }
-
-    /// §12.9.3.2 — the value of a BigIntLiteral lexeme (the digit text, `n` already stripped by the
-    /// lexer). Strips `_` separators, detects a `0x`/`0o`/`0b` radix prefix (else decimal), and parses
-    /// the digits into an arena-owned BigInt. Reuses the same separator-placement Early Error.
-    fn parseBigIntLiteral(self: *Parser, lexeme: []const u8) ParseError!*const std.math.big.int.Const {
-        if (!validNumericSeparators(lexeme)) return ParseError.UnexpectedToken;
-        var buf: std.ArrayList(u8) = .empty;
-        for (lexeme) |ch| if (ch != '_') try buf.append(self.arena, ch);
-        var s = buf.items;
-        var base: u8 = 10;
-        if (s.len >= 2 and s[0] == '0') {
-            base = switch (s[1]) {
-                'x', 'X' => 16,
-                'o', 'O' => 8,
-                'b', 'B' => 2,
-                else => 10,
-            };
-            if (base != 10) {
-                if (s.len == 2) return ParseError.UnexpectedToken; // prefix with no digits
-                s = s[2..];
-            }
-        }
-        return bigint.fromDigits(self.arena, s, base, false) catch ParseError.UnexpectedToken;
+    pub fn parseBigIntLiteral(self: *Parser, lexeme: []const u8) ParseError!*const std.math.big.int.Const {
+        return parse_expr.parseBigIntLiteral(self, lexeme);
     }
-
-    fn parsePrimary(self: *Parser) ParseError!*const ast.Node {
-        const t = self.peek();
-        switch (t.kind) {
-            .number => {
-                _ = self.advance();
-                if (t.is_bigint) { // §12.9.3.2 BigIntLiteral
-                    const b = self.parseBigIntLiteral(t.lexeme) catch return ParseError.UnexpectedToken;
-                    return self.alloc(.{ .bigint = b });
-                }
-                const n = self.parseNumericLiteral(t.lexeme) catch return ParseError.UnexpectedToken;
-                return self.alloc(.{ .number = n });
-            },
-            .string => {
-                // §12.9.4.1 / Annex B.1.2 Early Error: a LegacyOctalEscapeSequence /
-                // NonOctalDecimalEscape / `\0`-before-a-digit in a StringLiteral is a SyntaxError in
-                // strict mode (the lexer flagged the token; strict-ness is only known here).
-                if (self.strict and t.has_legacy_octal) return ParseError.UnexpectedToken;
-                _ = self.advance();
-                return self.alloc(.{ .string = t.string_value });
-            },
-            .kw_true => {
-                _ = self.advance();
-                return self.alloc(.{ .boolean = true });
-            },
-            .kw_false => {
-                _ = self.advance();
-                return self.alloc(.{ .boolean = false });
-            },
-            .kw_null => {
-                _ = self.advance();
-                return self.alloc(.null);
-            },
-            .regex => { // §13.2.7 RegularExpressionLiteral — lexeme = pattern, string_value = flags
-                // §12.9.5 Static Semantics (Early Errors): an invalid pattern or flag set is a
-                // parse-phase SyntaxError (Test262 `literals/regexp` negatives use `phase: parse`),
-                // not a deferred runtime error — so validate here rather than at RegExp construction.
-                regex_engine.validateLiteral(self.arena, t.lexeme, t.string_value) catch |e| switch (e) {
-                    error.OutOfMemory => return ParseError.OutOfMemory,
-                    error.SyntaxError => return ParseError.UnexpectedToken,
-                };
-                _ = self.advance();
-                return self.alloc(.{ .regex_literal = .{ .pattern = t.lexeme, .flags = t.string_value } });
-            },
-            .identifier => {
-                // §12.7.1: an escaped §12.7.2 ReservedWord is not a valid IdentifierReference.
-                if (isEscapedReservedIdent(t)) return ParseError.UnexpectedToken;
-                // §12.7.1 Early Error: an escaped `async` immediately followed (no LineTerminator) by
-                // `function` is the AsyncFunctionExpression production written with an escape — a
-                // SyntaxError, never `<identifier async> <function>`. (Caught here because async function
-                // expressions in unary-operand position, e.g. `void async function f(){}`, are not
-                // recognized at the assignment level.)
-                if (t.had_escape and std.mem.eql(u8, t.lexeme, "async") and
-                    self.idx + 1 < self.tokens.len and self.tokens[self.idx + 1].kind == .kw_function and
-                    !self.tokens[self.idx + 1].newline_before) return ParseError.UnexpectedToken;
-                // §13.1.1: `yield` is a reserved word in strict mode — using it as an
-                // IdentifierReference (a primary expression, e.g. a `m(x = yield)` param default
-                // inside an always-strict class body) is a SyntaxError.
-                if (self.strict and std.mem.eql(u8, t.lexeme, "yield")) return ParseError.UnexpectedToken;
-                // §14.4 / §15.5.1: inside a generator body `yield` is ALWAYS the yield operator (parsed
-                // at the assignment level by `parseYield`), never an IdentifierReference — so a `yield`
-                // reaching the primary position (`void yield`, `yield + x`, `(yield)`, the second
-                // `yield` in `yield 3 + yield 4`) is a SyntaxError.
-                if (self.in_generator and std.mem.eql(u8, t.lexeme, "yield")) return ParseError.UnexpectedToken;
-                // §15.8 / §15.8.1: inside an async context `await` is ALWAYS the AwaitExpression
-                // operator (parsed at the unary level by `parseUnary`), never an IdentifierReference —
-                // a bare `await` reaching primary position is a SyntaxError. Outside async (sloppy
-                // scripts/functions) `await` is an ordinary identifier and falls through below.
-                // §12.7.2 / §16.2.1.5: in MODULE code `await` is a reserved word — it is NOT a valid
-                // IdentifierReference ANYWHERE in the module, including the body of a nested NON-async
-                // function (where the Await capability does not propagate, so `await` is also not the
-                // operator). `{ await 0; }` in such a body must be a SyntaxError (the `early-does-not-
-                // propagate` tests), so reject `await` as a primary in module code regardless of `in_async`.
-                if ((self.in_async or self.is_module) and std.mem.eql(u8, t.lexeme, "await")) return ParseError.UnexpectedToken;
-                // §15.7.11: `await` is reserved as an IdentifierReference inside a static block body.
-                if (self.in_static_block and std.mem.eql(u8, t.lexeme, "await")) return ParseError.UnexpectedToken;
-                // §15.7.11 Early Error: ContainsArguments of a ClassStaticBlock's statement list is a
-                // SyntaxError — `arguments` may not appear as an IdentifierReference directly in a static
-                // block. `in_static_block` is cleared when entering a nested ordinary function (which
-                // rebinds `arguments`), so this only fires for the block's own references.
-                if (self.in_static_block and std.mem.eql(u8, t.lexeme, "arguments")) return ParseError.UnexpectedToken;
-                _ = self.advance();
-                return self.alloc(.{ .identifier = t.lexeme });
-            },
-            .lbrace => return self.parseObjectLiteral(),
-            .lbracket => { // §13.2.4 array literal (also the cover grammar for an ArrayAssignmentPattern)
-                _ = self.advance();
-                var elems: std.ArrayList(*const ast.Node) = .empty;
-                var last_was_spread = false;
-                while (self.peek().kind != .rbracket and self.peek().kind != .eof) {
-                    // §13.2.4 Elision — a hole `[a, , b]` / `[, x]` (a comma with no preceding element).
-                    if (self.peek().kind == .comma) {
-                        _ = self.advance();
-                        try elems.append(self.arena, try self.alloc(.elision));
-                        continue;
-                    }
-                    // An element may carry a `= AssignmentExpression` tail. In an array LITERAL this is
-                    // an ordinary assignment (`[a = 1]` ≡ `[(a = 1)]`); when the literal is refined to an
-                    // ArrayAssignmentPattern the `=` becomes the element's default. `parseSpreadable`'s
-                    // `parseAssignment` already consumes the `=` (assignment is right-recursive there), so
-                    // both readings share the same node shape (an `assign`/`assign_*` element or a spread).
-                    const el = try self.parseSpreadable();
-                    try elems.append(self.arena, el);
-                    last_was_spread = el.* == .spread;
-                    if (self.peek().kind == .comma) {
-                        _ = self.advance();
-                        // §13.15.5.1: a trailing comma AFTER a spread (`[...x,]`) is a valid array LITERAL
-                        // (no extra element) but makes the refined AssignmentRestElement non-last — record
-                        // a trailing `elision` so `validateAssignmentPattern` sees the spread is not last.
-                        // Literal evaluation drops a trailing elision that follows a spread.
-                        if (last_was_spread and self.peek().kind == .rbracket) {
-                            try elems.append(self.arena, try self.alloc(.elision));
-                        }
-                        continue;
-                    }
-                    break;
-                }
-                _ = try self.expect(.rbracket);
-                // §13.15.1: the literal itself is NOT a ParenthesizedExpression — clear any
-                // `last_was_paren` set by a parenthesized inner default (`[a = (1)]`), so the
-                // `=`/for-head cover-grammar refinement is not mis-rejected as a parenthesized target.
-                self.last_was_paren = false;
-                return self.alloc(.{ .array_literal = elems.items });
-            },
-            .kw_function => {
-                _ = self.advance();
-                return self.alloc(.{ .function = try self.parseFunction(false) });
-            },
-            .kw_this => {
-                _ = self.advance();
-                return self.alloc(.this);
-            },
-            .template => {
-                _ = self.advance();
-                return self.parseTemplate(t.string_value);
-            },
-            .kw_new => return self.parseNew(),
-            // §13.3.10 ImportCall `import ( AssignmentExpression [, AssignmentExpression] [,] )`.
-            // Only the call form is supported: a bare `import`, a static `import`/`export`
-            // declaration, and every MetaProperty form (`import.meta`, `import.source`,
-            // `import.defer`, `import.UNKNOWN`) remain parse-phase SyntaxErrors (the `else` below).
-            .kw_import => {
-                if (self.idx + 1 < self.tokens.len and self.tokens[self.idx + 1].kind == .lparen) {
-                    const ic = try self.parseImportCall();
-                    // A bare (unparenthesized) ImportCall is not a NewExpression target — clear any
-                    // stale `last_was_paren` so `parseNew`'s guard reads it correctly (a PARENTHESIZED
-                    // `new (import(''))` is valid and is handled by the `.lparen` arm, which sets it).
-                    self.last_was_paren = false;
-                    return ic;
-                }
-                return ParseError.UnexpectedToken;
-            },
-            // §15.7 ClassExpression (primary position). The name is optional (`class { … }`).
-            .kw_class => return self.alloc(.{ .class_expr = try self.parseClass(false, true) }),
-            // §13.3.5/§13.3.7: `super` is handled in `parsePostfix` (it must be the base of a
-            // SuperProperty/SuperCall). Reaching it here means a bare `super` in a non-postfix
-            // position (e.g. `super + 1`) — always a SyntaxError.
-            .kw_super => return ParseError.UnexpectedToken,
-            // §13.10.1: a PrivateIdentifier as a primary is ONLY valid as the LHS of `#x in obj`
-            // (handled in parseExpr) — as a member name it is consumed by `continuePostfix`. Reaching
-            // it here is a bare `#x` in expression position, always a SyntaxError.
-            .private_identifier => return ParseError.UnexpectedToken,
-            .lparen => {
-                // §13.2.3 ParenthesizedExpression : `(` Expression `)` — a full Expression, so the
-                // comma / sequence operator is allowed (`(a, b)` yields `b`). The arrow cover-grammar
-                // `( … ) =>` is already handled in `parseAssignment` (its lookahead fires before we
-                // reach here), so this path only sees a genuine parenthesized expression.
-                _ = self.advance();
-                const inner = try self.parseExpressionInBrackets();
-                _ = try self.expect(.rparen);
-                self.last_was_paren = true; // §13.13.1: a parenthesized operand defuses the mix check
-                return inner;
-            },
-            .eof => return ParseError.UnexpectedEof,
-            else => return ParseError.UnexpectedToken,
-        }
+    pub inline fn parsePrimary(self: *Parser) ParseError!*const ast.Node {
+        return parse_expr.parsePrimary(self);
     }
 };
-
-/// §13.1.1: `eval` and `arguments` are not valid as a BindingIdentifier or as an assignment /
-/// update target in strict mode.
-fn isEvalOrArguments(name: []const u8) bool {
-    return std.mem.eql(u8, name, "eval") or std.mem.eql(u8, name, "arguments");
-}
-
-/// §12.7.1 / §12.7.2: an `Identifier` is `IdentifierName but not ReservedWord`. A token that is an
-/// identifier whose IdentifierName contained a Unicode escape AND whose decoded StringValue is a
-/// §12.7.2 ReservedWord is NOT a valid Identifier (binding / reference) — a SyntaxError. (`yield`/
-/// `await` are excepted by §12.7.1 and are not in `isReservedWord`.) Non-escaped reserved words are
-/// lexed as keyword tokens and never reach an Identifier position as an `.identifier`, so this guard
-/// fires only for the escaped spelling. It does NOT apply at IdentifierName positions (property names,
-/// member access), where reserved words — escaped or not — are valid.
-fn isEscapedReservedIdent(t: lex.Token) bool {
-    return t.kind == .identifier and t.had_escape and lex.isReservedWord(t.lexeme);
-}
-
-/// §13.1.1 / Table: a name that may not be used as a BindingIdentifier in strict mode — `eval`,
-/// `arguments`, and the strict future-reserved words. (`let`/`static`/`yield` are contextual; as a
-/// *binding name* they are forbidden in strict. `let` is already lexed as a keyword so it never
-/// reaches here as an identifier lexeme, but listing it keeps the set complete.)
-/// §14.4: may a token begin a YieldExpression's argument (an AssignmentExpression)? Everything except
-/// the tokens that close/separate the enclosing context (`)`, `]`, `}`, `,`, `;`, `:`) and eof. (`:`
-/// closes a conditional/case/label; `}` closes a block/object; the rest are list/group separators.)
-fn startsYieldArgument(kind: lex.TokenKind) bool {
-    return switch (kind) {
-        .rparen, .rbracket, .rbrace, .comma, .semicolon, .colon, .eof => false,
-        else => true,
-    };
-}
-
-fn isStrictReservedBindingName(name: []const u8) bool {
-    if (isEvalOrArguments(name)) return true;
-    const reserved = [_][]const u8{
-        "implements", "interface", "let",    "package", "private",
-        "protected",  "public",    "static", "yield",
-    };
-    for (reserved) |r| {
-        if (std.mem.eql(u8, name, r)) return true;
-    }
-    return false;
-}
-
-/// Does any identifier bound by `pattern` violate the strict BindingIdentifier restrictions
-/// (§13.1.1)? Recurses through array/object binding patterns (and their rest elements).
-fn patternHasStrictReserved(pattern: *const ast.Pattern) bool {
-    switch (pattern.*) {
-        .identifier => |n| return isStrictReservedBindingName(n),
-        .array => |ap| {
-            for (ap.elements) |el| {
-                if (el.target) |t| if (patternHasStrictReserved(t)) return true;
-            }
-            if (ap.rest) |r| return patternHasStrictReserved(r);
-            return false;
-        },
-        .object => |op| {
-            for (op.properties) |prop| {
-                if (patternHasStrictReserved(prop.target)) return true;
-            }
-            if (op.rest) |r| return isStrictReservedBindingName(r);
-            return false;
-        },
-    }
-}
-
-/// §13.15.1 / §14.7.5: is `node` a simple AssignmentTarget usable as a for-in/of head? The M-subset
-/// accepts a plain identifier, a member `a.b`, or an index `a[k]` (the forms the interpreter's
-/// `bindForHead` can write). Destructuring-pattern heads (`for ([a] of …)`) are a later cycle.
-fn isSimpleAssignTarget(node: *const ast.Node) bool {
-    return switch (node.*) {
-        .identifier, .member, .index => true,
-        else => false,
-    };
-}
-
-/// §13.1.1: does any formal parameter (including the rest element) bind a strict-reserved name?
-fn paramsHaveStrictReserved(pl: Parser.ParamList) bool {
-    for (pl.params) |p| {
-        if (patternHasStrictReserved(p.pattern)) return true;
-    }
-    if (pl.rest) |r| return patternHasStrictReserved(r);
-    return false;
-}
-
-/// §15.5.1 Early Error: a GeneratorDeclaration/Expression's FormalParameters may neither bind nor
-/// reference `yield` (the params are outside the `[+Yield]` body but `yield` is still restricted). A
-/// param BindingIdentifier `yield` (`function* g(yield){}`) or a default that references `yield`
-/// (`function* g(a = yield){}` — parsed as the identifier `yield` since params are `~Yield`) is invalid.
-fn paramsHaveYield(pl: Parser.ParamList) bool {
-    for (pl.params) |p| {
-        if (patternBindsYield(p.pattern)) return true;
-        if (p.default) |d| if (nodeReferencesYield(d)) return true;
-    }
-    if (pl.rest) |r| return patternBindsYield(r);
-    return false;
-}
-
-fn patternBindsYield(pattern: *const ast.Pattern) bool {
-    switch (pattern.*) {
-        .identifier => |n| return std.mem.eql(u8, n, "yield"),
-        .array => |ap| {
-            for (ap.elements) |el| {
-                if (el.target) |t| if (patternBindsYield(t)) return true;
-                if (el.default) |d| if (nodeReferencesYield(d)) return true;
-            }
-            if (ap.rest) |r| return patternBindsYield(r);
-            return false;
-        },
-        .object => |op| {
-            for (op.properties) |prop| {
-                if (patternBindsYield(prop.target)) return true;
-                if (prop.default) |d| if (nodeReferencesYield(d)) return true;
-            }
-            if (op.rest) |r| return std.mem.eql(u8, r, "yield");
-            return false;
-        },
-    }
-}
-
-/// Shallow scan for a `yield` IdentifierReference or a `yield_expr` node in `node` — enough to reject a
-/// `yield` in a generator's FormalParameters (§15.5.1). Covers the common default-value expressions; a
-/// deeply buried `yield` (e.g. inside a nested function literal default) is not chased (rare; a nested
-/// non-generator function un-restricts `yield` anyway).
-fn nodeReferencesYield(node: *const ast.Node) bool {
-    return switch (node.*) {
-        .identifier => |n| std.mem.eql(u8, n, "yield"),
-        .yield_expr => true,
-        .unary => |u| nodeReferencesYield(u.operand),
-        .binary => |b| nodeReferencesYield(b.left) or nodeReferencesYield(b.right),
-        .logical => |l| nodeReferencesYield(l.left) or nodeReferencesYield(l.right),
-        .conditional => |c| nodeReferencesYield(c.cond) or nodeReferencesYield(c.then) or nodeReferencesYield(c.otherwise),
-        .assign => |a| nodeReferencesYield(a.value),
-        .comma => |c| nodeReferencesYield(c.left) or nodeReferencesYield(c.right),
-        .call => |c| nodeReferencesYield(c.callee),
-        .import_call => |ic| nodeReferencesYield(ic.specifier) or (if (ic.options) |o| nodeReferencesYield(o) else false),
-        else => false,
-    };
-}
-
-/// §15.8.1 / §15.6.1 Early Error: an AsyncFunction/AsyncArrow/AsyncGenerator's FormalParameters may
-/// neither bind `await` (`async function f(await){}`) nor — since params parse `~Await` — contain an
-/// AwaitExpression. A param BindingIdentifier `await`, or a default that references `await` as the
-/// identifier (`async (a = await) => {}`, parsed as the identifier `await` since params are `~Await`),
-/// is invalid. Mirrors `paramsHaveYield`.
-fn paramsHaveAwait(pl: Parser.ParamList) bool {
-    for (pl.params) |p| {
-        if (patternBindsAwait(p.pattern)) return true;
-        if (p.default) |d| if (nodeReferencesAwait(d)) return true;
-    }
-    if (pl.rest) |r| return patternBindsAwait(r);
-    return false;
-}
-
-fn patternBindsAwait(pattern: *const ast.Pattern) bool {
-    switch (pattern.*) {
-        .identifier => |n| return std.mem.eql(u8, n, "await"),
-        .array => |ap| {
-            for (ap.elements) |el| {
-                if (el.target) |t| if (patternBindsAwait(t)) return true;
-                if (el.default) |d| if (nodeReferencesAwait(d)) return true;
-            }
-            if (ap.rest) |r| return patternBindsAwait(r);
-            return false;
-        },
-        .object => |op| {
-            for (op.properties) |prop| {
-                if (patternBindsAwait(prop.target)) return true;
-                if (prop.default) |d| if (nodeReferencesAwait(d)) return true;
-            }
-            if (op.rest) |r| return std.mem.eql(u8, r, "await");
-            return false;
-        },
-    }
-}
-
-/// Shallow scan for an `await` IdentifierReference or an `await_expr` node in `node` — enough to
-/// reject `await` in an async function's FormalParameters (§15.8.1). Mirrors `nodeReferencesYield`.
-fn nodeReferencesAwait(node: *const ast.Node) bool {
-    return switch (node.*) {
-        .identifier => |n| std.mem.eql(u8, n, "await"),
-        .await_expr => true,
-        .unary => |u| nodeReferencesAwait(u.operand),
-        .binary => |b| nodeReferencesAwait(b.left) or nodeReferencesAwait(b.right),
-        .logical => |l| nodeReferencesAwait(l.left) or nodeReferencesAwait(l.right),
-        .conditional => |c| nodeReferencesAwait(c.cond) or nodeReferencesAwait(c.then) or nodeReferencesAwait(c.otherwise),
-        .assign => |a| nodeReferencesAwait(a.value),
-        .comma => |c| nodeReferencesAwait(c.left) or nodeReferencesAwait(c.right),
-        .call => |c| nodeReferencesAwait(c.callee),
-        .import_call => |ic| nodeReferencesAwait(ic.specifier) or (if (ic.options) |o| nodeReferencesAwait(o) else false),
-        else => false,
-    };
-}
-
-/// §8.2.7 VarDeclaredNames (subset) — does the statement `stmt` (a for-of/for-in body) `var`-declare
-/// a binding named `name`? Recurses through the nested Statement productions that share the function's
-/// VarScope (blocks, if/else, loops, try/catch/finally, switch, with, labels) but DOES NOT descend
-/// into nested function/class bodies (those open a new VarScope). Only the `using` for-head Early
-/// Error consumes this, so it runs off the hot path. A `var`'s pattern can bind multiple names; we
-/// check each. (let/const declarations are LexicallyDeclaredNames, not VarDeclaredNames — skipped.)
-fn bodyVarDeclaresName(stmt: *const ast.Stmt, name: []const u8) bool {
-    switch (stmt.*) {
-        .declaration => |d| {
-            if (d.kind != .var_decl) return false;
-            for (d.decls) |dec| if (patternBindsName(dec.target, name)) return true;
-            return false;
-        },
-        .block => |stmts| {
-            for (stmts) |*s| if (bodyVarDeclaresName(s, name)) return true;
-            return false;
-        },
-        .if_stmt => |s| {
-            if (bodyVarDeclaresName(s.then, name)) return true;
-            if (s.otherwise) |e| return bodyVarDeclaresName(e, name);
-            return false;
-        },
-        .while_stmt => |s| return bodyVarDeclaresName(s.body, name),
-        .do_while_stmt => |s| return bodyVarDeclaresName(s.body, name),
-        .for_stmt => |s| {
-            if (s.init) |i| if (bodyVarDeclaresName(i, name)) return true;
-            return bodyVarDeclaresName(s.body, name);
-        },
-        .for_in_stmt => |s| {
-            if (s.head == .decl and s.head.decl.kind == .var_decl and patternBindsName(s.head.decl.target, name)) return true;
-            return bodyVarDeclaresName(s.body, name);
-        },
-        .for_of_stmt => |s| {
-            if (s.head == .decl and s.head.decl.kind == .var_decl and patternBindsName(s.head.decl.target, name)) return true;
-            return bodyVarDeclaresName(s.body, name);
-        },
-        .try_stmt => |s| {
-            for (s.block) |*b| if (bodyVarDeclaresName(b, name)) return true;
-            if (s.catch_block) |cb| for (cb) |*b| if (bodyVarDeclaresName(b, name)) return true;
-            if (s.finally_block) |fb| for (fb) |*b| if (bodyVarDeclaresName(b, name)) return true;
-            return false;
-        },
-        .switch_stmt => |s| {
-            for (s.cases) |c| for (c.body) |*b| if (bodyVarDeclaresName(b, name)) return true;
-            return false;
-        },
-        .with_stmt => |s| return bodyVarDeclaresName(s.body, name),
-        .labeled_stmt => |s| return bodyVarDeclaresName(s.body, name),
-        else => return false, // func_decl/class_decl open a new VarScope; expr/ret/break/… bind nothing
-    }
-}
-
-/// Does the binding pattern `pat` bind an identifier named `name`? Walks nested array/object patterns
-/// and rest elements (mirrors `patternHasStrictReserved`).
-fn patternBindsName(pat: *const ast.Pattern, name: []const u8) bool {
-    switch (pat.*) {
-        .identifier => |n| return std.mem.eql(u8, n, name),
-        .array => |ap| {
-            for (ap.elements) |el| if (el.target) |t| if (patternBindsName(t, name)) return true;
-            if (ap.rest) |r| return patternBindsName(r, name);
-            return false;
-        },
-        .object => |op| {
-            for (op.properties) |prop| if (patternBindsName(prop.target, name)) return true;
-            if (op.rest) |r| return std.mem.eql(u8, r, name);
-            return false;
-        },
-    }
-}
-
-/// §15.1.3 IsSimpleParameterList — true iff every parameter is a plain BindingIdentifier with no
-/// default and there is no rest parameter (the precondition for allowing a "use strict" directive).
-fn isSimpleParameterList(pl: Parser.ParamList) bool {
-    if (pl.rest != null) return false;
-    for (pl.params) |p| {
-        if (p.default != null) return false;
-        if (p.pattern.* != .identifier) return false;
-    }
-    return true;
-}
-
-/// §15.3.1 Early Error: an ArrowFunction's BoundNames must contain no duplicate entries.
-/// Walks every parameter pattern (including nested array/object patterns and the rest element),
-/// collecting bound identifiers; returns true on the first repeat. Bounded by the formal list
-/// size, so it runs only on the arrow-creation path (never the hot call path).
-/// §15.7.1 Early Error: a ClassBody's PrivateBoundIdentifiers must contain no duplicates — EXCEPT a
-/// matching `get`/`set` accessor pair (same name, same static-ness) may co-exist. Returns true on a
-/// disallowed duplicate. (The allocator is the parse arena; on exhaustion we conservatively report
-/// no duplicate — privacy still holds at runtime.)
-fn hasDuplicatePrivateNames(arena: std.mem.Allocator, elements: []const ast.ClassElement) std.mem.Allocator.Error!bool {
-    // §15.7.1: a class has ONE PrivateEnvironment shared by static and instance members, so private
-    // names must be unique across BOTH placements (a `static #m` and an instance `#m()` clash). The
-    // only allowed repeat is a matching get/set accessor pair — same name AND same static placement.
-    const Seen = struct { name: []const u8, is_static: bool, has_get: bool, has_set: bool, has_other: bool };
-    var seen: std.ArrayListUnmanaged(Seen) = .empty;
-    for (elements) |el| {
-        if (!el.is_private) continue;
-        const is_get = el.kind == .get;
-        const is_set = el.kind == .set;
-        var found = false;
-        for (seen.items) |*s| {
-            if (!std.mem.eql(u8, s.name, el.key)) continue;
-            found = true;
-            // The get+set complement (one get, one set, no plain member, SAME placement) is the only
-            // legal repeat. A differing placement, or any other overlap, is a duplicate.
-            const same_placement = s.is_static == el.is_static;
-            if (is_get and same_placement and !s.has_get and !s.has_other) {
-                s.has_get = true;
-            } else if (is_set and same_placement and !s.has_set and !s.has_other) {
-                s.has_set = true;
-            } else {
-                return true; // any other collision on the same private name
-            }
-            break;
-        }
-        if (!found) {
-            try seen.append(arena, .{
-                .name = el.key,
-                .is_static = el.is_static,
-                .has_get = is_get,
-                .has_set = is_set,
-                .has_other = !is_get and !is_set,
-            });
-        }
-    }
-    return false;
-}
-
-fn hasDuplicateBoundNames(pl: Parser.ParamList) bool {
-    var names: std.ArrayList([]const u8) = .empty;
-    var buf: [64][]const u8 = undefined; // formal lists are tiny; a small fixed buffer suffices
-    var fba = std.heap.FixedBufferAllocator.init(std.mem.sliceAsBytes(buf[0..]));
-    const a = fba.allocator();
-    for (pl.params) |p| {
-        if (collectBoundNames(p.pattern, &names, a)) return true;
-    }
-    if (pl.rest) |r| {
-        if (collectBoundNames(r, &names, a)) return true;
-    }
-    return false;
-}
-
-/// §14.3.1 / §15.5.1 / §13.2.5.1 Early Error: a function/method's FormalParameters BoundNames must be
-/// disjoint from its body's LexicallyDeclaredNames (`function f(a){ let a }` / `*m(a){ const a }` are
-/// SyntaxErrors). Returns true on a conflict. Walks only the TOP-LEVEL statements of the body — a
-/// nested block's `let` is its own lexical scope. Top-level `let`/`const`/`class` are lexical; a
-/// top-level `function` declaration is VarDeclared (not Lexical) so it does NOT conflict here.
-fn paramsConflictWithBodyLexical(pl: Parser.ParamList, body: []const ast.Stmt) bool {
-    // Collect the parameter bound names into a small fixed buffer (formal lists are tiny).
-    var names: std.ArrayList([]const u8) = .empty;
-    var buf: [128][]const u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(std.mem.sliceAsBytes(buf[0..]));
-    const a = fba.allocator();
-    for (pl.params) |p| _ = collectBoundNames(p.pattern, &names, a);
-    if (pl.rest) |r| _ = collectBoundNames(r, &names, a);
-    if (names.items.len == 0) return false;
-    for (body) |stmt| {
-        switch (stmt) {
-            .declaration => |d| {
-                if (d.kind == .var_decl) continue; // var is not a LexicallyDeclaredName
-                for (d.decls) |decl| {
-                    if (patternBindsAny(decl.target, names.items)) return true;
-                }
-            },
-            .class_decl => |c| {
-                if (c.name) |nm| if (nameInList(nm, names.items)) return true;
-            },
-            else => {},
-        }
-    }
-    return false;
-}
-
-fn nameInList(name: []const u8, list: []const []const u8) bool {
-    for (list) |n| if (std.mem.eql(u8, n, name)) return true;
-    return false;
-}
-
-/// Does `pattern` bind any identifier present in `list`?
-fn patternBindsAny(pattern: *const ast.Pattern, list: []const []const u8) bool {
-    switch (pattern.*) {
-        .identifier => |n| return nameInList(n, list),
-        .array => |ap| {
-            for (ap.elements) |el| if (el.target) |t| if (patternBindsAny(t, list)) return true;
-            if (ap.rest) |r| return patternBindsAny(r, list);
-            return false;
-        },
-        .object => |op| {
-            for (op.properties) |prop| if (patternBindsAny(prop.target, list)) return true;
-            if (op.rest) |r| return nameInList(r, list);
-            return false;
-        },
-    }
-}
-
-/// Append `pattern`'s bound identifiers to `names`, returning true if any was already present.
-/// On allocator exhaustion (a pathologically large pattern) it conservatively returns false —
-/// the binding still succeeds at runtime; we just skip the duplicate diagnostic.
-/// §16.2: may a token kind appear as an IdentifierName (e.g. a NamedImport's imported name or a
-/// ModuleExportName)? IdentifierName admits ReservedWords, so any keyword token or `identifier` is
-/// accepted. (The lexer maps reserved words to dedicated `kw_*` kinds; a NamedImport like
-/// `{ default as d }` needs `default`/`class`/etc. to be valid imported names.)
-fn isIdentifierNameToken(kind: lex.TokenKind) bool {
-    return switch (kind) {
-        .identifier => true,
-        else => @tagName(kind).len > 3 and std.mem.startsWith(u8, @tagName(kind), "kw_"),
-    };
-}
-
-/// §16.2.1.5: is `name` usable as a module-level BindingIdentifier (module code is strict)? Rejects
-/// reserved words and the strict-reserved set (`eval`, `arguments`, `yield`, …).
-fn isValidBindingName(name: []const u8) bool {
-    if (lex.isReservedWord(name)) return false;
-    if (isStrictReservedBindingName(name)) return false;
-    return true;
-}
-
-/// §16.2.1.5 BoundNames of a module-level Declaration statement (used to collect the module's
-/// top-level declared names for the ExportedBinding early error). Returns the names declared by a
-/// `var`/`let`/`const`/`using` declaration, a function/class declaration, or `[]` otherwise.
-fn boundDeclNames(a: std.mem.Allocator, stmt: ast.Stmt) ![]const []const u8 {
-    var names: std.ArrayList([]const u8) = .empty;
-    switch (stmt) {
-        .declaration => |d| {
-            for (d.decls) |dec| _ = collectBoundNames(dec.target, &names, a);
-        },
-        .func_decl => |f| if (f.name) |n| try names.append(a, n),
-        .class_decl => |c| if (c.name) |n| try names.append(a, n),
-        else => {},
-    }
-    return names.items;
-}
-
-fn collectBoundNames(pattern: *const ast.Pattern, names: *std.ArrayList([]const u8), a: std.mem.Allocator) bool {
-    switch (pattern.*) {
-        .identifier => |n| {
-            for (names.items) |existing| {
-                if (std.mem.eql(u8, existing, n)) return true;
-            }
-            names.append(a, n) catch return false;
-            return false;
-        },
-        .array => |ap| {
-            for (ap.elements) |el| {
-                if (el.target) |t| if (collectBoundNames(t, names, a)) return true;
-            }
-            if (ap.rest) |r| return collectBoundNames(r, names, a);
-            return false;
-        },
-        .object => |op| {
-            for (op.properties) |prop| {
-                if (collectBoundNames(prop.target, names, a)) return true;
-            }
-            if (op.rest) |r| {
-                for (names.items) |existing| {
-                    if (std.mem.eql(u8, existing, r)) return true;
-                }
-                names.append(a, r) catch return false;
-            }
-            return false;
-        },
-    }
-}
-
-/// §15.7.1 Static Semantics: ContainsArguments — true iff the expression references the identifier
-/// `arguments` outside any nested ordinary-function (which binds its own `arguments`). Per the spec,
-/// recursion continues through ArrowFunction bodies (arrows have no own `arguments`) but stops at an
-/// ordinary FunctionExpression. Used to reject `arguments` inside a class FieldDefinition Initializer.
-fn containsArguments(node: *const ast.Node) bool {
-    switch (node.*) {
-        .identifier => |n| return std.mem.eql(u8, n, "arguments"),
-        .number, .bigint, .string, .boolean, .null, .this, .new_target, .regex_literal => return false,
-        .unary => |u| return containsArguments(u.operand),
-        .update => |u| return containsArguments(u.target),
-        .comma => |c| return containsArguments(c.left) or containsArguments(c.right),
-        .binary => |b| return containsArguments(b.left) or containsArguments(b.right),
-        .logical => |l| return containsArguments(l.left) or containsArguments(l.right),
-        .conditional => |c| return containsArguments(c.cond) or containsArguments(c.then) or containsArguments(c.otherwise),
-        .assign => |a| return containsArguments(a.value),
-        .assign_pattern => |a| return containsArguments(a.target) or containsArguments(a.value),
-        .elision => return false,
-        .assign_member => |a| return containsArguments(a.object) or containsArguments(a.value),
-        .assign_index => |a| return containsArguments(a.object) or containsArguments(a.key) or containsArguments(a.value),
-        .logical_assign => |a| return containsArguments(a.target) or containsArguments(a.value),
-        .compound_assign => |a| return containsArguments(a.target) or containsArguments(a.value),
-        .member => |m| return containsArguments(m.object),
-        .index => |ix| return containsArguments(ix.object) or containsArguments(ix.key),
-        .spread => |s| return containsArguments(s),
-        .call => |c| {
-            if (containsArguments(c.callee)) return true;
-            for (c.args) |a| if (containsArguments(a)) return true;
-            return false;
-        },
-        .new_expr => |n| {
-            if (containsArguments(n.callee)) return true;
-            for (n.args) |a| if (containsArguments(a)) return true;
-            return false;
-        },
-        .import_call => |ic| {
-            if (containsArguments(ic.specifier)) return true;
-            if (ic.options) |o| if (containsArguments(o)) return true;
-            return false;
-        },
-        .array_literal => |elems| {
-            for (elems) |e| if (containsArguments(e)) return true;
-            return false;
-        },
-        .object_literal => |props| {
-            for (props) |p| {
-                if (p.computed_key) |ck| if (containsArguments(ck)) return true;
-                if (containsArguments(p.value)) return true;
-                if (p.default) |d| if (containsArguments(d)) return true;
-            }
-            return false;
-        },
-        .template => |t| {
-            for (t.exprs) |e| if (containsArguments(e)) return true;
-            return false;
-        },
-        .optional => |o| {
-            if (containsArguments(o.base)) return true;
-            switch (o.link) {
-                .member => return false,
-                .index => |k| return containsArguments(k),
-                .call => |args| {
-                    for (args) |a| if (containsArguments(a)) return true;
-                    return false;
-                },
-            }
-        },
-        .super_call => |args| {
-            for (args) |a| if (containsArguments(a)) return true;
-            return false;
-        },
-        .super_member => |sm| return if (sm.key) |k| containsArguments(k) else false,
-        .super_assign => |sa| return (if (sa.key) |k| containsArguments(k) else false) or containsArguments(sa.value),
-        .private_member => |pm| return containsArguments(pm.object),
-        .private_assign => |pa| return containsArguments(pa.object) or containsArguments(pa.value),
-        .private_in => |pi| return containsArguments(pi.object),
-        // Recurse into ArrowFunction bodies (no own `arguments`); STOP at an ordinary function /
-        // class (they bind/scope their own `arguments`).
-        .function => |f| return f.is_arrow and bodyContainsArguments(f.body),
-        .class_expr => return false,
-        .yield_expr => |y| return if (y.argument) |a| containsArguments(a) else false,
-        .await_expr => |operand| return containsArguments(operand),
-    }
-}
-
-fn bodyContainsArguments(body: []const ast.Stmt) bool {
-    for (body) |s| if (stmtContainsArguments(s)) return true;
-    return false;
-}
-
-fn stmtContainsArguments(stmt: ast.Stmt) bool {
-    switch (stmt) {
-        .expr => |e| return containsArguments(e),
-        .ret => |maybe| return if (maybe) |e| containsArguments(e) else false,
-        .throw_stmt => |e| return containsArguments(e),
-        .block => |stmts| return bodyContainsArguments(stmts),
-        .declaration => |d| {
-            for (d.decls) |dec| if (dec.init) |ie| if (containsArguments(ie)) return true;
-            return false;
-        },
-        .if_stmt => |s| {
-            if (containsArguments(s.cond)) return true;
-            if (stmtContainsArguments(s.then.*)) return true;
-            if (s.otherwise) |els| return stmtContainsArguments(els.*);
-            return false;
-        },
-        .while_stmt => |s| return containsArguments(s.cond) or stmtContainsArguments(s.body.*),
-        .do_while_stmt => |s| return containsArguments(s.cond) or stmtContainsArguments(s.body.*),
-        .labeled_stmt => |s| return stmtContainsArguments(s.body.*),
-        .for_stmt => |s| {
-            if (s.init) |i| if (stmtContainsArguments(i.*)) return true;
-            if (s.cond) |c| if (containsArguments(c)) return true;
-            if (s.update) |u| if (containsArguments(u)) return true;
-            return stmtContainsArguments(s.body.*);
-        },
-        .for_in_stmt => |s| {
-            if (s.head == .target and containsArguments(s.head.target)) return true;
-            if (containsArguments(s.right)) return true;
-            return stmtContainsArguments(s.body.*);
-        },
-        .for_of_stmt => |s| {
-            if (s.head == .target and containsArguments(s.head.target)) return true;
-            if (containsArguments(s.right)) return true;
-            return stmtContainsArguments(s.body.*);
-        },
-        .switch_stmt => |s| {
-            if (containsArguments(s.discriminant)) return true;
-            for (s.cases) |case| {
-                if (case.test_expr) |te| if (containsArguments(te)) return true;
-                if (bodyContainsArguments(case.body)) return true;
-            }
-            return false;
-        },
-        .with_stmt => |s| return containsArguments(s.object) or stmtContainsArguments(s.body.*),
-        .try_stmt => |s| {
-            if (bodyContainsArguments(s.block)) return true;
-            if (s.catch_block) |cb| if (bodyContainsArguments(cb)) return true;
-            if (s.finally_block) |fb| if (bodyContainsArguments(fb)) return true;
-            return false;
-        },
-        .func_decl, .class_decl, .break_stmt, .continue_stmt => return false,
-    }
-}
-
-/// Does the function body's directive prologue (§11.2.1) contain a "use strict" directive? The
-/// prologue is the leading run of string-literal ExpressionStatements.
-fn bodyHasUseStrict(body: []const ast.Stmt) bool {
-    for (body) |s| {
-        switch (s) {
-            .expr => |e| switch (e.*) {
-                .string => |str| if (std.mem.eql(u8, str, "use strict")) return true,
-                else => return false, // first non-string-literal ends the directive prologue
-            },
-            else => return false,
-        }
-    }
-    return false;
-}
-
-// ── §14.2.1 / §14.12.1 / §14.15.1 / §16.1.1 duplicate-declaration Early Errors ────────────────
-// A post-parse static pass over each lexical scope. For every Block, Script/FunctionBody, switch
-// CaseBlock, and catch, it checks (1) LexicallyDeclaredNames are unique and (2) they are disjoint
-// from the scope's VarDeclaredNames. Parse-time only — no runtime/hot-path impact.
-
-/// The kind of the scope whose StatementList we are validating, which selects how a top-level
-/// FunctionDeclaration is classified: in a Block / switch CaseBlock it is a *LexicallyDeclaredName*
-/// (so a duplicate is an Early Error, strict-only between two functions per Annex B B.3.3); in a
-/// Script / FunctionBody it is a *VarDeclaredName* (so `function f(){} function f(){}` at top level
-/// is legal, but it still conflicts with a top-level `let f`).
-const ScopeKind = enum { script_or_body, block };
-
-/// A bounded name set backed by a fixed buffer — lexical/var name lists per scope are small. On
-/// overflow it stops recording (conservatively under-reporting a duplicate rather than misfiring);
-/// real programs never approach the cap.
-const NameSet = struct {
-    buf: [256][]const u8,
-    len: usize = 0,
-    fn init() NameSet {
-        // SAFETY: `len` starts at 0; `buf` slots are written by `add` before any read (`has`/`addPattern`
-        // only ever scan `buf[0..len]`), so the `undefined` backing storage is never observed.
-        return .{ .buf = undefined };
-    }
-    fn has(self: *const NameSet, name: []const u8) bool {
-        for (self.buf[0..self.len]) |n| if (std.mem.eql(u8, n, name)) return true;
-        return false;
-    }
-    /// Append `name`; returns true if it was already present (a duplicate).
-    fn add(self: *NameSet, name: []const u8) bool {
-        if (self.has(name)) return true;
-        if (self.len < self.buf.len) {
-            self.buf[self.len] = name;
-            self.len += 1;
-        }
-        return false;
-    }
-    fn addPatternDup(self: *NameSet, pattern: *const ast.Pattern) bool {
-        switch (pattern.*) {
-            .identifier => |n| return self.add(n),
-            .array => |ap| {
-                for (ap.elements) |el| if (el.target) |t| if (self.addPatternDup(t)) return true;
-                if (ap.rest) |r| return self.addPatternDup(r);
-                return false;
-            },
-            .object => |op| {
-                for (op.properties) |prop| if (self.addPatternDup(prop.target)) return true;
-                if (op.rest) |r| return self.add(r);
-                return false;
-            },
-        }
-    }
-    fn addPattern(self: *NameSet, pattern: *const ast.Pattern) void {
-        _ = self.addPatternDup(pattern);
-    }
-};
-
-fn declIsLexical(kind: ast.DeclKind) bool {
-    return kind != .var_decl; // let / const / using / await using
-}
-
-/// Append the VarDeclaredNames reachable from `stmt` into `set`, bubbling up through nested
-/// non-function statements (inner blocks, if/for/while/do/try/with/labeled bodies, switch cases)
-/// but STOPPING at any function/class boundary (a nested function body has its own var scope).
-/// Only `var` declarations contribute (a FunctionDeclaration is a *Declaration* → empty
-/// VarDeclaredNames, §14.2.2). We collect a `for`-head `var` (it hoists out of the loop) but not a
-/// `let`/`const` (a `for`'s lexical head is its own per-iteration scope).
-fn collectVarNames(stmt: ast.Stmt, set: *NameSet) void {
-    switch (stmt) {
-        .declaration => |d| {
-            if (d.kind == .var_decl) for (d.decls) |dec| set.addPattern(dec.target);
-        },
-        // §14.2.2 VarDeclaredNames: `StatementListItem : Declaration` → empty. A FunctionDeclaration
-        // is a *Declaration*, so it is NOT a VarDeclaredName of a Block (it is a LexicallyDeclaredName
-        // there, §14.2.9). It becomes a VarDeclaredName only at a Script/FunctionBody top level
-        // (TopLevelVarDeclaredNames) — added separately in `collectScopeVarNames`. So bubbling a
-        // FunctionDeclaration contributes nothing to VarDeclaredNames.
-        .func_decl => {},
-        .block => |stmts| for (stmts) |s| collectVarNames(s, set),
-        .if_stmt => |s| {
-            collectVarNames(s.then.*, set);
-            if (s.otherwise) |e| collectVarNames(e.*, set);
-        },
-        .while_stmt => |s| collectVarNames(s.body.*, set),
-        .do_while_stmt => |s| collectVarNames(s.body.*, set),
-        .for_stmt => |s| {
-            if (s.init) |i| if (i.* == .declaration and i.declaration.kind == .var_decl)
-                for (i.declaration.decls) |dec| set.addPattern(dec.target);
-            collectVarNames(s.body.*, set);
-        },
-        .for_in_stmt => |s| {
-            if (s.head == .decl and s.head.decl.kind == .var_decl) set.addPattern(s.head.decl.target);
-            collectVarNames(s.body.*, set);
-        },
-        .for_of_stmt => |s| {
-            if (s.head == .decl and s.head.decl.kind == .var_decl) set.addPattern(s.head.decl.target);
-            collectVarNames(s.body.*, set);
-        },
-        .try_stmt => |s| {
-            for (s.block) |b| collectVarNames(b, set);
-            if (s.catch_block) |cb| for (cb) |b| collectVarNames(b, set);
-            if (s.finally_block) |fb| for (fb) |b| collectVarNames(b, set);
-        },
-        .with_stmt => |s| collectVarNames(s.body.*, set),
-        .switch_stmt => |s| for (s.cases) |cs| for (cs.body) |b| collectVarNames(b, set),
-        .labeled_stmt => |s| collectVarNames(s.body.*, set),
-        else => {},
-    }
-}
-
-/// Collect, into `lex_set`, the top-level LexicallyDeclaredNames of `stmts` for a scope of `kind`,
-/// returning true on a duplicate (rule 1). In a Block / switch CaseBlock, a FunctionDeclaration is a
-/// LexicallyDeclaredName. Annex B B.3.3.6 relaxes the duplicate-entries Early Error ONLY for
-/// *plain* (non-async, non-generator) FunctionDeclarations in SLOPPY mode: two such functions in one
-/// block do not collide with each other. The relaxation does NOT extend to a function colliding with
-/// a `let`/`const`/`class`/generator/async-function of the same name, nor to the §14.2.1
-/// LexicallyDeclaredNames∩VarDeclaredNames rule (`{ var f; function f(){} }` is still an error) — so
-/// the de-duplicated plain-function names are folded into `lex_set` (for those checks) only once. In
-/// a Script/FunctionBody, top-level FunctionDeclarations are var-declared, not collected here.
-fn collectScopeLexicalNames(stmts: []const ast.Stmt, kind: ScopeKind, strict: bool, lex_set: *NameSet) bool {
-    // Plain sloppy block functions: collected once (deduped) so two of them don't collide, but still
-    // folded into `lex_set` below so they participate in every other conflict.
-    var sloppy_fns: NameSet = .init();
-    for (stmts) |stmt| {
-        switch (stmt) {
-            .declaration => |d| {
-                if (declIsLexical(d.kind)) {
-                    for (d.decls) |dec| if (lex_set.addPatternDup(dec.target)) return true;
-                }
-            },
-            .class_decl => |c| {
-                if (c.name) |nm| if (lex_set.add(nm)) return true;
-            },
-            .func_decl => |f| {
-                if (kind != .block) continue; // Script/FunctionBody: functions are var-declared
-                const nm = f.name orelse continue;
-                // Annex B applies only to a plain function in sloppy mode; async/generator/strict
-                // function declarations are ordinary LexicallyDeclaredNames (a duplicate is an error).
-                const annexb = !strict and !f.is_async and !f.is_generator;
-                if (annexb) {
-                    _ = sloppy_fns.add(nm); // dedupe; folded into lex_set after the loop
-                } else {
-                    if (lex_set.add(nm)) return true;
-                }
-            },
-            else => {},
-        }
-    }
-    // Fold the deduped plain-function names into the lexical set: a clash with an already-collected
-    // lexical name (let/const/class/generator/async/strict-fn) is the §14.2.1 duplicate Early Error;
-    // otherwise they join `lex_set` so the ∩-VarDeclaredNames check still sees them.
-    for (sloppy_fns.buf[0..sloppy_fns.len]) |nm| if (lex_set.add(nm)) return true;
-    return false;
-}
-
-/// Is any BoundName of a CatchParameter pattern present in `set`? (No-alloc recursion over the
-/// identifier / array / object pattern forms — used for the §14.15.1 catch-parameter Early Errors.)
-fn catchBoundNameInSet(pattern: *const ast.Pattern, set: *const NameSet) bool {
-    switch (pattern.*) {
-        .identifier => |n| return set.has(n),
-        .array => |ap| {
-            for (ap.elements) |el| if (el.target) |t| {
-                if (catchBoundNameInSet(t, set)) return true;
-            };
-            if (ap.rest) |r| return catchBoundNameInSet(r, set);
-            return false;
-        },
-        .object => |op| {
-            for (op.properties) |p| if (catchBoundNameInSet(p.target, set)) return true;
-            if (op.rest) |r| return set.has(r);
-            return false;
-        },
-    }
-}
-
-/// Validate one scope's StatementList (rules 1 + 2). `catch_param`, when set, is the CatchParameter the
-/// Block is the body of: §14.15.1 makes it a Syntax Error if any of its BoundNames also occurs in the
-/// Block's LexicallyDeclaredNames (`catch(e){ let e }` / `catch([e]){ let e }`). A SIMPLE-identifier
-/// catch param does NOT participate in the §14.2.1 LexicallyDeclaredNames∩VarDeclaredNames check —
-/// Annex B B.3.4 permits `catch(e){var e}` — but a destructuring CatchParameter (a BindingPattern) has
-/// no such exception, so its BoundNames may not collide with the Block's VarDeclaredNames either.
-fn checkScopeNames(stmts: []const ast.Stmt, kind: ScopeKind, strict: bool, catch_param: ?*const ast.Pattern) ParseError!void {
-    var lex_set: NameSet = .init();
-    if (collectScopeLexicalNames(stmts, kind, strict, &lex_set)) return ParseError.UnexpectedToken;
-    // §14.15.1: a CatchParameter BoundName may not also be a LexicallyDeclaredName of the Catch Block.
-    if (catch_param) |cp| if (catchBoundNameInSet(cp, &lex_set)) return ParseError.UnexpectedToken;
-    if (lex_set.len == 0) {
-        // §14.15.1 (non-Annex-B): a destructuring CatchParameter's BoundNames also exclude VarDeclaredNames.
-        if (catch_param) |cp| if (cp.* != .identifier) {
-            var var_set: NameSet = .init();
-            collectScopeVarNames(stmts, kind, &var_set);
-            if (catchBoundNameInSet(cp, &var_set)) return ParseError.UnexpectedToken;
-        };
-        return;
-    }
-    // §14.2.1 rule 2: LexicallyDeclaredNames ∩ VarDeclaredNames = ∅.
-    var var_set: NameSet = .init();
-    collectScopeVarNames(stmts, kind, &var_set);
-    for (lex_set.buf[0..lex_set.len]) |nm| if (var_set.has(nm)) return ParseError.UnexpectedToken;
-    // §14.15.1 (non-Annex-B): a destructuring CatchParameter's BoundNames also exclude VarDeclaredNames.
-    if (catch_param) |cp| if (cp.* != .identifier) {
-        if (catchBoundNameInSet(cp, &var_set)) return ParseError.UnexpectedToken;
-    };
-}
-
-/// VarDeclaredNames of a whole scope: every statement's bubbled-up `var` names (functions never
-/// bubble — see `collectVarNames`). At a Script/FunctionBody (`kind == .script_or_body`), a
-/// TOP-LEVEL FunctionDeclaration is additionally a VarDeclaredName (TopLevelVarDeclaredNames,
-/// §16.1.2 / §15.2.2), so `let f; function f(){}` at script/body level is an Early Error while
-/// `function f(){} function f(){}` (var∩var) is legal. In a Block, top-level functions are lexical
-/// (handled by `collectScopeLexicalNames`) and contribute nothing here.
-fn collectScopeVarNames(stmts: []const ast.Stmt, kind: ScopeKind, set: *NameSet) void {
-    if (kind == .script_or_body) {
-        for (stmts) |stmt| switch (stmt) {
-            .func_decl => |f| {
-                if (f.name) |nm| _ = set.add(nm);
-            },
-            else => {},
-        };
-    }
-    for (stmts) |stmt| collectVarNames(stmt, set);
-}
-
-/// Recursively validate `stmts` as a scope of `kind`, then descend into every nested scope
-/// (blocks, function/method/arrow bodies, switch CaseBlocks, catch). `strict` is the strictness in
-/// effect for `stmts`; it tightens going into a function body carrying its own `"use strict"`.
-fn validateScope(stmts: []const ast.Stmt, kind: ScopeKind, strict: bool) ParseError!void {
-    try checkScopeNames(stmts, kind, strict, @as(?*const ast.Pattern, null));
-    for (stmts) |stmt| try descendStmt(stmt, strict);
-}
-
-fn validateFunction(f: *const ast.Function, strict: bool) ParseError!void {
-    const inner = strict or bodyHasUseStrict(f.body);
-    // Parameter default initializers may carry nested function/class expressions (`(a = ()=>{}) =>`).
-    for (f.params) |p| if (p.default) |d| try descendNode(d, inner);
-    try validateScope(f.body, .script_or_body, inner);
-}
-
-fn validateClass(c: *const ast.Class, strict: bool) ParseError!void {
-    _ = strict;
-    // Class bodies are always strict; each method/getter/setter/field-initializer/static-block is
-    // its own FunctionBody-like scope. A ClassHeritage `extends LHS` is an outer expression.
-    if (c.superclass) |sc| try descendNode(sc, true);
-    for (c.elements) |el| {
-        if (el.computed_key) |ck| try descendNode(ck, true);
-        switch (el.value) {
-            .func => |fn_| try validateFunction(fn_, true),
-            .field_init => |maybe| if (maybe) |e| try descendNode(e, true),
-            .block => |blk| try validateScope(blk, .script_or_body, true),
-        }
-    }
-}
-
-/// Descend into the nested scopes of a single statement (and any function/class expressions inside
-/// its expressions), validating each. Does NOT re-check `stmt`'s own enclosing scope.
-fn descendStmt(stmt: ast.Stmt, strict: bool) ParseError!void {
-    switch (stmt) {
-        .block => |stmts| try validateScope(stmts, .block, strict),
-        .func_decl => |f| try validateFunction(f, strict),
-        .class_decl => |c| try validateClass(c, strict),
-        .declaration => |d| for (d.decls) |dec| if (dec.init) |ie| try descendNode(ie, strict),
-        .expr => |e| try descendNode(e, strict),
-        .ret => |maybe| if (maybe) |e| try descendNode(e, strict),
-        .throw_stmt => |e| try descendNode(e, strict),
-        .if_stmt => |s| {
-            try descendNode(s.cond, strict);
-            try descendStmt(s.then.*, strict);
-            if (s.otherwise) |e| try descendStmt(e.*, strict);
-        },
-        .while_stmt => |s| {
-            try descendNode(s.cond, strict);
-            try descendStmt(s.body.*, strict);
-        },
-        .do_while_stmt => |s| {
-            try descendNode(s.cond, strict);
-            try descendStmt(s.body.*, strict);
-        },
-        .for_stmt => |s| {
-            if (s.init) |i| try descendStmt(i.*, strict);
-            if (s.cond) |c| try descendNode(c, strict);
-            if (s.update) |u| try descendNode(u, strict);
-            try descendStmt(s.body.*, strict);
-        },
-        .for_in_stmt => |s| {
-            try descendNode(s.right, strict);
-            try descendStmt(s.body.*, strict);
-        },
-        .for_of_stmt => |s| {
-            try descendNode(s.right, strict);
-            try descendStmt(s.body.*, strict);
-        },
-        .try_stmt => |s| {
-            try validateScope(s.block, .block, strict);
-            if (s.catch_block) |cb| {
-                // §14.15.1: the Catch Block is validated as a Block, with the (simple-identifier)
-                // CatchParameter additionally barred from the Block's LexicallyDeclaredNames. A
-                // pattern catch param's own dup BoundNames are rejected at parse time (§14.15.1).
-                try checkScopeNames(cb, .block, strict, s.catch_param);
-                for (cb) |b| try descendStmt(b, strict);
-            }
-            if (s.finally_block) |fb| try validateScope(fb, .block, strict);
-        },
-        .with_stmt => |s| {
-            try descendNode(s.object, strict);
-            try descendStmt(s.body.*, strict);
-        },
-        .switch_stmt => |s| {
-            try descendNode(s.discriminant, strict);
-            // §14.12.1: the CaseBlock is ONE lexical scope merging all clause StatementLists.
-            var merged: std.ArrayList(ast.Stmt) = .empty;
-            var fba_buf: [64 * @sizeOf(ast.Stmt)]u8 = undefined;
-            var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
-            const a = fba.allocator();
-            var overflow = false;
-            for (s.cases) |cs| for (cs.body) |b| {
-                merged.append(a, b) catch {
-                    overflow = true;
-                };
-            };
-            if (!overflow) try checkScopeNames(merged.items, .block, strict, @as(?*const ast.Pattern, null));
-            // Descend into each clause's nested scopes regardless.
-            for (s.cases) |cs| {
-                if (cs.test_expr) |t| try descendNode(t, strict);
-                for (cs.body) |b| try descendStmt(b, strict);
-            }
-        },
-        .labeled_stmt => |s| try descendStmt(s.body.*, strict),
-        else => {},
-    }
-}
-
-/// Descend into function/class *expressions* nested in an expression node, validating their bodies.
-/// Most expression shapes can carry a function/arrow/class literal; we recurse structurally.
-fn descendNode(node: *const ast.Node, strict: bool) ParseError!void {
-    switch (node.*) {
-        .function => |f| try validateFunction(f, strict),
-        .class_expr => |c| try validateClass(c, strict),
-        .unary => |u| try descendNode(u.operand, strict),
-        .await_expr => |e| try descendNode(e, strict),
-        .spread => |e| try descendNode(e, strict),
-        .comma => |b| {
-            try descendNode(b.left, strict);
-            try descendNode(b.right, strict);
-        },
-        .binary => |b| {
-            try descendNode(b.left, strict);
-            try descendNode(b.right, strict);
-        },
-        .logical => |b| {
-            try descendNode(b.left, strict);
-            try descendNode(b.right, strict);
-        },
-        .assign => |a| try descendNode(a.value, strict),
-        .assign_pattern => |a| {
-            try descendNode(a.target, strict);
-            try descendNode(a.value, strict);
-        },
-        .assign_member => |a| {
-            try descendNode(a.object, strict);
-            try descendNode(a.value, strict);
-        },
-        .assign_index => |a| {
-            try descendNode(a.object, strict);
-            try descendNode(a.key, strict);
-            try descendNode(a.value, strict);
-        },
-        .logical_assign => |a| {
-            try descendNode(a.target, strict);
-            try descendNode(a.value, strict);
-        },
-        .compound_assign => |a| {
-            try descendNode(a.target, strict);
-            try descendNode(a.value, strict);
-        },
-        .conditional => |c| {
-            try descendNode(c.cond, strict);
-            try descendNode(c.then, strict);
-            try descendNode(c.otherwise, strict);
-        },
-        .update => |u| try descendNode(u.target, strict),
-        .member => |m| try descendNode(m.object, strict),
-        .index => |ix| {
-            try descendNode(ix.object, strict);
-            try descendNode(ix.key, strict);
-        },
-        .call => |c| {
-            try descendNode(c.callee, strict);
-            for (c.args) |arg| try descendNode(arg, strict);
-        },
-        .new_expr => |c| {
-            try descendNode(c.callee, strict);
-            for (c.args) |arg| try descendNode(arg, strict);
-        },
-        .import_call => |ic| {
-            try descendNode(ic.specifier, strict);
-            if (ic.options) |o| try descendNode(o, strict);
-        },
-        .array_literal => |els| for (els) |e| try descendNode(e, strict),
-        .object_literal => |props| for (props) |p| {
-            if (p.computed_key) |ck| try descendNode(ck, strict);
-            if (p.default) |df| try descendNode(df, strict);
-            try descendNode(p.value, strict);
-        },
-        .template => |t| for (t.exprs) |e| try descendNode(e, strict),
-        .yield_expr => |y| if (y.argument) |e| try descendNode(e, strict),
-        .optional => |o| {
-            try descendNode(o.base, strict);
-            switch (o.link) {
-                .member => {},
-                .index => |k| try descendNode(k, strict),
-                .call => |args| for (args) |arg| try descendNode(arg, strict),
-            }
-        },
-        .super_call => |args| for (args) |arg| try descendNode(arg, strict),
-        .super_member => |sm| if (sm.key) |k| try descendNode(k, strict),
-        .private_member => |pm| try descendNode(pm.object, strict),
-        .private_assign => |pa| {
-            try descendNode(pa.object, strict);
-            try descendNode(pa.value, strict);
-        },
-        .private_in => |pi| try descendNode(pi.object, strict),
-        else => {},
-    }
-}
-
-/// §11.2.1 Directive Prologue → §11.2.2 strict: scan a leading token run (a Script or FunctionBody)
-/// for a `"use strict"` (or `'use strict'`) directive. A Directive Prologue is the longest leading
-/// sequence of string-literal ExpressionStatements; a directive counts only when its *source text*
-/// is exactly `"use strict"` with no escape sequences or line continuations — so we compare the raw
-/// lexeme (quotes included), NOT the cooked value (`"use strict"` does NOT trigger strict).
-/// `toks` starts at the first token of the body (after the opening `{` for functions). Token-level
-/// (not AST-level) so it can run before statement parsing and fire the §13.x Early Errors below.
-fn directivePrologueIsStrict(toks: []const lex.Token) bool {
-    var i: usize = 0;
-    while (i < toks.len and toks[i].kind == .string) {
-        // A string is a standalone ExpressionStatement (a Directive) only when the next token
-        // terminates the statement: `;`, `}`, EOF, or a line terminator (ASI). If instead the next
-        // token continues the expression on the same line (`"x" + 1`, `"x".length`, `"x", y`), the
-        // string was an operand of a larger expression — the Directive Prologue has ended.
-        const next = if (i + 1 < toks.len) toks[i + 1] else lex.Token{ .kind = .eof, .lexeme = "" };
-        const terminated = switch (next.kind) {
-            .semicolon, .rbrace, .eof => true,
-            else => next.newline_before,
-        };
-        if (!terminated) return false;
-        // §11.2.2: a directive whose *source text* is exactly `"use strict"` (no escapes / line
-        // continuations) makes the unit strict — compare the raw lexeme, not the cooked value.
-        if (std.mem.eql(u8, toks[i].lexeme, "\"use strict\"") or
-            std.mem.eql(u8, toks[i].lexeme, "'use strict'")) return true;
-        // Continue the prologue past this directive and an optional explicit `;`.
-        i += 1;
-        if (i < toks.len and toks[i].kind == .semicolon) i += 1;
-    }
-    return false;
-}
-
-/// Does `kind` begin a PropertyName? Used to distinguish a `get`/`set` accessor (`get x(){}`)
-/// from an ordinary use of the identifiers `get`/`set` as a key (`{get: 1}`, `{get}`, `{get(){}}`).
-fn startsAccessorName(kind: lex.TokenKind) bool {
-    return switch (kind) {
-        .identifier, .string, .number, .lbracket, .private_identifier => true,
-        else => isKeywordName(kind), // `get if(){}` etc.
-    };
-}
-
-/// Is `kind` a reserved word usable as a (non-computed) property name? Per §13.2.5 any
-/// ReservedWord is a valid IdentifierName key.
-fn isKeywordName(kind: lex.TokenKind) bool {
-    return switch (kind) {
-        .kw_true, .kw_false, .kw_null, .kw_var, .kw_let, .kw_const, .kw_function, .kw_return, .kw_this, .kw_if, .kw_else, .kw_while, .kw_do, .kw_for, .kw_throw, .kw_try, .kw_catch, .kw_finally, .kw_break, .kw_continue, .kw_typeof, .kw_void, .kw_delete, .kw_new, .kw_instanceof, .kw_switch, .kw_case, .kw_default, .kw_import, .kw_export, .kw_class, .kw_extends, .kw_super, .kw_in, .kw_with => true,
-        else => false,
-    };
-}
-
-/// §12.9.3 NumericLiteralSeparator placement: each `_` must sit immediately between two digits of
-/// the literal's radix (so no leading/trailing/doubled `_`, none adjacent to `.`/`e`/sign/prefix).
-/// Separators are forbidden entirely in a LegacyOctal / NonOctalDecimal literal (`0` followed by a
-/// digit, e.g. `0_7`, `08`). Returns false on any violation.
-fn validNumericSeparators(s: []const u8) bool {
-    if (std.mem.indexOfScalar(u8, s, '_') == null) return true; // no separators → nothing to check
-    // Radix + the digit region. A `0` followed by a digit is LegacyOctal/NonOctalDecimal: no separators.
-    const hex = s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X');
-    const oct = s.len >= 2 and s[0] == '0' and (s[1] == 'o' or s[1] == 'O');
-    const bin = s.len >= 2 and s[0] == '0' and (s[1] == 'b' or s[1] == 'B');
-    if (s.len >= 2 and s[0] == '0' and !hex and !oct and !bin and ((s[1] >= '0' and s[1] <= '9') or s[1] == '_')) return false;
-    const isRadixDigit = struct {
-        fn f(c: u8, h: bool) bool {
-            return if (h) (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F') else (c >= '0' and c <= '9');
-        }
-    }.f;
-    for (s, 0..) |ch, i| {
-        if (ch != '_') continue;
-        if (i == 0 or i + 1 >= s.len) return false; // leading / trailing
-        if (!isRadixDigit(s[i - 1], hex) or !isRadixDigit(s[i + 1], hex)) return false; // not between two digits
-    }
-    return true;
-}
-
-/// ToString of a numeric PropertyName (§13.2.5 — `{1: x}` has key "1", `{0.5: x}` key "0.5").
-fn numericKey(arena: std.mem.Allocator, n: f64) ParseError![]const u8 {
-    if (n == @floor(n) and @abs(n) < 1e21) {
-        return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
-    }
-    return std.fmt.allocPrint(arena, "{d}", .{n});
-}
-
-fn binaryOpFor(kind: lex.TokenKind) ?ast.BinaryOp {
-    return switch (kind) {
-        .plus => .add,
-        .minus => .sub,
-        .star => .mul,
-        .slash => .div,
-        .percent => .mod,
-        .star_star => .exp,
-        .bit_and => .bit_and,
-        .bit_or => .bit_or,
-        .bit_xor => .bit_xor,
-        .shl => .shl,
-        .shr => .shr,
-        .shr_un => .shr_un,
-        .lt => .lt,
-        .gt => .gt,
-        .le => .le,
-        .ge => .ge,
-        .kw_instanceof => .instanceof_,
-        .kw_in => .in_op,
-        .eq => .eq,
-        .ne => .ne,
-        .seq => .seq,
-        .sne => .sne,
-        else => null,
-    };
-}
-
-/// The binary operator a compound-assignment token (`+=`, …) desugars to, else null (§13.15).
-fn compoundBinOp(kind: lex.TokenKind) ?ast.BinaryOp {
-    return switch (kind) {
-        .plus_assign => .add,
-        .minus_assign => .sub,
-        .star_assign => .mul,
-        .slash_assign => .div,
-        .percent_assign => .mod,
-        .star_star_assign => .exp,
-        .shl_assign => .shl,
-        .shr_assign => .shr,
-        .shr_un_assign => .shr_un,
-        .amp_assign => .bit_and,
-        .pipe_assign => .bit_or,
-        .caret_assign => .bit_xor,
-        else => null,
-    };
-}
-
-/// The logical operator a logical-assignment token (`&&=`/`||=`/`??=`) short-circuits on, else null
-/// (§13.15.2). Unlike `compoundBinOp` these are NOT a plain `x = x op v` desugar.
-fn logicalAssignOp(kind: lex.TokenKind) ?ast.LogicalOp {
-    return switch (kind) {
-        .amp_amp_assign => .and_,
-        .pipe_pipe_assign => .or_,
-        .question_question_assign => .coalesce,
-        else => null,
-    };
-}
-
-/// Precedence over token kinds (covers logical, equality, relational, additive,
-/// multiplicative). Assignment is handled separately in `parseAssignment`.
-fn opPrecedence(kind: lex.TokenKind) ?u8 {
-    return switch (kind) {
-        .pipe_pipe => 1,
-        .amp_amp => 2,
-        .bit_or => 3,
-        .bit_xor => 4,
-        .bit_and => 5,
-        .eq, .ne, .seq, .sne => 6,
-        .lt, .gt, .le, .ge, .kw_instanceof, .kw_in => 7,
-        .shl, .shr, .shr_un => 8,
-        .plus, .minus => 9,
-        .star, .slash, .percent => 10,
-        .star_star => 11, // right-assoc (handled in parseExpr)
-        else => null,
-    };
-}
