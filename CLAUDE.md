@@ -42,6 +42,36 @@ Constitution: `.specify/memory/constitution.md` — correctness/conformance befo
 - Do **not** set Claude/Anthropic as the commit author — commits are authored by the user.
 - No "Generated with Claude Code" or similar attribution in commit messages or PR descriptions.
 
+## Code organization — subsystem modules, NOT monoliths
+The interpreter and parser are split into focused per-subsystem modules. `src/interpreter.zig`
+and `src/parser.zig` are now THIN cores (struct definition, fields, `init`, top-level entry
+points, named result types, and thin delegating wrappers). **Behavior lives in the subsystem
+modules — add new code THERE, never by growing the core struct file.**
+- **Where new behavior goes** (route by subsystem; check the file's doc-comment header):
+  - interpreter: `interp_expr` (expressions/calls), `interp_stmt` (statements/loops/hoisting),
+    `interp_ops` (operators/coercion), `interp_async` (promises/generators/async),
+    `interp_native` (callNative dispatch, global fns), `interp_class`, `interp_property`,
+    `interp_module`, `interp_iter`, `interp_destr`, `interp_collection`, `interp_arraylike`.
+  - parser: `parse_expr`, `parse_stmt`, `parse_class`, `parse_pattern`, `parse_validate`
+    (early errors / scope validation).
+  - built-ins: the matching `builtin_*.zig`.
+- **File-size budget: keep every source file under ~2000 lines (aim <1500).** When a file
+  approaches the budget, SPLIT it as part of the same cycle using the delegation pattern below —
+  do not let a monolith re-form. Adding a whole new subsystem? Start it in its own `*_<area>.zig`.
+- **Delegation pattern (Zig 0.16 removed `usingnamespace`):** in the module write a free function
+  `pub fn name(self: *Interpreter, …) Ret { …body… }`; in the core file keep a thin method
+  `fn name(self: *Interpreter, …) Ret { return mod.name(self, …); }` so `self.name(…)` call sites
+  are unchanged. Share types across files by promoting anonymous `union(enum)` returns to NAMED
+  `pub` types in the core file; widen visibility (`pub`) only as needed.
+- **Perf rule (learned the hard way):** a thin forwarder on a HOT recursive path (`evalStmt`,
+  `evalExpr`, `evalBinary`, the recursive-descent `parse*`) MUST be `pub inline fn`, or the extra
+  call layer regresses the bench (the interpreter split cost +14% on loop_mix until inlined). Keep
+  tiny high-fan-in plumbing (`peek`/`advance`/`expect`) in the core file. Re-bench vs the pre-split
+  commit after any extraction, since the ±15% gate can mask a real regression.
+- **Layout:** flat `src/`, subsystem encoded by filename PREFIX (`interp_*`, `parse_*`,
+  `builtin_*`). No directory nesting (Zig `@import` is relative-path; nesting buys `../` churn and
+  zero compile benefit at this size). Revisit only past ~50–60 files, via named `build.zig` modules.
+
 ## Autonomous implementation loop — FULL Spec-Driven Development
 Every milestone is one **cycle** and gets its OWN spec folder; do not skip the paper trail even
 for a small fix. One **cycle** at a time:
@@ -77,7 +107,9 @@ per-cycle commit gate is waived: **auto-commit + push every cycle** that passes 
 **Bench is an absolute pre-commit gate**: run `zig build bench` immediately before EVERY
 commit. If it shows any regression (or fails), you MUST fix it — the offending code or the
 bench — BEFORE committing. Never, ever commit with a failing or regressed bench. Keep cycling through `tasks.md` until the milestone is done or the user
-interrupts; record decisions in each commit message. Outside autonomous mode, never push
+interrupts; record decisions in each commit message. **Put new behavior in the right subsystem
+module (see "Code organization") — do not grow `interpreter.zig`/`parser.zig`; split any file
+nearing ~2000 lines in the same cycle.** Outside autonomous mode, never push
 without the user's per-cycle validation.
 
 ### Agent parallelism within a cycle
