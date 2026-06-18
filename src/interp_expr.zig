@@ -13,6 +13,7 @@ const bigint = @import("bigint.zig");
 const Parser = @import("parser.zig").Parser;
 const builtin_proxy = @import("builtin_proxy.zig");
 const builtin_regexp = @import("builtin_regexp.zig");
+const builtin_arraybuffer = @import("builtin_arraybuffer.zig");
 const interpreter = @import("interpreter.zig");
 const Interpreter = interpreter.Interpreter;
 const EvalError = interpreter.EvalError;
@@ -722,7 +723,7 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
     // functions / bound functions / classes have `native == .none` and a `call` body, so they pass.
     if (ctor.call == null and ctor.native != .none) {
         const constructible = switch (ctor.native) {
-            .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor, .proxy_ctor, .regexp_ctor => true,
+            .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor, .proxy_ctor, .regexp_ctor, .array_buffer_ctor => true,
             else => false,
         };
         if (!constructible) return self.throwError("TypeError", "value is not a constructor");
@@ -748,6 +749,7 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
         },
         .proxy_ctor => return builtin_proxy.construct(self, new_obj, args), // §28.2.1.1
         .regexp_ctor => return builtin_regexp.construct(self, args), // §22.2.4.1 (new RegExp)
+        .array_buffer_ctor => return builtin_arraybuffer.construct(self, .{ .object = new_obj }, args), // §25.1.3.1 (new ArrayBuffer)
         else => {},
     }
 

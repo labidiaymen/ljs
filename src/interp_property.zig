@@ -18,6 +18,8 @@ const ops = @import("abstract_ops.zig");
 const sutf16 = @import("string_utf16.zig");
 const builtin_proxy = @import("builtin_proxy.zig");
 const builtin_object = @import("builtin_object.zig");
+const tarray = @import("typed_array.zig");
+const builtin_bigint = @import("builtin_bigint.zig");
 
 const toNumber = ops.toNumber;
 const toBoolean = ops.toBoolean;
@@ -192,6 +194,12 @@ pub fn getProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!C
                 }
                 // else fall through to the prototype chain (Array.prototype methods)
             }
+            // §10.4.5.4: a TypedArray integer-indexed [[Get]] — a CanonicalNumericIndexString key is
+            // handled entirely here (in-bounds → element, OOB/invalid/detached → undefined) and NEVER
+            // resolves as an ordinary string property; a non-numeric key falls through to the chain.
+            if (o.kind == .typed_array) {
+                if (canonicalNumericIndex(self, key)) |n| return .{ .normal = try typedArrayGet(self, o, n) };
+            }
             // §22.1.4.1/§10.4.3: a `new String(s)` wrapper is a String exotic — `.length` and the
             // canonical integer indices [0, len) read the boxed [[StringData]] (own, ahead of the
             // ordinary chain) so wrapper.length / wrapper[i] mirror the primitive (M-subset: byte
@@ -356,6 +364,16 @@ pub fn setProperty(self: *Interpreter, base: Value, key: []const u8, value: Valu
                         return .{ .normal = value };
                     }
                     try o.arraySet(o.arena, i, value);
+                    return .{ .normal = value };
+                }
+            }
+            // §10.4.5.5: a TypedArray integer-indexed [[Set]] — a CanonicalNumericIndexString key is
+            // handled entirely here. The value is coerced (observably, even out-of-bounds); the byte
+            // write lands only for a valid in-bounds index, else a silent no-op. The key is NEVER stored
+            // as an ordinary string property. A non-numeric key falls through to the ordinary path.
+            if (o.kind == .typed_array) {
+                if (canonicalNumericIndex(self, key)) |n| {
+                    if (try typedArraySet(self, o, n, value)) |abrupt| return abrupt;
                     return .{ .normal = value };
                 }
             }
@@ -775,4 +793,66 @@ pub fn hasPropertyV(self: *Interpreter, base: Value, key: Value) EvalError!bool 
         return if (c == .normal) c.normal.boolean else false;
     }
     return false;
+}
+
+// ── §10.4.5 Integer-Indexed (TypedArray) exotic element access ───────────────
+// A TypedArray's [[Get]]/[[Set]] for a CanonicalNumericIndexString key (§6.1.7) is fully handled by
+// the integer-indexed logic (§10.4.5.4/.5) and NEVER falls through to ordinary string-keyed storage:
+// such a key is never an own string property. These helpers gate behind `kind == .typed_array` so the
+// ordinary property hot path is byte-for-byte unchanged (the bench guard).
+
+/// §6.1.7 CanonicalNumericIndexString — if `key` is the canonical String form of a Number `n`
+/// (`ToString(ToNumber(key)) === key`, plus the special case `"-0"`), return that Number; else null.
+/// A canonical numeric index need NOT be an integer index (`"1.5"`, `"Infinity"`, `"-1"` qualify) —
+/// IsValidIntegerIndex applies the further integrality/bounds test.
+fn canonicalNumericIndex(self: *Interpreter, key: []const u8) ?f64 {
+    if (std.mem.eql(u8, key, "-0")) return -0.0;
+    // ToNumber(key): a non-numeric string yields NaN. NaN's canonical string is "NaN" — so a key of
+    // "NaN" round-trips and IS a canonical numeric index (an out-of-range one). Any other non-canonical
+    // spelling (leading zeros, whitespace, "+1") fails the round-trip below and is an ordinary key.
+    const n = ops.stringToNumber(key);
+    const canon = numberToString(self.arena, n) catch return null;
+    return if (std.mem.eql(u8, canon, key)) n else null;
+}
+
+/// §10.4.5.4 [[Get]] for a TypedArray integer-indexed key. `n` is the CanonicalNumericIndexString value.
+/// IsValidIntegerIndex (§10.4.5.1): not detached, integral, not -0, and `0 <= n < array_length`. A valid
+/// index reads the element via the codec; any out-of-bounds / invalid / detached read yields `undefined`.
+fn typedArrayGet(self: *Interpreter, o: *Object, n: f64) EvalError!Value {
+    const ta = o.typed_array.?;
+    const buf = ta.buffer.array_buffer orelse return .undefined;
+    if (buf.detached) return .undefined; // §10.4.5.1 step 1: a detached buffer → invalid index
+    if (n != @floor(n) or std.math.signbit(n) and n == 0) return .undefined; // not integral, or -0
+    if (n < 0 or n >= @as(f64, @floatFromInt(ta.array_length))) return .undefined; // out of bounds
+    const i: usize = @intFromFloat(n);
+    const v = try tarray.getElement(ta.elem, buf.bytes[ta.byte_offset..], i, self.arena);
+    return v;
+}
+
+/// §10.4.5.5 [[Set]] for a TypedArray integer-indexed key. The value is ALWAYS coerced (ToNumber, or
+/// ToBigInt for a bigint-content array) — observably, even for an out-of-bounds index (§10.4.5.16
+/// IntegerIndexedElementSet) — but the byte write happens only for a valid in-bounds index; an invalid
+/// or detached write is a silent no-op. Returns the abrupt completion if coercion throws, else null.
+fn typedArraySet(self: *Interpreter, o: *Object, n: f64, value: Value) EvalError!?Completion {
+    const ta = o.typed_array.?;
+    // §10.4.5.16 step 1-2: coerce the value per the array's content type FIRST (always observable).
+    var num: f64 = 0;
+    var big: ?*const std.math.big.int.Const = null;
+    if (ta.elem.contentType() == .bigint) {
+        const bc = try builtin_bigint.toBigIntPub(self, value);
+        if (bc.isAbrupt()) return bc;
+        big = bc.normal.bigint;
+    } else {
+        const nc = try self.toNumberThrowing(value);
+        if (nc.isAbrupt()) return nc;
+        num = nc.normal.number;
+    }
+    // §10.4.5.1 IsValidIntegerIndex — write only when the index is valid; else a silent no-op.
+    const buf = ta.buffer.array_buffer orelse return null;
+    if (buf.detached) return null;
+    if (n != @floor(n) or (std.math.signbit(n) and n == 0)) return null;
+    if (n < 0 or n >= @as(f64, @floatFromInt(ta.array_length))) return null;
+    const i: usize = @intFromFloat(n);
+    try tarray.setElement(ta.elem, buf.bytes[ta.byte_offset..], i, num, big);
+    return null;
 }

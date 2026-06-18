@@ -109,7 +109,54 @@ pub const SymbolProperty = struct {
     pv: PropertyValue,
 };
 
-pub const Kind = enum { ordinary, function, array };
+pub const Kind = enum { ordinary, function, array, array_buffer, typed_array, data_view };
+
+// ── §25.1 / §23.2 / §25.3 Typed-array data model ────────────────────────────
+// Three exotic object kinds back the binary stack. An `array_buffer` owns a heap byte block; a
+// `typed_array` and a `data_view` are VIEWS that point at an `array_buffer` Object (shared storage,
+// so a write through one view is visible through another / through a DataView). See `typed_array.zig`
+// for the `ElemType` element codecs that read/write `ArrayBufferData.bytes`.
+
+/// §25.1.5 the element type tag carried by a TypedArray view (the 11 concrete element types + their
+/// byte size / content type). Re-exported from `typed_array.zig` so `object.zig`/`runtime_types.zig`
+/// callers reach it as `rt.ElemType`.
+pub const ElemType = @import("typed_array.zig").ElemType;
+
+/// §25.1.1 ArrayBuffer internal slots ([[ArrayBufferData]] / [[ArrayBufferByteLength]] /
+/// [[ArrayBufferDetachKey]] / [[ArrayBufferMaxByteLength]]). Present iff `Object.array_buffer != null`.
+///   • `bytes` — the raw backing block, ALLOCATOR-OWNED (allocated with `Object.arena`, like every
+///     other arena-owned slice in the engine; freed at realm teardown, so no per-object free is needed
+///     and there is no leak under the testing allocator).
+///   • `detached` — §25.1.3.3 DetachArrayBuffer sets this true (and `bytes` becomes length 0); every
+///     view read then yields `undefined` and every write is a no-op (Phase 2 surfaces TypeErrors).
+///   • `max_byte_length` — §25.1.1 [[ArrayBufferMaxByteLength]] for a RESIZABLE buffer (null = a
+///     fixed-length buffer). Phase 1 only allocates fixed buffers; the slot exists for Phase 2-A.
+pub const ArrayBufferData = struct {
+    bytes: []u8,
+    detached: bool = false,
+    max_byte_length: ?usize = null,
+};
+
+/// §23.2.5 Integer-Indexed (TypedArray) exotic internal slots ([[ViewedArrayBuffer]] / [[ByteOffset]] /
+/// [[ArrayLength]] / [[TypedArrayName]]/[[ContentType]] captured by `elem`). Present iff
+/// `Object.typed_array != null`. `buffer` points at an `array_buffer` Object whose `bytes` it views:
+/// element `i` occupies `buffer.array_buffer.?.bytes[byte_offset + i*bpe ..][0..bpe]` where
+/// `bpe = elem.bytesPerElement()`. The view shares the buffer's storage (correct aliasing for free).
+pub const TypedArrayData = struct {
+    buffer: *Object,
+    byte_offset: usize,
+    array_length: usize,
+    elem: ElemType,
+};
+
+/// §25.3.5 DataView internal slots ([[ViewedArrayBuffer]] / [[ByteOffset]] / [[ByteLength]]). Present
+/// iff `Object.data_view != null`. Like a TypedArray it points at a shared `array_buffer` Object, but
+/// it reads/writes at explicit byte offsets with explicit endianness (Phase 2-C).
+pub const DataViewData = struct {
+    buffer: *Object,
+    byte_offset: usize,
+    byte_length: usize,
+};
 
 /// §27.2.6 [[PromiseState]] — a Promise is pending until settled, then fulfilled or rejected (once).
 pub const PromiseState = enum { pending, fulfilled, rejected };
@@ -476,6 +523,26 @@ pub const NativeId = enum {
     /// TypeError. Used as the poison `get`/`set` for `callee` (and historically `caller`) on a
     /// strict / unmapped arguments object. Never returns normally.
     throw_type_error,
+    // §25.1 ArrayBuffer — the constructor, the prototype getters, the `slice` method, and the
+    // `isView`/`Symbol.species` statics. Phase 1 wires the constructor + `byteLength` getter; the
+    // rest are filled by Phase 2-A (same ids, dispatched by `native_name`).
+    array_buffer_ctor, // new ArrayBuffer(length[, options])
+    array_buffer_proto_getter, // get ArrayBuffer.prototype.<byteLength|maxByteLength|resizable|detached> (native_name selects)
+    array_buffer_method, // ArrayBuffer.prototype.<slice|resize|transfer|...> (native_name selects) — Phase 2-A
+    array_buffer_static, // ArrayBuffer.<isView> (native_name selects) — Phase 2-A
+    // §23.2 TypedArray — the %TypedArray% abstract super, the 11 concrete constructors, the prototype
+    // getters/methods, and the `from`/`of`/`Symbol.species` statics. Phase 2-B owns these (ids reserved
+    // here so the dispatch table is stable). `native_name` selects the concrete type / method.
+    typed_array_ctor, // a concrete `new Int8Array(...)` etc. (native_name = the constructor name)
+    typed_array_abstract_ctor, // %TypedArray%() — abstract (direct construction throws)
+    typed_array_proto_getter, // get %TypedArray%.prototype.<buffer|byteLength|byteOffset|length|[Symbol.toStringTag]>
+    typed_array_method, // %TypedArray%.prototype.<native_name>
+    typed_array_static, // %TypedArray%.<from|of>
+    // §25.3 DataView — the constructor, the prototype getters, and the getXxx/setXxx accessors.
+    // Phase 2-C owns these. `native_name` selects buffer/byteLength/byteOffset / the get/set variant.
+    data_view_ctor, // new DataView(buffer[, byteOffset[, byteLength]])
+    data_view_proto_getter, // get DataView.prototype.<buffer|byteLength|byteOffset>
+    data_view_method, // DataView.prototype.<getInt8|setUint16|...>
 };
 
 /// §10.4.1 A Bound Function Exotic Object's internal slots: the wrapped target, the bound `this`, and

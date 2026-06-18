@@ -24,6 +24,7 @@ test {
     _ = @import("completion.zig");
     _ = @import("environment.zig");
     _ = @import("object.zig");
+    _ = @import("typed_array.zig");
     _ = @import("abstract_ops.zig");
     _ = @import("builtins.zig");
     _ = @import("builtin_array.zig");

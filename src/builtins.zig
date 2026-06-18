@@ -648,6 +648,27 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try defineConstructorBackref(regexp_fn); // §22.2.6.1 RegExp.prototype.constructor === RegExp
     try env.declare("RegExp", .{ .object = regexp_fn }, true, true);
 
+    // §25.1 ArrayBuffer (Phase 1 — spec 083) — the constructor (new-only; plain call throws),
+    // the `byteLength` getter, and [Symbol.toStringTag] = "ArrayBuffer". `slice`/`isView`/species/
+    // resizable land in Phase 2-A. Construction is handled in `constructNT` (attaches the backing
+    // bytes to the new instance); TypedArray/DataView constructors are intentionally NOT registered
+    // here (Phase 2-B/2-C) — half-stubbing them would falsely pass tests.
+    const array_buffer_fn = try Object.createNative(arena, .array_buffer_ctor, "ArrayBuffer");
+    array_buffer_fn.prototype = function_proto; // §20.2.3 the ctor function object → %Function.prototype%
+    if (array_buffer_fn.get("prototype")) |pv| if (pv == .object) {
+        const ap = pv.object;
+        ap.prototype = object_proto; // §25.1.6 ArrayBuffer.prototype inherits %Object.prototype%
+        // §25.1.6.1 get ArrayBuffer.prototype.byteLength — an accessor (no setter), non-enumerable.
+        const bl_get = try Object.createNative(arena, .array_buffer_proto_getter, "byteLength");
+        bl_get.prototype = function_proto;
+        try bl_get.defineData("name", .{ .string = "get byteLength" }, false, false, true);
+        try ap.defineAccessorEx("byteLength", bl_get, null, false);
+        // §25.1.6.6 ArrayBuffer.prototype[Symbol.toStringTag] = "ArrayBuffer" (non-writable/non-enum/configurable).
+        if (tag_sym) |s| try ap.defineSymbolData(s, .{ .string = "ArrayBuffer" }, false, false, true);
+    };
+    try defineConstructorBackref(array_buffer_fn); // §25.1.6.2 ArrayBuffer.prototype.constructor === ArrayBuffer
+    try env.declare("ArrayBuffer", .{ .object = array_buffer_fn }, true, true);
+
     // §25.5 JSON — a namespace ordinary object (NOT callable / NOT a constructor; proto =
     // %Object.prototype%) holding `parse`/`stringify` and [Symbol.toStringTag] = "JSON".
     const json_obj = try Object.create(arena, object_proto);

@@ -29,6 +29,15 @@ fn toBigIntPrim(it: *Interpreter, prim: Value) EvalError!Completion {
     }
 }
 
+/// §7.1.13 ToBigInt as a public Completion — ToPrimitive(number) `v`, then ToBigInt. Used by the
+/// integer-indexed TypedArray set path (`BigInt64Array`/`BigUint64Array` element writes) and any other
+/// built-in needing a throwing ToBigInt. `.normal` holds the `.bigint` Value; abrupt on a bad operand.
+pub fn toBigIntPub(it: *Interpreter, v: Value) EvalError!Completion {
+    const pc = try it.toPrimitive(v, .number);
+    if (pc.isAbrupt()) return pc;
+    return toBigIntPrim(it, pc.normal);
+}
+
 /// §21.2.1.1 BigInt ( value ) — ToPrimitive(number) the argument, then ToBigInt.
 pub fn bigintConstructor(it: *Interpreter, args: []const Value) EvalError!Completion {
     const v: Value = if (args.len > 0) args[0] else .undefined;

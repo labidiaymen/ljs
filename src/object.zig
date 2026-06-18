@@ -28,6 +28,10 @@ pub const RegExpData = rt.RegExpData;
 pub const CollectionKind = rt.CollectionKind;
 pub const CollectionEntry = rt.CollectionEntry;
 pub const Collection = rt.Collection;
+pub const ElemType = rt.ElemType;
+pub const ArrayBufferData = rt.ArrayBufferData;
+pub const TypedArrayData = rt.TypedArrayData;
+pub const DataViewData = rt.DataViewData;
 pub const SymbolProperty = rt.SymbolProperty;
 pub const Kind = rt.Kind;
 pub const PromiseState = rt.PromiseState;
@@ -187,6 +191,17 @@ pub const Object = struct {
     /// parameter binding of that name in `env`: reading/writing `arguments[i]` reads/writes the live
     /// parameter (and vice-versa). Null for an unmapped (strict / non-simple-params) arguments object.
     mapped_params: ?MappedParams = null,
+    /// §25.1.1 ArrayBuffer internal slots — present iff `kind == .array_buffer`. Owns the raw backing
+    /// byte block (allocator-owned, freed at realm teardown). Null for every other object (zero cost).
+    array_buffer: ?ArrayBufferData = null,
+    /// §23.2.5 TypedArray (Integer-Indexed exotic) internal slots — present iff `kind == .typed_array`.
+    /// A VIEW pointing at a shared `array_buffer` Object; integer-indexed get/set in interp_property.zig
+    /// routes through `typed_array.zig`'s codecs against `buffer.array_buffer.?.bytes`. Null otherwise.
+    typed_array: ?TypedArrayData = null,
+    /// §25.3.5 DataView internal slots — present iff `kind == .data_view`. A VIEW pointing at a shared
+    /// `array_buffer` Object, read/written at explicit byte offsets with explicit endianness. Null
+    /// otherwise (zero cost). Phase 2-C drives the getXxx/setXxx surface.
+    data_view: ?DataViewData = null,
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);
@@ -219,6 +234,36 @@ pub const Object = struct {
     pub fn createArray(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try create(arena, prototype);
         obj.kind = .array;
+        return obj;
+    }
+
+    /// §25.1.2.1 An ArrayBuffer exotic object backing `byte_length` zeroed bytes (allocator-owned). The
+    /// caller proto-links it to %ArrayBuffer.prototype%. `max_byte_length` is null for a fixed buffer.
+    pub fn createArrayBuffer(arena: std.mem.Allocator, prototype: ?*Object, byte_length: usize, max_byte_length: ?usize) std.mem.Allocator.Error!*Object {
+        const obj = try create(arena, prototype);
+        obj.kind = .array_buffer;
+        const bytes = try arena.alloc(u8, byte_length);
+        @memset(bytes, 0); // §25.1.2.1 step 2: a new ArrayBuffer's data block is zeroed.
+        obj.array_buffer = .{ .bytes = bytes, .detached = false, .max_byte_length = max_byte_length };
+        return obj;
+    }
+
+    /// §23.2.5.1 A TypedArray (Integer-Indexed) exotic VIEW over `buffer` (an `array_buffer` Object).
+    /// `byte_offset`/`array_length`/`elem` define which slice of `buffer.array_buffer.bytes` it sees.
+    /// The caller proto-links it to the concrete `<Type>Array.prototype`.
+    pub fn createTypedArray(arena: std.mem.Allocator, prototype: ?*Object, buffer: *Object, byte_offset: usize, array_length: usize, elem: ElemType) std.mem.Allocator.Error!*Object {
+        const obj = try create(arena, prototype);
+        obj.kind = .typed_array;
+        obj.typed_array = .{ .buffer = buffer, .byte_offset = byte_offset, .array_length = array_length, .elem = elem };
+        return obj;
+    }
+
+    /// §25.3.4 A DataView exotic VIEW over `buffer` (an `array_buffer` Object) at `byte_offset` for
+    /// `byte_length` bytes. The caller proto-links it to %DataView.prototype%.
+    pub fn createDataView(arena: std.mem.Allocator, prototype: ?*Object, buffer: *Object, byte_offset: usize, byte_length: usize) std.mem.Allocator.Error!*Object {
+        const obj = try create(arena, prototype);
+        obj.kind = .data_view;
+        obj.data_view = .{ .buffer = buffer, .byte_offset = byte_offset, .byte_length = byte_length };
         return obj;
     }
 
@@ -441,6 +486,12 @@ pub const Object = struct {
             .aggregate_error_ctor => 2,
             .suppressed_error_ctor => 3,
             .symbol_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor => 0,
+            // §25.1.1 ArrayBuffer ( length [ , options ] ) — length 1. §23.2.7.1 a concrete TypedArray
+            // constructor has length 3 (typedArray, byteOffset, length); §25.3.2.1 DataView length 1.
+            .array_buffer_ctor, .data_view_ctor => 1,
+            .typed_array_ctor => 3,
+            .typed_array_abstract_ctor => 0, // §23.2.1 %TypedArray% takes no declared parameters
+            .array_buffer_proto_getter, .typed_array_proto_getter, .data_view_proto_getter => 0,
             .proxy_ctor => 2, // §28.2.1.1 Proxy ( target, handler )
             .proxy_revocable => 2, // §28.2.2.1 Proxy.revocable ( target, handler )
             .proxy_revoke => 0, // §28.2.2.1.1 the revoke function takes no arguments

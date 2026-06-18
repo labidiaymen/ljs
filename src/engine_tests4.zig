@@ -751,3 +751,27 @@ test "M42: §B.2.2.1 Object.prototype.__proto__ accessor" {
     // get on a null-proto object returns null.
     try t.expectBool("Object.create(null).__proto__ === undefined", true);
 }
+
+test "M-typedarrays Phase 1: §25.1 ArrayBuffer foundation" {
+    // §25.1.3.1 new ArrayBuffer(length) — byteLength reflects the requested size.
+    try t.expectNumber("new ArrayBuffer(8).byteLength", 8);
+    try t.expectNumber("new ArrayBuffer().byteLength", 0); // undefined length → 0
+    try t.expectNumber("new ArrayBuffer(0).byteLength", 0);
+    // §25.1.3.1 step 1: a plain call (no `new`) is a TypeError.
+    try t.expectThrows("ArrayBuffer(8)");
+    // §7.1.22 ToIndex: a negative / non-integer-infinite length is a RangeError.
+    try t.expectThrows("new ArrayBuffer(-1)");
+    try t.expectThrows("new ArrayBuffer(Infinity)");
+    // §25.1.6.6 [Symbol.toStringTag] = "ArrayBuffer".
+    try t.expectStr("Object.prototype.toString.call(new ArrayBuffer(1))", "[object ArrayBuffer]");
+    try t.expectStr("new ArrayBuffer(2)[Symbol.toStringTag]", "ArrayBuffer");
+    // §25.1.6.2 prototype.constructor + chain.
+    try t.expectBool("new ArrayBuffer(1) instanceof ArrayBuffer", true);
+    try t.expectBool("ArrayBuffer.prototype.constructor === ArrayBuffer", true);
+    // §25.1.6.1 the byteLength getter is an accessor on the prototype (not an own data prop).
+    try t.expectBool("Object.getOwnPropertyDescriptor(ArrayBuffer.prototype,'byteLength').get !== undefined", true);
+    // §20.2.4.1 ArrayBuffer.length === 1.
+    try t.expectNumber("ArrayBuffer.length", 1);
+    // The getter rejects a non-ArrayBuffer receiver.
+    try t.expectThrows("Object.getOwnPropertyDescriptor(ArrayBuffer.prototype,'byteLength').get.call({})");
+}
