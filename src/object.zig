@@ -39,6 +39,7 @@ pub const GeneratorState = rt.GeneratorState;
 pub const ResumeKind = rt.ResumeKind;
 pub const TransferKind = rt.TransferKind;
 pub const Generator = rt.Generator;
+pub const ModuleRun = rt.ModuleRun;
 pub const AsyncGeneratorState = rt.AsyncGeneratorState;
 pub const AsyncGenRequest = rt.AsyncGenRequest;
 pub const AsyncGenerator = rt.AsyncGenerator;

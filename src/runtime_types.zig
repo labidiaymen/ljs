@@ -267,6 +267,17 @@ pub const Generator = struct {
     /// §27.6 back-pointer to the owning AsyncGenerator (its request queue + state), so the body thread
     /// and the servicer share it. Null for plain generators / async functions.
     async_gen: ?*AsyncGenerator = null,
+    /// §16.2.1.6 ExecuteAsyncModule: set iff this async-body Generator drives a top-level-await MODULE
+    /// body (there is no function object — `func` is unused). When set, the body thread runs the
+    /// module's top-level StatementList in the module Environment instead of a FunctionBody.
+    module_run: ?ModuleRun = null,
+};
+
+/// §16.2.1.6 the module-body payload for a top-level-await Generator: the module's top-level
+/// statements + its Module Environment Record. The async-body thread runs these in `env`.
+pub const ModuleRun = struct {
+    statements: []const ast.Stmt,
+    env: *Environment,
 };
 
 /// §27.6.1 [[AsyncGeneratorState]] — an async generator's lifecycle. `suspended_start` (body not yet

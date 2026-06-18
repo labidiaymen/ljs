@@ -14,6 +14,7 @@ pub const evaluateAsyncTest = engine.evaluateAsyncTest;
 pub const AsyncTestResult = engine.AsyncTestResult;
 pub const default_step_limit = engine.default_step_limit;
 pub const evaluateModule = engine.evaluateModule;
+pub const evaluateAsyncModule = engine.evaluateAsyncModule;
 pub const ModuleLoader = engine.ModuleLoader;
 pub const ResolvedSource = engine.ResolvedSource;
 

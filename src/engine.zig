@@ -203,6 +203,13 @@ pub fn evaluateModule(
             error.StepLimitExceeded => .step_limit,
         };
     };
+    // §16.2.1.6 a top-level-await module's `runModule` returns its (pending) evaluation PROMISE; the
+    // body suspends on `await` and resumes during the Job drain. Capture the promise so we can read
+    // its FINAL settled state after the drain (a sync module returns its body completion directly).
+    const tla_promise: ?*@import("object.zig").Object = if (root.program.has_top_level_await and completion == .normal and completion.normal == .object and completion.normal.object.promise != null)
+        completion.normal.object
+    else
+        null;
     interp.drainJobs() catch |e| {
         interp.cleanupGenerators();
         return switch (e) {
@@ -211,12 +218,109 @@ pub fn evaluateModule(
         };
     };
     interp.cleanupGenerators();
+    // §16.2.1.6 AsyncModuleExecutionFulfilled / …Rejected: surface the awaiting module's settled
+    // evaluation result (fulfilled → normal; rejected → thrown) once the drain has resumed its body.
+    if (tla_promise) |p| if (p.promise) |pd| switch (pd.state) {
+        .fulfilled => return .{ .normal = pd.result },
+        .rejected => return .{ .thrown = pd.result },
+        .pending => {}, // never settled (e.g. awaited a forever-pending promise) → fall through
+    };
     return switch (completion) {
         .normal => |v| .{ .normal = v },
         .throw => |v| .{ .thrown = v },
         .ret => |v| .{ .normal = v },
         .brk, .cont => .{ .normal = .undefined },
     };
+}
+
+/// §16.2 evaluate an `[async]`-flagged MODULE test: like `evaluateModule`, but inject the native
+/// `$DONE(err)` global (the Test262 async-completion callback) before evaluating the module graph,
+/// then DRAIN the Job queue (so top-level-await continuations + Promise reactions complete) and
+/// classify via whether/how `$DONE` was called. Used by the runner for module tests with the `async`
+/// flag (which call `$DONE()` at the end of their top-level-await body). Deterministic + step-bounded.
+pub fn evaluateAsyncModule(
+    arena: std.mem.Allocator,
+    prelude: []const u8,
+    root_key: []const u8,
+    root_source: []const u8,
+    loader: ModuleLoader,
+    step_limit: u64,
+) error{OutOfMemory}!AsyncTestResult {
+    const interp_mod = @import("interpreter.zig");
+    const obj_mod = @import("object.zig");
+    const global = Environment.create(arena, null) catch return error.OutOfMemory;
+    builtins.setup(arena, global) catch return error.OutOfMemory;
+    var gen_registry: std.ArrayListUnmanaged(*obj_mod.Generator) = .empty;
+    var job_queue: std.ArrayListUnmanaged(obj_mod.Job) = .empty;
+    const done_sink = arena.create(interp_mod.AsyncDone) catch return error.OutOfMemory;
+    done_sink.* = .{};
+    const done_fn = obj_mod.Object.createNative(arena, .test_done, "$DONE") catch return error.OutOfMemory;
+    if (global.lookup("Function")) |b| if (b.value == .object) {
+        if (b.value.object.get("prototype")) |pv| if (pv == .object) {
+            done_fn.prototype = pv.object;
+        };
+    };
+    global.declare("$DONE", .{ .object = done_fn }, true, true) catch return error.OutOfMemory;
+    if (global.lookup("%GlobalThis%")) |gb| if (gb.value == .object) {
+        gb.value.object.defineData("$DONE", .{ .object = done_fn }, true, false, true) catch return error.OutOfMemory;
+    };
+    var interp = Interpreter{ .arena = arena, .step_limit = step_limit, .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue, .async_done = done_sink };
+    interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
+
+    if (prelude.len > 0) {
+        const pre = Parser.parseMode(arena, prelude, false) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .syntax_error = "harness prelude parse error" },
+        };
+        const pc = interp.run(pre, global) catch |e| {
+            interp.cleanupGenerators();
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.StepLimitExceeded => .step_limit,
+            };
+        };
+        if (pc == .throw) {
+            interp.cleanupGenerators();
+            return .{ .sync_throw = pc.throw };
+        }
+    }
+
+    var cache: std.StringHashMapUnmanaged(*module_mod.ModuleRecord) = .empty;
+    const root = loadGraph(arena, loader, &cache, root_key, root_source) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SyntaxError => return .{ .syntax_error = "module parse/resolve error" },
+    };
+
+    const completion = interp.runModule(root, global) catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
+    // A module that threw synchronously (before reaching the async machinery / $DONE) failed.
+    if (completion == .throw and !done_sink.called) {
+        interp.cleanupGenerators();
+        return .{ .sync_throw = completion.throw };
+    }
+    interp.drainJobs() catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
+    interp.cleanupGenerators();
+    // A top-level-await module whose evaluation rejected (but never called $DONE) failed synchronously
+    // in spirit — surface the rejection reason so the runner can report it.
+    if (!done_sink.called) {
+        if (root.program.has_top_level_await and completion == .normal and completion.normal == .object) {
+            if (completion.normal.object.promise) |pd| if (pd.state == .rejected) return .{ .sync_throw = pd.result };
+        }
+        return .never_done;
+    }
+    if (done_sink.failed) return .{ .async_fail = done_sink.message };
+    return .async_pass;
 }
 
 /// Like `evaluate`, but with an explicit interpreter step cap (the watchdog, research D8).

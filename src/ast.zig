@@ -399,4 +399,8 @@ pub const Program = struct {
     import_entries: []const ImportEntry = &.{},
     export_entries: []const ExportEntry = &.{},
     requested_modules: []const []const u8 = &.{},
+    /// §16.2.1.6 [[HasTLA]] — true iff the module body contains a top-level AwaitExpression (`await`
+    /// outside any nested function), a `for await`, or an `await using`. Such a module evaluates
+    /// asynchronously (§16.2.1.6 ExecuteAsyncModule). Always false for a Script.
+    has_top_level_await: bool = false,
 };

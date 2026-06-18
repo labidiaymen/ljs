@@ -91,6 +91,10 @@ pub const Parser = struct {
     import_entries: std.ArrayListUnmanaged(ast.ImportEntry) = .empty,
     export_entries: std.ArrayListUnmanaged(ast.ExportEntry) = .empty,
     requested_modules: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// §16.2.1.6 [[HasTLA]]: set true when an AwaitExpression is parsed at MODULE top level (the module
+    /// goal `in_async` is set AND we are NOT inside a nested function — `in_function` false). Drives the
+    /// interpreter's async module-evaluation path. Never set for a Script (no module-goal `in_async`).
+    saw_top_level_await: bool = false,
 
     /// §13.2.5.1 CoverInitializedName obligation counter. An object/array literal `{x = d}` / `[a = d]`
     /// records a `= default` that is ONLY legal once the literal is refined to an AssignmentPattern
@@ -163,7 +167,13 @@ pub const Parser = struct {
             try toks.append(arena, t);
             if (t.kind == .eof) break;
         }
-        var p = Parser{ .tokens = toks.items, .arena = arena, .strict = true, .is_module = true };
+        // §16.2.1.5: a Module's top-level code is `ModuleItem : StatementListItem[~Yield, +Await,
+        // ~Return]`. The `[+Await]` means `await` at module top level is the §15.8 AwaitExpression
+        // operator (top-level await), not an IdentifierReference, and `await` may not be a
+        // BindingIdentifier. Reuse the `in_async` flag (which already gates the await operator in
+        // `parseUnary`, rejects `await` bindings, and is reset across nested non-async functions so
+        // `await` does NOT propagate into them, per §16.2.1.6 / the `early-does-not-propagate` tests).
+        var p = Parser{ .tokens = toks.items, .arena = arena, .strict = true, .is_module = true, .in_async = true };
         return p.parseModuleProgram();
     }
 
@@ -536,6 +546,8 @@ pub const Parser = struct {
             if (!self.in_async) return ParseError.UnexpectedToken;
             _ = self.advance(); // await
             is_await = true;
+            // §16.2.1.6 [[HasTLA]]: `for await` at module top level evaluates the module asynchronously.
+            if (self.is_module and !self.in_function) self.saw_top_level_await = true;
         }
         _ = try self.expect(.lparen);
         // §14.3.1.1: a ForStatement / ForInOfStatement is a UsingDeclaration allow-list context — the
@@ -842,6 +854,7 @@ pub const Parser = struct {
             .import_entries = self.import_entries.items,
             .export_entries = self.export_entries.items,
             .requested_modules = self.requested_modules.items,
+            .has_top_level_await = self.saw_top_level_await,
         };
     }
 
@@ -986,7 +999,7 @@ pub const Parser = struct {
                 return .{ .func_decl = f };
             },
             .kw_class => {
-                const c = try self.parseClass(true);
+                const c = try self.parseClass(true, false);
                 const nm = c.name orelse return ParseError.UnexpectedToken;
                 try self.export_entries.append(self.arena, .{ .export_name = nm, .local_name = nm });
                 return .{ .class_decl = c };
@@ -1022,7 +1035,7 @@ pub const Parser = struct {
                 return .{ .stmt = .{ .func_decl = f }, .local = f.name.? };
             },
             .kw_class => {
-                const c = try self.parseClass(true);
+                const c = try self.parseClass(true, true);
                 if (c.name != null) return .{ .stmt = .{ .class_decl = c }, .local = c.name.? };
                 const named = try self.arena.create(ast.Class);
                 named.* = .{ .name = "*default*", .superclass = c.superclass, .elements = c.elements };
@@ -1238,7 +1251,7 @@ pub const Parser = struct {
                 return .{ .func_decl = try self.parseFunction(false) };
             },
             // §15.7 ClassDeclaration (statement position). Requires a binding name.
-            .kw_class => return .{ .class_decl = try self.parseClass(true) },
+            .kw_class => return .{ .class_decl = try self.parseClass(true, false) },
             .kw_return => {
                 _ = self.advance();
                 var arg: ?*const ast.Node = null;
@@ -1545,7 +1558,7 @@ pub const Parser = struct {
     /// (§15.7 — classes are always strict), lexically inherited like a function body.
     /// `extends LeftHandSideExpression` is parsed (so heritage syntax doesn't parse-reject); the
     /// superclass link + `super` are wired in Cycle 2.
-    fn parseClass(self: *Parser, is_declaration: bool) ParseError!*const ast.Class {
+    fn parseClass(self: *Parser, is_declaration: bool, allow_anonymous: bool) ParseError!*const ast.Class {
         _ = self.advance(); // class
         var name: ?[]const u8 = null;
         // §15.7: a class name is a BindingIdentifier. `extends`/`{` end the (optional) name.
@@ -1558,7 +1571,7 @@ pub const Parser = struct {
             // §15.7.11: `await` is reserved inside a static block — `class await {}` there is invalid.
             if (self.in_static_block and std.mem.eql(u8, self.peek().lexeme, "await")) return ParseError.UnexpectedToken;
             name = self.advance().lexeme;
-        } else if (is_declaration) {
+        } else if (is_declaration and !allow_anonymous) {
             // A ClassDeclaration requires a name (the anonymous form is only a ClassExpression /
             // `export default`); reject `class { }` in statement position.
             return ParseError.UnexpectedToken;
@@ -2071,6 +2084,9 @@ pub const Parser = struct {
     fn parseUsingDecl(self: *Parser, kind: ast.DeclKind, for_head: bool) ParseError!ast.Stmt {
         // §14.3.1.1: a UsingDeclaration is a Syntax Error at the top level of a Script.
         if (!self.using_allowed and !for_head) return ParseError.UnexpectedToken;
+        // §16.2.1.6 [[HasTLA]]: an `await using` at module top level awaits at scope disposal, making
+        // the module evaluate asynchronously.
+        if (kind == .await_using_decl and self.is_module and !self.in_function) self.saw_top_level_await = true;
         if (kind == .await_using_decl) _ = self.advance(); // `await`
         _ = self.advance(); // `using`
         var decls: std.ArrayList(ast.Declarator) = .empty;
@@ -2662,8 +2678,11 @@ pub const Parser = struct {
         // §15.8 AwaitExpression : `await` UnaryExpression — inside an async context `await` is the
         // operator (at UnaryExpression precedence, so `await a.b()` awaits the call result and `await
         // -x` awaits `-x`). Outside async, `await` is an ordinary identifier (handled in parsePrimary).
-        if (self.in_async and self.peek().kind == .identifier and std.mem.eql(u8, self.peek().lexeme, "await")) {
+        if (self.in_async and self.peek().kind == .identifier and !self.peek().had_escape and std.mem.eql(u8, self.peek().lexeme, "await")) {
             _ = self.advance(); // await
+            // §16.2.1.6 [[HasTLA]]: an `await` at module top level (module goal, not inside a nested
+            // function) makes the module evaluate asynchronously.
+            if (self.is_module and !self.in_function) self.saw_top_level_await = true;
             const operand = try self.parseUnary();
             return self.alloc(.{ .await_expr = operand });
         }
@@ -3289,7 +3308,12 @@ pub const Parser = struct {
                 // operator (parsed at the unary level by `parseUnary`), never an IdentifierReference —
                 // a bare `await` reaching primary position is a SyntaxError. Outside async (sloppy
                 // scripts/functions) `await` is an ordinary identifier and falls through below.
-                if (self.in_async and std.mem.eql(u8, t.lexeme, "await")) return ParseError.UnexpectedToken;
+                // §12.7.2 / §16.2.1.5: in MODULE code `await` is a reserved word — it is NOT a valid
+                // IdentifierReference ANYWHERE in the module, including the body of a nested NON-async
+                // function (where the Await capability does not propagate, so `await` is also not the
+                // operator). `{ await 0; }` in such a body must be a SyntaxError (the `early-does-not-
+                // propagate` tests), so reject `await` as a primary in module code regardless of `in_async`.
+                if ((self.in_async or self.is_module) and std.mem.eql(u8, t.lexeme, "await")) return ParseError.UnexpectedToken;
                 // §15.7.11: `await` is reserved as an IdentifierReference inside a static block body.
                 if (self.in_static_block and std.mem.eql(u8, t.lexeme, "await")) return ParseError.UnexpectedToken;
                 // §15.7.11 Early Error: ContainsArguments of a ClassStaticBlock's statement list is a
@@ -3369,7 +3393,7 @@ pub const Parser = struct {
                 return ParseError.UnexpectedToken;
             },
             // §15.7 ClassExpression (primary position). The name is optional (`class { … }`).
-            .kw_class => return self.alloc(.{ .class_expr = try self.parseClass(false) }),
+            .kw_class => return self.alloc(.{ .class_expr = try self.parseClass(false, true) }),
             // §13.3.5/§13.3.7: `super` is handled in `parsePostfix` (it must be the base of a
             // SuperProperty/SuperCall). Reaching it here means a bare `super` in a non-postfix
             // position (e.g. `super + 1`) — always a SyntaxError.

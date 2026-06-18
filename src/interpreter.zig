@@ -233,7 +233,108 @@ pub const Interpreter = struct {
         try self.linkModule(root, global);
         const lc = try self.instantiateModule(root);
         if (lc.isAbrupt()) return lc;
+        // §16.2.1.6 if the root module has top-level await ([[HasTLA]]), evaluate it asynchronously:
+        // its body runs on the async substrate and suspends at each `await`. The returned value is the
+        // module's evaluation promise, pending until the realm Job-queue drain (driven by the caller)
+        // resumes the body to its terminal completion (then fulfilled / rejected). The engine reads the
+        // settled promise state after the drain to surface the module's final result.
+        if (root.program.has_top_level_await) return self.runModuleAsync(root);
         return self.evaluateModule(root);
+    }
+
+    /// §16.2.1.6 ExecuteAsyncModule — evaluate a top-level-await root module asynchronously. First
+    /// evaluate its dependencies synchronously (the documented single-awaiting-root scope), then spawn
+    /// an async body thread (reusing the §27.7 Generator substrate) that runs the module's top-level
+    /// statements; `await` suspends via the shared handoff. Returns the (pending) module promise; the
+    /// body resumes during the caller's Job drain, ultimately fulfilling/rejecting that promise.
+    fn runModuleAsync(self: *Interpreter, root: *module_mod.ModuleRecord) EvalError!Completion {
+        // Evaluate dependencies first (synchronously) so their bindings are live before the root runs.
+        for (root.deps) |dep| {
+            const c = try self.evaluateModule(dep);
+            if (c.isAbrupt()) return c;
+        }
+        const env = root.env.?;
+        const promise = try self.newPromise();
+        const gen = try self.arena.create(object_mod.Generator);
+        gen.* = .{
+            // SAFETY: a module-body Generator (`module_run` set) has no function object — `func` is
+            // never read on this path (`runGeneratorBody` returns at the `module_run` branch before
+            // touching `gen.func`, and the async-module body thread never calls the function-body code).
+            .func = undefined,
+            .args = &.{},
+            .this_val = .undefined,
+            .home_object = null,
+            .is_async = true,
+            .promise = promise,
+            .module_run = .{ .statements = root.program.statements, .env = env },
+        };
+        if (self.gen_registry) |reg| try reg.append(self.arena, gen);
+        gen.state = .executing;
+        gen.resume_kind = .next;
+        gen.sent_value = .undefined;
+        const t = std.Thread.spawn(.{}, asyncModuleBodyThread, .{ self, root, gen }) catch {
+            gen.state = .completed;
+            return self.throwError("RangeError", "Cannot spawn async module thread");
+        };
+        gen.thread = t;
+        gen.to_caller.waitUncancelable(self.io); // run to first await / completion
+        try self.settleAsyncTransfer(gen);
+        root.status = .evaluated;
+        return .{ .normal = .{ .object = promise } };
+    }
+
+    /// The async module-body thread (mirrors `asyncBodyThread`): a fresh body interpreter sharing the
+    /// realm, with `current_gen` set so top-level `await` reaches the handoff. Runs the module's
+    /// statements; on a normal terminal completion refreshes the module's namespace snapshot (post-eval
+    /// export values), then posts the terminal transfer (ret/throw) so the caller settles the module
+    /// promise. The settled promise state is the module's evaluation result the engine reads.
+    fn asyncModuleBodyThread(parent: *Interpreter, root: *module_mod.ModuleRecord, gen: *object_mod.Generator) void {
+        var body: Interpreter = .{
+            .arena = parent.arena,
+            .step_limit = parent.step_limit,
+            .globals = parent.globals,
+            .gen_registry = parent.gen_registry,
+            .job_queue = parent.job_queue,
+            .io = parent.io,
+            .current_gen = gen,
+            // Top-level-await module code may call the Test262 `$DONE` sink directly (the `[async]`
+            // module contract); the body thread needs the shared sink so that call is recorded.
+            .async_done = parent.async_done,
+        };
+        const comp = body.runGeneratorBody(gen) catch |e| blk: {
+            const kind: []const u8 = if (e == error.StepLimitExceeded) "RangeError" else "Error";
+            const msg: []const u8 = if (e == error.StepLimitExceeded) "step limit exceeded" else "out of memory";
+            const tc = body.throwError(kind, msg) catch break :blk Completion{ .throw = .undefined };
+            break :blk tc;
+        };
+        switch (comp) {
+            .normal, .ret => {
+                // Refresh the namespace snapshot with the final export values (a populate engine error
+                // becomes a throw transfer so it surfaces rather than being silently dropped).
+                if (root.namespace) |ns| {
+                    if (body.populateNamespace(root, ns)) |_| {
+                        gen.transfer_value = .undefined;
+                        gen.transfer_kind = .ret;
+                    } else |_| {
+                        const tc = body.throwError("Error", "module namespace finalization failed") catch Completion{ .throw = .undefined };
+                        gen.transfer_value = tc.throw;
+                        gen.transfer_kind = .throw;
+                    }
+                } else {
+                    gen.transfer_value = .undefined;
+                    gen.transfer_kind = .ret;
+                }
+            },
+            .throw => |v| {
+                gen.transfer_value = v;
+                gen.transfer_kind = .throw;
+            },
+            .brk, .cont => {
+                gen.transfer_value = .undefined;
+                gen.transfer_kind = .ret;
+            },
+        }
+        gen.to_caller.post(body.io);
     }
 
     /// §16.2.1.6.2 InnerModuleLinking — create each module's environment and hoist its top-level
@@ -4875,6 +4976,24 @@ pub const Interpreter = struct {
     }
 
     fn runGeneratorBody(self: *Interpreter, gen: *object_mod.Generator) EvalError!Completion {
+        // §16.2.1.6 ExecuteAsyncModule: a top-level-await module body has no function object — run the
+        // module's top-level StatementList in its (already linked + hoisted) Module Environment Record,
+        // strict, with `this` = undefined. `await` suspends via the shared async handoff; the terminal
+        // completion settles the module's promise (see runModuleAsync).
+        if (gen.module_run) |mr| {
+            self.this_val = .undefined;
+            self.home_object = null;
+            self.strict = true;
+            var last: Completion = .{ .normal = .undefined };
+            for (mr.statements) |stmt| {
+                last = try self.evalStmt(stmt, mr.env);
+                switch (last) {
+                    .normal => {},
+                    else => return last,
+                }
+            }
+            return last;
+        }
         const func = gen.func;
         const fd = func.call.?;
         // §15.5.2/§15.6.2: a sync/async GENERATOR's params were already bound on the caller thread

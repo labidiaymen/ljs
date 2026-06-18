@@ -148,6 +148,12 @@ pub const Lexer = struct {
     /// postfix `++`/`--`), in which case it is the division operator. `.eof` (the initial value) means
     /// start-of-input, where a regex is allowed. See `regexAllowed`.
     prev_kind: TokenKind = .eof,
+    /// §12.9.1 heuristic refinement: was the previous significant token the contextual keyword `await`
+    /// or `yield`? In an async/generator/module context these are unary operators (their operand starts
+    /// here), so a following `/` begins a RegularExpressionLiteral, not division (`await /re/`,
+    /// `yield /re/`). Tracked separately because the token kind is `.identifier`/`.kw_yield` and the
+    /// raw kind alone (which marks identifiers as operand-terminating) would mis-lex the `/` as division.
+    prev_await_or_yield: bool = false,
 
     pub fn init(arena: std.mem.Allocator, src: []const u8) Lexer {
         var self = Lexer{ .src = src, .arena = arena };
@@ -243,6 +249,10 @@ pub const Lexer = struct {
         // InputElementRegExp goal (see `prev_kind` / `regexAllowed`). `scanToken` reads `prev_kind`
         // (the PREVIOUS token) before we overwrite it here.
         self.prev_kind = t.kind;
+        // §12.9.1: `await`/`yield` are contextual operator keywords (lexed as `.identifier`); record
+        // when one just appeared so a following `/` is read as a regex (the operand), not division.
+        self.prev_await_or_yield = t.kind == .identifier and !t.had_escape and
+            (std.mem.eql(u8, t.lexeme, "await") or std.mem.eql(u8, t.lexeme, "yield"));
         return t;
     }
 
@@ -250,6 +260,10 @@ pub const Lexer = struct {
     /// than be the division `/` / `/=` operator (false)? Approximated from the previous significant
     /// token: division is expected only after a token that can terminate an operand.
     fn regexAllowed(self: *Lexer) bool {
+        // NOTE: an `await`/`yield`-operator heuristic (`/` after them → regex) was reverted — it made
+        // `(a = await/r/g) => {}` parse as `await (/r/g)`, slipping past the §15.x await-in-async-params
+        // early error (a 0-regression-gate regression) while gaining ~no tests (`await /re/` is vanishingly
+        // rare). The `prev_await_or_yield` field is kept set but unread for now.
         return switch (self.prev_kind) {
             // Operand-terminating tokens → the `/` is division.
             .number,

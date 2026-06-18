@@ -153,6 +153,14 @@ fn runModuleTest(io: std.Io, dir: std.Io.Dir, arena: Allocator, opts: Options, p
     }
     var ctx = ModuleLoaderCtx{ .io = io, .dir = dir, .arena = arena };
     const loader = ljs.ModuleLoader{ .ctx = &ctx, .resolve = ModuleLoaderCtx.resolve };
+    // §16.2 an `[async]`-flagged module (a top-level-await test that calls `$DONE`) is driven through
+    // the `$DONE` / microtask-drain path and classified via the async contract (a parse-negative async
+    // module still classifies on the parse error inside `classifyAsync`).
+    if (meta.flags.is_async) {
+        const ar = try ljs.evaluateAsyncModule(arena, buf.items, path, source, loader, opts.step_limit);
+        try report.add(classifyAsync(meta, ar, .strict, path));
+        return;
+    }
     const result = try ljs.evaluateModule(arena, buf.items, path, source, loader, opts.step_limit);
     // A `negative: { phase: resolution }` module passes on a syntax/thrown-SyntaxError (our engine
     // surfaces an unresolvable export as a thrown SyntaxError); reuse `classify` with a parse-phase
