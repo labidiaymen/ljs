@@ -29,7 +29,22 @@ const Inst = union(enum) {
     // (greedy prefers `body`, lazy prefers `exit`); ≥ max → `exit`. Avoids expanding `{n,m}` literally so
     // huge bounds (e.g. `b{9007199254740991}`) compile in O(1) space.
     rep_loop: struct { counter: usize, min: usize, max: usize, body: usize, exit: usize, greedy: bool },
+    // §22.2.2.3 Assertion :: (?= ) (?! ) (?<= ) (?<! ) — a lookaround. The body is its own compiled
+    // sub-program (its instructions end in `match`); `behind` runs it right-to-left (reversed +
+    // backward), `ahead` forward, both anchored at the current position and consuming nothing. On a
+    // positive assertion the body's captures persist; a negative assertion (whether it succeeds by the
+    // body failing) leaves the captures it would have set as undefined.
+    look: struct { negated: bool, behind: bool, body: *const Look },
     match, // success
+};
+
+/// A compiled lookaround body: a self-contained instruction stream (ending in `match`) plus its own
+/// counter-register count and the reverse flag (set for lookbehind, where the body was compiled in
+/// reverse term order and is executed backward).
+pub const Look = struct {
+    insts: []const Inst,
+    num_counters: usize,
+    reverse: bool,
 };
 
 const Range = struct { lo: u8, hi: u8 };
@@ -48,7 +63,7 @@ pub const NamedGroup = struct { name: []const u8, index: usize };
 
 // ─── Parser (pattern text → AST) ────────────────────────────────────────────────────────────────
 
-const NodeTag = enum { char, any, class, concat, alt, repeat, group, assert_start, assert_end, word_boundary, backref };
+const NodeTag = enum { char, any, class, concat, alt, repeat, group, assert_start, assert_end, word_boundary, backref, look };
 
 const Node = struct {
     tag: NodeTag,
@@ -62,6 +77,7 @@ const Node = struct {
     greedy: bool = true,
     group_index: usize = 0, // 0 = non-capturing
     backref_index: usize = 0,
+    behind: bool = false, // look: lookbehind (?<= / (?<! vs lookahead
 };
 
 const Parser = struct {
@@ -170,6 +186,11 @@ const Parser = struct {
         // A quantifier directly on an assertion/another quantifier is a SyntaxError (caught: atom is an
         // Atom here, but `**` would re-enter with atom = repeat — reject a quantifier on a repeat).
         if (atom.tag == .repeat) return CompileError.SyntaxError;
+        // §22.2.1 Term grammar: a lookbehind `(?<= )` / `(?<! )` is an Assertion, never a
+        // QuantifiableAssertion — quantifying it (`(?<=.)?`, `(?<=.){2,3}`) is always a SyntaxError.
+        // A lookahead `(?= )` / `(?! )` is a QuantifiableAssertion only in non-UnicodeMode (Annex B);
+        // in UnicodeMode (`u`/`v`) quantifying it is a SyntaxError too.
+        if (atom.tag == .look and (atom.behind or self.unicode)) return CompileError.SyntaxError;
         return self.mk(.{ .tag = .repeat, .sub = atom, .min = min, .max = max, .greedy = greedy });
     }
 
@@ -259,7 +280,22 @@ const Parser = struct {
             if (k == ':') {
                 self.pos += 1;
                 capturing = false;
-            } else if (k == '<' and self.pos + 1 < self.src.len and self.src[self.pos + 1] != '=' and self.src[self.pos + 1] != '!') {
+            } else if (k == '=' or k == '!') {
+                // (?=Disjunction) / (?!Disjunction) — lookahead assertion (consumes nothing).
+                self.pos += 1; // '=' or '!'
+                const lbody = try self.parseDisjunction();
+                if (self.peek() != ')') return CompileError.SyntaxError;
+                self.pos += 1; // ')'
+                return self.mk(.{ .tag = .look, .sub = lbody, .negated = k == '!', .behind = false });
+            } else if (k == '<' and self.pos + 1 < self.src.len and (self.src[self.pos + 1] == '=' or self.src[self.pos + 1] == '!')) {
+                // (?<=Disjunction) / (?<!Disjunction) — lookbehind assertion (consumes nothing).
+                const neg = self.src[self.pos + 1] == '!';
+                self.pos += 2; // '<' then '=' or '!'
+                const lbody = try self.parseDisjunction();
+                if (self.peek() != ')') return CompileError.SyntaxError;
+                self.pos += 1; // ')'
+                return self.mk(.{ .tag = .look, .sub = lbody, .negated = neg, .behind = true });
+            } else if (k == '<') {
                 self.pos += 1; // '<'
                 // §22.2.1 GroupSpecifier: `<` RegExpIdentifierName `>` — validated (non-empty, valid
                 // identifier code points) and unique within the pattern (duplicate name → SyntaxError).
@@ -271,7 +307,6 @@ const Parser = struct {
                 gi = self.group_count;
                 try self.names.append(self.arena, .{ .name = name, .index = gi });
             } else {
-                // (?=...) (?!...) (?<=...) (?<!...) lookaround — not yet supported.
                 return CompileError.SyntaxError;
             }
         } else {
@@ -585,6 +620,10 @@ const Compiler = struct {
     arena: std.mem.Allocator,
     insts: std.ArrayListUnmanaged(Inst) = .empty,
     num_counters: usize = 0,
+    /// When set (compiling a lookbehind body), a `concat` is emitted in reverse term order so that
+    /// backward VM execution visits the terms in source order. Atoms emit unchanged — the VM consumes
+    /// backward under a direction flag; only sequencing must be flipped here.
+    reverse: bool = false,
 
     /// Above this, a `{min,max}` bound is compiled with a runtime counter loop instead of being unrolled
     /// into literal copies — so `b{9007199254740991}` doesn't try to emit quadrillions of instructions.
@@ -605,7 +644,14 @@ const Compiler = struct {
             .assert_end => _ = try self.emit(.assert_end),
             .word_boundary => _ = try self.emit(.{ .word_boundary = n.negated }),
             .backref => _ = try self.emit(.{ .backref = n.backref_index }),
-            .concat => for (n.kids) |k| try self.compileNode(k),
+            .concat => if (self.reverse) {
+                var i = n.kids.len;
+                while (i > 0) {
+                    i -= 1;
+                    try self.compileNode(n.kids[i]);
+                }
+            } else for (n.kids) |k| try self.compileNode(k),
+            .look => try self.compileLook(n),
             .alt => {
                 // split a,b ; a: ...; jmp end; b: ...(recurse for >2)
                 var jmp_ends: std.ArrayListUnmanaged(usize) = .empty;
@@ -624,12 +670,28 @@ const Compiler = struct {
                 for (jmp_ends.items) |je| self.insts.items[je].jmp = self.insts.items.len;
             },
             .group => {
-                if (n.group_index > 0) _ = try self.emit(.{ .save = 2 * n.group_index });
+                // Forward: save start (2k) then end (2k+1). Reversed (lookbehind): the body runs
+                // backward, so we encounter the group's END boundary first — emit save 2k+1 first and
+                // 2k last, keeping start ≤ end in the recorded positions.
+                const first: usize = if (self.reverse) 2 * n.group_index + 1 else 2 * n.group_index;
+                const last: usize = if (self.reverse) 2 * n.group_index else 2 * n.group_index + 1;
+                if (n.group_index > 0) _ = try self.emit(.{ .save = first });
                 try self.compileNode(n.sub.?);
-                if (n.group_index > 0) _ = try self.emit(.{ .save = 2 * n.group_index + 1 });
+                if (n.group_index > 0) _ = try self.emit(.{ .save = last });
             },
             .repeat => try self.compileRepeat(n),
         }
+    }
+
+    /// Compile a lookaround body into its own self-contained sub-program (ending in `match`) and emit a
+    /// `look` instruction referencing it. Lookbehind bodies compile in reverse (and run backward).
+    fn compileLook(self: *Compiler, n: *Node) CompileError!void {
+        var sub = Compiler{ .arena = self.arena, .reverse = n.behind };
+        try sub.compileNode(n.sub.?);
+        _ = try sub.emit(.match);
+        const look = try self.arena.create(Look);
+        look.* = .{ .insts = sub.insts.items, .num_counters = sub.num_counters, .reverse = n.behind };
+        _ = try self.emit(.{ .look = .{ .negated = n.negated, .behind = n.behind, .body = look } });
     }
 
     fn compileRepeat(self: *Compiler, n: *Node) CompileError!void {
@@ -807,9 +869,22 @@ const Choice = struct { pc: usize, sp: usize, undo_len: usize };
 
 /// One entry of the backtracking undo log: the prior value of a capture slot (before a `save`) or of a
 /// loop counter (before a `count_init`/`count_inc`), so it can be restored when a choice point is taken.
+/// `saves_snapshot` restores the whole capture array to a copy taken before a lookaround sub-match ran
+/// (a lookaround's nested backtracking can mutate many slots, so the cheapest faithful undo is a copy).
 const Undo = union(enum) {
     save: struct { slot: usize, old: ?usize },
     counter: struct { idx: usize, old: usize },
+    saves_snapshot: []const ?usize,
+};
+
+/// Shared per-`exec` matching context. `saves` is the single capture array threaded through the whole
+/// pattern and every (possibly nested) lookaround sub-match; `steps` is the shared step budget.
+const Ctx = struct {
+    arena: std.mem.Allocator,
+    prog: *const Program,
+    input: []const u8,
+    saves: []?usize,
+    steps: usize = 0,
 };
 
 /// A budget on total VM steps: catastrophic backtracking (e.g. `(a*)*b` over a long non-matching input)
@@ -818,61 +893,66 @@ const Undo = union(enum) {
 /// documented casualty (Test262's catastrophic cases expect no match anyway).
 const max_steps: usize = 2_000_000;
 
-/// Backtracking execution starting at instruction 0, string position `at`. Returns the capture saves on a
-/// full match, or null on failure / step-budget exhaustion.
+/// Backtracking execution of an instruction stream, starting at instruction 0, string position `start`.
+/// Returns the end position on a full match (the shared `ctx.saves` is left holding the captures), or
+/// null on failure / step-budget exhaustion. `dir` is +1 forward (the whole pattern and lookahead
+/// bodies) or -1 backward (lookbehind bodies, whose instructions were compiled in reverse term order).
 ///
-/// Iterative, with a single shared `saves` array mutated in place: each `split` pushes a `Choice` for the
+/// Iterative, with the shared `ctx.saves` array mutated in place: each `split` pushes a `Choice` for the
 /// alternative branch, and each `save` logs the overwritten slot to `undo`. On backtrack the saves are
-/// rolled back to the choice point's `undo_len` and execution resumes there. Memory stays bounded by the
-/// current path depth (both stacks shrink on backtrack), so a long `a*` loop or deep nesting neither
-/// overflows the native call stack (no recursion) nor exhausts the heap (no per-step allocation).
-fn matchAt(arena: std.mem.Allocator, prog: *const Program, input: []const u8, at: usize) error{OutOfMemory}!?[]?usize {
-    const nslots = 2 * (prog.num_groups + 1);
-    const saves = try arena.alloc(?usize, nslots);
-    @memset(saves, null);
-    const counters = try arena.alloc(usize, prog.num_counters);
-    @memset(counters, 0);
+/// rolled back to the choice point's `undo_len` and execution resumes there. A `look` recursively runs
+/// its body (sharing `ctx.saves`); the captures it sets persist on success and are snapshot-restored on
+/// backtrack. Both stacks shrink on backtrack, so memory stays bounded by the current path depth.
+fn run(ctx: *Ctx, insts: []const Inst, counters: []usize, start: usize, dir: i2) error{OutOfMemory}!?usize {
+    const arena = ctx.arena;
+    const input = ctx.input;
+    const prog = ctx.prog;
+    const saves = ctx.saves;
     var bt: std.ArrayListUnmanaged(Choice) = .empty;
     var undo: std.ArrayListUnmanaged(Undo) = .empty;
     var pc: usize = 0;
-    var sp: usize = at;
-    var steps: usize = 0;
+    var sp: usize = start;
+    const fwd = dir > 0;
     while (true) {
-        steps += 1;
-        if (steps > max_steps) return null;
-        // `fail` rolls back to the most recent choice point (restoring saves via the undo log); if there
-        // are none, the match fails at this start position.
+        ctx.steps += 1;
+        if (ctx.steps > max_steps) return null;
+        // `failed` rolls back to the most recent choice point (restoring saves via the undo log); if there
+        // are none, the match fails.
         var failed = false;
-        switch (prog.insts[pc]) {
-            .match => return saves,
+        switch (insts[pc]) {
+            .match => return sp,
             .jmp => |x| pc = x,
             .char => |c| {
-                if (sp >= input.len) {
+                // Forward reads input[sp] and advances; backward reads input[sp-1] and retreats.
+                const have = if (fwd) sp < input.len else sp > 0;
+                if (!have) {
                     failed = true;
                 } else {
-                    const ib = input[sp];
+                    const ib = if (fwd) input[sp] else input[sp - 1];
                     const eq = if (prog.ignore_case) foldByte(ib) == foldByte(c) else ib == c;
-                    if (!eq) {
-                        failed = true;
-                    } else {
-                        sp += 1;
+                    if (!eq) failed = true else {
+                        sp = if (fwd) sp + 1 else sp - 1;
                         pc += 1;
                     }
                 }
             },
             .any => {
-                if (sp >= input.len or (!prog.dot_all and isLineTerm(input[sp]))) {
+                const have = if (fwd) sp < input.len else sp > 0;
+                const ch: u8 = if (have) (if (fwd) input[sp] else input[sp - 1]) else 0;
+                if (!have or (!prog.dot_all and isLineTerm(ch))) {
                     failed = true;
                 } else {
-                    sp += 1;
+                    sp = if (fwd) sp + 1 else sp - 1;
                     pc += 1;
                 }
             },
             .class => |cl| {
-                if (sp >= input.len or !classMatch(cl.ranges, cl.negated, input[sp], prog.ignore_case)) {
+                const have = if (fwd) sp < input.len else sp > 0;
+                const ch: u8 = if (have) (if (fwd) input[sp] else input[sp - 1]) else 0;
+                if (!have or !classMatch(cl.ranges, cl.negated, ch, prog.ignore_case)) {
                     failed = true;
                 } else {
-                    sp += 1;
+                    sp = if (fwd) sp + 1 else sp - 1;
                     pc += 1;
                 }
             },
@@ -897,11 +977,14 @@ fn matchAt(arena: std.mem.Allocator, prog: *const Program, input: []const u8, at
                     pc += 1; // an unmatched group backref matches the empty string
                 } else {
                     const seg = input[a.?..b.?];
-                    if (sp + seg.len > input.len) {
+                    // Forward consumes the captured bytes ahead of sp; backward consumes them behind sp.
+                    const have = if (fwd) sp + seg.len <= input.len else sp >= seg.len;
+                    if (!have) {
                         failed = true;
                     } else {
+                        const base = if (fwd) sp else sp - seg.len;
                         for (seg, 0..) |sc, i| {
-                            const ib = input[sp + i];
+                            const ib = input[base + i];
                             const eq = if (prog.ignore_case) foldByte(ib) == foldByte(sc) else ib == sc;
                             if (!eq) {
                                 failed = true;
@@ -909,7 +992,7 @@ fn matchAt(arena: std.mem.Allocator, prog: *const Program, input: []const u8, at
                             }
                         }
                         if (!failed) {
-                            sp += seg.len;
+                            sp = if (fwd) sp + seg.len else sp - seg.len;
                             pc += 1;
                         }
                     }
@@ -955,6 +1038,30 @@ fn matchAt(arena: std.mem.Allocator, prog: *const Program, input: []const u8, at
                 try bt.append(arena, .{ .pc = s.b, .sp = sp, .undo_len = undo.items.len });
                 pc = s.a;
             },
+            .look => |lk| {
+                // §22.2.2.3: run the body anchored at the current position, consuming nothing. A copy of
+                // the captures is taken first so a later backtrack past this assertion can restore them;
+                // for a negative assertion we always restore (its inner captures stay undefined per spec).
+                const snap = try arena.dupe(?usize, saves);
+                const sub_counters = try arena.alloc(usize, lk.body.num_counters);
+                @memset(sub_counters, 0);
+                const sub_dir: i2 = if (lk.behind) -1 else 1;
+                const matched = (try run(ctx, lk.body.insts, sub_counters, sp, sub_dir)) != null;
+                if (matched == lk.negated) {
+                    // Negative-and-matched or positive-and-failed → assertion fails. Restore captures.
+                    @memcpy(saves, snap);
+                    failed = true;
+                } else {
+                    if (lk.negated) {
+                        @memcpy(saves, snap); // negative success: inner captures are reset
+                    } else {
+                        // positive success: keep the body's captures, but log a snapshot so a backtrack
+                        // past this point restores them.
+                        try undo.append(arena, .{ .saves_snapshot = snap });
+                    }
+                    pc += 1; // position unchanged — lookaround consumes nothing
+                }
+            },
         }
         if (failed) {
             const cp = bt.pop() orelse return null;
@@ -962,12 +1069,26 @@ fn matchAt(arena: std.mem.Allocator, prog: *const Program, input: []const u8, at
                 switch (undo.pop().?) {
                     .save => |u| saves[u.slot] = u.old,
                     .counter => |u| counters[u.idx] = u.old,
+                    .saves_snapshot => |snap| @memcpy(saves, snap),
                 }
             }
             pc = cp.pc;
             sp = cp.sp;
         }
     }
+}
+
+/// Backtracking execution of the whole pattern at string position `at`. Returns the capture saves on a
+/// full match, or null on failure / step-budget exhaustion.
+fn matchAt(arena: std.mem.Allocator, prog: *const Program, input: []const u8, at: usize) error{OutOfMemory}!?[]?usize {
+    const nslots = 2 * (prog.num_groups + 1);
+    const saves = try arena.alloc(?usize, nslots);
+    @memset(saves, null);
+    const counters = try arena.alloc(usize, prog.num_counters);
+    @memset(counters, 0);
+    var ctx = Ctx{ .arena = arena, .prog = prog, .input = input, .saves = saves };
+    if ((try run(&ctx, prog.insts, counters, at, 1)) != null) return saves;
+    return null;
 }
 
 /// Try to match `prog` against `input`. If `sticky`, only at `start`; else scan forward from `start`.
