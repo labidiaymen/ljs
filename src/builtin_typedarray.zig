@@ -50,11 +50,18 @@ const TA = struct {
         const ta = o.typed_array.?;
         const buf = ta.buffer.array_buffer;
         const detached = buf == null or buf.?.detached;
+        // Clamp the byteOffset: a resizable ArrayBuffer may have shrunk BELOW the view's byteOffset, so
+        // even `bytes[byteOffset..]` would be out of range — yield an empty live slice (length 0) instead.
+        const live = if (detached) null else buf.?.bytes[@min(ta.byte_offset, buf.?.bytes.len)..];
         return .{
             .obj = o,
             .elem = ta.elem,
-            .bytes = if (detached) null else buf.?.bytes[ta.byte_offset..],
-            .length = if (detached) 0 else ta.array_length,
+            .bytes = live,
+            // §10.4.5.1: a resizable ArrayBuffer may have shrunk (during argument coercion's ToInteger,
+            // which can run user `valueOf`) below the stored `array_length`. Clamp the observed length to
+            // what the LIVE slice can hold so every length-derived byte range stays in bounds — for a
+            // non-resizable buffer this is exactly `array_length` (no behavior change).
+            .length = if (live) |b| @min(ta.array_length, b.len / ta.elem.bytesPerElement()) else 0,
         };
     }
 
@@ -576,7 +583,9 @@ fn copyWithin(it: *Interpreter, o: *Object, len: usize, args: []const Value) Eva
     };
     if (isDetached(o)) return it.throwError("TypeError", "Buffer detached during copyWithin");
     const ta = TA.of(o);
-    const count = @min(final -| from, ta.length -| to);
+    // Clamp by BOTH endpoints against the (live-clamped) length so neither the source nor the
+    // destination byte range can exceed the slice if the buffer shrank during the index coercions.
+    const count = @min(final -| from, @min(ta.length -| to, ta.length -| from));
     if (count > 0) {
         const bpe = ta.elem.bytesPerElement();
         const bytes = ta.bytes.?;
@@ -856,9 +865,14 @@ fn slice(it: *Interpreter, o: *Object, len: usize, start_v: Value, end_v: Value)
         const dst = TA.of(created);
         if (src.elem == dst.elem) {
             const bpe = src.elem.bytesPerElement();
-            // A user species constructor can return a view that ALIASES the source buffer, so use an
-            // overlap-tolerant copy (the regions may be the same bytes).
-            std.mem.copyForwards(u8, dst.bytes.?[0 .. count * bpe], src.bytes.?[start * bpe .. start * bpe + count * bpe]);
+            // Clamp the copy to what BOTH live slices hold: the source may have shrunk during the index
+            // coercions / speciesCreate (user `valueOf`/ctor), and a user species ctor can return a
+            // shorter view. `copyForwards` is overlap-tolerant (the regions may alias the same bytes).
+            const copy_elems = @min(@min(count, src.length -| start), dst.length);
+            // Guard: when the source shrank to nothing, `start * bpe` may exceed the live len, so even a
+            // zero-length `src.bytes[start*bpe..start*bpe]` slice would be out of range — skip entirely.
+            if (copy_elems > 0)
+                std.mem.copyForwards(u8, dst.bytes.?[0 .. copy_elems * bpe], src.bytes.?[start * bpe .. start * bpe + copy_elems * bpe]);
         } else {
             var i: usize = 0;
             while (i < count) : (i += 1) {

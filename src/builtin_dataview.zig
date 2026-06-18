@@ -184,6 +184,11 @@ fn getValue(it: *Interpreter, view: View, this_val: Value, args: []const Value) 
     }
 
     const start = dv.byte_offset + get_index;
+    // A resizable ArrayBuffer may have shrunk below the stored `byte_length`, so re-validate against the
+    // LIVE buffer before slicing (§25.3.4: GetViewByteLength reflects the current buffer) — RangeError.
+    if (start + view.size > ab.bytes.len) {
+        return it.throwError("RangeError", "DataView access is out of bounds");
+    }
     const raw = ab.bytes[start .. start + view.size];
     return readRaw(it, view, raw, endian);
 }
@@ -229,6 +234,11 @@ fn setValue(it: *Interpreter, view: View, this_val: Value, args: []const Value) 
     }
 
     const start = dv.byte_offset + get_index;
+    // Re-validate against the LIVE buffer (a resizable ArrayBuffer may have shrunk below the stored
+    // `byte_length` during the index/value coercions above) before slicing — RangeError.
+    if (start + view.size > ab.bytes.len) {
+        return it.throwError("RangeError", "DataView access is out of bounds");
+    }
     const dst = ab.bytes[start .. start + view.size];
     writeRaw(view, dst, endian, num, big_holder);
     return .{ .normal = .undefined };

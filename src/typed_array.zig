@@ -78,6 +78,11 @@ pub const ElemType = enum {
 pub fn getElement(elem: ElemType, bytes: []const u8, index: usize, arena: std.mem.Allocator) std.mem.Allocator.Error!Value {
     const bpe = elem.bytesPerElement();
     const off = index * bpe;
+    // Defensive (§10.4.5.1 IsValidIntegerIndex): a resizable ArrayBuffer may have shrunk below this
+    // index since `array_length` was recorded, so re-validate against the LIVE slice — an out-of-bounds
+    // read is `undefined`, never a panic. Covers both the indexed [[Get]] path and the %TypedArray%
+    // methods that iterate by the (possibly stale) length.
+    if (off + bpe > bytes.len) return .undefined;
     const raw = bytes[off .. off + bpe];
     return switch (elem) {
         .i8 => .{ .number = @floatFromInt(@as(i8, @bitCast(raw[0]))) },
@@ -101,6 +106,10 @@ pub fn getElement(elem: ElemType, bytes: []const u8, index: usize, arena: std.me
 pub fn setElement(elem: ElemType, bytes: []u8, index: usize, num: f64, big: ?*const std.math.big.int.Const) std.mem.Allocator.Error!void {
     const bpe = elem.bytesPerElement();
     const off = index * bpe;
+    // Defensive (§10.4.5.1 IsValidIntegerIndex): a resizable ArrayBuffer may have shrunk below this
+    // index since `array_length` was recorded — re-validate against the LIVE slice; an out-of-bounds
+    // write is a silent no-op, never a panic.
+    if (off + bpe > bytes.len) return;
     const dst = bytes[off .. off + bpe];
     switch (elem) {
         .i8 => dst[0] = @bitCast(toInt(i8, num)),

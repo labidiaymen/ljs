@@ -754,7 +754,13 @@ pub fn hasPropertyVC(self: *Interpreter, base: Value, key: Value) EvalError!Comp
         const o = base.object;
         if (o.proxy) |pd| return builtin_proxy.has(self, pd, key);
         // §10.1.7 OrdinaryHasProperty: own check, then delegate to a Proxy on the proto chain.
-        const own = if (key == .symbol) o.getSymbolProp(key.symbol) != null else ownHasString(o, key.string);
+        // A non-symbol key is normally a string, but a numeric index (e.g. from a typed-array `in`)
+        // can arrive un-coerced — ToPropertyKey it (§7.1.19: ToString for a number) rather than read
+        // the wrong union field.
+        const own = if (key == .symbol)
+            o.getSymbolProp(key.symbol) != null
+        else
+            ownHasString(o, if (key == .string) key.string else try self.toPropertyKeyString(key));
         if (own) return .{ .normal = .{ .boolean = true } };
         if (protoProxy(o)) |pp| return builtin_proxy.has(self, pp, key);
     }
@@ -825,7 +831,9 @@ pub fn typedArrayGet(self: *Interpreter, o: *Object, n: f64) EvalError!Value {
     if (n != @floor(n) or std.math.signbit(n) and n == 0) return .undefined; // not integral, or -0
     if (n < 0 or n >= @as(f64, @floatFromInt(ta.array_length))) return .undefined; // out of bounds
     const i: usize = @intFromFloat(n);
-    const v = try tarray.getElement(ta.elem, buf.bytes[ta.byte_offset..], i, self.arena);
+    // Clamp byteOffset: a resizable buffer may have shrunk below it, so `bytes[byte_offset..]` itself
+    // would be out of range; an empty live slice makes getElement's bounds guard return undefined.
+    const v = try tarray.getElement(ta.elem, buf.bytes[@min(ta.byte_offset, buf.bytes.len)..], i, self.arena);
     return v;
 }
 
@@ -853,6 +861,8 @@ pub fn typedArraySet(self: *Interpreter, o: *Object, n: f64, value: Value) EvalE
     if (n != @floor(n) or (std.math.signbit(n) and n == 0)) return null;
     if (n < 0 or n >= @as(f64, @floatFromInt(ta.array_length))) return null;
     const i: usize = @intFromFloat(n);
-    try tarray.setElement(ta.elem, buf.bytes[ta.byte_offset..], i, num, big);
+    // Clamp byteOffset (see typedArrayGet): a shrunk resizable buffer may sit below it; the empty live
+    // slice makes setElement's bounds guard a no-op.
+    try tarray.setElement(ta.elem, buf.bytes[@min(ta.byte_offset, buf.bytes.len)..], i, num, big);
     return null;
 }
