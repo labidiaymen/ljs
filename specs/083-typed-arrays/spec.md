@@ -1,6 +1,10 @@
 # Spec 083 — Typed Arrays: ArrayBuffer, TypedArray (×11), DataView
 
-**Status:** In progress
+**Status:** Done — `built-ins/` 45.0% → **53.2%** (21,155 → **25,011**, **+3,856**); `language/` held at
+40,450 (0 regressions). ArrayBuffer 58→184/442, TypedArray 1934/2876, DataView 628/1122. Integration
+caught + fixed a family of resizable-buffer-shrink panics (codec / copyWithin / slice / byteOffset /
+DataView revalidation) the agents' isolated runs missed. Deferred: `ArrayBuffer.prototype.transfer*`,
+length-tracking auto-resize, `Float16`, `SharedArrayBuffer`/`Atomics`.
 **Governing clauses:** ECMA-262 §25.1 (ArrayBuffer), §23.2 (TypedArray objects + %TypedArray%
 intrinsic), §25.3 (DataView), §10.4.5 (Integer-Indexed exotic objects), §6.1.7 (CanonicalNumericIndexString).
 

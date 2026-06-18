@@ -47,5 +47,6 @@
   full combined `built-ins/` + `language/` run, not the agents' isolated worktree gates.
 
 ## Close
-- [ ] T3 Final full `built-ins/` + `language/` run; record the conformance delta in spec.md Status;
-  update `baseline/builtins.json` to the new passing set (only now, never per-cycle); commit spec + code.
+- [x] T3 Final full `built-ins/` + `language/` run (0 panics): built-ins 45.0%→53.2% (+3,856),
+  language held at 40,450. Recorded the delta in spec.md Status; updated `baseline/builtins.json` to
+  the new passing set; committed spec + code.

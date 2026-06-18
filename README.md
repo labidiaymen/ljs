@@ -4,8 +4,8 @@ A JavaScript engine written from scratch in [Zig](https://ziglang.org) — **spe
 for correctness and Test262 conformance, with a measured (not deferred) performance story.
 
 > **Status (Test262, harness metric):**
-> `language/` **90.9%** (40,414 / 44,475) · `built-ins/` **45.0%** (21,155 / 46,981) ·
-> **combined 67.3%** (61,569 / 91,456). The standard built-in library is where the remaining work
+> `language/` **90.9%** (40,450 / 44,475) · `built-ins/` **53.2%** (25,011 / 46,981) ·
+> **combined 71.6%** (65,461 / 91,456). The standard built-in library is where the remaining work
 > is. A learning-grade, in-progress engine — not a drop-in Node replacement.
 
 Built with **Spec-Driven Development** ([Spec Kit](https://github.com/github/spec-kit)): every
@@ -68,11 +68,11 @@ Numbers are the standard Test262 harness metric (with `--harness-dir`). Only the
 tests, the `baseline/*.json` passing-set snapshots, and the `specs/` SDD docs are in git; the
 corpus is reproducible from `test262.pin`.
 
-**Current (verified):** `language/` **90.9%** (40,414 / 44,475) · `built-ins/` **45.0%**
-(21,155 / 46,981). The remaining `language/` ~9% is mostly runtime edge cases and a few
-module-evaluation / early-error details. The largest `built-ins/` gaps are big *separate* engines —
-`Temporal`, `Intl`, `TypedArray`/`ArrayBuffer`/`DataView`/`Atomics`, `Date` — alongside
-method-family gaps in the core prototypes (`Object`/`Array`/`String`/`Iterator`).
+**Current (verified):** `language/` **90.9%** (40,450 / 44,475) · `built-ins/` **53.2%**
+(25,011 / 46,981). The remaining `language/` ~9% is mostly runtime edge cases and a few
+module-evaluation / early-error details. `ArrayBuffer`/`TypedArray`/`DataView` are now implemented;
+the largest remaining `built-ins/` gaps are big *separate* engines — `Temporal`, `Intl`, `Atomics`,
+`Date` — alongside method-family gaps in the core prototypes (`Object`/`Array`/`String`/`Iterator`).
 
 ## Architecture
 
