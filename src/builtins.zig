@@ -774,6 +774,37 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         _ = ElemType;
     }
 
+    // §25.3 DataView (spec 083 Phase 2-C) — `new DataView(buffer[, byteOffset[, byteLength]])` (new-only;
+    // plain call throws), the `buffer`/`byteLength`/`byteOffset` getters, [Symbol.toStringTag] = "DataView",
+    // and the 10 get/set pairs (Int8/Uint8/Int16/Uint16/Int32/Uint32/Float32/Float64/BigInt64/BigUint64),
+    // each honouring a `littleEndian` flag. Construction is handled in `constructNT`.
+    const data_view_fn = try Object.createNative(arena, .data_view_ctor, "DataView");
+    data_view_fn.prototype = function_proto; // §20.2.3 the ctor function object → %Function.prototype%
+    if (data_view_fn.get("prototype")) |pv| if (pv == .object) {
+        const dp = pv.object;
+        dp.prototype = object_proto; // §25.3.3 DataView.prototype inherits %Object.prototype%
+        // §25.3.4.1–.3 the `buffer`/`byteLength`/`byteOffset` accessors (getter only, non-enumerable).
+        for ([_][]const u8{ "buffer", "byteLength", "byteOffset" }) |gn| {
+            const g = try Object.createNative(arena, .data_view_proto_getter, gn);
+            g.prototype = function_proto;
+            try g.defineData("name", .{ .string = try std.fmt.allocPrint(arena, "get {s}", .{gn}) }, false, false, true);
+            try dp.defineAccessorEx(gn, g, null, false);
+        }
+        // §25.3.4.5–.24 the 10 get/set pairs. `native_name` carries the full method name so the
+        // dispatch in builtin_dataview recovers the element type + get/set direction.
+        const dv_methods = [_][]const u8{
+            "getInt8",   "getUint8",   "getInt16",   "getUint16",   "getInt32",
+            "getUint32", "getFloat32", "getFloat64", "getBigInt64", "getBigUint64",
+            "setInt8",   "setUint8",   "setInt16",   "setUint16",   "setInt32",
+            "setUint32", "setFloat32", "setFloat64", "setBigInt64", "setBigUint64",
+        };
+        for (dv_methods) |mn| try defineMethod(arena, dp, mn, .data_view_method, mn);
+        // §25.3.4.25 DataView.prototype[Symbol.toStringTag] = "DataView" (non-writable/non-enum/configurable).
+        if (tag_sym) |s| try dp.defineSymbolData(s, .{ .string = "DataView" }, false, false, true);
+    };
+    try defineConstructorBackref(data_view_fn); // §25.3.3.1 DataView.prototype.constructor === DataView
+    try env.declare("DataView", .{ .object = data_view_fn }, true, true);
+
     // §25.5 JSON — a namespace ordinary object (NOT callable / NOT a constructor; proto =
     // %Object.prototype%) holding `parse`/`stringify` and [Symbol.toStringTag] = "JSON".
     const json_obj = try Object.create(arena, object_proto);
