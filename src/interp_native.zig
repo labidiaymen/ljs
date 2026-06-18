@@ -364,6 +364,8 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         // §25.1.3.1 a plain `ArrayBuffer(...)` call (no new) throws; construction is in constructNT.
         .array_buffer_ctor => return self.throwError("TypeError", "Constructor ArrayBuffer requires 'new'"),
         .array_buffer_proto_getter => return builtin_arraybuffer.getter(self, func.native_name, this_val), // §25.1.6
+        .array_buffer_method => return builtin_arraybuffer.method(self, func.native_name, this_val, args), // §25.1.6.7 slice / resize
+        .array_buffer_static => return builtin_arraybuffer.static(self, func.native_name, args), // §25.1.4.1 isView
         .collection_size => return interp_collection.collectionSize(self, func.native_name, this_val),
         .collection_iterator => {
             // `native_name` is "<home>:<which>" — <home> ("map"/"set") brands the receiver, <which>
@@ -656,10 +658,10 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .collection_size, .collection_iterator => unreachable, // handled in the first switch
         .proxy_ctor, .proxy_revocable, .proxy_revoke => unreachable, // handled in the first switch
         .regexp_ctor, .regexp_proto_getter, .regexp_to_string, .regexp_exec, .regexp_test => unreachable, // handled in the first switch
-        .array_buffer_ctor, .array_buffer_proto_getter => unreachable, // §25.1 handled in the first switch
-        // §23.2/§25.1/§25.3 ids RESERVED for Phase 2 (spec 083) — registered nowhere in Phase 1, so a
+        .array_buffer_ctor, .array_buffer_proto_getter, .array_buffer_method, .array_buffer_static => unreachable, // §25.1 handled in the first switch
+        // §23.2/§25.3 ids RESERVED for Phase 2-B/2-C (spec 083) — registered nowhere yet, so a
         // call cannot reach here; the arms exist only to keep this dispatch exhaustive.
-        .array_buffer_method, .array_buffer_static, .typed_array_ctor, .typed_array_abstract_ctor, .typed_array_proto_getter, .typed_array_method, .typed_array_static, .data_view_ctor, .data_view_proto_getter, .data_view_method => return self.throwError("TypeError", "not yet implemented"),
+        .typed_array_ctor, .typed_array_abstract_ctor, .typed_array_proto_getter, .typed_array_method, .typed_array_static, .data_view_ctor, .data_view_proto_getter, .data_view_method => return self.throwError("TypeError", "not yet implemented"),
         .json_parse, .json_stringify => unreachable, // handled in the first switch
         .iterator_helper, .iterator_helper_next, .iterator_from, .iterator_ctor => unreachable, // handled in the first switch
         .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch

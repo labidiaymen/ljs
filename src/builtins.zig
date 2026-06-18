@@ -663,9 +663,28 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         bl_get.prototype = function_proto;
         try bl_get.defineData("name", .{ .string = "get byteLength" }, false, false, true);
         try ap.defineAccessorEx("byteLength", bl_get, null, false);
+        // §25.1.6.2/.3/.4 get detached / resizable / maxByteLength — accessors (no setter), non-enum.
+        const ab_getters = [_][]const u8{ "maxByteLength", "resizable", "detached" };
+        for (ab_getters) |gn| {
+            const gf = try Object.createNative(arena, .array_buffer_proto_getter, gn);
+            gf.prototype = function_proto;
+            try gf.defineData("name", .{ .string = try std.fmt.allocPrint(arena, "get {s}", .{gn}) }, false, false, true);
+            try ap.defineAccessorEx(gn, gf, null, false);
+        }
+        // §25.1.6.7/.x ArrayBuffer.prototype.slice (length 2) / resize (length 1).
+        try defineMethodLen(arena, ap, "slice", .array_buffer_method, "slice", 2); // §25.1.6.7
+        try defineMethodLen(arena, ap, "resize", .array_buffer_method, "resize", 1); // §25.1.6.x (resizable)
         // §25.1.6.6 ArrayBuffer.prototype[Symbol.toStringTag] = "ArrayBuffer" (non-writable/non-enum/configurable).
         if (tag_sym) |s| try ap.defineSymbolData(s, .{ .string = "ArrayBuffer" }, false, false, true);
     };
+    // §25.1.4.1 ArrayBuffer.isView(arg) static (length 1).
+    try defineMethodLen(arena, array_buffer_fn, "isView", .array_buffer_static, "isView", 1);
+    // §25.1.5.3 get ArrayBuffer[Symbol.species] — a getter (no setter) returning the receiver `this`.
+    if (species_sym) |s| {
+        const sg = try Object.createNative(arena, .species_getter, "get [Symbol.species]");
+        sg.prototype = function_proto;
+        try array_buffer_fn.defineSymbolAccessorEx(s, sg, null, false);
+    }
     try defineConstructorBackref(array_buffer_fn); // §25.1.6.2 ArrayBuffer.prototype.constructor === ArrayBuffer
     try env.declare("ArrayBuffer", .{ .object = array_buffer_fn }, true, true);
 

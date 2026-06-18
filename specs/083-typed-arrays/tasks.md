@@ -16,9 +16,9 @@
 
 ## Phase 2 — Views (parallel, 3 agents against the fixed foundation; integrate sequentially)
 ### 2-A ArrayBuffer (full) — `src/builtin_arraybuffer.zig`
-- [ ] T2A.1 `ArrayBuffer.prototype.slice` (species-aware), `ArrayBuffer.isView`, `Symbol.species`,
+- [x] T2A.1 `ArrayBuffer.prototype.slice` (species-aware), `ArrayBuffer.isView`, `Symbol.species`,
   `[Symbol.toStringTag]`, detached-state checks.
-- [ ] T2A.2 Resizable: `maxByteLength` option, `resizable`, `resize`, `maxByteLength` getter (if cheap).
+- [x] T2A.2 Resizable: `maxByteLength` option, `resizable`, `resize`, `maxByteLength` getter (if cheap).
 - [ ] T2A.3 GATE + integrate.
 
 ### 2-B TypedArray (×11 + %TypedArray%) — `src/builtin_typedarray.zig`
