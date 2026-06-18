@@ -73,6 +73,8 @@ pub const HelperState = struct {
     inner_next: Value = .undefined,
     started: bool = false, // drop: whether the initial skip has run
     done: bool = false, // latched once the helper is exhausted/closed
+    running: bool = false, // §27.5.3.2: set while the helper's body is executing — a re-entrant
+    // `next`/`return` while it is set throws a TypeError ("the generator is currently running").
 };
 
 /// §24.1 / §24.2 / §24.3 / §24.4 the keyed-collection backing store, attached to an ordinary object

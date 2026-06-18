@@ -16,6 +16,24 @@ const StepResult = Interpreter.StepResult;
 const toBoolean = ops.toBoolean;
 const isCallable = interp.isCallable;
 
+/// §7.4.11 IteratorClose for a NORMAL completion (the value the helper carries is non-abrupt), so a
+/// throwing `return` (or a throwing `return` GETTER, or a non-Object `return()` result) PROPAGATES —
+/// unlike `Interpreter.iteratorClose`, which swallows for the throw-completion case. Used by the lazy
+/// helpers' own `return()` and by `take`'s exhaustion path (`IteratorClose(iterated, normal)`), both
+/// of which must surface a throwing underlying `return`. GetMethod: undefined/null `return` → no-op.
+fn closeIteratorNormal(it: *Interpreter, iterator: *Object) EvalError!Completion {
+    const rc = try it.getProperty(.{ .object = iterator }, "return"); // may throw (getter)
+    if (rc.isAbrupt()) return rc;
+    if (rc.normal == .undefined or rc.normal == .null) return .{ .normal = .undefined };
+    if (rc.normal != .object or !isCallable(rc.normal.object)) {
+        return it.throwError("TypeError", "iterator 'return' is not a function");
+    }
+    const res = try it.callFunction(rc.normal.object, &.{}, .{ .object = iterator });
+    if (res.isAbrupt()) return res; // §7.4.11 step 5: a thrown `return()` propagates
+    if (res.normal != .object) return it.throwError("TypeError", "iterator 'return' result is not an object");
+    return .{ .normal = .undefined };
+}
+
 fn iterNextDirect(it: *Interpreter, iterator: Value, next_fn: Value) EvalError!StepResult {
     if (next_fn != .object or !isCallable(next_fn.object)) {
         return .{ .abrupt = try it.throwError("TypeError", "iterator.next is not a function") };
@@ -40,11 +58,12 @@ pub fn iteratorHelper(it: *Interpreter, name: []const u8, this_val: Value, args:
     const eql = std.mem.eql;
     if (this_val != .object) return it.throwError("TypeError", "Iterator.prototype method called on a non-object");
     const o = this_val.object;
-    const nc = try it.getProperty2(this_val, "next"); // GetIteratorDirect: read next once
-    if (nc.isAbrupt()) return nc;
-    const next_fn = nc.normal;
 
     if (eql(u8, name, "toArray")) {
+        // §27.1.4.x toArray: O-is-Object check, then GetIteratorDirect (reads `next`), then drain.
+        const nc = try it.getProperty2(this_val, "next");
+        if (nc.isAbrupt()) return nc;
+        const next_fn = nc.normal;
         const arr = try Object.createArray(it.arena, it.arrayProto());
         while (true) {
             switch (try iterNextDirect(it, this_val, next_fn)) {
@@ -59,12 +78,20 @@ pub fn iteratorHelper(it: *Interpreter, name: []const u8, this_val: Value, args:
         return .{ .normal = .{ .object = arr } };
     }
 
-    // The remaining helpers all take a callback as args[0]; validate it, closing on failure.
+    // The remaining helpers all take a callback as args[0]. Per the current spec the iterated record
+    // is formed with [[NextMethod]] UNDEFINED, and `IsCallable(callback)` is checked BEFORE `next` is
+    // read (§27.1.4.x step order): a non-callable callback ⇒ IteratorClose(iterated, throw) — which
+    // reads/calls `return` ONLY (never `next`) — then the TypeError propagates.
     const cb: Value = if (args.len > 0) args[0] else .undefined;
     if (cb != .object or !isCallable(cb.object)) {
+        // IteratorClose(iterated, ThrowCompletion(TypeError)): the close calls `return` ONLY (never
+        // `next`); per §7.4.11 step 4 a throwing `return` is SWALLOWED so the TypeError wins.
         try it.iteratorClose(o);
         return it.throwError("TypeError", "Iterator helper callback is not callable");
     }
+    const nc = try it.getProperty2(this_val, "next"); // GetIteratorDirect: read next AFTER validation
+    if (nc.isAbrupt()) return nc;
+    const next_fn = nc.normal;
 
     if (eql(u8, name, "forEach")) {
         var i: f64 = 0;
@@ -164,9 +191,9 @@ pub fn iteratorHelper(it: *Interpreter, name: []const u8, this_val: Value, args:
 pub fn iteratorLimitHelper(it: *Interpreter, kind: object_mod.HelperKind, this_val: Value, args: []const Value) EvalError!Completion {
     if (this_val != .object) return it.throwError("TypeError", "Iterator.prototype method called on a non-object");
     const o = this_val.object;
-    const nc = try it.getProperty2(this_val, "next");
-    if (nc.isAbrupt()) return nc;
-    const next_fn = nc.normal;
+    // §27.1.4.x take/drop step order: the limit is validated (ToNumber → NaN/negative checks) with the
+    // iterated record's [[NextMethod]] still UNDEFINED, so a validation failure ⇒ IteratorClose (calls
+    // `return` ONLY, never `next`); `next` is read by GetIteratorDirect ONLY AFTER validation passes.
     const arg0: Value = if (args.len > 0) args[0] else .undefined;
     const numc = try it.toNumberV(arg0);
     if (numc.isAbrupt()) {
@@ -184,6 +211,9 @@ pub fn iteratorLimitHelper(it: *Interpreter, kind: object_mod.HelperKind, this_v
         try it.iteratorClose(o);
         return it.throwError("RangeError", "limit must be non-negative");
     }
+    const nc = try it.getProperty2(this_val, "next"); // GetIteratorDirect: read `next` AFTER validation
+    if (nc.isAbrupt()) return nc;
+    const next_fn = nc.normal;
     return .{ .normal = .{ .object = try makeHelper(it, kind, o, next_fn, .undefined, lim) } };
 }
 
@@ -257,18 +287,33 @@ pub fn helperNext(it: *Interpreter, name: []const u8, this_val: Value, args: []c
     }
     const st = this_val.object.iter_helper.?;
 
+    // §27.5.3.2 GeneratorValidate: a re-entrant next/return while the helper body is executing
+    // (e.g. a mapper that calls `iter.next()`) is a TypeError. Do NOT mark the helper done.
+    if (st.running) return it.throwError("TypeError", "Iterator Helper is already running");
+
     if (std.mem.eql(u8, name, "return")) {
+        const v: Value = if (args.len > 0) args[0] else .undefined;
         if (!st.done) {
             st.done = true;
-            if (st.inner) |inner| try it.iteratorClose(inner);
-            try it.iteratorClose(st.underlying);
+            // §7.4.11 IteratorClose with a NORMAL completion: a throwing inner/underlying `return`
+            // (or `return` getter) PROPAGATES. Close the in-flight inner first, then the underlying.
+            if (st.inner) |inner| {
+                const ic = try closeIteratorNormal(it, inner);
+                if (ic.isAbrupt()) return ic;
+            }
+            const uc = try closeIteratorNormal(it, st.underlying);
+            if (uc.isAbrupt()) return uc;
         }
-        const v: Value = if (args.len > 0) args[0] else .undefined;
         return iterResultObjectC(it, v, true);
     }
 
     if (st.done) return iterResultObjectC(it, .undefined, true);
     const under: Value = .{ .object = st.underlying };
+
+    // Mark the helper "executing" for the duration of the pull (so a callback that re-enters
+    // next/return throws). Cleared on every exit path below via `defer`.
+    st.running = true;
+    defer st.running = false;
 
     switch (st.kind) {
         .wrap => {
@@ -323,8 +368,11 @@ pub fn helperNext(it: *Interpreter, name: []const u8, this_val: Value, args: []c
         },
         .take => {
             if (st.remaining <= 0) {
+                // §27.1.4.x take step 8.b.i: Return ? IteratorClose(iterated, NormalCompletion) — a
+                // throwing underlying `return` PROPAGATES (not swallowed).
                 st.done = true;
-                try it.iteratorClose(st.underlying);
+                const cc = try closeIteratorNormal(it, st.underlying);
+                if (cc.isAbrupt()) return cc;
                 return iterResultObjectC(it, .undefined, true);
             }
             st.remaining -= 1;

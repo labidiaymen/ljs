@@ -14,10 +14,15 @@ const builtins = @import("builtins.zig");
 /// ToString(description) (or undefined when omitted). Called only as a function (`new Symbol()` is
 /// rejected in `construct`).
 pub fn constructor(it: *Interpreter, args: []const Value) EvalError!Completion {
-    const desc: ?[]const u8 = if (args.len > 0 and args[0] != .undefined)
-        try it.toString(args[0]) // §20.4.1.1 step 2: ToString(description)
-    else
-        null;
+    const desc: ?[]const u8 = if (args.len > 0 and args[0] != .undefined) blk: {
+        // §20.4.1.1 step 2: descString = ToString(description) — the FULL, observable ToString:
+        // an object runs ToPrimitive(string) (so `toString`/`valueOf` are called) and a Symbol
+        // description throws a TypeError (§7.1.17 step 3). The plain `it.toString` short-circuits
+        // both, so use the throwing form.
+        const sc = try it.toStringThrowing(args[0]);
+        if (sc.isAbrupt()) return sc;
+        break :blk sc.normal.string;
+    } else null;
     const sym = try builtins.newSymbol(it.arena, desc);
     return .{ .normal = .{ .symbol = sym } };
 }

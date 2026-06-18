@@ -423,6 +423,16 @@ pub const Object = struct {
             // ── iterators / generators ──
             .generator_method, .async_generator_method, .async_from_sync_method => 1, // next/return/throw
             .iterator_next => 0,
+            // §27.1.3 Iterator constructor (abstract) — length 0; §27.1.3.1.1 Iterator.from — length 1.
+            .iterator_ctor => 0,
+            .iterator_from => 1,
+            // §27.1.4 %Iterator.prototype% helpers (all share the `.iterator_helper` id, keyed by the
+            // spec method name): the lazy + eager helpers each take one argument (length 1); `toArray`
+            // takes none (length 0).
+            .iterator_helper => L.pick(name, .{.{ "toArray", 0 }}) orelse 1,
+            // An Iterator Helper object's own `next`/`return` (§27.1.4.x): `next` takes no argument,
+            // `return` takes one (the value forwarded to the underlying iterator's close).
+            .iterator_helper_next => L.pick(name, .{.{ "return", 1 }}) orelse 0,
             .array_values, .array_keys, .array_entries, .string_iterator, .generator_iterator, .async_generator_iterator, .species_getter => 0,
             // ── collections ──
             .collection_size, .collection_iterator => 0,
