@@ -13,15 +13,140 @@ pub fn toNumber(v: Value) f64 {
         .undefined => std.math.nan(f64),
         .null => 0,
         .boolean => |b| if (b) 1 else 0,
-        .string => |s| blk: {
-            const t = std.mem.trim(u8, s, " \t\r\n");
-            if (t.len == 0) break :blk 0;
-            break :blk std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
-        },
+        .string => |s| stringToNumber(s),
         .symbol => std.math.nan(f64), // §7.1.4: ToNumber(Symbol) throws — surfaced as NaN here (caller checks)
         .bigint => std.math.nan(f64), // §7.1.4: ToNumber(BigInt) throws — surfaced as NaN (caller checks tag)
         .object => std.math.nan(f64), // ToPrimitive deferred → NaN
     };
+}
+
+/// True if the WTF-8 byte run starting at `s[i]` is a §12.2 StrWhiteSpace code point (the white-space
+/// + line-terminator set ToNumber trims from a numeric string). Sets `len` to the code point's byte
+/// width. Covers the ASCII set plus the multibyte ones Test262 exercises (NBSP, the Unicode space
+/// separators U+2000..U+200A / U+202F / U+205F / U+3000, LS/PS U+2028/U+2029, BOM U+FEFF).
+fn strWhiteSpaceAt(s: []const u8, i: usize, len: *usize) bool {
+    const c = s[i];
+    if (c < 0x80) {
+        len.* = 1;
+        return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0B or c == 0x0C;
+    }
+    // Decode just enough to recognise the multibyte white-space code points.
+    if (c == 0xC2 and i + 1 < s.len and s[i + 1] == 0xA0) { // U+00A0 NBSP
+        len.* = 2;
+        return true;
+    }
+    if (c == 0xE1 and i + 2 < s.len and s[i + 1] == 0x9A and s[i + 2] == 0x80) { // U+1680 OGHAM SPACE MARK
+        len.* = 3;
+        return true;
+    }
+    if (c == 0xE2 and i + 2 < s.len) {
+        const cp = (@as(u21, c & 0x0F) << 12) | (@as(u21, s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F);
+        // U+2000..U+200A, U+2028 (LS), U+2029 (PS), U+202F (NNBSP), U+205F (MMSP).
+        if ((cp >= 0x2000 and cp <= 0x200A) or cp == 0x2028 or cp == 0x2029 or cp == 0x202F or cp == 0x205F) {
+            len.* = 3;
+            return true;
+        }
+    }
+    if (c == 0xE3 and i + 2 < s.len and s[i + 1] == 0x80 and s[i + 2] == 0x80) { // U+3000 IDEOGRAPHIC SPACE
+        len.* = 3;
+        return true;
+    }
+    if (c == 0xEF and i + 2 < s.len and s[i + 1] == 0xBB and s[i + 2] == 0xBF) { // U+FEFF BOM / ZWNBSP
+        len.* = 3;
+        return true;
+    }
+    len.* = 1;
+    return false;
+}
+
+/// §7.1.4.1.1 StringToNumber — parse a string per the StrNumericLiteral grammar (NOT
+/// `std.fmt.parseFloat`, which accepts `_` separators and other non-ECMAScript forms). Trims
+/// §12.2 StrWhiteSpace from both ends; empty (or all-white-space) → +0; `Infinity`/`±Infinity`;
+/// the `0x`/`0o`/`0b` radix integer literals (no sign); otherwise a decimal StrDecimalLiteral
+/// (optional sign, integer/fraction, optional exponent) with NO numeric-separator `_`. Anything
+/// the grammar rejects → NaN.
+pub fn stringToNumber(s: []const u8) f64 {
+    // Trim leading/trailing StrWhiteSpace.
+    var start: usize = 0;
+    while (start < s.len) {
+        var w: usize = 1;
+        if (!strWhiteSpaceAt(s, start, &w)) break;
+        start += w;
+    }
+    var end: usize = s.len;
+    while (end > start) {
+        // Find the start of the last code point in [start, end) and test it.
+        var j = end - 1;
+        while (j > start and (s[j] & 0xC0) == 0x80) j -= 1;
+        var w: usize = 1;
+        if (!strWhiteSpaceAt(s, j, &w) or j + w != end) break;
+        end = j;
+    }
+    const t = s[start..end];
+    if (t.len == 0) return 0; // StrWhiteSpace-only → +0
+
+    // Infinity / ±Infinity.
+    if (std.mem.eql(u8, t, "Infinity") or std.mem.eql(u8, t, "+Infinity")) return std.math.inf(f64);
+    if (std.mem.eql(u8, t, "-Infinity")) return -std.math.inf(f64);
+
+    // Radix integer literals: 0x/0X (hex), 0o/0O (octal), 0b/0B (binary). No sign permitted.
+    if (t.len > 2 and t[0] == '0') {
+        const radix: ?u8 = switch (t[1]) {
+            'x', 'X' => 16,
+            'o', 'O' => 8,
+            'b', 'B' => 2,
+            else => null,
+        };
+        if (radix) |r| return radixDigitsToNumber(t[2..], r);
+    }
+
+    // Decimal StrDecimalLiteral — reject anything `std.fmt.parseFloat` would over-accept
+    // (numeric separators, hex floats, etc.).
+    if (!isStrDecimalLiteral(t)) return std.math.nan(f64);
+    return std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
+}
+
+/// Parse `digits` as a non-empty run of base-`radix` digits → its Number value (used for the
+/// `0x`/`0o`/`0b` StringToNumber prefixes). Empty or any out-of-range digit → NaN. Accumulates in
+/// f64 so very long literals round to the nearest Number (matching the spec's MV → Number rounding).
+fn radixDigitsToNumber(digits: []const u8, radix: u8) f64 {
+    if (digits.len == 0) return std.math.nan(f64);
+    var acc: f64 = 0;
+    const rf: f64 = @floatFromInt(radix);
+    for (digits) |c| {
+        const d: u8 = switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'z' => c - 'a' + 10,
+            'A'...'Z' => c - 'A' + 10,
+            else => return std.math.nan(f64),
+        };
+        if (d >= radix) return std.math.nan(f64);
+        acc = acc * rf + @as(f64, @floatFromInt(d));
+    }
+    return acc;
+}
+
+/// True if `t` matches the §12.9.3 StrDecimalLiteral grammar: optional sign, then `.`-fraction or
+/// integer[.fraction], with an optional `e`/`E` signed exponent; ASCII digits only, NO `_`
+/// separators, NO hex/inf forms (those are handled by the caller). At least one digit is required.
+fn isStrDecimalLiteral(t: []const u8) bool {
+    var i: usize = 0;
+    if (i < t.len and (t[i] == '+' or t[i] == '-')) i += 1;
+    var saw_digit = false;
+    while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1) saw_digit = true;
+    if (i < t.len and t[i] == '.') {
+        i += 1;
+        while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1) saw_digit = true;
+    }
+    if (!saw_digit) return false; // need at least one digit before/after the dot
+    if (i < t.len and (t[i] == 'e' or t[i] == 'E')) {
+        i += 1;
+        if (i < t.len and (t[i] == '+' or t[i] == '-')) i += 1;
+        var saw_exp = false;
+        while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1) saw_exp = true;
+        if (!saw_exp) return false; // exponent indicator with no digits
+    }
+    return i == t.len; // every byte consumed → valid; trailing junk (e.g. "_", "0x") → invalid
 }
 
 /// §7.1.2 ToBoolean.
@@ -215,9 +340,7 @@ fn bigintRelOrder(l: Value, r: Value) ?std.math.Order {
 }
 
 fn strToNumber(s: []const u8) f64 {
-    const t = std.mem.trim(u8, s, " \t\r\n");
-    if (t.len == 0) return 0;
-    return std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
+    return stringToNumber(s); // §7.1.4.1.1 StrNumericLiteral (rejects `_`, honors 0x/0o/0b)
 }
 
 /// §7.2.16 IsStrictlyEqual (===).

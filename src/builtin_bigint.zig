@@ -8,8 +8,6 @@ const EvalError = interp.EvalError;
 const Value = @import("value.zig").Value;
 const Completion = @import("completion.zig").Completion;
 const bigint = @import("bigint.zig");
-const ops = @import("abstract_ops.zig");
-const toNumber = ops.toNumber;
 
 /// §7.1.13 ToBigInt — a primitive `prim` (after ToPrimitive) to a BigInt, or an abrupt completion
 /// carrying the right exception. Boolean→0n/1n, BigInt→itself, String→StringToBigInt (invalid →
@@ -43,9 +41,13 @@ pub fn bigintConstructor(it: *Interpreter, args: []const Value) EvalError!Comple
 pub fn bigintStatic(it: *Interpreter, name: []const u8, args: []const Value) EvalError!Completion {
     const bits_arg: Value = if (args.len > 0) args[0] else .undefined;
     const x_arg: Value = if (args.len > 1) args[1] else .undefined;
-    // §7.1.22 ToIndex: ToIntegerOrInfinity, must be a non-negative integer < 2^53.
-    const bits_n = toNumber(bits_arg);
-    if (std.math.isNan(bits_n) or bits_n < 0 or @floor(bits_n) != bits_n or bits_n > 9007199254740991.0) {
+    // §7.1.22 ToIndex = ToIntegerOrInfinity then a [0, 2^53-1] range check. ToIntegerOrInfinity
+    // does ToNumber (ToPrimitive an object, throw TypeError for a Symbol/BigInt `bits`), maps NaN/
+    // undefined → 0, truncates toward zero, and preserves ±Infinity (→ out of range → RangeError).
+    const bc = try it.toIntegerOrInfinity(bits_arg);
+    if (bc.isAbrupt()) return bc;
+    const bits_n = bc.normal.number;
+    if (bits_n < 0 or bits_n > 9007199254740991.0) {
         return it.throwError("RangeError", "Invalid bit count for BigInt.asIntN/asUintN");
     }
     const bits: usize = @intFromFloat(bits_n);
@@ -72,10 +74,14 @@ pub fn bigintMethod(it: *Interpreter, name: []const u8, this_val: Value, args: [
     };
     if (std.mem.eql(u8, name, "valueOf")) return .{ .normal = .{ .bigint = b } };
     // toString([radix]): radix defaults to 10; otherwise ToIntegerOrInfinity in [2,36].
+    // ToIntegerOrInfinity does ToNumber first, so a BigInt/Symbol radix throws a TypeError (per
+    // §21.2.3.3 step 2) and an object radix is ToPrimitive'd; the [2,36] guard then RangeErrors.
     var radix: u8 = 10;
     if (args.len > 0 and args[0] != .undefined) {
-        const rn = toNumber(args[0]);
-        if (std.math.isNan(rn) or rn < 2 or rn > 36 or @floor(rn) != rn) {
+        const rc = try it.toIntegerOrInfinity(args[0]);
+        if (rc.isAbrupt()) return rc;
+        const rn = rc.normal.number;
+        if (rn < 2 or rn > 36) {
             return it.throwError("RangeError", "toString() radix must be between 2 and 36");
         }
         radix = @intFromFloat(rn);

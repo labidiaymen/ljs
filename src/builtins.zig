@@ -206,6 +206,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     if (number_fn.get("prototype")) |pv| {
         if (pv == .object) {
             pv.object.prototype = object_proto; // §21.1.3 Number.prototype inherits %Object.prototype%
+            pv.object.primitive = .{ .number = 0 }; // §21.1.3: Number.prototype's [[NumberData]] is +0
             // §21.1.3 Number.prototype methods (native_name selects the handler).
             for ([_][]const u8{ "toString", "toLocaleString", "valueOf", "toFixed", "toExponential", "toPrecision" }) |m| {
                 try defineMethod(arena, pv.object, m, .number_method, m);

@@ -53,7 +53,10 @@ fn numberToFixed(it: *Interpreter, n: f64, args: []const Value) EvalError!Comple
     // §21.1.3.3 step 9: |x| ≥ 1e21 → ToString(x).
     if (@abs(n) >= 1e21) return .{ .normal = .{ .string = try it.toString(.{ .number = n }) } };
     const digits: usize = @intFromFloat(f);
-    const s = try std.fmt.allocPrint(it.arena, "{d:.[1]}", .{ n, digits });
+    // §21.1.3.3: the '-' is added only when x < 0, so -0 formats as "0" (not "-0"); `{d}` would
+    // otherwise emit the sign bit. Collapse -0 to +0 before formatting.
+    const x = if (n == 0) @as(f64, 0) else n;
+    const s = try std.fmt.allocPrint(it.arena, "{d:.[1]}", .{ x, digits });
     return .{ .normal = .{ .string = s } };
 }
 
@@ -68,10 +71,12 @@ fn numberToExponential(it: *Interpreter, n: f64, args: []const Value) EvalError!
     if (std.math.isInf(n)) return .{ .normal = .{ .string = if (n < 0) "-Infinity" else "Infinity" } };
     if (!undefined_digits and !(f >= 0 and f <= 100))
         return it.throwError("RangeError", "toExponential() argument must be between 0 and 100");
+    // §21.1.3.2: the '-' is added only when x < 0, so -0 → "0e+0" (not "-0e+0"). Collapse -0 → +0.
+    const x = if (n == 0) @as(f64, 0) else n;
     const s = if (undefined_digits)
-        try std.fmt.allocPrint(it.arena, "{e}", .{n})
+        try std.fmt.allocPrint(it.arena, "{e}", .{x})
     else
-        try std.fmt.allocPrint(it.arena, "{e:.[1]}", .{ n, @as(usize, @intFromFloat(f)) });
+        try std.fmt.allocPrint(it.arena, "{e:.[1]}", .{ x, @as(usize, @intFromFloat(f)) });
     return .{ .normal = .{ .string = try canonicalizeExponent(it.arena, s) } };
 }
 
