@@ -115,6 +115,47 @@ fn forEach(it: *Interpreter, coll: *Collection, this_val: Value, args: []const V
     return .{ .normal = .undefined };
 }
 
+/// §24.1.4 / §24.3.4 getOrInsert ( key , value ) — return the existing value for `key` (SameValue
+/// after CanonicalizeKeyedCollectionKey), or insert `value` and return it. Shared by Map + WeakMap.
+/// `weak` gates the §7.3 CanBeHeldWeakly key check (WeakMap.getOrInsert throws on a non-weak key).
+fn getOrInsert(it: *Interpreter, coll: *Collection, args: []const Value, weak: bool) EvalError!Completion {
+    const a0: Value = if (args.len > 0) args[0] else .undefined;
+    const a1: Value = if (args.len > 1) args[1] else .undefined;
+    if (weak and !canBeHeldWeakly(a0)) return it.throwError("TypeError", "Invalid value used as weak map key");
+    const k = normKey(a0); // CanonicalizeKeyedCollectionKey: -0 → +0
+    if (findIndex(coll, k)) |i| return .{ .normal = coll.entries.items[i].value };
+    try coll.entries.append(it.arena, .{ .key = k, .value = a1 });
+    coll.size += 1;
+    return .{ .normal = a1 };
+}
+
+/// §24.1.4 / §24.3.4 getOrInsertComputed ( key , callbackfn ) — like getOrInsert but the value to
+/// insert is produced lazily by `Call(callbackfn, undefined, « canonicalKey »)`, and ONLY when the
+/// key is absent. Spec step order: brand check → (weak: key check) → IsCallable(callbackfn) → lookup
+/// → call → insert. The callback may mutate the collection; after it returns we re-resolve the slot
+/// (the callback could have inserted/overwritten the same key) so the computed value wins.
+fn getOrInsertComputed(it: *Interpreter, coll: *Collection, args: []const Value, weak: bool) EvalError!Completion {
+    const a0: Value = if (args.len > 0) args[0] else .undefined;
+    const cb: Value = if (args.len > 1) args[1] else .undefined;
+    if (weak and !canBeHeldWeakly(a0)) return it.throwError("TypeError", "Invalid value used as weak map key");
+    if (cb != .object or !interp.isCallable(cb.object)) {
+        return it.throwError("TypeError", "callback is not a function");
+    }
+    const k = normKey(a0); // CanonicalizeKeyedCollectionKey: -0 → +0 (the canonical key is passed to cb)
+    if (findIndex(coll, k)) |i| return .{ .normal = coll.entries.items[i].value }; // present → no callback
+    const r = try it.callFunction(cb.object, &.{k}, .undefined); // Call(cb, undefined, « key »)
+    if (r.isAbrupt()) return r; // a throwing callback inserts nothing
+    const value = r.normal;
+    // The callback may already have inserted `k`; overwrite that slot rather than appending a dup.
+    if (findIndex(coll, k)) |i| {
+        coll.entries.items[i].value = value;
+    } else {
+        try coll.entries.append(it.arena, .{ .key = k, .value = value });
+        coll.size += 1;
+    }
+    return .{ .normal = value };
+}
+
 /// §24.1.3 Map.prototype dispatch (get/set/has/delete/clear/forEach). keys/values/entries/size are
 /// separate natives (collection_iterator / collection_size) handled in the interpreter.
 pub fn mapMethod(it: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
@@ -140,6 +181,8 @@ pub fn mapMethod(it: *Interpreter, name: []const u8, this_val: Value, args: []co
         return .{ .normal = .undefined };
     }
     if (eql(u8, name, "forEach")) return forEach(it, coll, this_val, args);
+    if (eql(u8, name, "getOrInsert")) return getOrInsert(it, coll, args, false);
+    if (eql(u8, name, "getOrInsertComputed")) return getOrInsertComputed(it, coll, args, false);
     unreachable;
 }
 
@@ -171,6 +214,8 @@ pub fn weakMapMethod(it: *Interpreter, name: []const u8, this_val: Value, args: 
     }
     if (eql(u8, name, "has")) return .{ .normal = .{ .boolean = canBeHeldWeakly(a0) and findIndex(coll, a0) != null } };
     if (eql(u8, name, "delete")) return .{ .normal = .{ .boolean = canBeHeldWeakly(a0) and remove(coll, a0) } };
+    if (eql(u8, name, "getOrInsert")) return getOrInsert(it, coll, args, true);
+    if (eql(u8, name, "getOrInsertComputed")) return getOrInsertComputed(it, coll, args, true);
     unreachable;
 }
 

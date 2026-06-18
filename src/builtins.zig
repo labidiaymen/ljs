@@ -45,6 +45,16 @@ fn defineMethod(arena: std.mem.Allocator, target: *Object, name: []const u8, id:
     try target.defineData(name, .{ .object = fn_obj }, true, false, true);
 }
 
+/// Like `defineMethod`, but also installs the `length` own data property (ExpectedArgumentCount,
+/// `{ writable:false, enumerable:false, configurable:true }`). Used where a Test262 case reads the
+/// method's `.length` (e.g. §24.1.4 Map.prototype.getOrInsert / getOrInsertComputed, length 2).
+fn defineMethodLen(arena: std.mem.Allocator, target: *Object, name: []const u8, id: NativeId, native_name: []const u8, len: f64) std.mem.Allocator.Error!void {
+    try defineMethod(arena, target, name, id, native_name);
+    if (target.get(name)) |fv| if (fv == .object) {
+        try fv.object.defineData("length", .{ .number = len }, false, false, true);
+    };
+}
+
 /// §19/§20.x.3 — install the `constructor` back-reference on a constructor's `.prototype`:
 /// `<Ctor>.prototype.constructor === <Ctor>`, descriptor `{ writable:true, enumerable:false,
 /// configurable:true }`. NON-enumerable is load-bearing (a stray enumerable `constructor` would
@@ -509,6 +519,9 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         try defineMethod(arena, mp, "delete", .map_method, "delete"); // §24.1.3.3
         try defineMethod(arena, mp, "clear", .map_method, "clear"); // §24.1.3.1
         try defineMethod(arena, mp, "forEach", .map_method, "forEach"); // §24.1.3.5
+        // §24.1.4 upsert proposal: getOrInsert(key,value) / getOrInsertComputed(key,callbackfn), length 2.
+        try defineMethodLen(arena, mp, "getOrInsert", .map_method, "getOrInsert", 2);
+        try defineMethodLen(arena, mp, "getOrInsertComputed", .map_method, "getOrInsertComputed", 2);
         try defineMethod(arena, mp, "keys", .collection_iterator, "map:keys"); // §24.1.3.8
         // §24.1.3.4/.12: `values` and `entries`; entries is shared with [Symbol.iterator].
         try defineMethod(arena, mp, "values", .collection_iterator, "map:values");
@@ -584,6 +597,9 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         try defineMethod(arena, wp, "set", .weakmap_method, "set"); // §24.3.3.5
         try defineMethod(arena, wp, "has", .weakmap_method, "has"); // §24.3.3.4
         try defineMethod(arena, wp, "delete", .weakmap_method, "delete"); // §24.3.3.2
+        // §24.3.4 upsert proposal: getOrInsert(key,value) / getOrInsertComputed(key,callbackfn), length 2.
+        try defineMethodLen(arena, wp, "getOrInsert", .weakmap_method, "getOrInsert", 2);
+        try defineMethodLen(arena, wp, "getOrInsertComputed", .weakmap_method, "getOrInsertComputed", 2);
         if (tag_sym) |s| try wp.defineSymbolData(s, .{ .string = "WeakMap" }, false, false, true); // §24.3.3.6
     };
     try defineConstructorBackref(weakmap_fn); // §24.3.3.1 WeakMap.prototype.constructor === WeakMap
