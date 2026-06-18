@@ -2275,6 +2275,19 @@ pub const Interpreter = struct {
         return .{ .key = el.key };
     }
 
+    /// §15.7.14 step 4 / §10.2.4: a STATIC class element keyed `"prototype"` (literal or a computed key
+    /// evaluating to the string `"prototype"`) is a TypeError — DefinePropertyOrThrow on the
+    /// constructor's non-configurable, non-writable `prototype` own property fails. A symbol key is
+    /// always distinct from the string `"prototype"`, and instance elements install on `.prototype`
+    /// (where `prototype` is a fine key), so neither is affected. Returns the abrupt completion to
+    /// propagate when this rule fires, else null.
+    fn staticPrototypeKeyError(self: *Interpreter, is_static: bool, key: KeyResult) EvalError!?Completion {
+        if (is_static and key.symbol == null and std.mem.eql(u8, key.key, "prototype")) {
+            return try self.throwError("TypeError", "Classes may not have a static property named 'prototype'");
+        }
+        return null;
+    }
+
     /// §7.3.25 CopyDataProperties — copy `source`'s own enumerable data properties into `target`
     /// (invoking getters to read the values). Null/undefined sources are no-ops. Used by object
     /// spread `{...source}`.
@@ -2456,6 +2469,12 @@ pub const Interpreter = struct {
         // constructor resolves against `Super.prototype`); the ctor reads its own `super_ctor` for
         // `super(...)` via `proto.constructor`.
         if (ctor.call) |*fd| fd.home_object = proto;
+        // §15.7.14 step 13 / §10.2.4 MakeConstructor: a class constructor's `prototype` own property is
+        // { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false } (an ordinary function
+        // gets a writable one; `createFunction` defaulted to writable). Lock it here so a later
+        // `static prototype`/`static get ['prototype']` element hits DefinePropertyOrThrow on a
+        // non-configurable property and throws (§14.5 prototype-property; static-prototype tests).
+        try ctor.defineData("prototype", .{ .object = proto }, false, false, false);
         // §15.7.14: the `constructor` own property of `.prototype` is non-enumerable (writable +
         // configurable). `set` would make it enumerable, so define it explicitly.
         try proto.defineData("constructor", .{ .object = ctor }, true, false, true);
@@ -2528,6 +2547,7 @@ pub const Interpreter = struct {
                     } else {
                         const key = try self.classElementKey(el, class_env);
                         if (key.isAbrupt()) return key.completion;
+                        if (try self.staticPrototypeKeyError(el.is_static, key)) |e| return e;
                         // §15.7.14: a class method's `name` is its property key (symbol → "[desc]").
                         try self.setFunctionName(f, if (key.symbol) |sym| try self.symbolPropName(sym) else key.key, "");
                         // §15.7.x: class methods are NON-enumerable (writable + configurable). Define
@@ -2569,6 +2589,7 @@ pub const Interpreter = struct {
                     } else {
                         const key = try self.classElementKey(el, class_env);
                         if (key.isAbrupt()) return key.completion;
+                        if (try self.staticPrototypeKeyError(el.is_static, key)) |e| return e;
                         // §15.7.14: a class accessor's name is "get x" / "set x" (symbol → "[desc]").
                         try self.setFunctionName(f, if (key.symbol) |sym| try self.symbolPropName(sym) else key.key, if (el.kind == .get) "get" else "set");
                         const getter: ?*Object = if (el.kind == .get) f else null;
@@ -2604,6 +2625,7 @@ pub const Interpreter = struct {
                     }
                     const key = try self.classElementKey(el, class_env);
                     if (key.isAbrupt()) return key.completion;
+                    if (try self.staticPrototypeKeyError(el.is_static, key)) |e| return e;
                     // §15.7.10: a field's name (string key, or "[desc]" for a symbol key) is the
                     // NamedEvaluation name for an anonymous function/class initializer.
                     const field_name = if (key.symbol) |sym| try self.symbolPropName(sym) else key.key;
@@ -3111,14 +3133,21 @@ pub const Interpreter = struct {
         return self.finishCtorReturn(fd, .undefined); // implicit return
     }
 
-    /// §10.2.1.3 EvaluateBody (constructor return): a DERIVED constructor that returns `undefined`
-    /// (an explicit `return;` or an implicit fall-off) without having called `super(...)` leaves `this`
-    /// uninitialized → ReferenceError (GetThisBinding). An object return, or any return after super(),
-    /// is unchanged. (Non-derived functions return their value untouched.)
+    /// §10.2.1.3 EvaluateBody / §10.2.2 [[Construct]] step 13 (constructor return). For a DERIVED
+    /// constructor: an Object return is returned as-is (step 13.a); a `return;`/fall-off `undefined`
+    /// yields GetThisBinding — a ReferenceError if `super(...)` was never called (step 13.e, `this`
+    /// uninitialized); and a NON-undefined NON-object return (e.g. `return null` / `return 5`) is a
+    /// TypeError (step 13.c). A BASE constructor ignores a non-object return (its `this` always wins),
+    /// and non-derived functions return their value untouched.
     fn finishCtorReturn(self: *Interpreter, fd: object_mod.FunctionData, value: Value) EvalError!Completion {
-        if (fd.is_derived_ctor and value == .undefined) {
-            if (self.this_init_cell) |c| if (!c.*)
-                return self.throwError("ReferenceError", "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
+        if (fd.is_derived_ctor and value != .object) {
+            if (value == .undefined) {
+                if (self.this_init_cell) |c| if (!c.*)
+                    return self.throwError("ReferenceError", "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
+            } else {
+                // §10.2.2 step 13.c: a derived ctor returning a primitive (null/number/string/etc.) throws.
+                return self.throwError("TypeError", "Derived constructors may only return object or undefined");
+            }
         }
         return .{ .normal = value };
     }
