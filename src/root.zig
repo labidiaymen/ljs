@@ -13,6 +13,9 @@ pub const evaluateWithLimit = engine.evaluateWithLimit;
 pub const evaluateAsyncTest = engine.evaluateAsyncTest;
 pub const AsyncTestResult = engine.AsyncTestResult;
 pub const default_step_limit = engine.default_step_limit;
+pub const evaluateModule = engine.evaluateModule;
+pub const ModuleLoader = engine.ModuleLoader;
+pub const ResolvedSource = engine.ResolvedSource;
 
 test {
     // Pull in every module so `zig build test` runs their unit tests.
@@ -29,6 +32,7 @@ test {
     _ = @import("lexer.zig");
     _ = @import("parser.zig");
     _ = @import("interpreter.zig");
+    _ = @import("module.zig");
     _ = @import("engine.zig");
     _ = @import("engine_tests.zig");
     _ = @import("engine_tests2.zig");

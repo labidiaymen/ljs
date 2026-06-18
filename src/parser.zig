@@ -81,6 +81,17 @@ pub const Parser = struct {
     /// keep `in` as a normal operator. Set only around `parseFor`'s first-clause parse.
     no_in: bool = false,
 
+    /// §16.2 module goal: true while parsing a Module (set by `parseModule`). Module code is always
+    /// strict (handled via `strict`), `import`/`export` declarations are legal at the top level only,
+    /// and the import/export entry accumulators below are live. False for a Script (the common path,
+    /// and the entire bench corpus) — module-item parsing is never reached.
+    is_module: bool = false,
+    /// §16.2.2 / §16.2.3 entry accumulators — populated by `parseImportDeclaration` /
+    /// `parseExportDeclaration` while parsing module items; folded into the `Program` by `parseModule`.
+    import_entries: std.ArrayListUnmanaged(ast.ImportEntry) = .empty,
+    export_entries: std.ArrayListUnmanaged(ast.ExportEntry) = .empty,
+    requested_modules: std.ArrayListUnmanaged([]const u8) = .empty,
+
     /// §13.2.5.1 CoverInitializedName obligation counter. An object/array literal `{x = d}` / `[a = d]`
     /// records a `= default` that is ONLY legal once the literal is refined to an AssignmentPattern
     /// (§13.15.5) or a BindingPattern. Each recorded default increments this; `validateAssignmentPattern`
@@ -138,6 +149,22 @@ pub const Parser = struct {
         }
         var p = Parser{ .tokens = toks.items, .arena = arena, .strict = strict };
         return p.parseProgram();
+    }
+
+    /// §16.2 parse the source text as a Module (the module goal). Module code is always strict
+    /// (§11.2.2), `import`/`export` declarations are permitted at the top level, and the top-level
+    /// `this` is undefined / `new.target` & `super` are restricted at runtime. Returns a `Program`
+    /// with `is_module = true` plus its ImportEntries / ExportEntries / RequestedModules.
+    pub fn parseModule(arena: std.mem.Allocator, src: []const u8) ParseError!ast.Program {
+        var lexer = lex.Lexer.init(arena, src);
+        var toks: std.ArrayList(lex.Token) = .empty;
+        while (true) {
+            const t = try lexer.next();
+            try toks.append(arena, t);
+            if (t.kind == .eof) break;
+        }
+        var p = Parser{ .tokens = toks.items, .arena = arena, .strict = true, .is_module = true };
+        return p.parseModuleProgram();
     }
 
     fn peek(self: *Parser) lex.Token {
@@ -777,6 +804,355 @@ pub const Parser = struct {
         // scope (blocks, function/method/arrow bodies, switch CaseBlocks, catch). Parse-time only.
         try validateScope(stmts.items, .script_or_body, self.strict);
         return .{ .statements = stmts.items, .strict = self.strict };
+    }
+
+    /// §16.2.1 ModuleBody : ModuleItemList. Parse the module goal: a list of ModuleItems where, in
+    /// addition to ordinary StatementListItems, `import` and `export` declarations are permitted at
+    /// the top level. Each `export <decl>` emits BOTH the inner declaration statement (so the binding
+    /// is created/evaluated normally) AND an ExportEntry; `import`/re-export `from` declarations emit
+    /// entries + requested modules but no executable statement.
+    fn parseModuleProgram(self: *Parser) ParseError!ast.Program {
+        var stmts: std.ArrayList(ast.Stmt) = .empty;
+        while (self.peek().kind != .eof) {
+            switch (self.peek().kind) {
+                .kw_import => {
+                    // §13.3.10: `import (` / `import .` are the dynamic ImportCall / `import.meta`
+                    // MetaProperty — an ExpressionStatement, not an ImportDeclaration. Defer to the
+                    // ordinary statement parser for those; only a module-specifier/binding `import`
+                    // begins an ImportDeclaration.
+                    const next = if (self.idx + 1 < self.tokens.len) self.tokens[self.idx + 1].kind else .eof;
+                    if (next == .lparen or next == .dot) {
+                        try stmts.append(self.arena, try self.parseStmt());
+                    } else {
+                        try self.parseImportDeclaration();
+                    }
+                },
+                .kw_export => {
+                    if (try self.parseExportDeclaration()) |s| try stmts.append(self.arena, s);
+                },
+                else => try stmts.append(self.arena, try self.parseStmt()),
+            }
+        }
+        try validateScope(stmts.items, .script_or_body, true);
+        try self.validateModuleEarlyErrors(stmts.items);
+        return .{
+            .statements = stmts.items,
+            .strict = true,
+            .is_module = true,
+            .import_entries = self.import_entries.items,
+            .export_entries = self.export_entries.items,
+            .requested_modules = self.requested_modules.items,
+        };
+    }
+
+    /// Record a RequestedModule specifier (de-duplicated, source order; §16.2.1.6 [[RequestedModules]]).
+    fn addRequestedModule(self: *Parser, spec: []const u8) ParseError!void {
+        for (self.requested_modules.items) |m| if (std.mem.eql(u8, m, spec)) return;
+        try self.requested_modules.append(self.arena, spec);
+    }
+
+    /// §16.2.2 ImportDeclaration. Forms: `import "m";` (side-effect), `import d from "m";`,
+    /// `import * as ns from "m";`, `import { a, b as c } from "m";`, and the default+named/namespace
+    /// combinations (`import d, { … } from "m"`, `import d, * as ns from "m"`).
+    fn parseImportDeclaration(self: *Parser) ParseError!void {
+        _ = self.advance(); // import
+        // `import "module";` — side-effect import, no bindings.
+        if (self.peek().kind == .string) {
+            const spec = self.advance().string_value;
+            try self.addRequestedModule(spec);
+            self.consumeSemicolon();
+            return;
+        }
+        var have_clause = false;
+        // ImportedDefaultBinding — a plain BindingIdentifier before `from`.
+        if (self.peek().kind == .identifier) {
+            const local = try self.importBindingName();
+            // module_request is filled once we read the `from` clause below; stage the entry.
+            try self.import_entries.append(self.arena, .{ .module_request = "", .import_name = "default", .local_name = local });
+            have_clause = true;
+            if (self.peek().kind == .comma) _ = self.advance() else {
+                const spec = try self.parseFromClause();
+                try self.fillPendingImportRequests(spec);
+                self.consumeSemicolon();
+                return;
+            }
+        }
+        if (self.peek().kind == .star) {
+            // NameSpaceImport `* as ns`.
+            _ = self.advance();
+            try self.expectContextual("as");
+            const local = try self.importBindingName();
+            try self.import_entries.append(self.arena, .{ .module_request = "", .import_name = "*", .local_name = local });
+            have_clause = true;
+        } else if (self.peek().kind == .lbrace) {
+            try self.parseNamedImports();
+            have_clause = true;
+        }
+        if (!have_clause) return ParseError.UnexpectedToken;
+        const spec = try self.parseFromClause();
+        try self.fillPendingImportRequests(spec);
+        self.consumeSemicolon();
+    }
+
+    /// Back-fill the `module_request` of every import entry staged for the current declaration (those
+    /// with an empty request) once the `from "spec"` clause is read, and record the requested module.
+    fn fillPendingImportRequests(self: *Parser, spec: []const u8) ParseError!void {
+        for (self.import_entries.items) |*e| {
+            if (e.module_request.len == 0) e.module_request = spec;
+        }
+        try self.addRequestedModule(spec);
+    }
+
+    /// §16.2.2 NamedImports `{ a, b as c }` — each ImportSpecifier introduces a local binding for an
+    /// imported name (`a` ⇒ import `a` as `a`; `b as c` ⇒ import `b` as `c`). An IdentifierName (not
+    /// just IdentifierReference) is a valid imported name; the local is a BindingIdentifier.
+    fn parseNamedImports(self: *Parser) ParseError!void {
+        _ = try self.expect(.lbrace);
+        while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
+            const imported = try self.moduleExportName(); // IdentifierName or StringLiteral
+            var local = imported;
+            if (self.isContextual("as")) {
+                _ = self.advance();
+                local = try self.importBindingName();
+            } else {
+                // Without `as`, the imported name must be a valid BindingIdentifier (so a string
+                // module-export name `{ "x" }` without `as` is a SyntaxError).
+                if (!isValidBindingName(imported)) return ParseError.UnexpectedToken;
+            }
+            try self.import_entries.append(self.arena, .{ .module_request = "", .import_name = imported, .local_name = local });
+            if (self.peek().kind == .comma) _ = self.advance() else break;
+        }
+        _ = try self.expect(.rbrace);
+    }
+
+    /// §16.2.3 ExportDeclaration. Returns the inner declaration statement to also emit (for
+    /// `export var/let/const/function/class` and `export default <decl/expr>`), or null for the
+    /// binding-list / re-export forms (which emit only entries).
+    fn parseExportDeclaration(self: *Parser) ParseError!?ast.Stmt {
+        _ = self.advance(); // export
+        switch (self.peek().kind) {
+            .star => {
+                // `export * from "m";` or `export * as ns from "m";`
+                _ = self.advance();
+                var export_name: ?[]const u8 = null;
+                if (self.isContextual("as")) {
+                    _ = self.advance();
+                    export_name = try self.moduleExportName();
+                }
+                const spec = try self.parseFromClause();
+                try self.addRequestedModule(spec);
+                try self.export_entries.append(self.arena, .{ .export_name = export_name, .module_request = spec, .import_name = "*" });
+                self.consumeSemicolon();
+                return null;
+            },
+            .lbrace => {
+                // `export { a, b as c };` (local) or `export { a } from "m";` (indirect re-export).
+                const specs = try self.parseExportSpecifiers();
+                if (self.isContextual("from")) {
+                    _ = self.advance();
+                    const spec = (try self.expect(.string)).string_value;
+                    try self.addRequestedModule(spec);
+                    for (specs) |s| try self.export_entries.append(self.arena, .{ .export_name = s.exported, .module_request = spec, .import_name = s.local });
+                } else {
+                    for (specs) |s| {
+                        // §16.2.3.1: a bare `export { a }` clause references a LOCAL binding `a`; a
+                        // module-export-name string here without `from` is illegal as a local ref.
+                        if (!isValidBindingName(s.local)) return ParseError.UnexpectedToken;
+                        try self.export_entries.append(self.arena, .{ .export_name = s.exported, .local_name = s.local });
+                    }
+                }
+                self.consumeSemicolon();
+                return null;
+            },
+            .kw_default => {
+                _ = self.advance(); // default
+                const dd = try self.parseExportDefault();
+                try self.export_entries.append(self.arena, .{ .export_name = "default", .local_name = dd.local });
+                return dd.stmt;
+            },
+            .kw_var, .kw_let, .kw_const => {
+                const stmt = try self.parseDecl();
+                self.consumeSemicolon();
+                for (boundDeclNames(self.arena, stmt) catch &.{}) |n| {
+                    try self.export_entries.append(self.arena, .{ .export_name = n, .local_name = n });
+                }
+                return stmt;
+            },
+            .kw_function => {
+                _ = self.advance();
+                const f = try self.parseFunction(false);
+                const nm = f.name orelse return ParseError.UnexpectedToken;
+                try self.export_entries.append(self.arena, .{ .export_name = nm, .local_name = nm });
+                return .{ .func_decl = f };
+            },
+            .kw_class => {
+                const c = try self.parseClass(true);
+                const nm = c.name orelse return ParseError.UnexpectedToken;
+                try self.export_entries.append(self.arena, .{ .export_name = nm, .local_name = nm });
+                return .{ .class_decl = c };
+            },
+            .identifier => {
+                // `export async function f(){}` — an AsyncFunctionDeclaration export.
+                if (self.atAsyncFunctionStart()) {
+                    _ = self.advance(); // async
+                    _ = self.advance(); // function
+                    const f = try self.parseFunction(true);
+                    const nm = f.name orelse return ParseError.UnexpectedToken;
+                    try self.export_entries.append(self.arena, .{ .export_name = nm, .local_name = nm });
+                    return .{ .func_decl = f };
+                }
+                return ParseError.UnexpectedToken;
+            },
+            else => return ParseError.UnexpectedToken,
+        }
+    }
+
+    const DefaultDecl = struct { stmt: ast.Stmt, local: []const u8 };
+
+    /// §16.2.3 `export default` of a HoistableDeclaration / ClassDeclaration / AssignmentExpression.
+    /// A named function/class is hoisted under its own name AND exported as `default` (so its
+    /// `local_name` is that name); an anonymous one binds the synthetic `*default*`. An
+    /// AssignmentExpression default lowers to `let *default* = <expr>;`. Returns the inner statement
+    /// plus the LOCAL binding name the default export entry should reference.
+    fn parseExportDefault(self: *Parser) ParseError!DefaultDecl {
+        switch (self.peek().kind) {
+            .kw_function => {
+                _ = self.advance();
+                const f = try self.namedOrDefault(try self.parseFunction(false));
+                return .{ .stmt = .{ .func_decl = f }, .local = f.name.? };
+            },
+            .kw_class => {
+                const c = try self.parseClass(true);
+                if (c.name != null) return .{ .stmt = .{ .class_decl = c }, .local = c.name.? };
+                const named = try self.arena.create(ast.Class);
+                named.* = .{ .name = "*default*", .superclass = c.superclass, .elements = c.elements };
+                return .{ .stmt = .{ .class_decl = named }, .local = "*default*" };
+            },
+            .identifier => {
+                if (self.atAsyncFunctionStart()) {
+                    _ = self.advance(); // async
+                    _ = self.advance(); // function
+                    const f = try self.namedOrDefault(try self.parseFunction(true));
+                    return .{ .stmt = .{ .func_decl = f }, .local = f.name.? };
+                }
+                return try self.exportDefaultExpr();
+            },
+            else => return try self.exportDefaultExpr(),
+        }
+    }
+
+    /// Ensure an exported-default function has a binding name (`*default*` when anonymous).
+    fn namedOrDefault(self: *Parser, f: *const ast.Function) ParseError!*const ast.Function {
+        if (f.name != null) return f;
+        const nf = try self.arena.create(ast.Function);
+        nf.* = f.*;
+        nf.name = "*default*";
+        return nf;
+    }
+
+    /// `export default <AssignmentExpression>;` → `let *default* = <expr>;`.
+    fn exportDefaultExpr(self: *Parser) ParseError!DefaultDecl {
+        const expr = try self.parseAssignment();
+        self.consumeSemicolon();
+        const pat = try self.allocPattern(.{ .identifier = "*default*" });
+        const decls = try self.arena.alloc(ast.Declarator, 1);
+        decls[0] = .{ .target = pat, .init = expr };
+        return .{ .stmt = .{ .declaration = .{ .kind = .let_decl, .decls = decls } }, .local = "*default*" };
+    }
+
+    const ExportSpec = struct { local: []const u8, exported: []const u8 };
+
+    /// §16.2.3 ExportsList `{ a, b as c }` — each ExportSpecifier maps a local name (or, with
+    /// `from`, a source import name) to an exported module name.
+    fn parseExportSpecifiers(self: *Parser) ParseError![]const ExportSpec {
+        _ = try self.expect(.lbrace);
+        var out: std.ArrayList(ExportSpec) = .empty;
+        while (self.peek().kind != .rbrace and self.peek().kind != .eof) {
+            const local = try self.moduleExportName();
+            var exported = local;
+            if (self.isContextual("as")) {
+                _ = self.advance();
+                exported = try self.moduleExportName();
+            }
+            try out.append(self.arena, .{ .local = local, .exported = exported });
+            if (self.peek().kind == .comma) _ = self.advance() else break;
+        }
+        _ = try self.expect(.rbrace);
+        return out.items;
+    }
+
+    /// §16.2.2 `from "ModuleSpecifier"`.
+    fn parseFromClause(self: *Parser) ParseError![]const u8 {
+        try self.expectContextual("from");
+        return (try self.expect(.string)).string_value;
+    }
+
+    /// §16.2.3 ModuleExportName : IdentifierName | StringLiteral. Returns the name text.
+    fn moduleExportName(self: *Parser) ParseError![]const u8 {
+        const t = self.peek();
+        if (t.kind == .string) {
+            _ = self.advance();
+            return t.string_value;
+        }
+        if (isIdentifierNameToken(t.kind)) {
+            _ = self.advance();
+            return t.lexeme;
+        }
+        return ParseError.UnexpectedToken;
+    }
+
+    /// An import-clause BindingIdentifier. §16.2.2 / §16.2.1.5: `eval` / `arguments` are forbidden as
+    /// imported binding names, and a reserved word is rejected.
+    fn importBindingName(self: *Parser) ParseError![]const u8 {
+        if (self.peek().kind != .identifier) return ParseError.UnexpectedToken;
+        if (isEscapedReservedIdent(self.peek())) return ParseError.UnexpectedToken;
+        const nm = self.advance().lexeme;
+        // Module code is strict: `eval`/`arguments`/strict-reserved are not valid binding names.
+        if (isStrictReservedBindingName(nm)) return ParseError.UnexpectedToken;
+        return nm;
+    }
+
+    fn isContextual(self: *Parser, word: []const u8) bool {
+        const t = self.peek();
+        return t.kind == .identifier and !t.had_escape and std.mem.eql(u8, t.lexeme, word);
+    }
+
+    fn expectContextual(self: *Parser, word: []const u8) ParseError!void {
+        if (!self.isContextual(word)) return ParseError.UnexpectedToken;
+        _ = self.advance();
+    }
+
+    fn consumeSemicolon(self: *Parser) void {
+        if (self.peek().kind == .semicolon) _ = self.advance();
+    }
+
+    /// §16.2.1.5 Module Static Semantics: Early Errors.
+    ///   • The ExportedNames of the ModuleItemList must contain no duplicate entries.
+    ///   • Each ExportedBinding (a LOCAL export's referenced name) must be declared at the module top
+    ///     level (a VarDeclaredName or LexicallyDeclaredName) — an `export { x }` / `export default`
+    ///     referencing an undeclared name is a SyntaxError.
+    fn validateModuleEarlyErrors(self: *Parser, stmts: []const ast.Stmt) ParseError!void {
+        // Collect the module's top-level declared names (var + lexical + function/class + the
+        // synthetic `*default*` for `export default`).
+        var declared: std.StringHashMapUnmanaged(void) = .empty;
+        for (stmts) |s| {
+            for (boundDeclNames(self.arena, s) catch &.{}) |n| try declared.put(self.arena, n, {});
+        }
+        for (self.import_entries.items) |e| try declared.put(self.arena, e.local_name, {});
+        // Duplicate ExportedNames.
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (self.export_entries.items) |e| {
+            if (e.export_name) |name| {
+                if (seen.contains(name)) return ParseError.UnexpectedToken;
+                try seen.put(self.arena, name, {});
+            }
+            // ExportedBinding must be declared (local exports only; re-exports resolve at link time).
+            if (e.module_request == null) {
+                if (e.local_name) |ln| {
+                    if (!declared.contains(ln)) return ParseError.UnexpectedToken;
+                }
+            }
+        }
     }
 
     fn parseStmt(self: *Parser) ParseError!ast.Stmt {
@@ -3410,6 +3786,41 @@ fn patternBindsAny(pattern: *const ast.Pattern, list: []const []const u8) bool {
 /// Append `pattern`'s bound identifiers to `names`, returning true if any was already present.
 /// On allocator exhaustion (a pathologically large pattern) it conservatively returns false —
 /// the binding still succeeds at runtime; we just skip the duplicate diagnostic.
+/// §16.2: may a token kind appear as an IdentifierName (e.g. a NamedImport's imported name or a
+/// ModuleExportName)? IdentifierName admits ReservedWords, so any keyword token or `identifier` is
+/// accepted. (The lexer maps reserved words to dedicated `kw_*` kinds; a NamedImport like
+/// `{ default as d }` needs `default`/`class`/etc. to be valid imported names.)
+fn isIdentifierNameToken(kind: lex.TokenKind) bool {
+    return switch (kind) {
+        .identifier => true,
+        else => @tagName(kind).len > 3 and std.mem.startsWith(u8, @tagName(kind), "kw_"),
+    };
+}
+
+/// §16.2.1.5: is `name` usable as a module-level BindingIdentifier (module code is strict)? Rejects
+/// reserved words and the strict-reserved set (`eval`, `arguments`, `yield`, …).
+fn isValidBindingName(name: []const u8) bool {
+    if (lex.isReservedWord(name)) return false;
+    if (isStrictReservedBindingName(name)) return false;
+    return true;
+}
+
+/// §16.2.1.5 BoundNames of a module-level Declaration statement (used to collect the module's
+/// top-level declared names for the ExportedBinding early error). Returns the names declared by a
+/// `var`/`let`/`const`/`using` declaration, a function/class declaration, or `[]` otherwise.
+fn boundDeclNames(a: std.mem.Allocator, stmt: ast.Stmt) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    switch (stmt) {
+        .declaration => |d| {
+            for (d.decls) |dec| _ = collectBoundNames(dec.target, &names, a);
+        },
+        .func_decl => |f| if (f.name) |n| try names.append(a, n),
+        .class_decl => |c| if (c.name) |n| try names.append(a, n),
+        else => {},
+    }
+    return names.items;
+}
+
 fn collectBoundNames(pattern: *const ast.Pattern, names: *std.ArrayList([]const u8), a: std.mem.Allocator) bool {
     switch (pattern.*) {
         .identifier => |n| {
@@ -4067,7 +4478,7 @@ fn startsAccessorName(kind: lex.TokenKind) bool {
 /// ReservedWord is a valid IdentifierName key.
 fn isKeywordName(kind: lex.TokenKind) bool {
     return switch (kind) {
-        .kw_true, .kw_false, .kw_null, .kw_var, .kw_let, .kw_const, .kw_function, .kw_return, .kw_this, .kw_if, .kw_else, .kw_while, .kw_do, .kw_for, .kw_throw, .kw_try, .kw_catch, .kw_finally, .kw_break, .kw_continue, .kw_typeof, .kw_void, .kw_delete, .kw_new, .kw_instanceof, .kw_switch, .kw_case, .kw_default, .kw_import, .kw_class, .kw_extends, .kw_super, .kw_in, .kw_with => true,
+        .kw_true, .kw_false, .kw_null, .kw_var, .kw_let, .kw_const, .kw_function, .kw_return, .kw_this, .kw_if, .kw_else, .kw_while, .kw_do, .kw_for, .kw_throw, .kw_try, .kw_catch, .kw_finally, .kw_break, .kw_continue, .kw_typeof, .kw_void, .kw_delete, .kw_new, .kw_instanceof, .kw_switch, .kw_case, .kw_default, .kw_import, .kw_export, .kw_class, .kw_extends, .kw_super, .kw_in, .kw_with => true,
         else => false,
     };
 }

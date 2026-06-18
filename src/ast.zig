@@ -357,8 +357,46 @@ pub const Stmt = union(enum) {
 /// A `switch` case; `test_expr == null` for `default`.
 pub const Case = struct { test_expr: ?*const Node, body: []const Stmt };
 
+/// §16.2.2 ImportEntry Record — one binding introduced by an ImportDeclaration. `module_request`
+/// is the specifier string. `import_name` is the name imported from the source module: `"*"` for a
+/// namespace import (`import * as ns from "m"`), `"default"` for a default import, or a named
+/// export. `local_name` is the binding introduced in the importing module's environment.
+pub const ImportEntry = struct {
+    module_request: []const u8,
+    import_name: []const u8, // exported name in the source module, or "*"
+    local_name: []const u8, // binding name in this module
+};
+
+/// §16.2.3 ExportEntry Record. Covers every export form:
+///   • local export   `export {x}` / `export let x` / `export default …` →
+///         `export_name` set, `local_name` set, `module_request`/`import_name` null.
+///   • indirect export `export {x as y} from "m"` →
+///         `export_name`+`import_name` set, `module_request` set, `local_name` null.
+///   • star export     `export * from "m"` →
+///         `module_request` set, `import_name == "*"`, `export_name` null (re-export all names).
+///   • namespace export `export * as ns from "m"` →
+///         `export_name` set, `import_name == "*"`, `module_request` set, `local_name` null.
+pub const ExportEntry = struct {
+    export_name: ?[]const u8 = null,
+    module_request: ?[]const u8 = null,
+    import_name: ?[]const u8 = null,
+    local_name: ?[]const u8 = null,
+};
+
 /// §11.2.2: a Script is strict if it carries a `"use strict"` directive prologue (or the runner runs
 /// it in strict `RunMode`). The interpreter reads this to gate runtime strict-mode semantics — most
 /// notably §9.1.1.4.16 SetMutableBinding / §6.2.5.6 PutValue: an assignment to an unresolved name
 /// CREATES a global property in sloppy code but throws ReferenceError in strict code.
-pub const Program = struct { statements: []const Stmt, strict: bool = false };
+///
+/// §16.2.1.6 A Module additionally carries `is_module = true`, its ImportEntries / ExportEntries, and
+/// the de-duplicated RequestedModules list (specifiers, in source order). These are empty for a
+/// Script. The body `statements` hold the executable ModuleItems (an `export let x = 1` lowers to a
+/// plain `declaration` stmt PLUS an export entry; an `export default <expr>` to a synthetic binding).
+pub const Program = struct {
+    statements: []const Stmt,
+    strict: bool = false,
+    is_module: bool = false,
+    import_entries: []const ImportEntry = &.{},
+    export_entries: []const ExportEntry = &.{},
+    requested_modules: []const []const u8 = &.{},
+};

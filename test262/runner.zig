@@ -60,7 +60,7 @@ pub fn run(io: std.Io, arena: Allocator, opts: Options, report: *rep.Report) Run
         _ = scratch_state.reset(.{ .retain_with_limit = 8 << 20 }); // free the previous test's allocations; release pathological spikes (keep up to 8 MiB) so a single huge test doesn't hold memory for the whole run
         const scratch = scratch_state.allocator();
         const source = dir.readFileAlloc(io, entry.path, scratch, .limited(8 << 20)) catch continue;
-        try runOne(io, scratch, opts, prelude, source, path_owned, report);
+        try runOne(io, dir, scratch, opts, prelude, source, path_owned, report);
     }
 }
 
@@ -69,14 +69,53 @@ fn readHarness(io: std.Io, arena: Allocator, hdir: []const u8, name: []const u8)
     return std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 << 20));
 }
 
-fn runOne(io: std.Io, arena: Allocator, opts: Options, prelude: []const u8, source: []const u8, path: []const u8, report: *rep.Report) RunError!void {
+/// §16.2.1.6 the minimal Test262 module loader context. Resolves a relative specifier against the
+/// referrer module's resolved key (a path relative to the suite root `dir`) and reads the sibling
+/// file from `dir`. This is a test-harness hook — NOT a general Node host module system.
+const ModuleLoaderCtx = struct {
+    io: std.Io,
+    dir: std.Io.Dir,
+    arena: Allocator,
+
+    fn resolve(ctx_ptr: *anyopaque, referrer_key: []const u8, specifier: []const u8) ?ljs.ResolvedSource {
+        const self: *ModuleLoaderCtx = @ptrCast(@alignCast(ctx_ptr));
+        const key = resolveSpecifier(self.arena, referrer_key, specifier) catch return null;
+        const src = self.dir.readFileAlloc(self.io, key, self.arena, .limited(8 << 20)) catch return null;
+        return .{ .key = key, .source = src };
+    }
+};
+
+/// Join `specifier` onto the directory of `referrer_key` and normalize `.`/`..` segments, producing
+/// a forward-slash key relative to the suite root. A non-relative specifier (no `./` or `../`) is a
+/// bare module specifier — unsupported by the harness loader (returns it as-is to fail resolution).
+fn resolveSpecifier(arena: Allocator, referrer_key: []const u8, specifier: []const u8) ![]const u8 {
+    // Base = referrer directory (everything up to the last '/').
+    const slash = std.mem.lastIndexOfScalar(u8, referrer_key, '/');
+    const base = if (slash) |s| referrer_key[0..s] else "";
+    var segs: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.tokenizeScalar(u8, base, '/');
+    while (it.next()) |s| try segs.append(arena, s);
+    var sit = std.mem.tokenizeScalar(u8, specifier, '/');
+    while (sit.next()) |s| {
+        if (std.mem.eql(u8, s, ".")) continue;
+        if (std.mem.eql(u8, s, "..")) {
+            if (segs.items.len > 0) _ = segs.pop();
+            continue;
+        }
+        try segs.append(arena, s);
+    }
+    return std.mem.join(arena, "/", segs.items);
+}
+
+fn runOne(io: std.Io, dir: std.Io.Dir, arena: Allocator, opts: Options, prelude: []const u8, source: []const u8, path: []const u8, report: *rep.Report) RunError!void {
     const meta = md.parse(arena, source) catch return; // not a test (no frontmatter) → skip silently
 
-    // Module linking is still unsupported at M11 → skip (not fail). `[async]` tests are now RUN
-    // (M11 Cycle 2): the engine injects a `$DONE` callback, drains the microtask Job queue, and the
-    // outcome is classified below — no longer skipped.
+    // §16.2 `[module]` tests: parse + link + evaluate as a Module (no longer skipped). The harness
+    // prelude (sta.js + assert.js + includes) runs as a script in the realm's global first (so
+    // `assert` / `$DONOTEVALUATE` are globals), then the module graph is loaded from disk relative
+    // to the test file and evaluated. `[async]` modules keep the `$DONE` drain via the engine.
     if (meta.flags.module) {
-        try report.add(.{ .path = path, .mode = .strict, .outcome = .skip, .reason = .unsupported_flag });
+        try runModuleTest(io, dir, arena, opts, prelude, meta, source, path, report);
         return;
     }
 
@@ -92,6 +131,45 @@ fn runOne(io: std.Io, arena: Allocator, opts: Options, prelude: []const u8, sour
 
     if (run_strict) try execOne(io, arena, opts, prelude, meta, source, path, .strict, report);
     if (run_sloppy) try execOne(io, arena, opts, prelude, meta, source, path, .sloppy, report);
+}
+
+/// §16.2 run one `[module]` test. Modules run in strict mode only (module code is always strict).
+/// Builds the harness prelude (sta + assert + `includes`), then parses + links + evaluates the
+/// module graph via `ljs.evaluateModule`. Classification reuses the script paths: a parse-negative
+/// module passes on a SyntaxError; a positive module passes on normal completion; a runtime-negative
+/// classifies on the thrown error's name; an `[async]` module classifies via the `$DONE` sink. The
+/// `negative: { phase: resolution }` case (unresolvable export) surfaces as a thrown SyntaxError.
+fn runModuleTest(io: std.Io, dir: std.Io.Dir, arena: Allocator, opts: Options, prelude: []const u8, meta: md.Metadata, source: []const u8, path: []const u8, report: *rep.Report) RunError!void {
+    // Module prelude = sta/assert + each `includes` file (no "use strict" prefix — modules are
+    // already strict, and the prelude runs as a separate sloppy script that only installs globals).
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(arena, prelude);
+    if (opts.harness_dir) |hdir| {
+        for (meta.includes) |inc| {
+            const c = readHarness(io, arena, hdir, inc) catch "";
+            try buf.appendSlice(arena, c);
+            try buf.appendSlice(arena, "\n");
+        }
+    }
+    var ctx = ModuleLoaderCtx{ .io = io, .dir = dir, .arena = arena };
+    const loader = ljs.ModuleLoader{ .ctx = &ctx, .resolve = ModuleLoaderCtx.resolve };
+    const result = try ljs.evaluateModule(arena, buf.items, path, source, loader, opts.step_limit);
+    // A `negative: { phase: resolution }` module passes on a syntax/thrown-SyntaxError (our engine
+    // surfaces an unresolvable export as a thrown SyntaxError); reuse `classify` with a parse-phase
+    // expectation by mapping resolution→parse semantics inline.
+    if (meta.negative) |neg| if (neg.phase == .resolution) {
+        const ok = switch (result) {
+            .syntax_error => true,
+            .thrown => |tv| blk: {
+                const got = errorName(tv) orelse break :blk false;
+                break :blk std.mem.eql(u8, got, neg.type_name);
+            },
+            else => false,
+        };
+        try report.add(.{ .path = path, .mode = .strict, .outcome = if (ok) .pass else .fail, .reason = if (ok) .none else .wrong_error });
+        return;
+    };
+    try report.add(classify(meta, result, .strict, path));
 }
 
 fn execOne(io: std.Io, arena: Allocator, opts: Options, prelude: []const u8, meta: md.Metadata, source: []const u8, path: []const u8, mode: Mode, report: *rep.Report) RunError!void {

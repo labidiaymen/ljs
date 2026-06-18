@@ -37,7 +37,8 @@ pub const TokenKind = enum {
     kw_case,
     kw_default,
     kw_with, // with (WithStatement, §14.11 — sloppy-only)
-    kw_import, // import (modules / dynamic ImportCall — unsupported, parse-rejected)
+    kw_import, // import (ImportDeclaration §16.2.2 / dynamic ImportCall §13.3.10)
+    kw_export, // export (ExportDeclaration §16.2.3 — module goal only)
     kw_class, // class (ClassDeclaration / ClassExpression, §15.7)
     kw_extends, // extends (ClassHeritage, §15.7)
     kw_super, // super (SuperCall / SuperProperty — unsupported, parse-rejected until Cycle 2)
@@ -375,6 +376,7 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, word, "default")) return .{ .kind = .kw_default, .lexeme = word };
             if (std.mem.eql(u8, word, "with")) return .{ .kind = .kw_with, .lexeme = word };
             if (std.mem.eql(u8, word, "import")) return .{ .kind = .kw_import, .lexeme = word };
+            if (std.mem.eql(u8, word, "export")) return .{ .kind = .kw_export, .lexeme = word };
             if (std.mem.eql(u8, word, "class")) return .{ .kind = .kw_class, .lexeme = word };
             if (std.mem.eql(u8, word, "extends")) return .{ .kind = .kw_extends, .lexeme = word };
             if (std.mem.eql(u8, word, "super")) return .{ .kind = .kw_super, .lexeme = word };

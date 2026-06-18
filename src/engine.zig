@@ -108,6 +108,117 @@ pub fn evaluate(arena: std.mem.Allocator, source: []const u8, mode: RunMode) err
     return evaluateWithLimit(arena, source, mode, default_step_limit);
 }
 
+const module_mod = @import("module.zig");
+
+/// §16.2.1.6 HostResolveImportedModule — the minimal harness loader interface. Given a referencing
+/// module's resolved key and a specifier, the host (the Test262 runner) returns the dependency's
+/// resolved key + source text by reading the sibling file from disk, or null if it can't be found.
+/// This is a TEST HARNESS hook, not a general Node host module system.
+pub const ModuleLoader = struct {
+    ctx: *anyopaque,
+    /// Resolve `specifier` relative to `referrer_key`; return the resolved key + source or null.
+    resolve: *const fn (ctx: *anyopaque, referrer_key: []const u8, specifier: []const u8) ?ResolvedSource,
+};
+
+pub const ResolvedSource = struct { key: []const u8, source: []const u8 };
+
+/// Parse + recursively load a module graph rooted at `root_key`/`root_source`, caching each module
+/// by resolved key (so a diamond / self-import is shared and a cycle terminates). Returns the root
+/// record, or a parse SyntaxError (the §16.2 parse goal) for any module that fails to parse.
+fn loadGraph(
+    arena: std.mem.Allocator,
+    loader: ModuleLoader,
+    cache: *std.StringHashMapUnmanaged(*module_mod.ModuleRecord),
+    root_key: []const u8,
+    root_source: []const u8,
+) error{ OutOfMemory, SyntaxError }!*module_mod.ModuleRecord {
+    if (cache.get(root_key)) |m| return m;
+    const program = Parser.parseModule(arena, root_source) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.SyntaxError,
+    };
+    const rec = arena.create(module_mod.ModuleRecord) catch return error.OutOfMemory;
+    rec.* = .{ .key = root_key, .program = program };
+    cache.put(arena, root_key, rec) catch return error.OutOfMemory;
+    var deps: std.ArrayListUnmanaged(*module_mod.ModuleRecord) = .empty;
+    for (program.requested_modules) |spec| {
+        const resolved = loader.resolve(loader.ctx, root_key, spec) orelse return error.SyntaxError;
+        const dep = try loadGraph(arena, loader, cache, resolved.key, resolved.source);
+        deps.append(arena, dep) catch return error.OutOfMemory;
+    }
+    rec.deps = deps.items;
+    return rec;
+}
+
+/// §16.2.1.6 Evaluate a `[module]` Test262 test: install the harness `prelude` (sta.js + assert.js +
+/// includes) as a SCRIPT in a fresh realm's global (so `assert`, `$DONOTEVALUATE`, … are globals),
+/// then parse + load + Link + Evaluate the module graph rooted at `root_source` (resolved key
+/// `root_key`), drain the Job queue (top-level await), and map the outcome. A parse-phase SyntaxError
+/// in ANY module → `.syntax_error`; an unresolved import / ambiguous export → a thrown SyntaxError
+/// (resolution phase). The realm + globals persist for the module env's parent chain.
+pub fn evaluateModule(
+    arena: std.mem.Allocator,
+    prelude: []const u8,
+    root_key: []const u8,
+    root_source: []const u8,
+    loader: ModuleLoader,
+    step_limit: u64,
+) error{OutOfMemory}!EvaluationResult {
+    const global = Environment.create(arena, null) catch return error.OutOfMemory;
+    builtins.setup(arena, global) catch return error.OutOfMemory;
+    var gen_registry: std.ArrayListUnmanaged(*@import("object.zig").Generator) = .empty;
+    var job_queue: std.ArrayListUnmanaged(@import("object.zig").Job) = .empty;
+    var interp = Interpreter{ .arena = arena, .step_limit = step_limit, .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
+    interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
+
+    // Run the harness prelude as a (sloppy) script in the global env to install harness globals.
+    if (prelude.len > 0) {
+        const pre = Parser.parseMode(arena, prelude, false) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .syntax_error = "harness prelude parse error" },
+        };
+        const pc = interp.run(pre, global) catch |e| {
+            interp.cleanupGenerators();
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.StepLimitExceeded => .step_limit,
+            };
+        };
+        if (pc == .throw) {
+            interp.cleanupGenerators();
+            return .{ .thrown = pc.throw };
+        }
+    }
+
+    var cache: std.StringHashMapUnmanaged(*module_mod.ModuleRecord) = .empty;
+    const root = loadGraph(arena, loader, &cache, root_key, root_source) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SyntaxError => return .{ .syntax_error = "module parse/resolve error" },
+    };
+
+    const completion = interp.runModule(root, global) catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
+    interp.drainJobs() catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
+    interp.cleanupGenerators();
+    return switch (completion) {
+        .normal => |v| .{ .normal = v },
+        .throw => |v| .{ .thrown = v },
+        .ret => |v| .{ .normal = v },
+        .brk, .cont => .{ .normal = .undefined },
+    };
+}
+
 /// Like `evaluate`, but with an explicit interpreter step cap (the watchdog, research D8).
 /// The Test262 harness uses this to bound runaway tests deterministically.
 pub fn evaluateWithLimit(arena: std.mem.Allocator, source: []const u8, mode: RunMode, step_limit: u64) error{OutOfMemory}!EvaluationResult {

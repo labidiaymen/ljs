@@ -29,6 +29,7 @@ const builtin_regexp = @import("builtin_regexp.zig");
 const builtins = @import("builtins.zig");
 const bigint = @import("bigint.zig");
 const Parser = @import("parser.zig").Parser;
+const module_mod = @import("module.zig");
 
 // ECMA-262 abstract operations live in abstract_ops.zig; alias them so call sites read naturally.
 const toNumber = ops.toNumber;
@@ -217,6 +218,202 @@ pub const Interpreter = struct {
     fn tick(self: *Interpreter) EvalError!void {
         self.steps += 1;
         if (self.steps > self.step_limit) return EvalError.StepLimitExceeded;
+    }
+
+    // ── §16.2.1.6 module linking & evaluation ────────────────────────────────
+
+    /// §16.2.1.6 Link + Evaluate a module graph rooted at `root` (whose `deps` were pre-resolved by
+    /// the loader). Returns the root body's Completion. A SyntaxError surfaced during linking (an
+    /// unresolvable / ambiguous import binding, §16.2.1.6.3 ResolveExport) is reported as an engine
+    /// `throw` of a SyntaxError so the runner classifies a `negative: { phase: resolution }` test.
+    pub fn runModule(self: *Interpreter, root: *module_mod.ModuleRecord, global: *Environment) EvalError!Completion {
+        self.strict = true;
+        // §9.4.1 module top-level `this` is undefined.
+        self.this_val = .undefined;
+        try self.linkModule(root, global);
+        const lc = try self.instantiateModule(root);
+        if (lc.isAbrupt()) return lc;
+        return self.evaluateModule(root);
+    }
+
+    /// §16.2.1.6.2 InnerModuleLinking — create each module's environment and hoist its top-level
+    /// declarations (depth-first over dependencies, once per module). Import bindings are created in a
+    /// SECOND pass (`instantiateModule`) once every module's environment exists.
+    fn linkModule(self: *Interpreter, m: *module_mod.ModuleRecord, global: *Environment) EvalError!void {
+        if (m.status != .unlinked) return;
+        m.status = .linking;
+        for (m.deps) |dep| try self.linkModule(dep, global);
+        const env = Environment.create(self.arena, global) catch return error.OutOfMemory;
+        env.is_var_scope = true; // a Module Environment Record is a var scope (hoist target).
+        m.env = env;
+        // §16.2.1.6.4 InitializeEnvironment (declaration step): hoist top-level lexical + var +
+        // function/class names as TDZ bindings (functions are instantiated when the body runs).
+        try self.hoistLexicalNames(m.program.statements, env);
+        try self.hoistVarNames(m.program.statements, env);
+        m.status = .linked;
+    }
+
+    /// §16.2.1.6.4 InitializeEnvironment (import step) — CreateImportBinding for each ImportEntry,
+    /// resolving the imported name in the (already-linked) source module. A namespace import binds the
+    /// source module's namespace object. Recurses over dependencies once (idempotent via status).
+    fn instantiateModule(self: *Interpreter, m: *module_mod.ModuleRecord) EvalError!Completion {
+        if (m.status == .evaluating or m.status == .evaluated or m.status == .unlinked) return .{ .normal = .undefined };
+        if (m.status == .linking) return .{ .normal = .undefined };
+        // Use `evaluating` transiently as an "imports-bound" guard to avoid re-entry on cycles.
+        m.status = .evaluating;
+        for (m.deps) |dep| {
+            const c = try self.instantiateModule(dep);
+            if (c.isAbrupt()) {
+                m.status = .linked;
+                return c;
+            }
+        }
+        const env = m.env.?;
+        for (m.program.import_entries) |ie| {
+            const src = m.depFor(ie.module_request) orelse {
+                m.status = .linked;
+                return self.throwError("SyntaxError", "unresolved module specifier");
+            };
+            if (std.mem.eql(u8, ie.import_name, "*")) {
+                const ns = try self.moduleNamespace(src);
+                env.declare(ie.local_name, .{ .object = ns }, false, true) catch return error.OutOfMemory;
+            } else {
+                // §16.2.1.6.3 ResolveExport: find the (module, local) the imported name denotes.
+                const rb = self.resolveExportBinding(src, ie.import_name) orelse {
+                    m.status = .linked;
+                    return self.throwError("SyntaxError", "the requested module does not provide an export");
+                };
+                const senv = rb.module.env orelse {
+                    m.status = .linked;
+                    return self.throwError("SyntaxError", "unresolved import");
+                };
+                env.declareImport(ie.local_name, senv, rb.local) catch return error.OutOfMemory;
+            }
+        }
+        m.status = .linked;
+        return .{ .normal = .undefined };
+    }
+
+    /// §16.2.1.6.3 ResolveExport result — the resolved binding's owning module + LOCAL name. For a
+    /// local export this is `(m, local)`; an indirect/star re-export hops to the defining module.
+    const ResolvedBinding = struct { module: *const module_mod.ModuleRecord, local: []const u8 };
+
+    /// One entry of the §16.2.1.6.3 resolveSet (a (module, exportName) pair already in flight) used to
+    /// break circular indirect/star re-export chains.
+    const ResolveVisit = struct { module: *const module_mod.ModuleRecord, name: []const u8 };
+
+    /// §16.2.1.6.3 ResolveExport — find the module + LOCAL binding name that an exported `name`
+    /// resolves to, following indirect (`export {a} from "m"`) and star (`export * from "m"`)
+    /// re-exports. A `resolveSet` breaks circular requests (a cyclic indirect re-export resolves to
+    /// null, not an infinite loop). Returns null if the name is not resolvable (or is ambiguous).
+    fn resolveExport(m: *const module_mod.ModuleRecord, name: []const u8, visited: *std.ArrayListUnmanaged(ResolveVisit), a: std.mem.Allocator) ?ResolvedBinding {
+        // §16.2.1.6.3 step 1: if (module, name) is already in the resolveSet, this is a circular
+        // request → return null (the caller treats it as "not provided here").
+        for (visited.items) |v| {
+            if (v.module == m and std.mem.eql(u8, v.name, name)) return null;
+        }
+        visited.append(a, .{ .module = m, .name = name }) catch return null;
+        // Direct local / indirect named exports.
+        for (m.program.export_entries) |e| {
+            const en = e.export_name orelse continue;
+            if (!std.mem.eql(u8, en, name)) continue;
+            if (e.module_request) |req| {
+                const dep = m.depFor(req) orelse return null;
+                const inner = e.import_name orelse return null;
+                return resolveExport(dep, inner, visited, a);
+            }
+            return .{ .module = m, .local = e.local_name orelse en };
+        }
+        // §16.2.1.6.3 star re-exports: search each `export * from "m"` for the name. The first
+        // resolution wins (ambiguity across stars is not distinguished in this minimal resolver).
+        for (m.program.export_entries) |e| {
+            if (e.export_name != null) continue;
+            const star = e.import_name orelse continue;
+            if (!std.mem.eql(u8, star, "*")) continue;
+            const req = e.module_request orelse continue;
+            const dep = m.depFor(req) orelse continue;
+            if (resolveExport(dep, name, visited, a)) |r| return r;
+        }
+        return null;
+    }
+
+    /// Resolve an exported `name` to the (module, local) binding it denotes — a thin wrapper over
+    /// `resolveExport` that owns the resolveSet. Used by import binding instantiation and namespaces.
+    fn resolveExportBinding(self: *Interpreter, m: *const module_mod.ModuleRecord, name: []const u8) ?ResolvedBinding {
+        var visited: std.ArrayListUnmanaged(ResolveVisit) = .empty;
+        return resolveExport(m, name, &visited, self.arena);
+    }
+
+    /// §16.2.1.6 InnerModuleEvaluation — evaluate dependencies first (once), then this module's body
+    /// in its environment with `this` = undefined, strict. Idempotent (a module evaluates once).
+    fn evaluateModule(self: *Interpreter, m: *module_mod.ModuleRecord) EvalError!Completion {
+        if (m.status == .evaluated or m.status == .evaluating) return .{ .normal = .undefined };
+        m.status = .evaluating;
+        for (m.deps) |dep| {
+            const c = try self.evaluateModule(dep);
+            if (c.isAbrupt()) {
+                m.status = .evaluated;
+                return c;
+            }
+        }
+        const env = m.env.?;
+        const saved_this = self.this_val;
+        const saved_strict = self.strict;
+        self.this_val = .undefined;
+        self.strict = true;
+        defer self.this_val = saved_this;
+        defer self.strict = saved_strict;
+        var last: Completion = .{ .normal = .undefined };
+        for (m.program.statements) |stmt| {
+            last = try self.evalStmt(stmt, env);
+            if (last.isAbrupt()) {
+                m.status = .evaluated;
+                return last;
+            }
+        }
+        m.status = .evaluated;
+        // After evaluation, refresh any namespace object already built for this module so its
+        // snapshot reflects the final export values.
+        if (m.namespace != null) try self.populateNamespace(m, m.namespace.?);
+        return last;
+    }
+
+    /// §10.4.6 build (and cache) the module namespace exotic object for `m`. Properties are the
+    /// module's exported names, reading the current binding values (snapshot refreshed post-eval).
+    fn moduleNamespace(self: *Interpreter, m: *module_mod.ModuleRecord) EvalError!*Object {
+        if (m.namespace) |ns| return ns;
+        const ns = Object.create(self.arena, null) catch return error.OutOfMemory;
+        m.namespace = ns;
+        try self.populateNamespace(m, ns);
+        return ns;
+    }
+
+    /// Fill a namespace object with the module's exported names → current values. Local exports read
+    /// the module env; `export * as ns` / re-exports resolve through the source module.
+    fn populateNamespace(self: *Interpreter, m: *module_mod.ModuleRecord, ns: *Object) EvalError!void {
+        for (m.program.export_entries) |e| {
+            const name = e.export_name orelse continue;
+            if (std.mem.eql(u8, name, "default") == false and e.import_name != null and std.mem.eql(u8, e.import_name.?, "*")) {
+                // `export * as sub from "m"` — value is the sub-module's namespace object.
+                const req = e.module_request orelse continue;
+                const dep = m.depFor(req) orelse continue;
+                const sub = try self.moduleNamespace(dep);
+                ns.defineData(name, .{ .object = sub }, true, true, false) catch return error.OutOfMemory;
+                continue;
+            }
+            const rb = self.resolveExportBinding(m, name) orelse continue;
+            const val = lookupModuleExport(rb.module, rb.local);
+            ns.defineData(name, val, true, true, false) catch return error.OutOfMemory;
+        }
+    }
+
+    /// Read the current value of a module's local binding (following an import alias), or undefined.
+    fn lookupModuleExport(m: *const module_mod.ModuleRecord, local: []const u8) Value {
+        const env = m.env orelse return .undefined;
+        const raw = env.lookupLocal(local) orelse return .undefined;
+        const b = Environment.resolveAlias(raw) orelse return .undefined;
+        if (!b.initialized) return .undefined;
+        return b.value;
     }
 
     // ── statements ──────────────────────────────────────────────────────────
@@ -1062,7 +1259,9 @@ pub const Interpreter = struct {
                     },
                     .unresolved => return self.throwError("ReferenceError", name),
                 };
-                const b = env.lookup(name) orelse return self.throwError("ReferenceError", name);
+                const raw = env.lookup(name) orelse return self.throwError("ReferenceError", name);
+                // §16.2.1.6 resolve an import alias through to the exporting module's live binding cell.
+                const b = Environment.resolveAlias(raw) orelse return self.throwError("ReferenceError", name);
                 if (!b.initialized) return self.throwError("ReferenceError", name); // TDZ (staged; see declaration note)
                 return .{ .normal = b.value };
             },
@@ -1243,6 +1442,8 @@ pub const Interpreter = struct {
                 switch (u.target.*) {
                     .identifier => |name| {
                         const b = env.lookup(name) orelse return self.throwError("ReferenceError", name);
+                        // §16.2.1.6: an import binding is immutable — `++`/`--` on it is a TypeError.
+                        if (b.alias != null) return self.throwError("TypeError", "Assignment to constant variable.");
                         if (!b.initialized) return self.throwError("ReferenceError", name); // §13.4 TDZ on the GetValue
                         const oldc = try self.toNumberV(b.value);
                         if (oldc.isAbrupt()) return oldc;

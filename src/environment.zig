@@ -8,7 +8,15 @@ pub const Binding = struct {
     value: Value,
     mutable: bool,
     initialized: bool,
+    /// §16.2.1.6 CreateImportBinding — an immutable INDIRECT binding. When non-null this binding is an
+    /// import alias: reads/writes resolve through to `(alias.env, alias.name)` — the exporting module's
+    /// binding cell — so the import reflects the live state of the export (TDZ before init, current
+    /// value after). Resolved by name+env (not a raw `*Binding`) so a rehash of the source map can't
+    /// dangle the alias. Null for every ordinary binding (the hot declarative path is unchanged).
+    alias: ?ImportAlias = null,
 };
+
+pub const ImportAlias = struct { env: *Environment, name: []const u8 };
 
 pub const Environment = struct {
     arena: std.mem.Allocator,
@@ -43,6 +51,26 @@ pub const Environment = struct {
 
     pub fn declare(self: *Environment, name: []const u8, value: Value, mutable: bool, initialized: bool) std.mem.Allocator.Error!void {
         try self.vars.put(self.arena, name, .{ .value = value, .mutable = mutable, .initialized = initialized });
+    }
+
+    /// §16.2.1.6 CreateImportBinding — declare `local` as an immutable indirect binding aliasing
+    /// `(source_env, source_name)` (the exporting module's binding). Reads/writes of `local` resolve
+    /// through to the source cell, so the import is live.
+    pub fn declareImport(self: *Environment, local: []const u8, source_env: *Environment, source_name: []const u8) std.mem.Allocator.Error!void {
+        try self.vars.put(self.arena, local, .{ .value = .undefined, .mutable = false, .initialized = true, .alias = .{ .env = source_env, .name = source_name } });
+    }
+
+    /// Follow an import alias chain to the underlying binding cell (the exporting module's binding).
+    /// A plain (non-alias) binding is returned as-is. Bounded chain walk (re-exports may alias once).
+    pub fn resolveAlias(b: *Binding) ?*Binding {
+        var cur = b;
+        var guard: u32 = 0;
+        while (cur.alias) |a| {
+            guard += 1;
+            if (guard > 64) return null; // cyclic / runaway alias chain
+            cur = a.env.vars.getPtr(a.name) orelse return null;
+        }
+        return cur;
     }
 
     /// Resolve `name` in THIS scope only (no parent walk) — used to detect whether a binding is
