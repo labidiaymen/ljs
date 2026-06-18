@@ -614,6 +614,7 @@ pub const Interpreter = struct {
                 try setFunctionLength(obj, paramCount(f.params));
                 try self.setFunctionName(obj, f.name orelse "", "");
                 try setConstructorBackref(obj); // §10.2.4 MakeConstructor: F.prototype.constructor === F
+                try self.finalizeFunctionPrototype(obj); // §10.2.4/§27.5.1 prototype descriptor + proto link
                 if (f.name) |name| try env.declare(name, .{ .object = obj }, true, true);
                 return .{ .normal = .undefined };
             },
@@ -2916,6 +2917,28 @@ pub const Interpreter = struct {
         try pv.object.defineData("constructor", .{ .object = obj }, true, false, true);
     }
 
+    /// §10.2.4 / §27.5.1 — fix up a function object's own `prototype` property metadata after
+    /// `createFunction` installed it with default `set` semantics:
+    ///   • An ordinary function's `.prototype` is `{ writable:true, enumerable:false, configurable:true }`.
+    ///   • A generator/async-generator function's `.prototype` is `{ writable:true, enumerable:false,
+    ///     configurable:FALSE }` (§27.3.3/§27.4) and its [[Prototype]] is %GeneratorPrototype% /
+    ///     %AsyncGeneratorPrototype% (so `Object.getPrototypeOf(g.prototype) === %GeneratorPrototype%`,
+    ///     and a generator instance — proto-linked to `g.prototype` — inherits `.next`/`.return`/`.throw`).
+    /// No-op for functions without an own `.prototype` (arrows, async non-generators, methods).
+    fn finalizeFunctionPrototype(self: *Interpreter, obj: *Object) std.mem.Allocator.Error!void {
+        const fd = obj.call orelse return;
+        const pv = obj.get("prototype") orelse return;
+        if (pv != .object) return;
+        if (fd.is_generator) {
+            // The generator-instance prototype carries no `constructor` and is non-configurable.
+            pv.object.prototype = if (fd.is_async) self.asyncGeneratorProto() else self.generatorProto();
+            try obj.defineData("prototype", pv, true, false, false);
+        } else {
+            // §10.2.4: an ordinary constructor's `.prototype` is non-enumerable + configurable.
+            try obj.defineData("prototype", pv, true, false, true);
+        }
+    }
+
     /// §20.2.4.2 / §10.2.9 SetFunctionName — install the `name` own data property `{ writable:false,
     /// enumerable:false, configurable:true }`. `prefix` (when non-empty) is space-joined ahead of the
     /// name ("get"/"set"/"bound"). Names are interned in the realm arena so they outlive the call.
@@ -2987,6 +3010,7 @@ pub const Interpreter = struct {
         try setFunctionLength(obj, paramCount(f.params));
         try self.setFunctionName(obj, f.name orelse "", "");
         try setConstructorBackref(obj); // §10.2.4 MakeConstructor: F.prototype.constructor === F (no-op for arrows)
+        try self.finalizeFunctionPrototype(obj); // §10.2.4/§27.5.1 prototype descriptor + proto link
         // §15.2.5 step 4: initialize the immutable self-name binding to the created function object.
         if (has_self_name) try closure_env.declare(f.name.?, .{ .object = obj }, false, true);
         return .{ .normal = .{ .object = obj } };
@@ -4863,7 +4887,14 @@ pub const Interpreter = struct {
         gen.call_env = try self.instantiateGeneratorParams(gen, &abrupt);
         if (abrupt) |c| return c;
         if (self.gen_registry) |reg| try reg.append(self.arena, gen);
-        const obj = try Object.create(self.arena, self.generatorProto());
+        // §27.5.1.1 OrdinaryCreateFromConstructor(func, "%GeneratorPrototype%"): the new generator's
+        // [[Prototype]] is `Get(func, "prototype")` when that is an object, else the realm
+        // %GeneratorPrototype% intrinsic (so `Object.getPrototypeOf(g()) === g.prototype`).
+        const inst_proto: ?*Object = blk: {
+            if (func.get("prototype")) |pv| if (pv == .object) break :blk pv.object;
+            break :blk self.generatorProto();
+        };
+        const obj = try Object.create(self.arena, inst_proto);
         obj.generator = gen;
         return .{ .normal = .{ .object = obj } };
     }
@@ -5011,6 +5042,14 @@ pub const Interpreter = struct {
         const args = gen.args;
         const call_env = try Environment.create(self.arena, fd.closure);
         call_env.is_var_scope = true; // §10.2.11: a generator/async FunctionBody is a VariableEnvironment
+        // §10.2.11 step 19/22: the `arguments` exotic is created and bound BEFORE parameter
+        // initialization, so a default-parameter initializer (`g(x = arguments[0])`) sees it. It is
+        // suppressed only when a PARAMETER is literally named `arguments` (§10.2.11 step 17.a — that
+        // binding shadows). Arrows inherit `arguments` lexically (handled at call sites, not here).
+        if (!paramsBindName(fd, "arguments")) {
+            const ao = try self.makeArgumentsObject(args, gen.func, call_env, fd);
+            try call_env.declare("arguments", .{ .object = ao }, true, true);
+        }
         for (fd.params, 0..) |param, i| {
             var v: Value = if (i < args.len) args[i] else .undefined;
             var defaulted = false;
@@ -5052,11 +5091,21 @@ pub const Interpreter = struct {
                 }
             }
         }
-        if (call_env.lookupLocal("arguments") == null) {
-            const ao = try self.makeArgumentsObject(args, gen.func, call_env, fd);
-            try call_env.declare("arguments", .{ .object = ao }, true, true);
-        }
         return call_env;
+    }
+
+    /// §10.2.11: does the function's BoundNames of FormalParameters contain `name`? Used to suppress
+    /// the implicit `arguments` exotic when a parameter literally binds `arguments`. Covers the simple
+    /// `SingleNameBinding` and rest-identifier forms (a destructuring pattern binding the name is a
+    /// vanishingly rare edge not exercised by the conformance corpus).
+    fn paramsBindName(fd: object_mod.FunctionData, name: []const u8) bool {
+        for (fd.params) |param| {
+            if (param.pattern.* == .identifier and std.mem.eql(u8, param.pattern.identifier, name)) return true;
+        }
+        if (fd.rest) |rest_pat| {
+            if (rest_pat.* == .identifier and std.mem.eql(u8, rest_pat.identifier, name)) return true;
+        }
+        return false;
     }
 
     fn runGeneratorBody(self: *Interpreter, gen: *object_mod.Generator) EvalError!Completion {
@@ -5867,7 +5916,14 @@ pub const Interpreter = struct {
         ag.* = .{ .gen = gen };
         gen.async_gen = ag;
         if (self.gen_registry) |reg| try reg.append(self.arena, gen);
-        const obj = try Object.create(self.arena, self.asyncGeneratorProto());
+        // §27.6.1.1 OrdinaryCreateFromConstructor(func, "%AsyncGeneratorPrototype%"): the new
+        // async-generator's [[Prototype]] is `Get(func, "prototype")` when that is an object, else the
+        // realm %AsyncGeneratorPrototype% intrinsic.
+        const inst_proto: ?*Object = blk: {
+            if (func.get("prototype")) |pv| if (pv == .object) break :blk pv.object;
+            break :blk self.asyncGeneratorProto();
+        };
+        const obj = try Object.create(self.arena, inst_proto);
         obj.async_generator = ag;
         return .{ .normal = .{ .object = obj } };
     }
@@ -6400,6 +6456,13 @@ pub const Interpreter = struct {
         if (arg != .undefined and toBoolean(arg)) {
             sink.failed = true;
             sink.message = self.toString(arg) catch "async test failed";
+            if (arg == .object) {
+                const nm = arg.object.get("name");
+                const ms = arg.object.get("message");
+                if (nm != null and nm.? == .string and ms != null and ms.? == .string) {
+                    sink.message = std.fmt.allocPrint(self.arena, "{s}: {s}", .{ nm.?.string, ms.?.string }) catch sink.message;
+                }
+            }
         }
         return .{ .normal = .undefined };
     }
