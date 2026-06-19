@@ -190,12 +190,14 @@ pub fn getProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!C
             if (o.kind == .array) {
                 if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(o.arrayLen()) } };
                 if (parseIndex(key)) |i| {
-                    // §10.4.2.4: a present own index returns its value; a HOLE (absent own index) is
-                    // NOT undefined — it falls through to the prototype chain (so an inherited
-                    // `Array.prototype[i]` is observed). Only a truly absent-everywhere index is undefined.
+                    // §10.4.2.4: a present own dense index returns its value. Otherwise fall through to
+                    // the ordinary [[Get]] below, which (a) reads a non-default-attribute index demoted
+                    // into the property map by `Object.defineProperty` (honoring its descriptor), or
+                    // (b) for a true hole, walks the PROTOTYPE CHAIN so an inherited `Array.prototype[i]`
+                    // is observed. A truly absent-everywhere index ends up undefined via that chain.
                     if (o.arrayHas(i)) return .{ .normal = o.arrayGet(i) };
                 }
-                // else fall through to the prototype chain (Array.prototype methods)
+                // a non-index key falls through to the prototype chain (Array.prototype methods)
             }
             // §10.4.5.4: a TypedArray integer-indexed [[Get]] — a CanonicalNumericIndexString key is
             // handled entirely here (in-bounds → element, OOB/invalid/detached → undefined) and NEVER
@@ -358,9 +360,12 @@ pub fn setProperty(self: *Interpreter, base: Value, key: []const u8, value: Valu
             }
             if (o.kind == .array) {
                 if (std.mem.eql(u8, key, "length")) {
-                    // §23.1.4.1 ArraySetLength — ToUint32; a non-integral / >2^32-1 value is a
-                    // RangeError. No eager fill on a length increase (sparse): just record it.
-                    const n = toNumber(value);
+                    // §23.1.4.1 ArraySetLength — ToNumber(value) (observable; ToPrimitive may run
+                    // valueOf/toString), then ToUint32; a non-integral / >2^32-1 value is a RangeError.
+                    // No eager fill on a length increase (sparse): just record it.
+                    const nc = try self.toNumberV(value);
+                    if (nc.isAbrupt()) return nc;
+                    const n = toNumber(nc.normal);
                     if (std.math.isNan(n) or n < 0 or n > 4294967295.0 or n != @floor(n)) {
                         return self.throwError("RangeError", "Invalid array length");
                     }
@@ -376,20 +381,26 @@ pub fn setProperty(self: *Interpreter, base: Value, key: []const u8, value: Valu
                     return .{ .normal = value };
                 }
                 if (parseIndex(key)) |i| {
-                    // Hot path: an extensible, non-frozen array takes the raw dense/sparse set.
-                    if (o.extensible and !o.array_frozen) {
+                    // A non-default-attribute index that was demoted to the ordinary property map is
+                    // NOT in the dense store — its writability/accessor semantics live in the map, so
+                    // fall through to OrdinarySetWithOwnDescriptor below rather than the dense fast path.
+                    if (!o.arrayHas(i) and o.properties.get(key) != null) {
+                        // fall through to the §10.1.9.2 ordinary set path
+                    } else if (o.extensible and !o.array_frozen) {
+                        // Hot path: an extensible, non-frozen array takes the raw dense/sparse set.
+                        try o.arraySet(o.arena, i, value);
+                        return .{ .normal = value };
+                    } else {
+                        // §10.1.9.2: a frozen array rejects any element write; a non-extensible array
+                        // rejects a NEW index (an existing index of a sealed array stays writable).
+                        const reject = o.array_frozen or !o.arrayHas(i);
+                        if (reject) {
+                            if (self.strict) return self.throwError("TypeError", "Cannot add/modify property on a non-extensible array");
+                            return .{ .normal = value };
+                        }
                         try o.arraySet(o.arena, i, value);
                         return .{ .normal = value };
                     }
-                    // §10.1.9.2: a frozen array rejects any element write; a non-extensible array
-                    // rejects a NEW index (an existing index of a sealed array stays writable).
-                    const reject = o.array_frozen or !o.arrayHas(i);
-                    if (reject) {
-                        if (self.strict) return self.throwError("TypeError", "Cannot add/modify property on a non-extensible array");
-                        return .{ .normal = value };
-                    }
-                    try o.arraySet(o.arena, i, value);
-                    return .{ .normal = value };
                 }
             }
             // §10.4.5.5: a TypedArray integer-indexed [[Set]] — a CanonicalNumericIndexString key is
@@ -435,6 +446,13 @@ pub fn setProperty(self: *Interpreter, base: Value, key: []const u8, value: Valu
                     if (!c.normal.boolean and self.strict) return self.throwError("TypeError", "proxy [[Set]] returned false");
                     return .{ .normal = value };
                 }
+            }
+            // §10.1.9.2 → §10.1.6.3: creating a NEW own property on a non-extensible object is
+            // rejected ([[Set]] returns false → throw in strict). An EXISTING own (writable) property
+            // is still overwritten. Array indices are handled by the dense path above.
+            if (!o.extensible and o.kind != .array and o.properties.get(key) == null) {
+                if (self.strict) return self.throwError("TypeError", "Cannot add property, object is not extensible");
+                return .{ .normal = value };
             }
             // §10.4.4.4: writing a MAPPED arguments index also writes the live parameter binding
             // (and vice-versa — keeping `arguments[i]` and the parameter in sync).
@@ -553,9 +571,18 @@ pub fn setSymbolProperty(self: *Interpreter, base: Value, key: *Symbol, value: V
             }
             if (o.getSymbolProp(key)) |loc| {
                 if (loc.pv.payload == .accessor) {
-                    const setter = loc.pv.payload.accessor.set orelse return .{ .normal = value };
+                    const setter = loc.pv.payload.accessor.set orelse {
+                        // §10.1.9.2: a getter-only accessor → [[Set]] returns false (throw in strict).
+                        if (self.strict) return self.throwError("TypeError", "Cannot set property that has only a getter");
+                        return .{ .normal = value };
+                    };
                     const sc = try self.callFunction(setter, &.{value}, base);
                     if (sc.isAbrupt()) return sc;
+                    return .{ .normal = value };
+                }
+                // §10.1.9.2: a non-writable data property (own or inherited) → [[Set]] returns false.
+                if (!loc.pv.writable) {
+                    if (self.strict) return self.throwError("TypeError", "Cannot assign to read only property");
                     return .{ .normal = value };
                 }
             }
@@ -564,6 +591,12 @@ pub fn setSymbolProperty(self: *Interpreter, base: Value, key: *Symbol, value: V
                     const c = try builtin_proxy.set(self, pp, .{ .symbol = key }, value, base);
                     if (c.isAbrupt()) return c;
                     if (!c.normal.boolean and self.strict) return self.throwError("TypeError", "proxy [[Set]] returned false");
+                    return .{ .normal = value };
+                }
+                // §10.1.9.2 → §10.1.6.3: creating a NEW own symbol property on a non-extensible
+                // object is rejected ([[Set]] returns false → throw in strict).
+                if (!o.extensible) {
+                    if (self.strict) return self.throwError("TypeError", "Cannot add property, object is not extensible");
                     return .{ .normal = value };
                 }
             }
@@ -584,12 +617,20 @@ pub fn deleteProperty(self: *Interpreter, base: Value, key: []const u8) EvalErro
             if (o.proxy) |pd| return builtin_proxy.deleteProperty(self, pd, .{ .string = key }); // §10.5.10 [[Delete]]
             if (o.kind == .array) {
                 if (parseIndex(key)) |i| {
-                    // §10.4.2.1: delete an index → a true hole (dense slot recorded in `holes`,
+                    // A non-default-attribute index lives in the property map; honor its
+                    // [[Configurable]] (a frozen/sealed or explicit non-configurable index can't be
+                    // deleted → false, no removal). §10.1.10.1.
+                    if (o.properties.get(key)) |pv| {
+                        if (!pv.configurable) return .{ .normal = .{ .boolean = false } };
+                        _ = o.properties.orderedRemove(key);
+                        try o.arrayDelete(i);
+                        return .{ .normal = .{ .boolean = true } };
+                    }
+                    // §10.4.2.1: a frozen array's dense indices are non-configurable → undeletable.
+                    if (o.array_frozen and o.arrayHas(i)) return .{ .normal = .{ .boolean = false } };
+                    // delete a dense/sparse index → a true hole (dense slot recorded in `holes`,
                     // sparse entry removed). The slot reads `undefined` and is absent thereafter.
                     try o.arrayDelete(i);
-                    // Drop any stale string-keyed entry for this index left by a generic
-                    // `Object.defineProperty(arr, i, …)` so the index is no longer an own property.
-                    if (o.properties.count() != 0) _ = o.properties.orderedRemove(key);
                     return .{ .normal = .{ .boolean = true } };
                 }
             }

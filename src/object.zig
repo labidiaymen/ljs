@@ -596,7 +596,10 @@ pub const Object = struct {
         obj.native = id;
         obj.native_name = name;
         const proto = try create(arena, null);
-        try obj.set("prototype", .{ .object = proto });
+        // §20 a built-in CONSTRUCTOR's `.prototype` is a non-writable, non-enumerable, non-configurable
+        // own data property (e.g. `Object.prototype` / `Array.prototype`). (Built-in METHODS created via
+        // this path drop `prototype` separately; ordinary user functions take the writable-prototype path.)
+        try obj.defineData("prototype", .{ .object = proto }, false, false, false);
         // §20.2.4.1: a built-in function's `length` own property (the count of expected arguments) —
         // non-enumerable, non-writable, configurable. Defined BEFORE `name` so OrdinaryOwnPropertyKeys
         // lists `length` first (matching the spec's property order). `null` ⇒ unknown native ⇒ omit it
@@ -959,6 +962,7 @@ pub const Object = struct {
         self.extensible = false;
         var it = self.properties.iterator();
         while (it.next()) |entry| entry.value_ptr.configurable = false;
+        for (self.symbol_props.items) |*sp| sp.pv.configurable = false;
     }
 
     /// §7.3.16 SetIntegrityLevel("frozen") — clear [[Extensible]], make every own property
@@ -975,6 +979,10 @@ pub const Object = struct {
         while (it.next()) |entry| {
             entry.value_ptr.configurable = false;
             if (entry.value_ptr.payload == .data) entry.value_ptr.writable = false;
+        }
+        for (self.symbol_props.items) |*sp| {
+            sp.pv.configurable = false;
+            if (sp.pv.payload == .data) sp.pv.writable = false;
         }
     }
 
@@ -994,6 +1002,10 @@ pub const Object = struct {
             if (entry.value_ptr.configurable) return false;
             if (entry.value_ptr.payload == .data and entry.value_ptr.writable) return false;
         }
+        for (self.symbol_props.items) |sp| {
+            if (sp.pv.configurable) return false;
+            if (sp.pv.payload == .data and sp.pv.writable) return false;
+        }
         return true;
     }
 
@@ -1004,6 +1016,7 @@ pub const Object = struct {
         if (self.extensible) return false;
         var it = self.properties.iterator();
         while (it.next()) |entry| if (entry.value_ptr.configurable) return false;
+        for (self.symbol_props.items) |sp| if (sp.pv.configurable) return false;
         return true;
     }
 
@@ -1046,15 +1059,20 @@ pub const Object = struct {
     }
 };
 
-/// A loose value equality for the non-configurable redefinition guard (§10.1.6.3): primitives compare
-/// by value, objects by identity. This is simpler than §7.2.11 SameValue (NaN/±0 corner cases) but
-/// sufficient for the basic "redefine a frozen prop to its current value is allowed" check.
+/// §7.2.11 SameValue — used by §10.1.6.3 ValidateAndApplyPropertyDescriptor to decide whether a
+/// value re-write on a non-writable, non-configurable data property is allowed (only an IDENTICAL
+/// value is). SameValue distinguishes +0 from -0 and treats NaN as equal to NaN; primitives compare
+/// by value, objects by identity.
 fn sameValueLoose(a: Value, b: Value) bool {
     return switch (a) {
         .undefined => b == .undefined,
         .null => b == .null,
         .boolean => |x| b == .boolean and b.boolean == x,
-        .number => |x| b == .number and (x == b.number or (std.math.isNan(x) and std.math.isNan(b.number))),
+        .number => |x| b == .number and blk: {
+            if (std.math.isNan(x) and std.math.isNan(b.number)) break :blk true;
+            if (x == 0 and b.number == 0) break :blk std.math.signbit(x) == std.math.signbit(b.number); // +0 ≠ -0
+            break :blk x == b.number;
+        },
         .string => |x| b == .string and std.mem.eql(u8, x, b.string),
         .bigint => |x| b == .bigint and x.eql(b.bigint.*),
         .symbol => |x| b == .symbol and b.symbol == x,

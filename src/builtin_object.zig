@@ -98,13 +98,44 @@ pub fn arrayDefineLength(it: *Interpreter, arr: *Object, d: object_mod.Descripto
     if (d.configurable) |c| if (c) return it.throwError("TypeError", "Cannot make array length configurable");
     // A length value change is gated by the CURRENT writability.
     if (d.has_value) {
-        const n = toNumber(d.value.?);
+        // §10.4.2.4 step 3: numberLen = ToNumber(Value) — observably (ToPrimitive may run valueOf /
+        // toString and throw); step 2: newLen = ToUint32(Value); step 4: RangeError if newLen != numberLen.
+        const nc = try it.toNumberV(d.value.?);
+        if (nc.isAbrupt()) return nc;
+        const n = toNumber(nc.normal);
         if (std.math.isNan(n) or n < 0 or n > 4294967295.0 or n != @floor(n)) {
             return it.throwError("RangeError", "Invalid array length");
         }
         const new_len: usize = @intFromFloat(n);
         if (new_len != arr.arrayLen() and !arr.array_length_writable) {
             return it.throwError("TypeError", "Cannot assign to read only property 'length'");
+        }
+        // §10.4.2.4 steps 15-17: a SHRINK deletes indices from oldLen-1 down to newLen. A dense /
+        // sparse index is configurable (deletable); a non-configurable index lives in the ordinary
+        // property map. If such an index is encountered, the truncation stops just above it (length =
+        // idx+1) and DefineOwnProperty fails (TypeError). Find the largest blocking index in [newLen, oldLen).
+        if (new_len < arr.arrayLen()) {
+            var blocker: ?usize = null;
+            var pit = arr.properties.iterator();
+            while (pit.next()) |entry| {
+                if (arrayIndex(entry.key_ptr.*)) |idx| {
+                    if (idx >= new_len and !entry.value_ptr.configurable) {
+                        if (blocker == null or idx > blocker.?) blocker = idx;
+                    }
+                }
+            }
+            if (blocker) |idx| {
+                // Delete every (deletable) index strictly above the blocker, then stop and fail.
+                try shrinkDeletingMapIndices(arr, idx + 1);
+                try arr.arraySetLen(idx + 1);
+                // §10.4.2.4 step 17.d.iii: still apply a present, FALSE writable before failing.
+                if (d.writable) |w| if (!w) {
+                    arr.array_length_writable = false;
+                };
+                return it.throwError("TypeError", "Cannot shrink array length past a non-configurable index");
+            }
+            // No blocker: drop any map-stored indices >= newLen too (they are configurable here).
+            try shrinkDeletingMapIndices(arr, new_len);
         }
         try arr.arraySetLen(new_len);
     }
@@ -114,6 +145,20 @@ pub fn arrayDefineLength(it: *Interpreter, arr: *Object, d: object_mod.Descripto
         arr.array_length_writable = w;
     }
     return .{ .normal = .undefined };
+}
+
+/// Remove every map-stored array index `>= floor` from the ordinary property map (used by the
+/// ArraySetLength shrink to delete configurable map-backed indices above the truncation point).
+fn shrinkDeletingMapIndices(arr: *Object, floor: usize) std.mem.Allocator.Error!void {
+    var to_remove: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer to_remove.deinit(arr.arena);
+    var pit = arr.properties.iterator();
+    while (pit.next()) |entry| {
+        if (arrayIndex(entry.key_ptr.*)) |idx| {
+            if (idx >= floor) try to_remove.append(arr.arena, entry.key_ptr.*);
+        }
+    }
+    for (to_remove.items) |k| _ = arr.properties.orderedRemove(k);
 }
 
 /// §10.4.2 IsArrayIndex — a canonical numeric string key `< 2^32-1`. Stricter than `parseIndex`:
@@ -185,11 +230,15 @@ pub fn arrayDefineIndex(it: *Interpreter, arr: *Object, i: usize, key: []const u
 
     // §6.2.6.1 representable by the dense element store iff a data descriptor whose (merged) attributes
     // are the element-store defaults (writable/enumerable/configurable = true) on a non-frozen array.
+    // §10.1.6.3: for a NEW property an OMITTED attribute defaults to FALSE — so a partial descriptor on
+    // a not-yet-present index is NON-default and routes to the map; only an existing dense slot inherits
+    // its `true` defaults when an attribute is omitted (a plain value-update stays dense).
+    const attr_default = in_dense; // omitted attribute → dense default (true) only when modifying a dense slot
     const wants_default =
         !d.isAccessor() and
-        (d.writable orelse true) and
-        (d.enumerable orelse true) and
-        (d.configurable orelse true) and
+        (d.writable orelse attr_default) and
+        (d.enumerable orelse attr_default) and
+        (d.configurable orelse attr_default) and
         !arr.array_frozen;
 
     if (wants_default) {
@@ -201,16 +250,16 @@ pub fn arrayDefineIndex(it: *Interpreter, arr: *Object, i: usize, key: []const u
 
     // Non-default attributes / accessor: store in the ordinary property map so getOwnPropertyDescriptor,
     // Object.keys (enumerability), and integrity reflect the requested attributes. The dense store cannot
-    // express per-index attributes, so the index lives ONLY in the map here (it is not in the dense store:
-    // a prior dense slot can't coexist because the validation above ran on the dense descriptor and any
-    // value mismatch is a configurable redefinition that supersedes it). `key` is the arena-owned
-    // canonical key string the caller computed (the property map stores the slice as-is).
+    // express per-index attributes, so the index lives ONLY in the map here. When DEMOTING an existing
+    // dense slot, first materialize it into the map as its default-attribute data property (w/e/c = true)
+    // so §10.1.6.3 merges the new (partial) descriptor against the REAL current attributes rather than
+    // defaulting the omitted ones to false. `key` is the arena-owned canonical key string the caller computed.
+    if (in_dense) {
+        try arr.defineData(key, arr.arrayGet(i), true, true, true);
+        try arr.arrayDelete(i);
+    }
     const ok = try arr.defineProperty(key, d);
     if (!ok) return it.throwError("TypeError", "Cannot redefine property");
-    // If a dense slot existed for this index (a default-attribute value being demoted to non-default
-    // attributes), remove it so the index is not double-counted by the dense enumeration paths — the
-    // map entry is now the single source of truth.
-    if (in_dense) try arr.arrayDelete(i);
     // §10.4.2.1 step 3.h: [[Length]] still grows to include the index, but the dense store is NOT written
     // (that would double-count the index in enumeration). Reading `arr[i]` via the interpreter's
     // dense-only index path is an accepted M-subset gap for non-default-attribute indices.
@@ -500,20 +549,69 @@ pub fn objectCreate(it: *Interpreter, args: []const Value) EvalError!Completion 
 }
 
 /// §20.1.2.1 Object.assign ( target, ...sources ) — ToObject(target), then for each source copy
-/// every own ENUMERABLE property (Get from source, Set on target). Returns target.
+/// every own ENUMERABLE property — string AND symbol keys, in OwnPropertyKeys order — via
+/// Get(from, key) then Set(to, key, val, Throw=true). The Throw=true Set means a non-writable /
+/// non-extensible / frozen / sealed target raises a TypeError independent of the caller's strict
+/// mode. Returns the (boxed) target.
 pub fn objectAssign(it: *Interpreter, args: []const Value) EvalError!Completion {
-    const target = if (args.len > 0) args[0] else .undefined;
-    if (target == .undefined or target == .null) return it.throwError("TypeError", "Cannot convert undefined or null to object");
-    if (target != .object) return .{ .normal = target }; // M-subset: primitive target wrapper is read-only → return as-is
+    const target_arg = if (args.len > 0) args[0] else .undefined;
+    if (target_arg == .undefined or target_arg == .null) return it.throwError("TypeError", "Cannot convert undefined or null to object");
+    // §20.1.2.1 step 1: ToObject(target) — a primitive boxes to its wrapper (the result IS that object).
+    const to = switch (try it.toObjectForArrayLike(target_arg)) {
+        .obj => |o| o,
+        .abrupt => |c| return c,
+    };
+    const target: Value = .{ .object = to };
+    // §20.1.2.1 step 3: a Set with Throw=true regardless of the caller's strictness.
+    const saved_strict = it.strict;
+    it.strict = true;
+    defer it.strict = saved_strict;
     if (args.len > 1) for (args[1..]) |source| {
         if (source == .undefined or source == .null) continue; // §20.1.2.1 step 4.a: skip nullish
-        var keys: std.ArrayListUnmanaged(Value) = .empty;
-        if (try it.ownEnumerableKeys(source, &keys)) |abrupt| return abrupt;
-        for (keys.items) |k| {
-            const vc = try it.getProperty(source, k.string);
-            if (vc.isAbrupt()) return vc;
-            const sc = try it.setProperty(target, k.string, vc.normal);
-            if (sc.isAbrupt()) return sc;
+        // §20.1.2.1 step 4.b.i: keys = from.[[OwnPropertyKeys]]() — string AND symbol, in order.
+        if (source == .object) {
+            const keys = switch (try it.ordinaryOwnKeys(source.object)) {
+                .keys => |k| k,
+                .abrupt => |c| return c,
+            };
+            for (keys) |k| {
+                // §20.1.2.1 step 4.b.ii: copy only own ENUMERABLE keys.
+                switch (k) {
+                    .symbol => |sym| {
+                        const enumerable = switch (try it.ordinaryGetOwnPropertySymbol(source.object, sym)) {
+                            .pv => |pv| if (pv) |p| p.enumerable else false,
+                            .abrupt => |c| return c,
+                        };
+                        if (!enumerable) continue;
+                        const vc = try it.getSymbolProperty(source, sym);
+                        if (vc.isAbrupt()) return vc;
+                        const sc = try it.setSymbolProperty(target, sym, vc.normal);
+                        if (sc.isAbrupt()) return sc;
+                    },
+                    .string => |key| {
+                        const enumerable = switch (try it.ordinaryGetOwnProperty(source.object, key)) {
+                            .pv => |pv| if (pv) |p| p.enumerable else false,
+                            .abrupt => |c| return c,
+                        };
+                        if (!enumerable) continue;
+                        const vc = try it.getProperty(source, key);
+                        if (vc.isAbrupt()) return vc;
+                        const sc = try it.setProperty(target, key, vc.normal);
+                        if (sc.isAbrupt()) return sc;
+                    },
+                    else => {},
+                }
+            }
+        } else {
+            // A primitive source (e.g. a string) boxes — copy its own enumerable string keys.
+            var keys: std.ArrayListUnmanaged(Value) = .empty;
+            if (try it.ownEnumerableKeys(source, &keys)) |abrupt| return abrupt;
+            for (keys.items) |k| {
+                const vc = try it.getProperty(source, k.string);
+                if (vc.isAbrupt()) return vc;
+                const sc = try it.setProperty(target, k.string, vc.normal);
+                if (sc.isAbrupt()) return sc;
+            }
         }
     };
     return .{ .normal = target };

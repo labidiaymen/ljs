@@ -39,6 +39,10 @@ var function_proto: ?*Object = null;
 fn defineMethod(arena: std.mem.Allocator, target: *Object, name: []const u8, id: NativeId, native_name: []const u8) std.mem.Allocator.Error!void {
     const fn_obj = try Object.createNative(arena, id, native_name);
     fn_obj.prototype = function_proto;
+    // §17 a built-in METHOD (not a constructor) has NO `prototype` own property — drop the one
+    // `createNative` installs (it serves constructors). Otherwise `m.hasOwnProperty("prototype")`
+    // is wrongly true and the property would be a non-configurable carrier.
+    _ = fn_obj.properties.orderedRemove("prototype");
     // §20.2.4.2: a built-in method's `name` own property is its property key (non-enumerable,
     // non-writable, configurable). (`length` per-native is deferred — see specs/015 spec.md.)
     try fn_obj.defineData("name", .{ .string = name }, false, false, true);

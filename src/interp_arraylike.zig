@@ -164,16 +164,17 @@ pub fn toObjectForArrayLike(self: *Interpreter, v: Value) EvalError!Interpreter.
             return .{ .obj = w };
         },
         else => {
-            // number / boolean / symbol / bigint box into the matching wrapper. The prototype is the
-            // realm's `<Wrapper>.prototype` (e.g. `Boolean.prototype`) so inherited indexed props /
-            // `length` set on that prototype are observable as in the spec's ToObject(this).
-            const proto: ?*Object = switch (v) {
+            // §7.1.18 ToObject: number / boolean / symbol / bigint box into the matching wrapper,
+            // proto-linked to the realm's `<Wrapper>.prototype` (e.g. `Boolean.prototype`) so both
+            // `ToObject(1).constructor === Number` AND inherited indexed props / `length` set on that
+            // prototype are observable, as in the spec's ToObject(this).
+            const proto: ?*Object = (switch (v) {
                 .number => self.globalProto("Number"),
                 .boolean => self.globalProto("Boolean"),
                 .symbol => self.globalProto("Symbol"),
                 .bigint => self.globalProto("BigInt"),
                 else => null,
-            } orelse self.objectProto();
+            }) orelse self.objectProto();
             const w = try Object.create(self.arena, proto);
             w.primitive = v;
             return .{ .obj = w };

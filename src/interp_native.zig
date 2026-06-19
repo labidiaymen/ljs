@@ -619,11 +619,17 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
             return .{ .normal = .{ .string = if (b) "true" else "false" } };
         },
         .object_ctor => {
-            // §20.1.1.1 Object ( [ value ] ): an object argument is returned as-is; otherwise a fresh
-            // ordinary object is created proto-linked to %Object.prototype% (so its inherited
-            // `toString`/`hasOwnProperty`/etc. — and thus ToPrimitive — resolve).
-            if (args.len > 0 and args[0] == .object) return .{ .normal = args[0] };
-            return .{ .normal = .{ .object = try Object.create(self.arena, self.objectProto()) } };
+            // §20.1.1.1 Object ( [ value ] ): an object argument is returned as-is; undefined/null (or
+            // no argument) → a fresh ordinary object proto-linked to %Object.prototype%; any other
+            // primitive → ToObject(value), boxing into its wrapper (Number/String/Boolean/Symbol/BigInt)
+            // so `new Object(1).constructor === Number`.
+            const v = if (args.len > 0) args[0] else .undefined;
+            if (v == .object) return .{ .normal = v };
+            if (v == .undefined or v == .null) return .{ .normal = .{ .object = try Object.create(self.arena, self.objectProto()) } };
+            return switch (try self.toObjectForArrayLike(v)) {
+                .obj => |o| .{ .normal = .{ .object = o } },
+                .abrupt => |c| c,
+            };
         },
         .object_to_string => return builtin_object.objectToString(self, this_val),
         // §20.1.3.7 Object.prototype.valueOf returns ToObject(this). For an object receiver that is
