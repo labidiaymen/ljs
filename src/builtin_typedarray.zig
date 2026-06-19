@@ -67,7 +67,11 @@ const TA = struct {
     }
 
     fn get(self: TA, it: *Interpreter, i: usize) std.mem.Allocator.Error!Value {
-        return tarray.getElement(self.elem, self.bytes.?, i, it.arena);
+        // §10.4.5.1 IntegerIndexedElementGet: a detached buffer (`bytes == null`) — or an index past
+        // the live slice — reads as `undefined`, never a panic. A callback / coercion may have detached
+        // or shrunk the buffer between the stale length and this read; `getElement` re-checks the slice.
+        const bytes = self.bytes orelse return .undefined;
+        return tarray.getElement(self.elem, bytes, i, it.arena);
     }
 };
 
@@ -85,6 +89,22 @@ fn isDetached(o: *Object) bool {
     const ta = o.typed_array.?;
     const buf = ta.buffer.array_buffer;
     return buf == null or buf.?.detached;
+}
+
+/// §10.4.5.2 IsTypedArrayOutOfBounds — for a view onto a RESIZABLE buffer that has shrunk, the view
+/// can fall (partly) outside the live bytes. A detached buffer is also OOB. A length-TRACKING view is
+/// OOB iff its byte offset is past the buffer's end; a FIXED-length view is OOB iff its full extent
+/// (offset + arrayLength*bpe) exceeds the live byte length. ValidateTypedArray (used by every §23.2.3
+/// method) throws a TypeError when this holds.
+fn isOutOfBounds(o: *Object) bool {
+    const ta = o.typed_array.?;
+    const buf = ta.buffer.array_buffer orelse return true;
+    if (buf.detached) return true;
+    const blen = buf.bytes.len;
+    if (ta.tracks_length) return ta.byte_offset > blen;
+    const bpe = ta.elem.bytesPerElement();
+    // Fixed view: offset + arrayLength*bpe must fit within the live buffer.
+    return ta.byte_offset + ta.array_length * bpe > blen;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -489,13 +509,17 @@ pub fn method(it: *Interpreter, name: []const u8, this_val: Value, args: []const
     const arg1: Value = if (args.len > 1) args[1] else .undefined;
     const arg2: Value = if (args.len > 2) args[2] else .undefined;
 
-    // Iterators (§23.2.3.6/.16/.32/.36) — don't require a non-detached buffer to CREATE.
+    // §23.2.3 ValidateTypedArray (§23.2.3.6/.16/.32 iterators ALSO validate at creation): throw a
+    // TypeError on a detached buffer OR an out-of-bounds view (a fixed/length-tracking view onto a
+    // resizable buffer that shrank below the view's extent — §10.4.5.2 IsTypedArrayOutOfBounds).
+    if (isDetached(o)) return it.throwError("TypeError", "Cannot operate on a detached buffer");
+    if (isOutOfBounds(o)) return it.throwError("TypeError", "TypedArray is out of bounds");
+
+    // Iterators (§23.2.3.6/.16/.32/.36).
     if (eql(u8, name, "values")) return makeIter(it, o, .value);
     if (eql(u8, name, "keys")) return makeIter(it, o, .key);
     if (eql(u8, name, "entries")) return makeIter(it, o, .entry);
 
-    // §23.2.3 ValidateTypedArray for the rest: throw on a detached buffer up front.
-    if (isDetached(o)) return it.throwError("TypeError", "Cannot operate on a detached buffer");
     const len = TA.of(o).length;
 
     if (eql(u8, name, "at")) return at(it, o, len, arg0);
@@ -593,8 +617,16 @@ fn copyWithin(it: *Interpreter, o: *Object, len: usize, args: []const Value) Eva
     if (count > 0) {
         const bpe = ta.elem.bytesPerElement();
         const bytes = ta.bytes.?;
-        // §23.2.3.5 step 14: a byte-level memmove honouring overlap.
-        std.mem.copyForwards(u8, bytes[to * bpe .. to * bpe + count * bpe], bytes[from * bpe .. from * bpe + count * bpe]);
+        const dst = bytes[to * bpe .. to * bpe + count * bpe];
+        const src = bytes[from * bpe .. from * bpe + count * bpe];
+        // §23.2.3.5 step 14: a byte-level memmove honouring overlap. `copyForwards` is only
+        // overlap-safe when dst ≤ src; when dst > src (forward overlap) copy high-to-low instead,
+        // otherwise each just-written byte would clobber an as-yet-unread source byte.
+        if (to <= from) {
+            std.mem.copyForwards(u8, dst, src);
+        } else {
+            std.mem.copyBackwards(u8, dst, src);
+        }
     }
     return .{ .normal = .{ .object = o } };
 }
@@ -1074,9 +1106,26 @@ fn withMethod(it: *Interpreter, o: *Object, len: usize, index_v: Value, value: V
     return .{ .normal = .{ .object = created } };
 }
 
-/// §23.2.3.31 toLocaleString — ToString each element joined by "," (M-subset: no locale formatting).
+/// §23.2.3.31 toLocaleString — like Array.prototype.toLocaleString but over [[ArrayLength]]: for each
+/// element, ? ToString(? Invoke(element, "toLocaleString")), joined by ",". A user `toLocaleString`
+/// may detach/shrink the buffer mid-iteration; re-read the LIVE length each step (crash-safe) and treat
+/// an index past the live end as `undefined` → the empty String (matching a [[Get]] on an OOB index).
 fn toLocaleString(it: *Interpreter, o: *Object, len: usize) EvalError!Completion {
-    return join(it, o, len, .{ .string = "," });
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        if (i > 0) try buf.appendSlice(it.arena, ",");
+        // Re-fetch the live view: a prior element's toLocaleString may have detached/shrunk the buffer.
+        const live = TA.of(o);
+        if (i >= live.length) continue; // OOB [[Get]] → undefined → empty String.
+        const el = try live.get(it, i);
+        const inv = try it.invokeMethod(el, "toLocaleString", &.{});
+        if (inv.isAbrupt()) return inv;
+        const sc = try it.toStringThrowing(inv.normal);
+        if (sc.isAbrupt()) return sc;
+        try buf.appendSlice(it.arena, sc.normal.string);
+    }
+    return .{ .normal = .{ .string = buf.items } };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────

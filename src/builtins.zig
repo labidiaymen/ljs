@@ -263,6 +263,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         if (pv == .object) {
             pv.object.prototype = object_proto; // §21.2.3 BigInt.prototype inherits %Object.prototype%
             try defineMethod(arena, pv.object, "toString", .bigint_method, "toString");
+            try defineMethod(arena, pv.object, "toLocaleString", .bigint_method, "toLocaleString");
             try defineMethod(arena, pv.object, "valueOf", .bigint_method, "valueOf");
         }
     }
@@ -840,18 +841,30 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         }
 
         // §23.2.3 prototype methods (non-enumerable). `values` doubles as [Symbol.iterator].
-        const ta_methods = [_][]const u8{
-            "at",          "copyWithin",     "entries",    "every",         "fill",    "filter",
-            "find",        "findIndex",      "findLast",   "findLastIndex", "forEach", "includes",
-            "indexOf",     "join",           "keys",       "lastIndexOf",   "map",     "reduce",
-            "reduceRight", "reverse",        "set",        "slice",         "some",    "sort",
-            "subarray",    "toLocaleString", "toReversed", "toSorted",      "with",
+        // Each method's `length` own property is its §23.2.3 ExpectedArgumentCount.
+        const ta_methods = [_]struct { name: []const u8, len: f64 }{
+            .{ .name = "at", .len = 1 },             .{ .name = "copyWithin", .len = 2 },
+            .{ .name = "entries", .len = 0 },        .{ .name = "every", .len = 1 },
+            .{ .name = "fill", .len = 1 },           .{ .name = "filter", .len = 1 },
+            .{ .name = "find", .len = 1 },           .{ .name = "findIndex", .len = 1 },
+            .{ .name = "findLast", .len = 1 },       .{ .name = "findLastIndex", .len = 1 },
+            .{ .name = "forEach", .len = 1 },        .{ .name = "includes", .len = 1 },
+            .{ .name = "indexOf", .len = 1 },        .{ .name = "join", .len = 1 },
+            .{ .name = "keys", .len = 0 },           .{ .name = "lastIndexOf", .len = 1 },
+            .{ .name = "map", .len = 1 },            .{ .name = "reduce", .len = 1 },
+            .{ .name = "reduceRight", .len = 1 },    .{ .name = "reverse", .len = 0 },
+            .{ .name = "set", .len = 1 },            .{ .name = "slice", .len = 2 },
+            .{ .name = "some", .len = 1 },           .{ .name = "sort", .len = 1 },
+            .{ .name = "subarray", .len = 2 },       .{ .name = "toLocaleString", .len = 0 },
+            .{ .name = "toReversed", .len = 0 },     .{ .name = "toSorted", .len = 1 },
+            .{ .name = "with", .len = 2 },
         };
-        for (ta_methods) |mn| try defineMethod(arena, ta_proto, mn, .typed_array_method, mn);
-        // §23.2.3.36 values + §23.2.3.40 [Symbol.iterator] (same function object).
+        for (ta_methods) |m| try defineMethodLen(arena, ta_proto, m.name, .typed_array_method, m.name, m.len);
+        // §23.2.3.36 values + §23.2.3.40 [Symbol.iterator] (same function object). length 0.
         const ta_values = try Object.createNative(arena, .typed_array_method, "values");
         ta_values.prototype = function_proto;
         try ta_values.defineData("name", .{ .string = "values" }, false, false, true);
+        try ta_values.defineData("length", .{ .number = 0 }, false, false, true);
         try ta_proto.defineData("values", .{ .object = ta_values }, true, false, true);
         if (iter_sym2) |s| try ta_proto.defineSymbolData(s, .{ .object = ta_values }, true, false, true);
         // §23.2.3.37 %TypedArray%.prototype.toString === %Array.prototype.toString%.
@@ -862,8 +875,8 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         };
 
         // §23.2.2 statics on the %TypedArray% constructor: from / of / get [Symbol.species].
-        try defineMethod(arena, ta_abstract, "from", .typed_array_static, "from");
-        try defineMethod(arena, ta_abstract, "of", .typed_array_static, "of");
+        try defineMethodLen(arena, ta_abstract, "from", .typed_array_static, "from", 1); // §23.2.2.1
+        try defineMethodLen(arena, ta_abstract, "of", .typed_array_static, "of", 0); // §23.2.2.2
         if (species_sym) |s| {
             const sg = try Object.createNative(arena, .typed_array_static, "species");
             sg.prototype = function_proto;
@@ -1151,5 +1164,20 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
             try fp.defineAccessorEx("caller", tte, tte, false);
             try fp.defineAccessorEx("arguments", tte, tte, false);
         }
+    }
+
+    // The minimal Test262 host object `$262` (NOT ECMA-262): only `detachArrayBuffer`, used by the
+    // suite to detach an ArrayBuffer so detached-buffer behavior — an in-scope ECMAScript semantic —
+    // can be exercised. Permitted as a test harness, like the module loader. A plain (writable,
+    // enumerable, configurable) global so the harness's `if (!$262 ...)` guard sees it.
+    {
+        const obj262 = try Object.create(arena, object_proto);
+        const detach = try Object.createNative(arena, .dollar262_method, "detachArrayBuffer");
+        detach.prototype = function_proto;
+        _ = detach.properties.orderedRemove("prototype");
+        try detach.defineData("name", .{ .string = "detachArrayBuffer" }, false, false, true);
+        try detach.defineData("length", .{ .number = 1 }, false, false, true);
+        try obj262.defineData("detachArrayBuffer", .{ .object = detach }, true, true, true);
+        try env.declare("$262", .{ .object = obj262 }, true, true);
     }
 }

@@ -592,6 +592,10 @@ pub const NativeId = enum {
     date_ctor, // new Date(...) / Date(...) (plain call → current-time string)
     date_static, // Date.<now|parse|UTC>
     date_proto_method, // Date.prototype.<getTime|setFullYear|toISOString|[Symbol.toPrimitive]|...>
+    // The minimal Test262 host object `$262` (NOT ECMA-262): only `detachArrayBuffer`, which the
+    // suite uses to drive detached-buffer behavior (an in-scope ECMAScript semantic). Permitted as a
+    // test harness, like the module loader; NOT a general Node host API. `native_name` selects.
+    dollar262_method, // $262.detachArrayBuffer(buffer)
 };
 
 /// §10.4.1 A Bound Function Exotic Object's internal slots: the wrapped target, the bound `this`, and

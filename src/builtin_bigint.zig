@@ -82,6 +82,12 @@ pub fn bigintMethod(it: *Interpreter, name: []const u8, this_val: Value, args: [
         else => return it.throwError("TypeError", "BigInt.prototype method called on incompatible receiver"),
     };
     if (std.mem.eql(u8, name, "valueOf")) return .{ .normal = .{ .bigint = b } };
+    // §21.2.3.2 toLocaleString([reserved]) — the M-subset has no Intl, so it returns the base-10
+    // string (ToString with radix 10), ignoring any locale arguments (which are NOT a radix).
+    if (std.mem.eql(u8, name, "toLocaleString")) {
+        const s = bigint.toStringRadix(it.arena, b, 10) catch |e| return it.bigintError(e);
+        return .{ .normal = .{ .string = s } };
+    }
     // toString([radix]): radix defaults to 10; otherwise ToIntegerOrInfinity in [2,36].
     // ToIntegerOrInfinity does ToNumber first, so a BigInt/Symbol radix throws a TypeError (per
     // §21.2.3.3 step 2) and an object radix is ToPrimitive'd; the [2,36] guard then RangeErrors.

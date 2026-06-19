@@ -373,6 +373,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .array_buffer_proto_getter => return builtin_arraybuffer.getter(self, func.native_name, this_val), // §25.1.6
         .array_buffer_method => return builtin_arraybuffer.method(self, func.native_name, this_val, args), // §25.1.6.7 slice / resize
         .array_buffer_static => return builtin_arraybuffer.static(self, func.native_name, args), // §25.1.4.1 isView
+        .dollar262_method => return builtin_arraybuffer.detach262(self, args), // $262.detachArrayBuffer (test host hook)
         // §23.2 TypedArray (spec 083 Phase 2-B). A concrete `<Type>Array(...)` plain call (no new) throws
         // (§23.2.5.1 step 1); the abstract %TypedArray%() always throws (§23.2.1.1). Construction is in
         // constructNT. The prototype getters / methods / statics dispatch by `native_name`.
@@ -703,6 +704,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .regexp_ctor, .regexp_proto_getter, .regexp_to_string, .regexp_exec, .regexp_test, .regexp_symbol_method, .regexp_string_iterator_next, .regexp_static => unreachable, // handled in the first switch
         // §25.1 ArrayBuffer / §23.2 TypedArray / §25.3 DataView (spec 083) — all handled in the first switch.
         .array_buffer_ctor, .array_buffer_proto_getter, .array_buffer_method, .array_buffer_static => unreachable,
+        .dollar262_method => unreachable, // $262.detachArrayBuffer — never a constructor; handled in the first switch
         .typed_array_ctor, .typed_array_abstract_ctor, .typed_array_proto_getter, .typed_array_method, .typed_array_static => unreachable,
         .data_view_ctor, .data_view_proto_getter, .data_view_method => unreachable,
         .date_ctor, .date_static, .date_proto_method => unreachable, // §21.4 handled in the first switch

@@ -151,6 +151,19 @@ pub fn static(it: *Interpreter, name: []const u8, args: []const Value) EvalError
     return it.throwError("TypeError", "Unknown ArrayBuffer static method");
 }
 
+/// The Test262 host hook `$262.detachArrayBuffer(arrayBuffer)` — DetachArrayBuffer (§25.1.3.3) on the
+/// supplied ArrayBuffer so the suite can exercise detached-buffer behavior (an in-scope ECMAScript
+/// semantic). Returns null. A non-ArrayBuffer argument is a TypeError. NOT part of ECMA-262.
+pub fn detach262(it: *Interpreter, args: []const Value) EvalError!Completion {
+    const arg: Value = if (args.len > 0) args[0] else .undefined;
+    if (arg != .object or arg.object.kind != .array_buffer or arg.object.array_buffer == null) {
+        return it.throwError("TypeError", "$262.detachArrayBuffer expects an ArrayBuffer");
+    }
+    arg.object.array_buffer.?.detached = true;
+    arg.object.array_buffer.?.bytes = &.{};
+    return .{ .normal = .null };
+}
+
 /// §25.1.6.7 ArrayBuffer.prototype.slice ( start, end ) — RequireInternalSlot + IsDetachedBuffer →
 /// TypeError; clamp the relative [start, end) indices into [0, len]; SpeciesConstructor a new
 /// ArrayBuffer of the resulting length (default %ArrayBuffer%); copy the bytes. The species result is
