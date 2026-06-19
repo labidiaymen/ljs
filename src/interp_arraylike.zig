@@ -12,6 +12,7 @@ const interpreter = @import("interpreter.zig");
 const Interpreter = interpreter.Interpreter;
 const EvalError = interpreter.EvalError;
 const interp_property = @import("interp_property.zig");
+const sutf16 = @import("string_utf16.zig");
 
 const toNumber = ops.toNumber;
 const toBoolean = ops.toBoolean;
@@ -46,6 +47,12 @@ pub fn hasIndexChain(self: *Interpreter, o: *Object, i: usize) bool {
     var p: ?*Object = o;
     while (p) |obj| {
         if (obj.kind == .array and obj.arrayHas(i)) return true;
+        // §10.4.3: a `new String(s)` / boxed-String wrapper exposes the canonical integer indices
+        // [0, len) as own properties — HasProperty must report them (else the generic Array methods
+        // see a hole and skip the character).
+        if (obj.primitive) |prim| if (prim == .string) {
+            if (obj.getProp(key) == null and sutf16.codeUnitAt(prim.string, i) != null) return true;
+        };
         if (obj.getProp(key) != null) return true;
         p = obj.prototype;
     }
@@ -157,10 +164,17 @@ pub fn toObjectForArrayLike(self: *Interpreter, v: Value) EvalError!Interpreter.
             return .{ .obj = w };
         },
         else => {
-            // number / boolean / symbol / bigint box into an ordinary wrapper with no indexed own
-            // props (M-subset: length is absent → LengthOfArrayLike yields 0, which matches the spec
-            // result for these — they have no "length").
-            const w = try Object.create(self.arena, self.objectProto());
+            // number / boolean / symbol / bigint box into the matching wrapper. The prototype is the
+            // realm's `<Wrapper>.prototype` (e.g. `Boolean.prototype`) so inherited indexed props /
+            // `length` set on that prototype are observable as in the spec's ToObject(this).
+            const proto: ?*Object = switch (v) {
+                .number => self.globalProto("Number"),
+                .boolean => self.globalProto("Boolean"),
+                .symbol => self.globalProto("Symbol"),
+                .bigint => self.globalProto("BigInt"),
+                else => null,
+            } orelse self.objectProto();
+            const w = try Object.create(self.arena, proto);
             w.primitive = v;
             return .{ .obj = w };
         },

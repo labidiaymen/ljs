@@ -266,47 +266,25 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
         if (out.kind == .array and out.arrayLen() != count) try out.arraySetLen(count);
         return .{ .normal = .{ .object = out } };
     }
-    if (eql(u8, name, "concat")) { // §23.1.3.2 (M-subset: spreadable iff Array)
-        // §23.1.3.2 step 1: A = ArraySpeciesCreate(O, 0). Populate via CreateDataPropertyOrThrow.
+    if (eql(u8, name, "concat")) { // §23.1.3.1
+        // §23.1.3.1 step 2: A = ArraySpeciesCreate(O, 0). Populate via CreateDataPropertyOrThrow.
         const ac = try it.arraySpeciesCreate(arr, 0);
         if (ac.isAbrupt()) return ac;
         const out = ac.normal.object;
         var n: usize = 0;
-        // §23.1.3.2: the receiver O is concat item 0. IsConcatSpreadable (M-subset: an Array) → spread its
-        // 0..len indices via Get; else append O itself.
-        if (obj.kind == .array) {
-            var i: usize = 0;
-            while (i < len) : (i += 1) {
-                if (al.has(i)) {
-                    const ec = try al.get(i);
-                    if (ec.isAbrupt()) return ec;
-                    if (try cdp(it, out, n, ec.normal)) |c| return c;
-                }
-                n += 1;
-            }
+        // §23.1.3.1: the receiver O is concat item 0, then each argument. Each item is spread iff
+        // IsConcatSpreadable (Get(@@isConcatSpreadable) overrides IsArray) — spread visits 0..len via
+        // HasProperty/Get; a non-spreadable item is appended as a single element.
+        if (try concatAppend(it, out, &n, .{ .object = obj })) |c| return c;
+        for (args) |a| if (try concatAppend(it, out, &n, a)) |c| return c;
+        // §23.1.3.1 step 6: Set(A, "length", n, true) — records the final length (and on a custom
+        // species result, the only place length is set).
+        if (out.kind == .array) {
+            if (out.arrayLen() != n) try out.arraySetLen(n);
         } else {
-            if (try cdp(it, out, n, this_val)) |c| return c;
-            n += 1;
+            const sc = try it.setPropertyPub(.{ .object = out }, "length", num.v(n));
+            if (sc.isAbrupt()) return sc;
         }
-        for (args) |a| {
-            if (a == .object and a.object.kind == .array) {
-                const spread: AL = .{ .it = it, .o = a.object };
-                const slen = a.object.arrayLen();
-                var j: usize = 0;
-                while (j < slen) : (j += 1) {
-                    if (spread.has(j)) {
-                        const ec = try spread.get(j);
-                        if (ec.isAbrupt()) return ec;
-                        if (try cdp(it, out, n, ec.normal)) |c| return c;
-                    }
-                    n += 1;
-                }
-            } else {
-                if (try cdp(it, out, n, a)) |c| return c;
-                n += 1;
-            }
-        }
-        if (out.kind == .array and out.arrayLen() != n) try out.arraySetLen(n);
         return .{ .normal = .{ .object = out } };
     }
 
@@ -339,7 +317,7 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
                 hi -= 1;
             }
         }
-        return .{ .normal = this_val };
+        return .{ .normal = .{ .object = obj } }; // §23.1.3.x: returns O (the boxed object), not the raw `this`
     }
     if (eql(u8, name, "fill")) { // §23.1.3.8 (visits holes; Set with Throw=true)
         const value: Value = if (args.len > 0) args[0] else .undefined;
@@ -353,7 +331,7 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
         };
         var i = start;
         while (i < end) : (i += 1) if (try al.setT(i, value)) |c| return c;
-        return .{ .normal = this_val };
+        return .{ .normal = .{ .object = obj } }; // §23.1.3.x: returns O (the boxed object), not the raw `this`
     }
     if (eql(u8, name, "copyWithin")) { // §23.1.3.4
         const to = switch (try relIndex(it, if (args.len > 0) args[0] else .undefined, len, 0)) {
@@ -396,7 +374,7 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
                 t += 1;
             }
         }
-        return .{ .normal = this_val };
+        return .{ .normal = .{ .object = obj } }; // §23.1.3.x: returns O (the boxed object), not the raw `this`
     }
     if (eql(u8, name, "splice")) return splice(it, al, len, args);
 
@@ -411,7 +389,7 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
         }
         const cb = args[0].object;
         const this_arg: Value = if (args.len > 1) args[1] else .undefined;
-        return callbackMethod(it, name, this_val, al, len, cb, this_arg);
+        return callbackMethod(it, name, al, len, cb, this_arg);
     }
 
     // ── reduce / reduceRight ─────────────────────────────────────────────────────────────────────
@@ -419,7 +397,7 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
         if (args.len == 0 or args[0] != .object or !isCallable(args[0].object)) {
             return it.throwError("TypeError", "callback is not a function");
         }
-        return reduce(it, eql(u8, name, "reduceRight"), this_val, al, len, args[0].object, if (args.len > 1) args[1] else null);
+        return reduce(it, eql(u8, name, "reduceRight"), al, len, args[0].object, if (args.len > 1) args[1] else null);
     }
 
     // ── flat ─────────────────────────────────────────────────────────────────────────────────────
@@ -442,7 +420,7 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
     }
 
     // ── sort ─────────────────────────────────────────────────────────────────────────────────────
-    if (eql(u8, name, "sort")) return sort(it, this_val, al, len, if (args.len > 0) args[0] else .undefined);
+    if (eql(u8, name, "sort")) return sort(it, al, len, if (args.len > 0) args[0] else .undefined);
 
     // ── ES2023 change-array-by-copy (new dense Array; read via Get; no holes) ─────────────────────
     if (eql(u8, name, "toReversed")) return toReversed(it, al, len);
@@ -471,7 +449,7 @@ pub fn cdp(it: *Interpreter, out: *Object, index: usize, v: Value) EvalError!?Co
 
 /// §23.1.3 dispatch for the callback-taking iteration/search methods. `cb` is callable; holes are
 /// skipped for forEach/map/filter/some/every/flatMap, visited (as undefined) for find*.
-fn callbackMethod(it: *Interpreter, name: []const u8, this_val: Value, al: AL, len: usize, cb: *Object, this_arg: Value) EvalError!Completion {
+fn callbackMethod(it: *Interpreter, name: []const u8, al: AL, len: usize, cb: *Object, this_arg: Value) EvalError!Completion {
     const eql = std.mem.eql;
     const visit_holes = eql(u8, name, "find") or eql(u8, name, "findIndex") or
         eql(u8, name, "findLast") or eql(u8, name, "findLastIndex");
@@ -500,7 +478,10 @@ fn callbackMethod(it: *Interpreter, name: []const u8, this_val: Value, al: AL, l
         const ec = try al.get(i);
         if (ec.isAbrupt()) return ec;
         const el = ec.normal;
-        const r = try it.callFunction(cb, &.{ el, num.v(i), this_val }, this_arg);
+        // §23.1.3.x: the callback's 3rd arg is O = ToObject(this) — the boxed object, NOT the raw
+        // primitive (so `Array.prototype.forEach.call(false, cb)` passes a Boolean wrapper, observable
+        // via `o instanceof Boolean`).
+        const r = try it.callFunction(cb, &.{ el, num.v(i), .{ .object = al.o } }, this_arg);
         if (r.isAbrupt()) return r;
         const rv = r.normal;
         if (is_map) {
@@ -551,9 +532,62 @@ fn callbackMethod(it: *Interpreter, name: []const u8, this_val: Value, al: AL, l
     return .{ .normal = .undefined }; // forEach
 }
 
+/// §23.1.3.1.1 IsConcatSpreadable ( O ): a non-Object is not spreadable; otherwise Get(O,
+/// @@isConcatSpreadable) — when not undefined, ToBoolean(it); else IsArray(O). Returns the bool, or the
+/// abrupt completion from the (possibly accessor) symbol Get.
+const SpreadResult = union(enum) { yes: bool, abrupt: Completion };
+fn isConcatSpreadable(it: *Interpreter, v: Value) EvalError!SpreadResult {
+    if (v != .object) return .{ .yes = false };
+    if (it.wellKnownSymbol("isConcatSpreadable")) |sym| {
+        const sc = try it.getSymbolProperty(v, sym);
+        if (sc.isAbrupt()) return .{ .abrupt = sc };
+        if (sc.normal != .undefined) return .{ .yes = ops.toBoolean(sc.normal) };
+    }
+    return .{ .yes = v.object.kind == .array };
+}
+
+/// §23.1.3.1 step 5: append one concat item to `out` at running index `n`. A spreadable item spreads
+/// its present [0, len) indices (HasProperty/Get); else the item itself is one element. A spread that
+/// would push `n` past 2^53-1 throws a TypeError. Returns the abrupt completion to propagate, else null.
+fn concatAppend(it: *Interpreter, out: *Object, n: *usize, item: Value) EvalError!?Completion {
+    const spread = switch (try isConcatSpreadable(it, item)) {
+        .abrupt => |c| return c,
+        .yes => |b| b,
+    };
+    if (!spread) {
+        // §23.1.3.1 step 5.c.iii: a non-spreadable item — but n must stay ≤ 2^53-1.
+        if (@as(f64, @floatFromInt(n.*)) >= 9007199254740991) {
+            return try it.throwError("TypeError", "Array length exceeds the maximum");
+        }
+        if (try cdp(it, out, n.*, item)) |c| return c;
+        n.* += 1;
+        return null;
+    }
+    const src = item.object;
+    const slen = switch (try it.lengthOfArrayLike(src)) {
+        .len => |l| l,
+        .abrupt => |c| return c,
+    };
+    // §23.1.3.1 step 5.b.iii: if n + len > 2^53-1, throw a TypeError (before any element copy).
+    if (@as(f64, @floatFromInt(n.*)) + @as(f64, @floatFromInt(slen)) > 9007199254740991) {
+        return try it.throwError("TypeError", "Array length exceeds the maximum");
+    }
+    const sal: AL = .{ .it = it, .o = src };
+    var k: usize = 0;
+    while (k < slen) : (k += 1) {
+        if (sal.has(k)) {
+            const ec = try sal.get(k);
+            if (ec.isAbrupt()) return ec;
+            if (try cdp(it, out, n.*, ec.normal)) |c| return c;
+        }
+        n.* += 1;
+    }
+    return null;
+}
+
 /// §23.1.3.24 / §23.1.3.25 reduce / reduceRight. Skips holes; a missing initial value with no present
 /// element → TypeError.
-fn reduce(it: *Interpreter, right: bool, this_val: Value, al: AL, len: usize, cb: *Object, init: ?Value) EvalError!Completion {
+fn reduce(it: *Interpreter, right: bool, al: AL, len: usize, cb: *Object, init: ?Value) EvalError!Completion {
     var acc: Value = if (init) |v| v else .undefined;
     var have_acc = init != null;
     var idx: usize = 0;
@@ -579,7 +613,8 @@ fn reduce(it: *Interpreter, right: bool, this_val: Value, al: AL, len: usize, cb
         if (!al.has(i)) continue;
         const ec = try al.get(i);
         if (ec.isAbrupt()) return ec;
-        const r = try it.callFunction(cb, &.{ acc, ec.normal, num.v(i), this_val }, .undefined);
+        // §23.1.3.24/.25: reduce callback's 4th arg is O = ToObject(this) — the boxed object.
+        const r = try it.callFunction(cb, &.{ acc, ec.normal, num.v(i), .{ .object = al.o } }, .undefined);
         if (r.isAbrupt()) return r;
         acc = r.normal;
     }
@@ -692,7 +727,7 @@ fn splice(it: *Interpreter, al: AL, len: usize, args: []const Value) EvalError!C
 
 /// §23.1.3.30 sort(comparefn). Default comparator = ToString ascending; an optional comparator
 /// function. holes + undefined sort to the end (§23.1.3.30 SortIndexedProperties).
-fn sort(it: *Interpreter, this_val: Value, al: AL, len: usize, comparefn: Value) EvalError!Completion {
+fn sort(it: *Interpreter, al: AL, len: usize, comparefn: Value) EvalError!Completion {
     if (comparefn != .undefined and (comparefn != .object or !isCallable(comparefn.object))) {
         return it.throwError("TypeError", "comparator is not a function");
     }
@@ -747,7 +782,7 @@ fn sort(it: *Interpreter, this_val: Value, al: AL, len: usize, comparefn: Value)
         i += 1;
     }
     if (al.o.kind == .array and al.o.arrayLen() != len) try al.o.arraySetLen(len);
-    return .{ .normal = this_val };
+    return .{ .normal = .{ .object = al.o } }; // §23.1.3.30 step 6: return O (the boxed object)
 }
 
 const CompareResult = union(enum) { order: i32, abrupt: Completion };

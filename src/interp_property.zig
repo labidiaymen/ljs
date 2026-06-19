@@ -190,7 +190,10 @@ pub fn getProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!C
             if (o.kind == .array) {
                 if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(o.arrayLen()) } };
                 if (parseIndex(key)) |i| {
-                    return .{ .normal = o.arrayGet(i) };
+                    // §10.4.2.4: a present own index returns its value; a HOLE (absent own index) is
+                    // NOT undefined — it falls through to the prototype chain (so an inherited
+                    // `Array.prototype[i]` is observed). Only a truly absent-everywhere index is undefined.
+                    if (o.arrayHas(i)) return .{ .normal = o.arrayGet(i) };
                 }
                 // else fall through to the prototype chain (Array.prototype methods)
             }
@@ -227,8 +230,30 @@ pub fn getProperty(self: *Interpreter, base: Value, key: []const u8) EvalError!C
             // §10.1.8.1 OrdinaryGet — locate the property (data or accessor) on the chain.
             // Data-property fast path: a single descriptor read, no accessor branch.
             const loc = o.getProp(key) orelse {
-                // §10.1.8.1 step 3: the property is absent on the ordinary chain. If a Proxy sits on
-                // the prototype chain, its [[Get]] trap must fire (with `this`=base). Walk to it.
+                // §10.1.8.1 step 3: the property is absent on the ordinary string-keyed chain. An
+                // INHERITED Array exotic's `length` / canonical index, or a boxed-String wrapper's
+                // index/`length`, are internal slots invisible to `getProp` — resolve them by walking
+                // the prototype chain (only reached on a miss, so the ordinary hot path is untouched).
+                if (std.mem.eql(u8, key, "length") or parseIndex(key) != null) {
+                    var p: ?*Object = o.prototype;
+                    while (p) |holder| {
+                        if (holder.kind == .array) {
+                            if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(holder.arrayLen()) } };
+                            if (parseIndex(key)) |i| if (holder.arrayHas(i)) return .{ .normal = holder.arrayGet(i) };
+                        } else if (holder.primitive) |prim| {
+                            if (prim == .string and holder.getProp(key) == null) {
+                                if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .number = @floatFromInt(sutf16.utf16Length(prim.string)) } };
+                                if (parseIndex(key)) |i| if (sutf16.codeUnitAt(prim.string, i) != null) {
+                                    return .{ .normal = .{ .string = try sutf16.charAtAlloc(self.arena, prim.string, i) } };
+                                };
+                            }
+                        }
+                        // Stop at the first holder that owns the string key (an ordinary shadow).
+                        if (holder.properties.getPtr(key) != null) break;
+                        p = holder.prototype;
+                    }
+                }
+                // If a Proxy sits on the prototype chain, its [[Get]] trap must fire (with `this`=base).
                 if (protoProxy(o)) |pp| return builtin_proxy.get(self, pp, .{ .string = key }, base);
                 return .{ .normal = .undefined };
             };
