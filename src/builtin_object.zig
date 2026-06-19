@@ -852,8 +852,11 @@ pub fn objectGetPrototypeOf(it: *Interpreter, args: []const Value) EvalError!Com
             .abrupt => |c| c,
         },
         .string => return .{ .normal = if (it.stringProto()) |p| .{ .object = p } else .null },
+        .number => return .{ .normal = if (it.globalProto("Number")) |p| .{ .object = p } else .null },
+        .boolean => return .{ .normal = if (it.globalProto("Boolean")) |p| .{ .object = p } else .null },
+        .symbol => return .{ .normal = if (it.globalProto("Symbol")) |p| .{ .object = p } else .null },
+        .bigint => return .{ .normal = if (it.globalProto("BigInt")) |p| .{ .object = p } else .null },
         .undefined, .null => return it.throwError("TypeError", "Cannot convert undefined or null to object"),
-        else => return .{ .normal = .null }, // number/boolean: M-subset (no boxed wrapper proto)
     }
 }
 
@@ -994,6 +997,14 @@ pub fn objectTestIntegrity(it: *Interpreter, args: []const Value, t: IntegrityTe
 pub fn objectHasOwnProperty(it: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
     const pk = try it.toPropertyKey(if (args.len > 0) args[0] else .undefined);
     if (pk.isAbrupt()) return pk.completion;
+    // §20.1.3.2 → §7.3.12 HasOwnProperty → [[GetOwnProperty]]: a Proxy forwards to its trap
+    // (or its target). Present iff the descriptor is not undefined.
+    if (this_val == .object) if (this_val.object.proxy) |pd| {
+        const keyv: Value = if (pk.symbol) |sym| .{ .symbol = sym } else .{ .string = pk.key };
+        const dc = try proxy.getOwnProperty(it, pd, keyv);
+        if (dc.isAbrupt()) return dc;
+        return .{ .normal = .{ .boolean = dc.normal == .object } };
+    };
     if (pk.symbol) |sym| {
         if (this_val == .undefined or this_val == .null) return it.throwError("TypeError", "Cannot convert undefined or null to object");
         if (this_val == .object) {
@@ -1033,6 +1044,16 @@ pub fn hasOwnProp(it: *Interpreter, base: Value, key: []const u8) EvalError!bool
 pub fn objectPropertyIsEnumerable(it: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
     const pk = try it.toPropertyKey(if (args.len > 0) args[0] else .undefined);
     if (pk.isAbrupt()) return pk.completion;
+    // §20.1.3.4 → [[GetOwnProperty]]: a Proxy forwards; the result is the descriptor's [[Enumerable]]
+    // (false when the property is absent — descriptor undefined).
+    if (this_val == .object) if (this_val.object.proxy) |pd| {
+        const keyv: Value = if (pk.symbol) |sym| .{ .symbol = sym } else .{ .string = pk.key };
+        const dc = try proxy.getOwnProperty(it, pd, keyv);
+        if (dc.isAbrupt()) return dc;
+        if (dc.normal != .object) return .{ .normal = .{ .boolean = false } };
+        const en = dc.normal.object.get("enumerable") orelse return .{ .normal = .{ .boolean = false } };
+        return .{ .normal = .{ .boolean = en == .boolean and en.boolean } };
+    };
     if (pk.symbol) |sym| {
         if (this_val == .undefined or this_val == .null) return it.throwError("TypeError", "Cannot convert undefined or null to object");
         if (this_val == .object) {

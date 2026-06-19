@@ -908,20 +908,20 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         // §23.2.3 prototype methods (non-enumerable). `values` doubles as [Symbol.iterator].
         // Each method's `length` own property is its §23.2.3 ExpectedArgumentCount.
         const ta_methods = [_]struct { name: []const u8, len: f64 }{
-            .{ .name = "at", .len = 1 },             .{ .name = "copyWithin", .len = 2 },
-            .{ .name = "entries", .len = 0 },        .{ .name = "every", .len = 1 },
-            .{ .name = "fill", .len = 1 },           .{ .name = "filter", .len = 1 },
-            .{ .name = "find", .len = 1 },           .{ .name = "findIndex", .len = 1 },
-            .{ .name = "findLast", .len = 1 },       .{ .name = "findLastIndex", .len = 1 },
-            .{ .name = "forEach", .len = 1 },        .{ .name = "includes", .len = 1 },
-            .{ .name = "indexOf", .len = 1 },        .{ .name = "join", .len = 1 },
-            .{ .name = "keys", .len = 0 },           .{ .name = "lastIndexOf", .len = 1 },
-            .{ .name = "map", .len = 1 },            .{ .name = "reduce", .len = 1 },
-            .{ .name = "reduceRight", .len = 1 },    .{ .name = "reverse", .len = 0 },
-            .{ .name = "set", .len = 1 },            .{ .name = "slice", .len = 2 },
-            .{ .name = "some", .len = 1 },           .{ .name = "sort", .len = 1 },
-            .{ .name = "subarray", .len = 2 },       .{ .name = "toLocaleString", .len = 0 },
-            .{ .name = "toReversed", .len = 0 },     .{ .name = "toSorted", .len = 1 },
+            .{ .name = "at", .len = 1 },          .{ .name = "copyWithin", .len = 2 },
+            .{ .name = "entries", .len = 0 },     .{ .name = "every", .len = 1 },
+            .{ .name = "fill", .len = 1 },        .{ .name = "filter", .len = 1 },
+            .{ .name = "find", .len = 1 },        .{ .name = "findIndex", .len = 1 },
+            .{ .name = "findLast", .len = 1 },    .{ .name = "findLastIndex", .len = 1 },
+            .{ .name = "forEach", .len = 1 },     .{ .name = "includes", .len = 1 },
+            .{ .name = "indexOf", .len = 1 },     .{ .name = "join", .len = 1 },
+            .{ .name = "keys", .len = 0 },        .{ .name = "lastIndexOf", .len = 1 },
+            .{ .name = "map", .len = 1 },         .{ .name = "reduce", .len = 1 },
+            .{ .name = "reduceRight", .len = 1 }, .{ .name = "reverse", .len = 0 },
+            .{ .name = "set", .len = 1 },         .{ .name = "slice", .len = 2 },
+            .{ .name = "some", .len = 1 },        .{ .name = "sort", .len = 1 },
+            .{ .name = "subarray", .len = 2 },    .{ .name = "toLocaleString", .len = 0 },
+            .{ .name = "toReversed", .len = 0 },  .{ .name = "toSorted", .len = 1 },
             .{ .name = "with", .len = 2 },
         };
         for (ta_methods) |m| try defineMethodLen(arena, ta_proto, m.name, .typed_array_method, m.name, m.len);
@@ -1093,11 +1093,11 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     const math_obj = try Object.create(arena, object_proto);
     const math_methods = [_][]const u8{
         // §21.3.2 — full method set.
-        "pow",    "floor", "ceil", "abs",    "round", "trunc", "sign",  "sqrt",
-        "max",    "min",   "sin",  "cos",    "tan",   "asin",  "acos",  "atan",
-        "atan2",  "sinh",  "cosh", "tanh",   "asinh", "acosh", "atanh", "exp",
-        "expm1",  "log",   "log2", "log10",  "log1p", "cbrt",  "hypot", "sign",
-        "fround", "clz32", "imul", "random",
+        "pow",    "floor", "ceil", "abs",    "round",    "trunc", "sign",  "sqrt",
+        "max",    "min",   "sin",  "cos",    "tan",      "asin",  "acos",  "atan",
+        "atan2",  "sinh",  "cosh", "tanh",   "asinh",    "acosh", "atanh", "exp",
+        "expm1",  "log",   "log2", "log10",  "log1p",    "cbrt",  "hypot", "sign",
+        "fround", "clz32", "imul", "random", "f16round",
     };
     for (math_methods) |m| try defineMethod(arena, math_obj, m, .math_method, m);
     // §21.3.1 value properties — non-writable / non-enumerable / non-configurable.

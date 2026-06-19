@@ -211,8 +211,14 @@ pub fn deleteProperty(it: *Interpreter, pd: *ProxyData, key: Value) EvalError!Co
         .abrupt => |c| return c,
     };
     if (trap == null) {
+        // §10.5.10 step 7: forward to target.[[Delete]]. When the target is itself a Proxy its
+        // own [[Delete]] (trap or forwarded) must run, so a symbol key routes through the proxy
+        // delete too rather than the raw symbol store.
         return switch (key) {
-            .symbol => |s| .{ .normal = .{ .boolean = e.target.deleteSymbol(s) } },
+            .symbol => |s| if (e.target.proxy) |tpd|
+                deleteProperty(it, tpd, key)
+            else
+                .{ .normal = .{ .boolean = e.target.deleteSymbol(s) } },
             else => it.deleteProperty(.{ .object = e.target }, key.string),
         };
     }

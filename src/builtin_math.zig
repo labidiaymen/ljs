@@ -9,84 +9,144 @@ const Value = @import("value.zig").Value;
 const Completion = @import("completion.zig").Completion;
 const ops = @import("abstract_ops.zig");
 
-const toNumber = ops.toNumber;
 const numToInt32 = ops.numberToInt32;
 const numToUint32 = ops.numberToUint32;
+
+/// §7.1.4 ToNumber on one Math argument, propagating an abrupt completion (a throwing `valueOf`/
+/// `Symbol@@toPrimitive`, or a Symbol/BigInt TypeError). On `null` (no arg) yields NaN.
+fn coerceArg(it: *Interpreter, a: ?Value) EvalError!union(enum) { num: f64, abrupt: Completion } {
+    const v = a orelse return .{ .num = std.math.nan(f64) };
+    const c = try it.toNumberThrowing(v);
+    if (c.isAbrupt()) return .{ .abrupt = c };
+    return .{ .num = c.normal.number };
+}
+
+/// §6.1.6.1.3 Number::exponentiate(base, exponent) — the two cases where C `pow` diverges from
+/// ECMAScript: a NaN exponent is NaN regardless of base, and abs(base)==1 with ±∞ exponent is NaN.
+/// Everything else matches `std.math.pow`.
+fn ecmaPow(base: f64, exponent: f64) f64 {
+    if (std.math.isNan(exponent)) return std.math.nan(f64);
+    if (std.math.isInf(exponent) and @abs(base) == 1) return std.math.nan(f64);
+    return std.math.pow(f64, base, exponent);
+}
 
 pub fn call(it: *Interpreter, name: []const u8, args: []const Value) EvalError!Completion {
     // §21.3.2.27 random — no operands.
     if (std.mem.eql(u8, name, "random")) return .{ .normal = .{ .number = it.randomNext() } };
 
-    // §21.3.2.24/.25 max/min — variadic, ToNumber each, NaN-propagating, ±0-aware.
-    if (std.mem.eql(u8, name, "max")) {
-        var m: f64 = -std.math.inf(f64);
+    // §21.3.2.24/.25 max/min — variadic. Spec: FIRST ToNumber EVERY arg in order (so a later
+    // throwing/side-effecting coercion runs even when an earlier arg is NaN), THEN reduce.
+    if (std.mem.eql(u8, name, "max") or std.mem.eql(u8, name, "min")) {
+        const is_max = name[1] == 'a';
+        var m: f64 = if (is_max) -std.math.inf(f64) else std.math.inf(f64);
+        var saw_nan = false;
         for (args) |a| {
-            const v = toNumber(a);
-            if (std.math.isNan(v)) return .{ .normal = .{ .number = std.math.nan(f64) } };
-            // §21.3.2.24 step 4: +0 is considered larger than -0 (so max(+0,-0) = +0).
-            if (v > m or (v == 0 and m == 0 and !std.math.signbit(v))) m = v;
+            switch (try coerceArg(it, a)) {
+                .abrupt => |c| return c,
+                .num => |v| {
+                    if (std.math.isNan(v)) {
+                        saw_nan = true;
+                        continue;
+                    }
+                    if (is_max) {
+                        // §21.3.2.24 step 4: +0 is considered larger than -0.
+                        if (v > m or (v == 0 and m == 0 and !std.math.signbit(v))) m = v;
+                    } else {
+                        // §21.3.2.25 step 4: -0 is considered smaller than +0.
+                        if (v < m or (v == 0 and m == 0 and std.math.signbit(v))) m = v;
+                    }
+                },
+            }
         }
-        return .{ .normal = .{ .number = m } };
-    }
-    if (std.mem.eql(u8, name, "min")) {
-        var m: f64 = std.math.inf(f64);
-        for (args) |a| {
-            const v = toNumber(a);
-            if (std.math.isNan(v)) return .{ .normal = .{ .number = std.math.nan(f64) } };
-            // §21.3.2.25 step 4: -0 is considered smaller than +0 (so min(+0,-0) = -0).
-            if (v < m or (v == 0 and m == 0 and std.math.signbit(v))) m = v;
-        }
+        if (saw_nan) return .{ .normal = .{ .number = std.math.nan(f64) } };
         return .{ .normal = .{ .number = m } };
     }
 
-    // §21.3.2.18 hypot — variadic; any ±Inf operand → +Inf (even if a NaN is also present).
+    // §21.3.2.18 hypot — variadic; ToNumber every arg in order first, then: any ±Inf → +Inf
+    // (even alongside NaN), else NaN if any NaN, else sqrt(Σ x²).
     if (std.mem.eql(u8, name, "hypot")) {
         var sum: f64 = 0;
         var any_nan = false;
+        var any_inf = false;
         for (args) |a| {
-            const v = toNumber(a);
-            if (std.math.isInf(v)) return .{ .normal = .{ .number = std.math.inf(f64) } };
-            if (std.math.isNan(v)) any_nan = true;
-            sum += v * v;
+            switch (try coerceArg(it, a)) {
+                .abrupt => |c| return c,
+                .num => |v| {
+                    if (std.math.isInf(v)) any_inf = true;
+                    if (std.math.isNan(v)) any_nan = true;
+                    sum += v * v;
+                },
+            }
         }
+        if (any_inf) return .{ .normal = .{ .number = std.math.inf(f64) } };
         if (any_nan) return .{ .normal = .{ .number = std.math.nan(f64) } };
         return .{ .normal = .{ .number = @sqrt(sum) } };
     }
 
     // §21.3.2.11 clz32 — ToUint32 then count leading zeros (32 for 0).
     if (std.mem.eql(u8, name, "clz32")) {
-        const u: u32 = numToUint32(if (args.len > 0) toNumber(args[0]) else std.math.nan(f64));
+        const xc = try coerceArg(it, if (args.len > 0) args[0] else null);
+        const xv = switch (xc) {
+            .abrupt => |c| return c,
+            .num => |v| v,
+        };
+        const u: u32 = numToUint32(xv);
         return .{ .normal = .{ .number = @floatFromInt(@clz(u)) } };
     }
     // §21.3.2.19 imul — ToInt32 both, multiply mod 2^32, reinterpret as Int32.
     if (std.mem.eql(u8, name, "imul")) {
-        const a: i32 = numToInt32(if (args.len > 0) toNumber(args[0]) else std.math.nan(f64));
-        const b: i32 = numToInt32(if (args.len > 1) toNumber(args[1]) else std.math.nan(f64));
+        const ac = try coerceArg(it, if (args.len > 0) args[0] else null);
+        const av = switch (ac) {
+            .abrupt => |c| return c,
+            .num => |v| v,
+        };
+        const bc = try coerceArg(it, if (args.len > 1) args[1] else null);
+        const bv = switch (bc) {
+            .abrupt => |c| return c,
+            .num => |v| v,
+        };
+        const a: i32 = numToInt32(av);
+        const b: i32 = numToInt32(bv);
         const prod: u32 = @as(u32, @bitCast(a)) *% @as(u32, @bitCast(b));
         return .{ .normal = .{ .number = @floatFromInt(@as(i32, @bitCast(prod))) } };
     }
 
-    const x = if (args.len > 0) toNumber(args[0]) else std.math.nan(f64);
-    const y = if (args.len > 1) toNumber(args[1]) else std.math.nan(f64);
+    // Unary/binary §21.3.2 functions: ToNumber arg0 (then arg1 for pow/atan2) in order, throwing.
+    const xc = try coerceArg(it, if (args.len > 0) args[0] else null);
+    const x = switch (xc) {
+        .abrupt => |c| return c,
+        .num => |v| v,
+    };
+    const yc = try coerceArg(it, if (args.len > 1) args[1] else null);
+    const y = switch (yc) {
+        .abrupt => |c| return c,
+        .num => |v| v,
+    };
     const r: f64 = blk: {
-        if (std.mem.eql(u8, name, "pow")) break :blk std.math.pow(f64, x, y); // §21.3.2.26
+        if (std.mem.eql(u8, name, "pow")) break :blk ecmaPow(x, y); // §21.3.2.26
         if (std.mem.eql(u8, name, "atan2")) break :blk std.math.atan2(x, y); // §21.3.2.8
         if (std.mem.eql(u8, name, "floor")) break :blk @floor(x); // §21.3.2.16
         if (std.mem.eql(u8, name, "ceil")) break :blk @ceil(x); // §21.3.2.10
         if (std.mem.eql(u8, name, "round")) { // §21.3.2.28 — half-up toward +Infinity.
-            // NaN / ±0 / ±Inf pass through; a magnitude ≥ 2^52 is already integral (avoid x+0.5
-            // rounding error). For x in (-0.5, 0) the result is -0, so guard the sign explicitly.
+            // NaN / ±0 / ±Inf pass through; a magnitude ≥ 2^52 is already integral.
             if (std.math.isNan(x) or x == 0 or std.math.isInf(x)) break :blk x;
             if (@abs(x) >= 4503599627370496.0) break :blk x;
             if (x < 0 and x >= -0.5) break :blk -0.0; // (-0.5,0]→-0, and -0.5→-0
-            break :blk @floor(x + 0.5);
+            // round to nearest, ties toward +∞. NOT floor(x+0.5): for x just below 0.5, x+0.5
+            // rounds up to exactly 1.0 (S15.8.2.15_A7). Use floor(x) + carry on frac ≥ 0.5.
+            const f = @floor(x);
+            break :blk if (x - f >= 0.5) f + 1 else f;
         }
         if (std.mem.eql(u8, name, "trunc")) break :blk @trunc(x); // §21.3.2.38
         if (std.mem.eql(u8, name, "abs")) break :blk @abs(x); // §21.3.2.1
         if (std.mem.eql(u8, name, "sqrt")) break :blk @sqrt(x); // §21.3.2.32
         if (std.mem.eql(u8, name, "cbrt")) break :blk std.math.cbrt(x); // §21.3.2.9
-        if (std.mem.eql(u8, name, "sign")) break :blk std.math.sign(x); // §21.3.2.30
+        if (std.mem.eql(u8, name, "sign")) { // §21.3.2.30 — NaN/±0 pass through; else ±1.
+            if (std.math.isNan(x) or x == 0) break :blk x;
+            break :blk if (x > 0) 1.0 else -1.0;
+        }
         if (std.mem.eql(u8, name, "fround")) break :blk @as(f64, @as(f32, @floatCast(x))); // §21.3.2.29
+        if (std.mem.eql(u8, name, "f16round")) break :blk @as(f64, @as(f16, @floatCast(x))); // §21.3.2.17
         // §21.3.2.{2-7} inverse + circular trig.
         if (std.mem.eql(u8, name, "sin")) break :blk @sin(x);
         if (std.mem.eql(u8, name, "cos")) break :blk @cos(x);

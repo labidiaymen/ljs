@@ -441,7 +441,7 @@ pub const Parser = struct {
                 .dot => {
                     _ = self.advance();
                     // §13.3.1 MemberExpression `.` IdentifierName — the property name after `.` may be
-                    // any IdentifierName, INCLUDING reserved words (`new m.delete`, `new a.for`). Use
+                    // any IdentifierName, INCLUDING reserved words (`new m.delete`, `new Symbol.for()`). Use
                     // `expectPropertyName` (not `expect(.identifier)`), matching the non-`new` member path.
                     const name = try self.expectPropertyName();
                     callee = try self.alloc(.{ .member = .{ .object = callee, .name = name } });

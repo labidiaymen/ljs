@@ -10,6 +10,8 @@ const Object = object_mod.Object;
 const ops = @import("abstract_ops.zig");
 const sutf16 = @import("string_utf16.zig");
 const builtins = @import("builtins.zig");
+const builtin_proxy = @import("builtin_proxy.zig");
+const ProxyData = @import("runtime_types.zig").ProxyData;
 const interpreter = @import("interpreter.zig");
 const Interpreter = interpreter.Interpreter;
 const EvalError = interpreter.EvalError;
@@ -558,7 +560,8 @@ pub fn evalForIn(self: *Interpreter, s: anytype, env: *Environment, my_labels: [
     // EnumerateObjectProperties — the enumerable string keys to visit (computed once up front;
     // mutations to the object during the loop are not reflected, an accepted M-subset simplification).
     var keys: std.ArrayListUnmanaged(Value) = .empty;
-    try enumerateKeys(self, rc.normal, &keys);
+    const ek = try enumerateKeys(self, rc.normal, &keys);
+    if (ek.isAbrupt()) return ek; // a Proxy ownKeys/getOwnPropertyDescriptor trap may throw
     for (keys.items) |k| {
         const hb = try bindForHead(self, s.head, k, env);
         if (hb.completion.isAbrupt()) return hb.completion;
@@ -848,12 +851,24 @@ pub fn assignToTarget(self: *Interpreter, node: *const ast.Node, value: Value, e
 /// the first built-in prototype (everything above it is also built-in), which yields the correct
 /// observable enumeration (e.g. `for (k in [])` visits nothing, not `push`/`join`/…). Strings box
 /// to enumerable character-index keys (`length` is non-enumerable → skipped).
-pub fn enumerateKeys(self: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!void {
+pub fn enumerateKeys(self: *Interpreter, value: Value, out: *std.ArrayListUnmanaged(Value)) EvalError!Completion {
     var seen: std.StringHashMapUnmanaged(void) = .{};
     switch (value) {
         .object => |start| {
             var obj: ?*Object = start;
             while (obj) |o| {
+                // §10.5.11/§14.7.5: a Proxy enumerates via its [[OwnPropertyKeys]] (the `ownKeys`
+                // trap or forwarded), filtered by each key's [[GetOwnProperty]] enumerable flag.
+                // Its own `properties`/`array` stores are empty, so it MUST take this trap path.
+                if (o.proxy) |pd| {
+                    const pc = try enumerateProxyKeys(self, pd, &seen, out);
+                    if (pc.isAbrupt()) return pc;
+                    obj = switch (try self.ordinaryGetPrototypeOf(o)) {
+                        .proto => |p| p,
+                        .abrupt => |c| return c,
+                    };
+                    continue;
+                }
                 // Stop at a realm built-in prototype: its properties are spec-non-enumerable.
                 if (isBuiltinProto(self, o)) break;
                 // Array exotic integer indices (numeric order), then ordinary string keys. `length`
@@ -889,6 +904,38 @@ pub fn enumerateKeys(self: *Interpreter, value: Value, out: *std.ArrayListUnmana
         },
         else => {}, // §13.5 ToObject of a number/boolean → no own enumerable string keys (M-subset)
     }
+    return .{ .normal = .undefined };
+}
+
+/// §14.7.5/§10.5.11: enumerate one Proxy's own enumerable STRING keys. Calls the proxy's
+/// [[OwnPropertyKeys]] (ownKeys trap or forwarded), skips Symbol keys and already-seen names, and
+/// keeps a key only if its [[GetOwnProperty]] reports `enumerable: true`. A trap throw propagates.
+fn enumerateProxyKeys(
+    self: *Interpreter,
+    pd: *ProxyData,
+    seen: *std.StringHashMapUnmanaged(void),
+    out: *std.ArrayListUnmanaged(Value),
+) EvalError!Completion {
+    const kc = try builtin_proxy.ownKeys(self, pd);
+    if (kc.isAbrupt()) return kc;
+    if (kc.normal != .object) return .{ .normal = .undefined };
+    const arr = kc.normal.object;
+    const n = arr.arrayLen();
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const kv = arr.arrayGet(i);
+        if (kv != .string) continue; // §14.7.5 step 6.b: Symbol keys are not enumerated
+        const key = kv.string;
+        if (seen.contains(key)) continue;
+        try seen.put(self.arena, key, {}); // a shadowed name is fixed at the first occurrence
+        // [[GetOwnProperty]] for the enumerable flag (and to honor an absent / non-enumerable prop).
+        const dc = try builtin_proxy.getOwnProperty(self, pd, kv);
+        if (dc.isAbrupt()) return dc;
+        if (dc.normal != .object) continue; // undefined → not enumerated
+        const en = dc.normal.object.get("enumerable") orelse continue;
+        if (en == .boolean and en.boolean) try out.append(self.arena, kv);
+    }
+    return .{ .normal = .undefined };
 }
 
 /// Is `o` one of the realm's built-in prototype objects (`Object`/`Array`/`String`/Error-family

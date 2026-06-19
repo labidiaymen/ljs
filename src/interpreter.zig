@@ -1095,7 +1095,9 @@ pub fn isConstructor(obj: *Object) bool {
     // dispatch) — every genuine built-in constructor, so `Reflect.construct` / `new.target` IsConstructor
     // checks agree with what `new` accepts. (Symbol/BigInt are callable-but-not-`new` → excluded.)
     return switch (obj.native) {
-        .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor, .proxy_ctor, .regexp_ctor, .array_buffer_ctor, .typed_array_ctor, .typed_array_abstract_ctor, .data_view_ctor, .date_ctor, .weakref_ctor, .finalization_registry_ctor, .disposable_stack_ctor, .async_disposable_stack_ctor => true,
+        // §20.4.1: Symbol HAS [[Construct]] (it may appear in an `extends` clause) even though a
+        // direct `new Symbol()` throws — `isConstructor(Symbol)` must therefore be true.
+        .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor, .proxy_ctor, .regexp_ctor, .array_buffer_ctor, .typed_array_ctor, .typed_array_abstract_ctor, .data_view_ctor, .date_ctor, .weakref_ctor, .finalization_registry_ctor, .disposable_stack_ctor, .async_disposable_stack_ctor, .symbol_ctor => true,
         else => false,
     };
 }

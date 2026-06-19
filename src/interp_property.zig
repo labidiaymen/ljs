@@ -467,8 +467,43 @@ pub fn setProperty(self: *Interpreter, base: Value, key: []const u8, value: Valu
             return .{ .normal = value };
         },
         .undefined, .null => return self.throwError("TypeError", "Cannot set properties of null or undefined"),
-        else => return .{ .normal = value },
+        // §6.2.5.6 PutValue on a primitive base: ToObject(base) yields a fresh wrapper, then
+        // OrdinarySetWithOwnDescriptor runs with Receiver = the primitive. An inherited accessor's
+        // setter is invoked with `this` = base. Otherwise the write targets the (primitive) receiver
+        // and fails — a TypeError in strict mode, a silent no-op in sloppy.
+        else => return try setOnPrimitive(self, base, key, value),
     }
+}
+
+/// §10.1.9 [[Set]] over a primitive base (number/string/boolean/symbol/bigint). Resolves an inherited
+/// setter on the wrapper prototype and calls it with `this` = the primitive; if no setter exists the
+/// write would create/overwrite on the primitive receiver, which is rejected (strict → TypeError).
+fn setOnPrimitive(self: *Interpreter, base: Value, key: []const u8, value: Value) EvalError!Completion {
+    const proto: ?*Object = switch (base) {
+        .string => self.stringProto(),
+        .number => self.globalProto("Number"),
+        .boolean => self.globalProto("Boolean"),
+        .symbol => self.globalProto("Symbol"),
+        .bigint => self.globalProto("BigInt"),
+        else => null,
+    };
+    if (proto) |p| {
+        if (p.getProp(key)) |loc| switch (loc.pv.payload) {
+            .accessor => |a| {
+                if (a.set) |setter| {
+                    const c = try self.callFunction(setter, &.{value}, base);
+                    if (c.isAbrupt()) return c;
+                    return .{ .normal = value };
+                }
+                // A get-only inherited accessor: the write is rejected (strict → TypeError).
+                if (self.strict) return self.throwError("TypeError", "Cannot set property which has only a getter");
+                return .{ .normal = value };
+            },
+            .data => {}, // an inherited data property does not let the primitive receiver be written
+        };
+    }
+    if (self.strict) return self.throwError("TypeError", "Cannot create property on a primitive value");
+    return .{ .normal = value };
 }
 
 /// §13.3.3 / §7.1.19 ToPropertyKey-aware [[Get]] for a computed key (`a[k]`). A Symbol key routes
@@ -539,11 +574,21 @@ pub fn getSymbolProperty(self: *Interpreter, base: Value, key: *Symbol) EvalErro
                 },
             }
         },
-        .string => {
-            // §22.1: a primitive String boxes to String.prototype for symbol keys too (so
-            // `"ab"[Symbol.iterator]` resolves the iterator method).
-            if (self.stringProto()) |proto| {
-                if (proto.getSymbolProp(key)) |loc| switch (loc.pv.payload) {
+        .undefined, .null => return self.throwError("TypeError", "Cannot read properties of null or undefined"),
+        // §22.1/§20.4/etc.: a primitive boxes to its wrapper prototype for symbol keys too, so
+        // `"ab"[Symbol.iterator]` and `Symbol.toPrimitive[Symbol.toPrimitive]` resolve the inherited
+        // method/accessor (with `this` = the primitive base).
+        else => {
+            const proto: ?*Object = switch (base) {
+                .string => self.stringProto(),
+                .number => self.globalProto("Number"),
+                .boolean => self.globalProto("Boolean"),
+                .symbol => self.globalProto("Symbol"),
+                .bigint => self.globalProto("BigInt"),
+                else => null,
+            };
+            if (proto) |p| {
+                if (p.getSymbolProp(key)) |loc| switch (loc.pv.payload) {
                     .data => |v| return .{ .normal = v },
                     .accessor => |a| {
                         const getter = a.get orelse return .{ .normal = .undefined };
@@ -553,8 +598,6 @@ pub fn getSymbolProperty(self: *Interpreter, base: Value, key: *Symbol) EvalErro
             }
             return .{ .normal = .undefined };
         },
-        .undefined, .null => return self.throwError("TypeError", "Cannot read properties of null or undefined"),
-        else => return .{ .normal = .undefined },
     }
 }
 
@@ -604,7 +647,12 @@ pub fn setSymbolProperty(self: *Interpreter, base: Value, key: *Symbol, value: V
             return .{ .normal = value };
         },
         .undefined, .null => return self.throwError("TypeError", "Cannot set properties of null or undefined"),
-        else => return .{ .normal = value },
+        // §6.2.5.6 PutValue on a primitive base with a symbol key — same rejection as string keys
+        // (no inherited symbol setter is resolved here; strict → TypeError, sloppy → no-op).
+        else => {
+            if (self.strict) return self.throwError("TypeError", "Cannot create property on a primitive value");
+            return .{ .normal = value };
+        },
     }
 }
 
@@ -616,6 +664,9 @@ pub fn deleteProperty(self: *Interpreter, base: Value, key: []const u8) EvalErro
         .object => |o| {
             if (o.proxy) |pd| return builtin_proxy.deleteProperty(self, pd, .{ .string = key }); // §10.5.10 [[Delete]]
             if (o.kind == .array) {
+                // §10.4.2/§22.1.4.1: an Array's `length` is a non-configurable own property — a
+                // [[Delete]] of it always returns false (it is synthetic, never in `properties`).
+                if (std.mem.eql(u8, key, "length")) return .{ .normal = .{ .boolean = false } };
                 if (parseIndex(key)) |i| {
                     // A non-default-attribute index lives in the property map; honor its
                     // [[Configurable]] (a frozen/sealed or explicit non-configurable index can't be
