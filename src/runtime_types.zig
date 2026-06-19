@@ -187,9 +187,11 @@ pub const PromiseReaction = struct {
     kind: enum { fulfill, reject },
     /// The user-supplied handler (`onFulfilled` / `onRejected`), or null for the default pass-through.
     handler: ?*Object,
-    /// The capability (derived promise) this reaction settles. Null for a reaction with no derived
-    /// promise (e.g. the internal await reaction, which resumes a thread instead).
-    capability: ?*Object,
+    /// The capability (derived-promise record) this reaction settles — its [[Resolve]]/[[Reject]]
+    /// are CALLED with the handler result (so a user-subclass `then`/species capability routes
+    /// through its own resolving functions). Null for a reaction with no derived promise (e.g. the
+    /// internal await reaction, which resumes a thread instead).
+    capability: ?*PromiseCapability,
     /// §27.7 await: when set, running this reaction resumes the async body thread `gen` with the
     /// settlement value (fulfill → `.next(value)`; reject → `.throw(value)`) instead of calling a
     /// handler / settling a capability. `capability`/`handler` are null in that case.
@@ -217,13 +219,28 @@ pub const PromiseData = struct {
 /// settle when `remaining` hits 0. `errors`/`values` double as the AggregateError list for `any`.
 /// Allocated in the realm arena; pointed at by each element closure (so they share one counter/array).
 pub const CombinatorState = struct {
-    /// The result promise to settle when all inputs have settled (the combinator's returned promise).
-    capability: *Object,
+    /// The result capability to settle when all inputs have settled (the combinator's returned
+    /// promise + its resolve/reject — so a subclass/species result settles through its own functions).
+    capability: *PromiseCapability,
     /// One slot per input: the fulfillment value (`all`), the `{status,...}` record (`allSettled`),
     /// or the rejection reason (`any`). Grown as the iterable is consumed.
     values: std.ArrayListUnmanaged(Value) = .empty,
     /// §27.2.4.1.1 [[Remaining]] — inputs not yet settled. The combinator settles when this reaches 0.
     remaining: usize = 1,
+};
+
+/// §27.2.1.5 PromiseCapability Record — `{ [[Promise]], [[Resolve]], [[Reject]] }`. Built by
+/// NewPromiseCapability(C): `new C(executor)` where the `executor` (a `promise_capability_executor`
+/// native) writes the just-passed resolve/reject here. The constructor `C` may be a user subclass
+/// (subclassing) or the species result, so the resolve/reject are whatever `C` handed the executor —
+/// not necessarily the engine's own resolving functions. Allocated in the realm arena.
+pub const PromiseCapability = struct {
+    /// The promise produced by `new C(executor)` (`undefined` until the constructor returns).
+    promise: Value = .undefined,
+    /// The resolve / reject functions captured by the executor (`undefined` until the executor runs;
+    /// NewPromiseCapability throws a TypeError if either is still non-callable afterward, §27.2.1.5).
+    resolve: Value = .undefined,
+    reject: Value = .undefined,
 };
 
 /// §9.5 a Job enqueued on the realm Job (microtask) queue. The engine drains the queue once the
@@ -507,6 +524,11 @@ pub const NativeId = enum {
     promise_finally, // Promise.prototype.finally
     promise_resolve, // Promise.resolve(x)
     promise_reject, // Promise.reject(x)
+    promise_with_resolvers, // §27.2.4.3 Promise.withResolvers() — { promise, resolve, reject }
+    /// §27.2.1.5.1 GetCapabilitiesExecutor — the executor passed to `new C(executor)` by
+    /// NewPromiseCapability. It captures the just-built resolve/reject into the shared
+    /// `PromiseCapability` record (`capability` slot on the function object).
+    promise_capability_executor,
     promise_all, // Promise.all(iterable) (§27.2.4.1)
     promise_all_settled, // Promise.allSettled(iterable) (§27.2.4.2)
     promise_any, // Promise.any(iterable) (§27.2.4.3)

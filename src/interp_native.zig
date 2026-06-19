@@ -472,12 +472,14 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .promise_then => return interp_async.promiseThen(self, this_val, args),
         .promise_catch => return interp_async.promiseCatch(self, this_val, args),
         .promise_finally => return interp_async.promiseFinally(self, this_val, args),
-        .promise_resolve => return interp_async.promiseStaticResolve(self, args),
-        .promise_reject => return interp_async.promiseStaticReject(self, args),
-        .promise_all => return interp_async.promiseCombinator(self, args, .all),
-        .promise_all_settled => return interp_async.promiseCombinator(self, args, .all_settled),
-        .promise_any => return interp_async.promiseCombinator(self, args, .any),
-        .promise_race => return interp_async.promiseCombinator(self, args, .race),
+        .promise_resolve => return interp_async.promiseStaticResolve(self, this_val, args),
+        .promise_reject => return interp_async.promiseStaticReject(self, this_val, args),
+        .promise_with_resolvers => return interp_async.promiseWithResolvers(self, this_val),
+        .promise_capability_executor => return interp_async.promiseCapabilityExecutor(self, func, args),
+        .promise_all => return interp_async.promiseCombinator(self, this_val, args, .all),
+        .promise_all_settled => return interp_async.promiseCombinator(self, this_val, args, .all_settled),
+        .promise_any => return interp_async.promiseCombinator(self, this_val, args, .any),
+        .promise_race => return interp_async.promiseCombinator(self, this_val, args, .race),
         .promise_combinator_element => return interp_async.promiseCombinatorElement(self, func, args),
         .promise_resolve_fn, .promise_reject_fn => return interp_async.promiseResolvingFn(self, func, args),
         .promise_finally_thunk => return interp_async.promiseFinallyThunk(self, func, args),
@@ -687,7 +689,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .bigint_static => return builtin_bigint.bigintStatic(self, func.native_name, args), // §21.2.2 asIntN/asUintN
         .bigint_method => return builtin_bigint.bigintMethod(self, func.native_name, this_val, args), // §21.2.3 toString/valueOf
         .symbol_ctor => return builtin_symbol.constructor(self, args), // §20.4.1.1 Symbol([description])
-        .promise_ctor => return interp_async.promiseConstructor(self, args), // §27.2.3.1 Promise(executor) called w/o new
+        .promise_ctor => return interp_async.promiseConstructor(self, this_val, args), // §27.2.3.1 Promise(executor)
         .array_ctor, .array_method, .array_static, .string_method, .string_static, .math_method, .reflect_method => unreachable, // handled in the first switch
         .species_getter, .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
         .symbol_static, .symbol_description => unreachable, // handled in the first switch
@@ -705,6 +707,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .json_parse, .json_stringify => unreachable, // handled in the first switch
         .iterator_helper, .iterator_helper_next, .iterator_from, .iterator_ctor => unreachable, // handled in the first switch
         .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch
+        .promise_with_resolvers, .promise_capability_executor => unreachable, // handled in the first switch
         .promise_all, .promise_all_settled, .promise_any, .promise_race, .promise_combinator_element => unreachable, // handled in the first switch
         .promise_resolve_fn, .promise_reject_fn, .promise_finally_thunk, .test_done => unreachable, // handled in the first switch
         .eval_fn => unreachable, // §19.2.1 handled in the first switch (indirect eval path)

@@ -509,17 +509,29 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     // sentinel global name so `interpreter.promiseProto` resolves it for engine-created promises.
     const promise_fn = try Object.createNative(arena, .promise_ctor, "Promise");
     promise_fn.prototype = function_proto; // §20.2.3 the Promise constructor → %Function.prototype%
+    try promise_fn.defineData("length", .{ .number = 1 }, false, false, true); // §27.2.3 Promise.length === 1
     if (promise_fn.get("prototype")) |pv| {
         if (pv == .object) {
             pv.object.prototype = object_proto; // §27.2.3.2 Promise.prototype inherits %Object.prototype%
-            try defineMethod(arena, pv.object, "then", .promise_then, "then"); // §27.2.5.4
-            try defineMethod(arena, pv.object, "catch", .promise_catch, "catch"); // §27.2.5.1
-            try defineMethod(arena, pv.object, "finally", .promise_finally, "finally"); // §27.2.5.3
+            try defineMethodLen(arena, pv.object, "then", .promise_then, "then", 2); // §27.2.5.4
+            try defineMethodLen(arena, pv.object, "catch", .promise_catch, "catch", 1); // §27.2.5.1
+            try defineMethodLen(arena, pv.object, "finally", .promise_finally, "finally", 1); // §27.2.5.3
+            // §27.2.5.5 Promise.prototype[@@toStringTag] === "Promise" (configurable, non-writable).
+            if (symbol_fn.get("toStringTag")) |t| if (t == .symbol)
+                try pv.object.defineSymbolData(t.symbol, .{ .string = "Promise" }, false, false, true);
             try env.declare("%PromisePrototype%", .{ .object = pv.object }, false, true);
         }
     }
-    try defineMethod(arena, promise_fn, "resolve", .promise_resolve, "resolve"); // §27.2.4.5
-    try defineMethod(arena, promise_fn, "reject", .promise_reject, "reject"); // §27.2.4.4
+    try defineMethodLen(arena, promise_fn, "resolve", .promise_resolve, "resolve", 1); // §27.2.4.7
+    try defineMethodLen(arena, promise_fn, "reject", .promise_reject, "reject", 1); // §27.2.4.4
+    try defineMethodLen(arena, promise_fn, "withResolvers", .promise_with_resolvers, "withResolvers", 0); // §27.2.4.3
+    // §27.2.4.10 get Promise[Symbol.species] — returns `this` (the receiver constructor); used by
+    // then/finally/combinators via SpeciesConstructor. A configurable, non-enumerable accessor.
+    if (symbol_fn.get("species")) |sp| if (sp == .symbol) {
+        const sg = try Object.createNative(arena, .species_getter, "get [Symbol.species]");
+        sg.prototype = function_proto;
+        try promise_fn.defineSymbolAccessorEx(sp.symbol, sg, null, false);
+    };
     try defineConstructorBackref(promise_fn); // §27.2.5.2 Promise.prototype.constructor === Promise
     try env.declare("Promise", .{ .object = promise_fn }, true, true);
 
@@ -991,10 +1003,10 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     // `allSettled`/`any` are static, non-enumerable methods on the Promise constructor.
     if (env.lookup("Promise")) |b| if (b.value == .object) {
         const pf = b.value.object;
-        try defineMethod(arena, pf, "all", .promise_all, "all"); // §27.2.4.1
-        try defineMethod(arena, pf, "allSettled", .promise_all_settled, "allSettled"); // §27.2.4.2
-        try defineMethod(arena, pf, "any", .promise_any, "any"); // §27.2.4.3
-        try defineMethod(arena, pf, "race", .promise_race, "race"); // §27.2.4.6
+        try defineMethodLen(arena, pf, "all", .promise_all, "all", 1); // §27.2.4.1
+        try defineMethodLen(arena, pf, "allSettled", .promise_all_settled, "allSettled", 1); // §27.2.4.2
+        try defineMethodLen(arena, pf, "any", .promise_any, "any", 1); // §27.2.4.3
+        try defineMethodLen(arena, pf, "race", .promise_race, "race", 1); // §27.2.4.6
     };
 
     // §20.5.7 AggregateError — the error thrown by `Promise.any` when every input rejects. A native

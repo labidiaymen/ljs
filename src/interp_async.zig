@@ -634,13 +634,137 @@ pub fn promiseResolveValue(self: *Interpreter, x: Value) EvalError!*Object {
     return p;
 }
 
+/// The `%Promise%` constructor object (`Promise`), or null in a realm-less eval.
+pub fn promiseCtor(self: *Interpreter) ?*Object {
+    const g = self.globals orelse return null;
+    const b = g.lookup("Promise") orelse return null;
+    return if (b.value == .object) b.value.object else null;
+}
+
+/// The result of building a PromiseCapability: the record, or an abrupt completion from a throwing
+/// constructor / non-constructor argument. Named (not an inline union) so several helpers share it.
+pub const CapResult = union(enum) { cap: *object_mod.PromiseCapability, abrupt: Completion };
+
+/// `true` iff `o` is callable AND has a [[Construct]] (an ordinary function/class/bound ctor, a
+/// native constructor, or a Proxy whose target is a constructor). Mirrors §7.2.4 IsConstructor —
+/// arrow functions / built-in methods are callable but NOT constructors.
+pub fn isConstructorObj(o: *Object) bool {
+    if (o.proxy) |pd| return if (pd.revoked) false else isConstructorObj(pd.target);
+    if (o.bound) |b| return isConstructorObj(b.target);
+    if (o.call) |fd| return !fd.is_arrow; // ordinary fn / class / method body — arrows have no [[Construct]]
+    return switch (o.native) {
+        .promise_ctor, .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor, .proxy_ctor, .regexp_ctor, .array_buffer_ctor, .typed_array_ctor, .data_view_ctor, .date_ctor => true,
+        else => false,
+    };
+}
+
+/// §27.2.1.5 NewPromiseCapability ( C ) — construct `new C(executor)` where `executor` captures the
+/// resolve/reject `C` hands it into a fresh PromiseCapability record. `C` must be a constructor
+/// (TypeError otherwise). After construction both `[[Resolve]]` and `[[Reject]]` must be callable
+/// (§27.2.1.5 step 7/9 — a constructor that never calls the executor, or calls it with a
+/// non-callable, throws). Returns the capability, or propagates an abrupt completion from `new C`.
+pub fn newPromiseCapability(self: *Interpreter, c: Value) EvalError!CapResult {
+    if (c != .object or !isConstructorObj(c.object)) {
+        return .{ .abrupt = try self.throwError("TypeError", "Promise capability requires a constructor") };
+    }
+    const cap = try self.arena.create(object_mod.PromiseCapability);
+    cap.* = .{};
+    // §27.2.1.5.1 GetCapabilitiesExecutor — a fresh native closure carrying `cap`.
+    const executor = try Object.createNative(self.arena, .promise_capability_executor, "");
+    executor.prototype = self.functionProto();
+    executor.capability = cap;
+    const rc = try self.construct(c.object, &.{.{ .object = executor }});
+    if (rc.isAbrupt()) return .{ .abrupt = rc };
+    // §27.2.1.5 step 7/9: the resolve and reject captured by the executor must be callable.
+    if (cap.resolve != .object or !isCallable(cap.resolve.object) or cap.reject != .object or !isCallable(cap.reject.object)) {
+        return .{ .abrupt = try self.throwError("TypeError", "Promise resolve or reject is not callable") };
+    }
+    cap.promise = rc.normal;
+    return .{ .cap = cap };
+}
+
+/// §27.2.1.5.1 the GetCapabilitiesExecutor body — record the resolve/reject it is called with into
+/// the captured capability. A second call (resolve/reject already set) is a TypeError (§ step 4/6).
+pub fn promiseCapabilityExecutor(self: *Interpreter, func: *Object, args: []const Value) EvalError!Completion {
+    const cap = func.capability orelse return .{ .normal = .undefined };
+    if (cap.resolve != .undefined or cap.reject != .undefined) {
+        return self.throwError("TypeError", "Promise executor already invoked");
+    }
+    cap.resolve = if (args.len > 0) args[0] else .undefined;
+    cap.reject = if (args.len > 1) args[1] else .undefined;
+    return .{ .normal = .undefined };
+}
+
+/// §27.2.4.7.1-style fast path: build a capability over the genuine `%Promise%` (no user
+/// constructor), reusing the engine's own resolving functions. Used when the species/constructor is
+/// the built-in Promise so we keep the cheap direct-settlement path.
+pub fn newBuiltinCapability(self: *Interpreter, promise: *Object) EvalError!*object_mod.PromiseCapability {
+    const cap = try self.arena.create(object_mod.PromiseCapability);
+    cap.* = .{
+        .promise = .{ .object = promise },
+        .resolve = .{ .object = try makeResolvingFunction(self, promise, .promise_resolve_fn) },
+        .reject = .{ .object = try makeResolvingFunction(self, promise, .promise_reject_fn) },
+    };
+    return cap;
+}
+
+/// §27.2.4.3 SpeciesConstructor(O, %Promise%) then NewPromiseCapability(C). `then`/`catch`/`finally`
+/// derive their result promise this way: read `O.constructor`, then `C[@@species]`; default to
+/// `%Promise%`. When the species IS the genuine %Promise% (the common case), take the fast builtin
+/// capability; otherwise construct via the user species. Returns the capability or an abrupt
+/// completion (a poisoned `constructor`/`@@species` getter, or a throwing species constructor).
+pub fn speciesCapability(self: *Interpreter, o: *Object) EvalError!CapResult {
+    const default_ctor = promiseCtor(self);
+    // §7.3.22 SpeciesConstructor: C = O.constructor; if undefined → default. Else S = C[@@species];
+    // null/undefined S → default. A non-constructor S → TypeError.
+    const cc = try self.getProperty(.{ .object = o }, "constructor");
+    if (cc.isAbrupt()) return .{ .abrupt = cc };
+    var species: Value = .undefined;
+    if (cc.normal == .undefined) {
+        species = if (default_ctor) |d| .{ .object = d } else .undefined;
+    } else if (cc.normal == .object) {
+        const sym = self.wellKnownSpecies() orelse return fastOrAbrupt(self, o, default_ctor);
+        const sc = try self.getSymbolProperty(cc.normal, sym);
+        if (sc.isAbrupt()) return .{ .abrupt = sc };
+        species = if (sc.normal == .null) .undefined else sc.normal;
+        if (species == .undefined) species = if (default_ctor) |d| .{ .object = d } else .undefined;
+    } else {
+        return .{ .abrupt = try self.throwError("TypeError", "constructor is not an object") };
+    }
+    // Fast path: the species is the genuine %Promise% → reuse the engine resolving functions.
+    if (species == .object and default_ctor != null and species.object == default_ctor.?) {
+        return .{ .cap = try newBuiltinCapability(self, try self.newPromise()) };
+    }
+    return newPromiseCapability(self, species);
+}
+
+fn fastOrAbrupt(self: *Interpreter, o: *Object, default_ctor: ?*Object) EvalError!CapResult {
+    _ = o;
+    _ = default_ctor;
+    return .{ .cap = try newBuiltinCapability(self, try self.newPromise()) };
+}
+
+/// Resolve a PromiseCapability's promise with `value` by CALLING its [[Resolve]] function (works for
+/// both the engine's own resolving function and a user subclass's). For the builtin fast path this
+/// is equivalent to `resolvePromise`.
+pub fn capabilityResolve(self: *Interpreter, cap: *object_mod.PromiseCapability, value: Value) EvalError!Completion {
+    if (cap.resolve != .object) return .{ .normal = .undefined };
+    return self.callFunction(cap.resolve.object, &.{value}, .undefined);
+}
+
+/// Reject a PromiseCapability's promise with `reason` by CALLING its [[Reject]] function.
+pub fn capabilityReject(self: *Interpreter, cap: *object_mod.PromiseCapability, reason: Value) EvalError!Completion {
+    if (cap.reject != .object) return .{ .normal = .undefined };
+    return self.callFunction(cap.reject.object, &.{reason}, .undefined);
+}
+
 /// §27.2.5.4.1 PerformPromiseThen — attach a fulfill/reject reaction pair to `promise`, returning
 /// the derived result promise (`capability`). If `promise` is already settled, the matching
 /// reaction is enqueued as a Job immediately; otherwise it is appended to the pending list.
 /// `on_fulfilled`/`on_rejected` are the user handlers (null ⇒ default pass-through). When
 /// `result_promise` is provided it is used as the capability (so `await`/internal callers can pass
 /// null for "no derived promise"); a normal `then` always creates one.
-pub fn performPromiseThen(self: *Interpreter, promise: *Object, on_fulfilled: ?*Object, on_rejected: ?*Object, capability: ?*Object) EvalError!void {
+pub fn performPromiseThen(self: *Interpreter, promise: *Object, on_fulfilled: ?*Object, on_rejected: ?*Object, capability: ?*object_mod.PromiseCapability) EvalError!void {
     const pd = promise.promise.?;
     const fulfill_reaction: object_mod.PromiseReaction = .{ .kind = .fulfill, .handler = on_fulfilled, .capability = capability };
     const reject_reaction: object_mod.PromiseReaction = .{ .kind = .reject, .handler = on_rejected, .capability = capability };
@@ -674,8 +798,10 @@ pub fn runReactionJob(self: *Interpreter, reaction: object_mod.PromiseReaction, 
         const hc = try self.callFunction(h, &.{argument}, .undefined);
         if (cap) |c| {
             switch (hc) {
-                .normal => |v| try resolvePromise(self, c, v),
-                .throw => |e| try rejectPromiseRaw(self, c, e),
+                // §27.2.2.1 step 9/10: a normal handler result resolves the capability; a throw
+                // rejects it — by CALLING its [[Resolve]]/[[Reject]] (subclass-aware).
+                .normal => |v| _ = try capabilityResolve(self, c, v),
+                .throw => |e| _ = try capabilityReject(self, c, e),
                 else => {},
             }
         }
@@ -683,8 +809,8 @@ pub fn runReactionJob(self: *Interpreter, reaction: object_mod.PromiseReaction, 
     }
     // Default handler (§27.2.4.7.1 identity / §27.2.4.7.2 thrower).
     if (cap) |c| switch (reaction.kind) {
-        .fulfill => try resolvePromise(self, c, argument),
-        .reject => try rejectPromiseRaw(self, c, argument),
+        .fulfill => _ = try capabilityResolve(self, c, argument),
+        .reject => _ = try capabilityReject(self, c, argument),
     };
 }
 
@@ -1259,19 +1385,31 @@ pub fn asyncFromSyncMethod(self: *Interpreter, name: []const u8, this_val: Value
     wrap.prototype = self.functionProto();
     wrap.afs_done = step.done;
     // PerformPromiseThen(valueWrapper, wrap) with the result promise as the capability.
-    try performPromiseThen(self, value_wrapper, wrap, null, promise);
+    try performPromiseThen(self, value_wrapper, wrap, null, try newBuiltinCapability(self, promise));
     return .{ .normal = .{ .object = promise } };
 }
 
 /// §27.2.3.1 the Promise constructor — `new Promise(executor)`: create a pending promise, build its
 /// resolve/reject functions, call `executor(resolve, reject)`, and reject the promise if the
 /// executor throws (§27.2.3.1 step 9–10). `executor` must be callable (§27.2.3.1 step 2 TypeError).
-pub fn promiseConstructor(self: *Interpreter, args: []const Value) EvalError!Completion {
+pub fn promiseConstructor(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
+    // §27.2.3.1 step 1: `Promise(...)` called without `new` (NewTarget undefined) → TypeError.
+    if (self.native_new_target == .undefined) {
+        return self.throwError("TypeError", "Constructor Promise requires 'new'");
+    }
     const executor: Value = if (args.len > 0) args[0] else .undefined;
     if (executor != .object or !isCallable(executor.object)) {
         return self.throwError("TypeError", "Promise resolver is not a function");
     }
-    const promise = try self.newPromise();
+    // §27.2.3.1 step 3–4 OrdinaryCreateFromConstructor: when invoked via `new`/`super`, the instance
+    // (`this_val`) was already created with NewTarget.prototype — attach PromiseData to IT so a
+    // subclass's prototype is preserved. (A realm-less call with no instance falls back to a fresh one.)
+    const promise = if (this_val == .object and this_val.object.promise == null) blk: {
+        const pd = try self.arena.create(object_mod.PromiseData);
+        pd.* = .{};
+        this_val.object.promise = pd;
+        break :blk this_val.object;
+    } else try self.newPromise();
     const resolve_fn = try makeResolvingFunction(self, promise, .promise_resolve_fn);
     const reject_fn = try makeResolvingFunction(self, promise, .promise_reject_fn);
     const rc = try self.callFunction(executor.object, &.{ .{ .object = resolve_fn }, .{ .object = reject_fn } }, .undefined);
@@ -1289,50 +1427,148 @@ pub fn promiseConstructor(self: *Interpreter, args: []const Value) EvalError!Com
 /// §27.2.4.5 Promise.resolve(x) / §27.2.4.4 Promise.reject(r) — the `this`-static factories. resolve
 /// returns `x` unchanged if it is already a promise, else a promise resolved with `x`; reject always
 /// makes a fresh rejected promise.
-pub fn promiseStaticResolve(self: *Interpreter, args: []const Value) EvalError!Completion {
+pub fn promiseStaticResolve(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
+    // §27.2.4.7 PromiseResolve(C, x): `this` (C) must be an Object (TypeError otherwise).
+    if (this_val != .object) return self.throwError("TypeError", "Promise.resolve called on a non-object");
     const x: Value = if (args.len > 0) args[0] else .undefined;
-    const p = try promiseResolveValue(self, x);
-    return .{ .normal = .{ .object = p } };
+    // §27.2.4.7 step 2: if x is already a promise whose `.constructor` IS C, return x unchanged.
+    if (x == .object and x.object.promise != null) {
+        const xc = try self.getProperty(x, "constructor");
+        if (xc.isAbrupt()) return xc;
+        if (xc.normal == .object and xc.normal.object == this_val.object) return .{ .normal = x };
+    }
+    // §27.2.4.7 step 3: NewPromiseCapability(C); call its resolve with x; return its promise. The
+    // identity short-circuit (step 2) already fired above, so a same-realm %Promise% input that
+    // wasn't returned (its `.constructor` was reassigned) is wrapped in a FRESH promise here. Fast
+    // path: C is the genuine %Promise% → reuse the engine's own resolving functions.
+    const cap = if (this_val.object == promiseCtor(self))
+        try newBuiltinCapability(self, try self.newPromise())
+    else switch (try newPromiseCapability(self, this_val)) {
+        .cap => |c| c,
+        .abrupt => |a| return a,
+    };
+    const rc = try capabilityResolve(self, cap, x);
+    if (rc.isAbrupt()) return rc;
+    return .{ .normal = cap.promise };
 }
 
-pub fn promiseStaticReject(self: *Interpreter, args: []const Value) EvalError!Completion {
+pub fn promiseStaticReject(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
+    // §27.2.4.4: `this` (C) must be a constructor; NewPromiseCapability(C); call its reject with r.
+    if (this_val != .object) return self.throwError("TypeError", "Promise.reject called on a non-object");
     const r: Value = if (args.len > 0) args[0] else .undefined;
-    const p = try self.newPromise();
-    try rejectPromiseRaw(self, p, r);
-    return .{ .normal = .{ .object = p } };
+    if (this_val.object == promiseCtor(self)) {
+        const p = try self.newPromise();
+        try rejectPromiseRaw(self, p, r);
+        return .{ .normal = .{ .object = p } };
+    }
+    const sc = try newPromiseCapability(self, this_val);
+    const cap = switch (sc) {
+        .cap => |c| c,
+        .abrupt => |a| return a,
+    };
+    const rc = try capabilityReject(self, cap, r);
+    if (rc.isAbrupt()) return rc;
+    return .{ .normal = cap.promise };
+}
+
+/// §27.2.4.3 Promise.withResolvers() — `{ promise, resolve, reject }` from NewPromiseCapability(this).
+pub fn promiseWithResolvers(self: *Interpreter, this_val: Value) EvalError!Completion {
+    if (this_val != .object) return self.throwError("TypeError", "Promise.withResolvers called on a non-object");
+    const sc = try newPromiseCapability(self, this_val);
+    const cap = switch (sc) {
+        .cap => |c| c,
+        .abrupt => |a| return a,
+    };
+    const obj = try Object.create(self.arena, self.objectProto());
+    try obj.set("promise", cap.promise);
+    try obj.set("resolve", cap.resolve);
+    try obj.set("reject", cap.reject);
+    return .{ .normal = .{ .object = obj } };
 }
 
 /// §27.2.4.1/.2/.3/.6 the shared driver. A non-iterable argument rejects the result promise (the
 /// spec returns `IfAbruptRejectPromise` — a rejected promise, not a sync throw).
-pub fn promiseCombinator(self: *Interpreter, args: []const Value, comptime kind: CombinatorKind) EvalError!Completion {
-    const result = try self.newPromise();
+pub fn promiseCombinator(self: *Interpreter, this_val: Value, args: []const Value, comptime kind: CombinatorKind) EvalError!Completion {
+    // §27.2.4.1 step 1–3: C = this (must be an Object/constructor); capability = NewPromiseCapability(C).
+    if (this_val != .object) return self.throwError("TypeError", "Promise combinator called on a non-object");
+    const fast = this_val.object == promiseCtor(self);
+    const cap = blk: {
+        if (fast) break :blk try newBuiltinCapability(self, try self.newPromise());
+        const nc = try newPromiseCapability(self, this_val);
+        switch (nc) {
+            .cap => |c| break :blk c,
+            .abrupt => |a| return a, // §27.2.4.1 step 2: a throwing capability ctor throws synchronously
+        }
+    };
+    // §27.2.4.1.1 GetPromiseResolve(C): C.resolve must be callable (else IfAbruptRejectPromise).
+    const promise_resolve: ?*Object = blk: {
+        if (fast) break :blk null; // fast path: use promiseResolveValue directly
+        const rc = try self.getProperty(this_val, "resolve");
+        if (rc.isAbrupt()) {
+            const rej = try capabilityReject(self, cap, rc.throw);
+            if (rej.isAbrupt()) return rej;
+            return .{ .normal = cap.promise };
+        }
+        if (rc.normal != .object or !isCallable(rc.normal.object)) {
+            const rej = try capabilityReject(self, cap, (try self.throwError("TypeError", "Promise.resolve is not callable")).throw);
+            if (rej.isAbrupt()) return rej;
+            return .{ .normal = cap.promise };
+        }
+        break :blk rc.normal.object;
+    };
+
     const arg: Value = if (args.len > 0) args[0] else .undefined;
     // §7.4 GetIterator + drain the iterable to a value list; a non-iterable (or a throwing
     // iterator) rejects the result promise rather than throwing synchronously.
     var items: std.ArrayListUnmanaged(Value) = .empty;
     const ic = try self.iterateToList(arg, &items);
     if (ic.isAbrupt()) {
-        try rejectPromiseRaw(self, result, ic.throw);
-        return .{ .normal = .{ .object = result } };
+        const rej = try capabilityReject(self, cap, ic.throw);
+        if (rej.isAbrupt()) return rej;
+        return .{ .normal = cap.promise };
     }
+
+    // Resolve one input element to a promise via C.resolve (or the fast %Promise% path).
+    const resolveElem = struct {
+        fn call(s: *Interpreter, pr: ?*Object, c: Value, item: Value) EvalError!Completion {
+            if (pr) |f| return s.callFunction(f, &.{item}, c);
+            return .{ .normal = .{ .object = try promiseResolveValue(s, item) } };
+        }
+    }.call;
 
     if (kind == .race) {
         // §27.2.4.6.1 PerformPromiseRace — forward each element's settlement to the result promise.
-        // The first to settle wins (`resolvePromise`/`rejectPromiseRaw` honor [[AlreadyResolved]]).
         for (items.items) |item| {
-            const ep = try promiseResolveValue(self, item);
-            try performPromiseThen(self, ep, try makeResolvingFunction(self, result, .promise_resolve_fn), try makeResolvingFunction(self, result, .promise_reject_fn), null);
+            const epc = try resolveElem(self, promise_resolve, this_val, item);
+            if (epc.isAbrupt()) {
+                const rej = try capabilityReject(self, cap, epc.throw);
+                if (rej.isAbrupt()) return rej;
+                return .{ .normal = cap.promise };
+            }
+            if (epc.normal != .object) continue;
+            const tc = try invokeThen(self, epc.normal.object, cap, null, null);
+            if (tc.isAbrupt()) {
+                const rej = try capabilityReject(self, cap, tc.throw);
+                if (rej.isAbrupt()) return rej;
+                return .{ .normal = cap.promise };
+            }
         }
-        return .{ .normal = .{ .object = result } };
+        return .{ .normal = cap.promise };
     }
 
     const state = try self.arena.create(object_mod.CombinatorState);
-    state.* = .{ .capability = result };
+    state.* = .{ .capability = cap };
     for (items.items, 0..) |item, index| {
         // §27.2.4.1.1 step d.iii: a placeholder slot per element (filled by its resolve closure).
         try state.values.append(self.arena, .undefined);
         state.remaining += 1;
-        const ep = try promiseResolveValue(self, item);
+        const epc = try resolveElem(self, promise_resolve, this_val, item);
+        if (epc.isAbrupt()) {
+            const rej = try capabilityReject(self, cap, epc.throw);
+            if (rej.isAbrupt()) return rej;
+            return .{ .normal = cap.promise };
+        }
+        if (epc.normal != .object) continue;
         const on_f = try makeCombinatorElement(self, state, index, switch (kind) {
             .all => "all",
             .all_settled => "settled_fulfill",
@@ -1340,19 +1576,49 @@ pub fn promiseCombinator(self: *Interpreter, args: []const Value, comptime kind:
             .race => unreachable,
         });
         const on_r: ?*Object = switch (kind) {
-            // §27.2.4.1: `all` reject → reject the result promise directly (the default reject closure).
-            .all => try makeResolvingFunction(self, result, .promise_reject_fn),
+            // §27.2.4.1: `all` reject → reject the result capability directly.
+            .all => try makeCombinatorElement(self, state, index, "all_reject"),
             // §27.2.4.2/.3: `allSettled` reject and `any` reject record into the shared state.
             .all_settled => try makeCombinatorElement(self, state, index, "settled_reject"),
             .any => try makeCombinatorElement(self, state, index, "any_reject"),
             .race => unreachable,
         };
-        try performPromiseThen(self, ep, on_f, on_r, null);
+        const tc = try invokeThen(self, epc.normal.object, null, on_f, on_r);
+        if (tc.isAbrupt()) {
+            const rej = try capabilityReject(self, cap, tc.throw);
+            if (rej.isAbrupt()) return rej;
+            return .{ .normal = cap.promise };
+        }
     }
     // §27.2.4.1.1 step e: the implicit final decrement — if every element already settled (or there
     // were none), settle the result now.
     try combinatorSettleIfDone(self, state, kind);
-    return .{ .normal = .{ .object = result } };
+    return .{ .normal = cap.promise };
+}
+
+/// Invoke `ep.then(onFulfilled, onRejected)` — calling the element promise's OWN `then` (so a
+/// thenable element drives the combinator). If `cap` is given (race fast path), its resolve/reject
+/// are the handlers. Returns the `then` call completion (abrupt propagates as an IfAbruptRejectPromise
+/// at the call site). `ep` may be any thenable; for the fast %Promise% path it is a native promise.
+fn invokeThen(self: *Interpreter, ep: *Object, cap: ?*object_mod.PromiseCapability, on_f: ?*Object, on_r: ?*Object) EvalError!Completion {
+    // Fast path: a genuine native promise → attach reactions directly (no observable `then` read).
+    if (ep.promise != null and ep.prototype == promiseProto(self)) {
+        if (cap) |c| {
+            try performPromiseThen(self, ep, c.resolve.object, c.reject.object, null);
+        } else {
+            try performPromiseThen(self, ep, on_f, on_r, null);
+        }
+        return .{ .normal = .undefined };
+    }
+    // General path: Invoke `ep.then(onF, onR)`.
+    const then_c = try self.getProperty(.{ .object = ep }, "then");
+    if (then_c.isAbrupt()) return then_c;
+    if (then_c.normal != .object or !isCallable(then_c.normal.object)) {
+        return self.throwError("TypeError", "then is not a function");
+    }
+    const f: Value = if (cap) |c| c.resolve else if (on_f) |o| .{ .object = o } else .undefined;
+    const r: Value = if (cap) |c| c.reject else if (on_r) |o| .{ .object = o } else .undefined;
+    return self.callFunction(then_c.normal.object, &.{ f, r }, .{ .object = ep });
 }
 
 /// Build one combinator per-element resolve/reject closure (id `promise_combinator_element`),
@@ -1380,13 +1646,16 @@ pub fn promiseCombinatorElement(self: *Interpreter, func: *Object, args: []const
         // §27.2.4.1.2: record the fulfillment value; reject is the result promise's reject closure.
         state.values.items[index] = arg;
         try combinatorSettleIfDone(self, state, .all);
+    } else if (std.mem.eql(u8, func.native_name, "all_reject")) {
+        // §27.2.4.1: `all` reject → reject the result capability directly (first rejection wins).
+        _ = try capabilityReject(self, state.capability, arg);
     } else if (std.mem.eql(u8, func.native_name, "any_reject")) {
         // §27.2.4.3.2: record the rejection reason; if ALL reject, fail with an AggregateError.
         state.values.items[index] = arg;
         try combinatorSettleIfDone(self, state, .any);
     } else if (std.mem.eql(u8, func.native_name, "any_fulfill")) {
         // §27.2.4.3.1 step 8.j: the FIRST fulfillment resolves `any`'s result (later ones are no-ops).
-        try resolvePromise(self, state.capability, arg);
+        _ = try capabilityResolve(self, state.capability, arg);
     } else {
         // §27.2.4.2.2/.3 allSettled — build the `{status, value|reason}` record either way.
         const rec = try Object.create(self.arena, self.objectProto());
@@ -1412,7 +1681,7 @@ pub fn combinatorSettleIfDone(self: *Interpreter, state: *object_mod.CombinatorS
         .all, .all_settled => {
             const arr = try Object.createArray(self.arena, self.arrayProto());
             try arr.elements.appendSlice(self.arena, state.values.items);
-            try resolvePromise(self, state.capability, .{ .object = arr });
+            _ = try capabilityResolve(self, state.capability, .{ .object = arr });
         },
         .any => {
             // §27.2.4.3.1 step 8.d.iii / .3.2: every input rejected → reject with an AggregateError
@@ -1420,7 +1689,7 @@ pub fn combinatorSettleIfDone(self: *Interpreter, state: *object_mod.CombinatorS
             const errs = try Object.createArray(self.arena, self.arrayProto());
             try errs.elements.appendSlice(self.arena, state.values.items);
             const agg = try makeAggregateError(self, .{ .object = errs }, "All promises were rejected");
-            try rejectPromiseRaw(self, state.capability, agg);
+            _ = try capabilityReject(self, state.capability, agg);
         },
         .race => unreachable,
     }
@@ -1445,35 +1714,49 @@ pub fn promiseThen(self: *Interpreter, this_val: Value, args: []const Value) Eva
     }
     const on_f = handlerArg(args, 0);
     const on_r = handlerArg(args, 1);
-    const result = try self.newPromise();
-    try performPromiseThen(self, this_val.object, on_f, on_r, result);
-    return .{ .normal = .{ .object = result } };
+    // §27.2.5.4 step 3: C = SpeciesConstructor(this, %Promise%); resultCapability = NewPromiseCapability(C).
+    const sc = try speciesCapability(self, this_val.object);
+    const cap = switch (sc) {
+        .cap => |c| c,
+        .abrupt => |a| return a,
+    };
+    try performPromiseThen(self, this_val.object, on_f, on_r, cap);
+    return .{ .normal = cap.promise };
 }
 
 /// §27.2.5.1 Promise.prototype.catch(onRejected) — `this.then(undefined, onRejected)`.
 pub fn promiseCatch(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
-    const on_r = handlerArg(args, 0);
-    if (this_val != .object or this_val.object.promise == null) {
-        return self.throwError("TypeError", "Promise.prototype.catch called on a non-Promise");
+    // §27.2.5.1: catch delegates to `this.then(undefined, onRejected)` — Invoke(this, "then", ...).
+    const on_r: Value = if (args.len > 0) args[0] else .undefined;
+    const then_c = try self.getProperty(this_val, "then");
+    if (then_c.isAbrupt()) return then_c;
+    if (then_c.normal != .object or !isCallable(then_c.normal.object)) {
+        return self.throwError("TypeError", "then is not a function");
     }
-    const result = try self.newPromise();
-    try performPromiseThen(self, this_val.object, null, on_r, result);
-    return .{ .normal = .{ .object = result } };
+    return self.callFunction(then_c.normal.object, &.{ .undefined, on_r }, this_val);
 }
 
 /// §27.2.5.3 Promise.prototype.finally(onFinally) — `this.then(thunk, thrower)` where the thunks run
 /// `onFinally()` and then pass through the original value / re-throw the reason. If `onFinally` is
 /// not callable, both handlers are it (so `then` treats them as the default pass-through).
 pub fn promiseFinally(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
-    if (this_val != .object or this_val.object.promise == null) {
-        return self.throwError("TypeError", "Promise.prototype.finally called on a non-Promise");
+    // §27.2.5.3 step 2: `this` must be an Object (not necessarily a native promise — finally calls
+    // `this.then`, so a thenable subclass instance works).
+    if (this_val != .object) {
+        return self.throwError("TypeError", "Promise.prototype.finally called on a non-object");
     }
+    // §27.2.5.3 step 4: C = SpeciesConstructor(this, %Promise%) — used to build the thunks' result.
     const on_finally: Value = if (args.len > 0) args[0] else .undefined;
-    const result = try self.newPromise();
+    // Read `then` once (§27.2.5.3 dispatches through `this.then`).
+    const then_c = try self.getProperty(this_val, "then");
+    if (then_c.isAbrupt()) return then_c;
+    if (then_c.normal != .object or !isCallable(then_c.normal.object)) {
+        return self.throwError("TypeError", "then is not a function");
+    }
     if (on_finally != .object or !isCallable(on_finally.object)) {
-        // §27.2.5.3 step 6/8: a non-callable onFinally → both reactions are the default pass-through.
-        try performPromiseThen(self, this_val.object, null, null, result);
-        return .{ .normal = .{ .object = result } };
+        // §27.2.5.3 step 6/8: a non-callable onFinally → both reactions are onFinally itself (so
+        // `then` treats them as the default pass-through).
+        return self.callFunction(then_c.normal.object, &.{ on_finally, on_finally }, this_val);
     }
     // §27.2.5.3.1/.2 the thunks: each captures onFinally; the value-thunk re-fulfills with the
     // original value after onFinally(), the thrower-thunk re-throws the reason.
@@ -1483,8 +1766,7 @@ pub fn promiseFinally(self: *Interpreter, this_val: Value, args: []const Value) 
     const thrower_thunk = try Object.createNative(self.arena, .promise_finally_thunk, "thrower");
     thrower_thunk.prototype = self.functionProto();
     thrower_thunk.finally_value = on_finally.object;
-    try performPromiseThen(self, this_val.object, value_thunk, thrower_thunk, result);
-    return .{ .normal = .{ .object = result } };
+    return self.callFunction(then_c.normal.object, &.{ .{ .object = value_thunk }, .{ .object = thrower_thunk } }, this_val);
 }
 
 /// The finally value/thrower thunk body (§27.2.5.3.1/.2): call the captured onFinally(); on the

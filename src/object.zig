@@ -38,6 +38,7 @@ pub const PromiseState = rt.PromiseState;
 pub const PromiseReaction = rt.PromiseReaction;
 pub const PromiseData = rt.PromiseData;
 pub const CombinatorState = rt.CombinatorState;
+pub const PromiseCapability = rt.PromiseCapability;
 pub const Job = rt.Job;
 pub const GeneratorState = rt.GeneratorState;
 pub const ResumeKind = rt.ResumeKind;
@@ -163,6 +164,9 @@ pub const Object = struct {
     /// §27.2.4.1.2 the shared combinator state a `promise_combinator_element` closure settles into
     /// (its `values`/`remaining`/`capability`). Set on those function objects only; null elsewhere.
     combinator: ?*CombinatorState = null,
+    /// §27.2.1.5.1 the PromiseCapability a `promise_capability_executor` closure fills (writes the
+    /// resolve/reject it is handed). Set on that native only; null elsewhere.
+    capability: ?*PromiseCapability = null,
     /// §27.2.4.1.2 [[Index]] — which `combinator.values` slot this element closure writes. Meaningful
     /// only when `combinator != null`. The combinator's [[AlreadyCalled]] guard rides on this closure
     /// firing at most once: a second settle of the same input promise is a no-op (`already_called`).
