@@ -884,6 +884,15 @@ pub const Interpreter = struct {
         return self.globalProto("Array");
     }
 
+    /// %DisposableStack.prototype% / %AsyncDisposableStack.prototype% — the [[Prototype]] for instances
+    /// produced by `move` (which must always be the genuine intrinsic, ignoring a subclass's prototype).
+    pub fn disposableStackProto(self: *Interpreter) ?*Object {
+        return self.globalProto("DisposableStack");
+    }
+    pub fn asyncDisposableStackProto(self: *Interpreter) ?*Object {
+        return self.globalProto("AsyncDisposableStack");
+    }
+
     /// The realm's well-known `Symbol.species` identity (held on the `Symbol` constructor). Null only in
     /// a realm-less unit-test eval (no `Symbol`) — ArraySpeciesCreate then defaults to a plain Array.
     pub fn wellKnownSpecies(self: *Interpreter) ?*Symbol {
@@ -1076,7 +1085,7 @@ pub fn isConstructor(obj: *Object) bool {
     // A native with no AST body: only the genuine built-in constructors qualify.
     if (obj.native == .none) return true; // a bound function wrapping a constructible target
     return switch (obj.native) {
-        .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor => true,
+        .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .disposable_stack_ctor, .async_disposable_stack_ctor => true,
         else => false,
     };
 }

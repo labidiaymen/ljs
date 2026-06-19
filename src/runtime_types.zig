@@ -102,6 +102,25 @@ pub const Collection = struct {
     size: usize = 0,
 };
 
+/// §`explicit-resource-management` one entry of a DisposableStack's [[DisposeCapability]] —
+/// a DisposableResource Record { [[ResourceValue]], [[Hint]], [[DisposeMethod]] }. `method == null`
+/// is a no-op disposal (a null/undefined `use` resource); `value` is the `this` passed to `method`.
+pub const DisposeEntry = struct {
+    value: Value,
+    method: ?*Object,
+};
+
+/// §`explicit-resource-management` a DisposableStack / AsyncDisposableStack instance's internal
+/// slots: [[DisposableState]] (pending vs disposed, the `disposed` flag) and the
+/// [[DisposeCapability]].[[DisposableResourceStack]] (LIFO — disposed in REVERSE push order).
+/// `is_async` brands the stack kind (AsyncDisposableStack uses @@asyncDispose + disposeAsync).
+/// Present iff `Object.disposable != null`.
+pub const DisposableData = struct {
+    is_async: bool,
+    disposed: bool = false,
+    stack: std.ArrayListUnmanaged(DisposeEntry) = .empty,
+};
+
 /// §6.1.7.1 one symbol-keyed own property: the Symbol identity plus its value/attribute payload.
 /// Symbol-keyed properties live in a SEPARATE store from the string-keyed `properties` map so the
 /// hot string get/set path is untouched; they are also (correctly) never surfaced by for-in /
@@ -542,6 +561,20 @@ pub const NativeId = enum {
     promise_combinator_element,
     aggregate_error_ctor, // §20.5.7 AggregateError(errors, message) — thrown by Promise.any when all reject
     suppressed_error_ctor, // §20.5.8 SuppressedError(error, suppressed, message) — §ER DisposeResources aggregation
+    error_to_string, // §20.5.3.4 Error.prototype.toString ( ) — `${name}: ${message}` (or one half)
+    error_is_error, // §20.5.2.1 Error.isError ( arg ) — true iff arg has an [[ErrorData]] slot
+    error_stack_getter, // get Error.prototype.stack — string for [[ErrorData]], undefined otherwise
+    error_stack_setter, // set Error.prototype.stack — SetterThatIgnoresPrototypeProperties (string only)
+    // §`explicit-resource-management` DisposableStack + AsyncDisposableStack — the constructors, the
+    // use/adopt/defer/dispose/disposeAsync/move methods, the `disposed` getter, and the @@dispose /
+    // @@asyncDispose aliases. `native_name` selects the method within each family. Backing store is
+    // `Object.disposable` (a DisposableData record: the LIFO resource stack + the disposed flag).
+    disposable_stack_ctor, // new DisposableStack()
+    async_disposable_stack_ctor, // new AsyncDisposableStack()
+    disposable_stack_method, // DisposableStack.prototype.<use|adopt|defer|dispose|move>
+    async_disposable_stack_method, // AsyncDisposableStack.prototype.<use|adopt|defer|disposeAsync|move>
+    disposable_stack_disposed, // get DisposableStack/AsyncDisposableStack.prototype.disposed
+    disposable_adopt_wrapper, // the CreateBuiltinFunction closure `adopt` pushes (captures value+onDispose)
     /// §27.2.1.3 the resolve / reject functions passed to an executor (and to a thenable's `then`).
     /// `promise_slot` (on the function object) is the promise they settle; `native_name` selects
     /// "resolve" vs "reject". These also back the finally-handler thunks (native_name "finally_*").

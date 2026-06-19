@@ -166,19 +166,54 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     try defineConstructorBackref(object_fn); // §20.1.2.1 Object.prototype.constructor === Object
     try env.declare("Object", .{ .object = object_fn }, true, true);
 
-    // §20.5 The Error family — each a native constructor; `name` is the error name.
+    // §20.5 The Error family. `error_names[0]` is "Error" (the root); the rest are the NativeError
+    // constructors. §20.5.6: each NativeError ctor's [[Prototype]] is %Error% (the Error ctor) and its
+    // `.prototype`'s [[Prototype]] is %Error.prototype%. The root Error ctor → %Function.prototype%,
+    // and %Error.prototype% → %Object.prototype%.
+    var error_ctor_obj: ?*Object = null;
+    var error_proto_obj: ?*Object = null;
     for (error_names) |name| {
+        const is_root = std.mem.eql(u8, name, "Error");
         const ctor = try Object.createNative(arena, .error_ctor, name);
-        ctor.prototype = function_proto; // §20.2.3 the constructor function object → %Function.prototype%
-        // instances carry their own `name`; also expose it on the prototype for completeness.
+        // §20.5.6.2: a NativeError ctor's [[Prototype]] is %Error%; the root Error → %Function.prototype%.
+        ctor.prototype = if (is_root) function_proto else error_ctor_obj;
         if (ctor.get("prototype")) |pv| {
             if (pv == .object) {
-                pv.object.prototype = object_proto; // §20.5.3.1 Error.prototype inherits %Object.prototype%
-                try pv.object.set("name", .{ .string = name });
+                // §20.5.3.1 / §20.5.6.3: <Error>.prototype's [[Prototype]] is %Object.prototype% (root)
+                // or %Error.prototype% (NativeError).
+                pv.object.prototype = if (is_root) object_proto else error_proto_obj;
+                // §20.5.3.2 / §20.5.6.3.3: `name` is a NON-enumerable own DATA property (writable,
+                // configurable). §20.5.3.3 / §20.5.6.3.2: `message` is the empty string (same attrs).
+                try pv.object.defineData("name", .{ .string = name }, true, false, true);
+                try pv.object.defineData("message", .{ .string = "" }, true, false, true);
+                if (is_root) {
+                    error_proto_obj = pv.object;
+                    // §20.5.3.4 Error.prototype.toString — non-enumerable method.
+                    try defineMethod(arena, pv.object, "toString", .error_to_string, "toString");
+                }
             }
         }
         try defineConstructorBackref(ctor); // §20.5.3.1 / §20.5.6.3.1 <Error>.prototype.constructor === <Error>
+        if (is_root) {
+            error_ctor_obj = ctor;
+            // §20.5.2.1 Error.isError ( arg ) — a static method (writable/non-enum/configurable).
+            try defineMethod(arena, ctor, "isError", .error_is_error, "isError");
+        }
         try env.declare(name, .{ .object = ctor }, true, true);
+    }
+    // §`error-stack-accessor` get/set Error.prototype.stack — an accessor (non-enumerable,
+    // configurable). The getter (length 0) returns a string for [[ErrorData]], undefined otherwise;
+    // the setter (length 1) is SetterThatIgnoresPrototypeProperties (string-only).
+    if (error_proto_obj) |ep| {
+        const stack_get = try Object.createNative(arena, .error_stack_getter, "get stack");
+        const stack_set = try Object.createNative(arena, .error_stack_setter, "set stack");
+        stack_get.prototype = function_proto;
+        stack_set.prototype = function_proto;
+        _ = stack_get.properties.orderedRemove("prototype");
+        _ = stack_set.properties.orderedRemove("prototype");
+        try stack_get.defineData("name", .{ .string = "get stack" }, false, false, true);
+        try stack_set.defineData("name", .{ .string = "set stack" }, false, false, true);
+        try ep.defineAccessorEx("stack", stack_get, stack_set, false);
     }
 
     // §22.1 String( x ) — ToString; String.prototype methods (boxing finds them via getProperty).
@@ -1081,11 +1116,23 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     // constructor carrying its rejection list in `errors`; proto-linked like the other Error ctors.
     {
         const ctor = try Object.createNative(arena, .aggregate_error_ctor, "AggregateError");
-        ctor.prototype = function_proto; // §20.2.3 the constructor function object → %Function.prototype%
+        // §20.5.7.2: AggregateError extends Error — its [[Prototype]] is %Error% (the Error ctor).
+        ctor.prototype = function_proto;
+        if (env.lookup("Error")) |eb| if (eb.value == .object) {
+            ctor.prototype = eb.value.object;
+        };
         if (ctor.get("prototype")) |pv| {
             if (pv == .object) {
-                pv.object.prototype = object_proto; // §20.5.7.3 AggregateError.prototype inherits %Object.prototype%
-                try pv.object.set("name", .{ .string = "AggregateError" });
+                // §20.5.7.3: AggregateError.prototype's [[Prototype]] is %Error.prototype%.
+                pv.object.prototype = object_proto;
+                if (env.lookup("Error")) |eb| if (eb.value == .object) {
+                    if (eb.value.object.get("prototype")) |epv| if (epv == .object) {
+                        pv.object.prototype = epv.object;
+                    };
+                };
+                // §20.5.7.3.2/.3: `name` "AggregateError" + `message` "" — non-enumerable data props.
+                try pv.object.defineData("name", .{ .string = "AggregateError" }, true, false, true);
+                try pv.object.defineData("message", .{ .string = "" }, true, false, true);
             }
         }
         try defineConstructorBackref(ctor); // §20.5.7.3.1 AggregateError.prototype.constructor === AggregateError
@@ -1111,12 +1158,70 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
                         pv.object.prototype = epv.object;
                     };
                 };
-                try pv.object.set("name", .{ .string = "SuppressedError" });
-                try pv.object.set("message", .{ .string = "" });
+                try pv.object.defineData("name", .{ .string = "SuppressedError" }, true, false, true);
+                try pv.object.defineData("message", .{ .string = "" }, true, false, true);
             }
         }
         try defineConstructorBackref(ctor); // §20.5.8.3.1 SuppressedError.prototype.constructor === SuppressedError
         try env.declare("SuppressedError", .{ .object = ctor }, true, true);
+    }
+
+    // §`explicit-resource-management` DisposableStack + AsyncDisposableStack — the two stack objects of
+    // the Explicit Resource Management proposal. Each is a 0-arg native constructor whose prototype
+    // carries the use/adopt/defer/dispose(+disposeAsync)/move methods, the `disposed` getter, the
+    // @@dispose/@@asyncDispose alias (same function object as dispose/disposeAsync), and a
+    // non-writable @@toStringTag. Built after Symbol so the well-known symbols exist.
+    const dispose_sym: ?*Symbol = if (symbol_fn.get("dispose")) |s| (if (s == .symbol) s.symbol else null) else null;
+    const async_dispose_sym: ?*Symbol = if (symbol_fn.get("asyncDispose")) |s| (if (s == .symbol) s.symbol else null) else null;
+    const to_string_tag_sym: ?*Symbol = if (symbol_fn.get("toStringTag")) |s| (if (s == .symbol) s.symbol else null) else null;
+    {
+        const ctor = try Object.createNative(arena, .disposable_stack_ctor, "DisposableStack");
+        ctor.prototype = function_proto;
+        if (ctor.get("prototype")) |pv| if (pv == .object) {
+            const proto = pv.object;
+            proto.prototype = object_proto; // §DisposableStack.prototype inherits %Object.prototype%
+            for ([_][]const u8{ "use", "adopt", "defer", "dispose", "move" }) |m| {
+                try defineMethod(arena, proto, m, .disposable_stack_method, m);
+            }
+            // get DisposableStack.prototype.disposed — native_name "sync" brands the kind.
+            const disp_get = try Object.createNative(arena, .disposable_stack_disposed, "sync");
+            disp_get.prototype = function_proto;
+            _ = disp_get.properties.orderedRemove("prototype");
+            try disp_get.defineData("name", .{ .string = "get disposed" }, false, false, true);
+            try disp_get.defineData("length", .{ .number = 0 }, false, false, true);
+            try proto.defineAccessorEx("disposed", disp_get, null, false);
+            // proto[@@dispose] === proto.dispose (writable/non-enum/configurable).
+            if (dispose_sym) |sym| if (proto.get("dispose")) |dv| {
+                try proto.defineSymbolData(sym, dv, true, false, true);
+            };
+            // proto[@@toStringTag] = "DisposableStack" (non-writable/non-enum/configurable).
+            if (to_string_tag_sym) |sym| try proto.defineSymbolData(sym, .{ .string = "DisposableStack" }, false, false, true);
+        };
+        try defineConstructorBackref(ctor);
+        try env.declare("DisposableStack", .{ .object = ctor }, true, true);
+    }
+    {
+        const ctor = try Object.createNative(arena, .async_disposable_stack_ctor, "AsyncDisposableStack");
+        ctor.prototype = function_proto;
+        if (ctor.get("prototype")) |pv| if (pv == .object) {
+            const proto = pv.object;
+            proto.prototype = object_proto;
+            for ([_][]const u8{ "use", "adopt", "defer", "disposeAsync", "move" }) |m| {
+                try defineMethod(arena, proto, m, .async_disposable_stack_method, m);
+            }
+            const disp_get = try Object.createNative(arena, .disposable_stack_disposed, "async");
+            disp_get.prototype = function_proto;
+            _ = disp_get.properties.orderedRemove("prototype");
+            try disp_get.defineData("name", .{ .string = "get disposed" }, false, false, true);
+            try disp_get.defineData("length", .{ .number = 0 }, false, false, true);
+            try proto.defineAccessorEx("disposed", disp_get, null, false);
+            if (async_dispose_sym) |sym| if (proto.get("disposeAsync")) |dv| {
+                try proto.defineSymbolData(sym, dv, true, false, true);
+            };
+            if (to_string_tag_sym) |sym| try proto.defineSymbolData(sym, .{ .string = "AsyncDisposableStack" }, false, false, true);
+        };
+        try defineConstructorBackref(ctor);
+        try env.declare("AsyncDisposableStack", .{ .object = ctor }, true, true);
     }
 
     // §19.3 / §9.3.4 globalThis — a reified global object whose own properties MIRROR the global

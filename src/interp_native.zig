@@ -26,6 +26,7 @@ const builtin_arraybuffer = @import("builtin_arraybuffer.zig");
 const builtin_typedarray = @import("builtin_typedarray.zig");
 const builtin_dataview = @import("builtin_dataview.zig");
 const builtin_date = @import("builtin_date.zig");
+const builtin_disposable = @import("builtin_disposable.zig");
 const interpreter = @import("interpreter.zig");
 const Interpreter = interpreter.Interpreter;
 const EvalError = interpreter.EvalError;
@@ -523,36 +524,48 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
                 break :blk try Object.create(self.arena, if (pv == .object) pv.object else null);
             };
             err.error_data = true; // §20.5 [[ErrorData]] → §20.1.3.6 "Error" tag
-            try err.set("name", .{ .string = func.native_name });
-            const msg: Value = if (args.len > 0 and args[0] != .undefined)
-                .{ .string = try self.toString(args[0]) }
-            else
-                .{ .string = "" };
-            try err.set("message", msg);
+            // §20.5.1.1 step 3: if `message` is not undefined, install a non-enumerable own
+            // `message` (writable/configurable). When undefined, NO own `message` is created (the
+            // prototype's empty-string `message` shows through). `name` lives on the prototype.
+            if (args.len > 0 and args[0] != .undefined) {
+                const ms = try self.toStringThrowing(args[0]);
+                if (ms.isAbrupt()) return ms;
+                try err.defineData("message", ms.normal, true, false, true);
+            }
+            // §20.5.1.1 step 4: InstallErrorCause(O, options) — `options` is args[1].
+            const cc = try installErrorCause(self, err, if (args.len > 1) args[1] else .undefined);
+            if (cc.isAbrupt()) return cc;
             return .{ .normal = .{ .object = err } };
         },
         .aggregate_error_ctor => {
-            // §20.5.7.1.1 AggregateError(errors, message) — `errors` is an iterable of the
-            // collected errors (IteratorToList); `message` (if not undefined) becomes `.message`.
-            const proto: ?*Object = blk: {
-                const pv = func.get("prototype") orelse break :blk null;
-                break :blk if (pv == .object) pv.object else null;
+            // §20.5.7.1.1 AggregateError(errors, message[, options]) — `errors` is an iterable of
+            // the collected errors (IteratorToList); `message` (if not undefined) becomes `.message`.
+            const err = if (self.native_new_target != .undefined and this_val == .object)
+                this_val.object
+            else blk: {
+                const pv = func.get("prototype");
+                break :blk try Object.create(self.arena, if (pv != null and pv.? == .object) pv.?.object else null);
             };
-            const err = try Object.create(self.arena, proto);
             err.error_data = true; // §20.5 [[ErrorData]] → §20.1.3.6 "Error" tag
-            try err.set("name", .{ .string = "AggregateError" });
-            const msg: Value = if (args.len > 1 and args[1] != .undefined)
-                .{ .string = try self.toString(args[1]) }
-            else
-                .{ .string = "" };
-            try err.set("message", msg);
-            // §20.5.7.1.1 step 4: ToList the `errors` iterable into the own `errors` data property.
+            // §20.5.7.1.1: superclass-then-subclass order — `message` ToString first, then
+            // InstallErrorCause, then ToList(errors). (Test order-of-args-evaluation depends on this.)
+            if (args.len > 1 and args[1] != .undefined) {
+                const ms = try self.toStringThrowing(args[1]);
+                if (ms.isAbrupt()) return ms;
+                try err.defineData("message", ms.normal, true, false, true);
+            }
+            const cc = try installErrorCause(self, err, if (args.len > 2) args[2] else .undefined);
+            if (cc.isAbrupt()) return cc;
+            // §20.5.7.1.1 step 5: ToList the `errors` iterable into a non-enumerable own `errors`.
+            // ALWAYS iterate `errors` (undefined when the arg is absent) — IterableToList(undefined)
+            // is GetIterator(undefined) which throws a TypeError (the `new AggregateError()` case).
             const errs = try Object.createArray(self.arena, self.arrayProto());
-            if (args.len > 0) {
+            {
                 var list: std.ArrayListUnmanaged(Value) = .empty;
-                const lc = try self.iterateToList(args[0], &list);
+                const lc = try self.iterateToList(if (args.len > 0) args[0] else .undefined, &list);
                 if (lc.isAbrupt()) return lc;
                 try errs.elements.appendSlice(self.arena, list.items);
+                errs.array_length = errs.elements.items.len;
             }
             try err.defineData("errors", .{ .object = errs }, true, false, true);
             return .{ .normal = .{ .object = err } };
@@ -560,19 +573,107 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .suppressed_error_ctor => {
             // §20.5.8.1 SuppressedError ( error, suppressed, message ) — own `error` / `suppressed`
             // data properties (writable/non-enumerable/configurable) + optional `message`.
-            const proto: ?*Object = blk: {
-                const pv = func.get("prototype") orelse break :blk null;
-                break :blk if (pv == .object) pv.object else null;
+            const err = if (self.native_new_target != .undefined and this_val == .object)
+                this_val.object
+            else blk: {
+                const pv = func.get("prototype");
+                break :blk try Object.create(self.arena, if (pv != null and pv.? == .object) pv.?.object else null);
             };
-            const err = try Object.create(self.arena, proto);
             err.error_data = true; // §20.5 [[ErrorData]] → §20.1.3.6 "Error" tag
             if (args.len > 2 and args[2] != .undefined) {
-                try err.set("message", .{ .string = try self.toString(args[2]) });
+                const ms = try self.toStringThrowing(args[2]);
+                if (ms.isAbrupt()) return ms;
+                try err.defineData("message", ms.normal, true, false, true);
             }
             try err.defineData("error", if (args.len > 0) args[0] else .undefined, true, false, true);
             try err.defineData("suppressed", if (args.len > 1) args[1] else .undefined, true, false, true);
             return .{ .normal = .{ .object = err } };
         },
+        // §20.5.2.1 Error.isError ( arg ) — true iff arg has an [[ErrorData]] internal slot.
+        .error_is_error => return .{ .normal = .{ .boolean = errorIsError(if (args.len > 0) args[0] else .undefined) } },
+        // §20.5.3.4 Error.prototype.toString ( ) — `${name}: ${message}` (or one half when the other
+        // is the empty string). `name`/`message` default to "Error"/"" when undefined; each is ToString'd.
+        .error_to_string => {
+            if (this_val != .object) return self.throwError("TypeError", "Error.prototype.toString called on a non-object");
+            const nc = try self.getProperty(this_val, "name");
+            if (nc.isAbrupt()) return nc;
+            const name: []const u8 = if (nc.normal == .undefined) "Error" else blk: {
+                const s = try self.toStringThrowing(nc.normal);
+                if (s.isAbrupt()) return s;
+                break :blk s.normal.string;
+            };
+            const mc = try self.getProperty(this_val, "message");
+            if (mc.isAbrupt()) return mc;
+            const msg: []const u8 = if (mc.normal == .undefined) "" else blk: {
+                const s = try self.toStringThrowing(mc.normal);
+                if (s.isAbrupt()) return s;
+                break :blk s.normal.string;
+            };
+            if (name.len == 0) return .{ .normal = .{ .string = msg } };
+            if (msg.len == 0) return .{ .normal = .{ .string = name } };
+            const out = try std.fmt.allocPrint(self.arena, "{s}: {s}", .{ name, msg });
+            return .{ .normal = .{ .string = out } };
+        },
+        // get/set Error.prototype.stack (the `error-stack-accessor` proposal).
+        .error_stack_getter => {
+            // §1: this must be an Object; §3: no [[ErrorData]] slot → undefined; else a string.
+            if (this_val != .object) return self.throwError("TypeError", "get Error.prototype.stack called on a non-object");
+            if (!this_val.object.error_data) return .{ .normal = .undefined };
+            return .{ .normal = .{ .string = "" } }; // implementation-defined stack trace string
+        },
+        .error_stack_setter => {
+            // §1: this must be an Object; §3: v must be a String; then
+            // SetterThatIgnoresPrototypeProperties(this, %Error.prototype%, "stack", v).
+            if (this_val != .object) return self.throwError("TypeError", "set Error.prototype.stack called on a non-object");
+            const v: Value = if (args.len > 0) args[0] else .undefined;
+            if (v != .string) return self.throwError("TypeError", "Error.prototype.stack setter requires a string value");
+            const recv = this_val.object;
+            // SetterThatIgnoresPrototypeProperties: if this IS the home object (%Error.prototype%) → TypeError.
+            if (self.globalProto("Error")) |ep| if (recv == ep) {
+                return self.throwError("TypeError", "Cannot set Error.prototype.stack on %Error.prototype%");
+            };
+            // §SetterThatIgnoresPrototypeProperties: if an own "stack" exists, Set(this, "stack", v,
+            // Throw=true) — change only the value, keeping the existing attributes; a non-writable own
+            // (or an accessor with no setter) throws a TypeError. Else CreateDataPropertyOrThrow with
+            // { writable, enumerable, configurable } all true.
+            if (recv.properties.getPtr("stack")) |pv| {
+                switch (pv.payload) {
+                    .data => {
+                        if (!pv.writable) return self.throwError("TypeError", "Cannot assign to read-only own 'stack' property");
+                        pv.payload = .{ .data = v };
+                    },
+                    .accessor => |a| {
+                        if (a.set) |s| {
+                            const sc = try self.callFunction(s, &.{v}, this_val);
+                            if (sc.isAbrupt()) return sc;
+                        } else return self.throwError("TypeError", "Cannot set own 'stack' accessor property with no setter");
+                    },
+                }
+            } else {
+                if (!recv.extensible) return self.throwError("TypeError", "Cannot add stack property to a non-extensible object");
+                try recv.defineData("stack", v, true, true, true);
+            }
+            return .{ .normal = .undefined };
+        },
+        // §`explicit-resource-management` DisposableStack / AsyncDisposableStack.
+        .disposable_stack_ctor, .async_disposable_stack_ctor => {
+            // A plain call (no new) throws; construction is in constructNT (`super(...)` reaches here).
+            if (self.native_new_target == .undefined or this_val != .object) {
+                return self.throwError("TypeError", "Constructor requires 'new'");
+            }
+            try builtin_disposable.initInstance(self, this_val.object, func.native == .async_disposable_stack_ctor);
+            return .{ .normal = this_val };
+        },
+        .disposable_stack_method => return builtin_disposable.method(self, func.native_name, this_val, args, false),
+        .async_disposable_stack_method => {
+            if (std.mem.eql(u8, func.native_name, "disposeAsync")) return builtin_disposable.asyncDisposeMethod(self, this_val);
+            return builtin_disposable.method(self, func.native_name, this_val, args, true);
+        },
+        .disposable_stack_disposed => {
+            // The getter's native_name is "sync" / "async" (the stack kind it brands).
+            return builtin_disposable.disposedGetter(self, this_val, std.mem.eql(u8, func.native_name, "async"));
+        },
+        .disposable_adopt_wrapper => return builtin_disposable.adoptWrapper(self, func),
         .string_ctor => {
             // §22.1.1.1 String ( value ) — `String(sym)` is the ALLOWED Symbol→string conversion
             // (SymbolDescriptiveString), so it routes through the infallible ToString, not the
@@ -782,6 +883,37 @@ pub fn makeArgumentsObject(self: *Interpreter, args: []const Value, func: *Objec
         }
     }
     return ao;
+}
+
+/// §20.5.8.1 InstallErrorCause ( O, options ) — if `options` is an Object and HasProperty(options,
+/// "cause") is true, install a NON-enumerable own `cause` (writable/configurable) whose value is
+/// Get(options, "cause"). Both the HasProperty and the Get are observable (a Proxy `has` trap / a
+/// `get cause` accessor may throw — those abrupt completions propagate). A no-op for a non-Object.
+fn installErrorCause(self: *Interpreter, err: *Object, options: Value) EvalError!Completion {
+    if (options != .object) return .{ .normal = .undefined };
+    const has = try self.hasPropertyV(options, .{ .string = "cause" });
+    // hasPropertyV swallows abruptness; re-run through the completion-returning form so a throwing
+    // `has` trap surfaces. (hasPropertyVC returns the boolean as a Completion, abrupt on throw.)
+    const hc = try self.hasPropertyVC(options, .{ .string = "cause" });
+    if (hc.isAbrupt()) return hc;
+    if (!has) return .{ .normal = .undefined };
+    const cv = try self.getProperty(options, "cause");
+    if (cv.isAbrupt()) return cv;
+    try err.defineData("cause", cv.normal, true, false, true);
+    return .{ .normal = .undefined };
+}
+
+/// §20.5.2.1 Error.isError ( arg ) — true iff `arg` is an Object with an [[ErrorData]] internal
+/// slot (every Error-family instance, including AggregateError / SuppressedError; NOT a plain
+/// object faking the prototype / toStringTag). For a Proxy, the test forwards to the target.
+fn errorIsError(arg: Value) bool {
+    if (arg != .object) return false;
+    var o = arg.object;
+    while (o.proxy) |pd| {
+        if (pd.revoked) return false;
+        o = pd.target;
+    }
+    return o.error_data;
 }
 
 /// §10.4.4: a simple parameter list — every parameter is a plain BindingIdentifier with no

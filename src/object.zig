@@ -28,6 +28,8 @@ pub const RegExpData = rt.RegExpData;
 pub const CollectionKind = rt.CollectionKind;
 pub const CollectionEntry = rt.CollectionEntry;
 pub const Collection = rt.Collection;
+pub const DisposeEntry = rt.DisposeEntry;
+pub const DisposableData = rt.DisposableData;
 pub const ElemType = rt.ElemType;
 pub const ArrayBufferData = rt.ArrayBufferData;
 pub const TypedArrayData = rt.TypedArrayData;
@@ -210,6 +212,15 @@ pub const Object = struct {
     /// a Date instance, or NaN for an invalid Date (TimeClip out of range / unparsable). Null for every
     /// other object (zero cost). %Date.prototype% itself is an ordinary object (no [[DateValue]]).
     date_value: ?f64 = null,
+    /// §`explicit-resource-management` [[DisposableState]] + [[DisposeCapability]] — present iff this
+    /// object is a DisposableStack / AsyncDisposableStack instance. Holds the LIFO resource stack and
+    /// the disposed flag. Null for every other object (zero cost).
+    disposable: ?*DisposableData = null,
+    /// §`sec-disposablestack.prototype.adopt` the captured (value, onDispose) of the wrapper closure
+    /// CreateBuiltinFunction'd by `adopt` — set on a `disposable_adopt_wrapper` native only. When the
+    /// stack disposes, the wrapper calls `onDispose(value)`. Meaningless on every other object.
+    adopt_value: Value = .undefined,
+    adopt_on_dispose: ?*Object = null,
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);
@@ -493,6 +504,15 @@ pub const Object = struct {
             .object_ctor, .array_ctor, .string_ctor, .number_ctor, .boolean_ctor, .function_ctor, .bigint_ctor, .promise_ctor, .error_ctor => 1,
             .aggregate_error_ctor => 2,
             .suppressed_error_ctor => 3,
+            .error_to_string => 0, // §20.5.3.4 Error.prototype.toString
+            .error_is_error => 1, // §20.5.2.1 Error.isError ( arg )
+            .error_stack_getter => 0, // get Error.prototype.stack
+            .error_stack_setter => 1, // set Error.prototype.stack ( v )
+            // §`explicit-resource-management` DisposableStack ctors take 0 args. The prototype methods:
+            // use 1, adopt 2, defer 1, dispose/disposeAsync/move 0. The `disposed` getter + adopt
+            // wrapper take 0. (native_name selects the method within the *_method families.)
+            .disposable_stack_ctor, .async_disposable_stack_ctor, .disposable_stack_disposed, .disposable_adopt_wrapper => 0,
+            .disposable_stack_method, .async_disposable_stack_method => L.pick(name, .{ .{ "use", 1 }, .{ "adopt", 2 }, .{ "defer", 1 } }) orelse 0,
             .symbol_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor => 0,
             // §25.1.1 ArrayBuffer ( length [ , options ] ) — length 1. §23.2.7.1 a concrete TypedArray
             // constructor has length 3 (typedArray, byteOffset, length); §25.3.2.1 DataView length 1.

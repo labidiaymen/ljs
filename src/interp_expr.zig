@@ -17,6 +17,7 @@ const builtin_arraybuffer = @import("builtin_arraybuffer.zig");
 const builtin_typedarray = @import("builtin_typedarray.zig");
 const builtin_dataview = @import("builtin_dataview.zig");
 const builtin_date = @import("builtin_date.zig");
+const builtin_disposable = @import("builtin_disposable.zig");
 const interpreter = @import("interpreter.zig");
 const Interpreter = interpreter.Interpreter;
 const EvalError = interpreter.EvalError;
@@ -726,7 +727,7 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
     // functions / bound functions / classes have `native == .none` and a `call` body, so they pass.
     if (ctor.call == null and ctor.native != .none) {
         const constructible = switch (ctor.native) {
-            .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor, .proxy_ctor, .regexp_ctor, .array_buffer_ctor, .typed_array_ctor, .data_view_ctor, .date_ctor => true,
+            .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor, .proxy_ctor, .regexp_ctor, .array_buffer_ctor, .typed_array_ctor, .data_view_ctor, .date_ctor, .disposable_stack_ctor, .async_disposable_stack_ctor => true,
             else => false,
         };
         if (!constructible) return self.throwError("TypeError", "value is not a constructor");
@@ -764,6 +765,19 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
         },
         .data_view_ctor => return builtin_dataview.construct(self, .{ .object = new_obj }, args), // §25.3.2.1 (new DataView)
         .date_ctor => return builtin_date.construct(self, .{ .object = new_obj }, args), // §21.4.2.1 (new Date)
+        // §`explicit-resource-management` (new DisposableStack / AsyncDisposableStack) — attach the
+        // pending [[DisposeCapability]] to the freshly-created instance (subclass prototype preserved).
+        // §GetPrototypeFromConstructor: a non-object NewTarget.prototype falls back to the intrinsic
+        // %DisposableStack.prototype% (not %Object.prototype%).
+        .disposable_stack_ctor, .async_disposable_stack_ctor => {
+            const is_async = ctor.native == .async_disposable_stack_ctor;
+            const nt_proto_is_obj = if (new_target.get("prototype")) |pv| pv == .object else false;
+            if (!nt_proto_is_obj) {
+                new_obj.prototype = if (is_async) self.asyncDisposableStackProto() else self.disposableStackProto();
+            }
+            try builtin_disposable.initInstance(self, new_obj, is_async);
+            return .{ .normal = .{ .object = new_obj } };
+        },
         else => {},
     }
 
