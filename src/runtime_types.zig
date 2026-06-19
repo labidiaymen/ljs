@@ -437,6 +437,7 @@ pub const NativeId = enum {
     object_ctor, // Object()
     object_to_string, // Object.prototype.toString
     object_value_of, // §20.1.3.7 Object.prototype.valueOf (returns ToObject(this) — the receiver)
+    object_to_locale_string, // §20.1.3.5 Object.prototype.toLocaleString → Invoke(O, "toString")
     array_ctor, // Array(...)
     array_method, // Array.prototype.<native_name> / Array.isArray
     array_static, // §23.1.2 Array.from / Array.of

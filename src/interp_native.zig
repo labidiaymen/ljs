@@ -757,6 +757,12 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
             .undefined, .null => self.throwError("TypeError", "Object.prototype.valueOf called on null or undefined"),
             else => .{ .normal = this_val },
         },
+        // §20.1.3.5 Object.prototype.toLocaleString — O = ToObject(this); return Invoke(O, "toString").
+        .object_to_locale_string => {
+            if (this_val == .undefined or this_val == .null)
+                return self.throwError("TypeError", "Object.prototype.toLocaleString called on null or undefined");
+            return self.invokeMethod(this_val, "toString", &.{});
+        },
         .function_ctor => return interp_expr.functionConstructor(self, args),
         .function_proto_noop => return .{ .normal = .undefined }, // §20.2.3 %Function.prototype%() → undefined
         // §20.2.3.6 Function.prototype[@@hasInstance] ( V ) → §7.3.21 OrdinaryHasInstance(this, V).

@@ -817,6 +817,14 @@ pub fn ordinarySetPrototypeOf(self: *Interpreter, o: *Object, proto: ?*Object) E
     }
     if (o.prototype == proto) return .{ .ok = true };
     if (!o.extensible) return .{ .ok = false };
+    // §10.1.2 step 8: walk the proposed prototype chain; reject if it would create a cycle
+    // back to `o`. Stop walking at a proxy (its [[GetPrototypeOf]] is not statically known).
+    var p = proto;
+    while (p) |pp| {
+        if (pp == o) return .{ .ok = false };
+        if (pp.proxy != null) break;
+        p = pp.prototype;
+    }
     o.prototype = proto;
     return .{ .ok = true };
 }

@@ -123,6 +123,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     if (object_proto) |op| {
         try defineMethod(arena, op, "toString", .object_to_string, "toString");
         try defineMethod(arena, op, "valueOf", .object_value_of, "valueOf"); // §20.1.3.7
+        try defineMethod(arena, op, "toLocaleString", .object_to_locale_string, "toLocaleString"); // §20.1.3.5
         try defineMethod(arena, op, "hasOwnProperty", .object_has_own_property, "hasOwnProperty");
         try defineMethod(arena, op, "propertyIsEnumerable", .object_property_is_enumerable, "propertyIsEnumerable");
         try defineMethod(arena, op, "isPrototypeOf", .object_is_prototype_of, "isPrototypeOf");
