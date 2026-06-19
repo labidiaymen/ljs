@@ -840,7 +840,10 @@ pub const Object = struct {
                 const cur_is_accessor = cur.payload == .accessor;
                 if (d.isAccessor() and !cur_is_accessor) return false;
                 if (d.isData() and cur_is_accessor) return false;
-                if (!cur_is_accessor and !cur.writable) {
+                if (cur_is_accessor) {
+                    if (d.get) |g| if (g != cur.payload.accessor.get) return false;
+                    if (d.set) |s| if (s != cur.payload.accessor.set) return false;
+                } else if (!cur.writable) {
                     if (d.writable orelse false) return false;
                     if (d.has_value) {
                         if (!sameValueLoose(cur.payload.data, d.value.?)) return false;
@@ -945,7 +948,11 @@ pub const Object = struct {
                 const cur_is_accessor = cur.payload == .accessor;
                 if (d.isAccessor() and !cur_is_accessor) return null;
                 if (d.isData() and cur_is_accessor) return null;
-                if (!cur_is_accessor and !cur.writable) {
+                if (cur_is_accessor) {
+                    // §10.1.6.3 step 4: a non-configurable accessor cannot have its [[Get]]/[[Set]] changed.
+                    if (d.get) |g| if (g != cur.payload.accessor.get) return null;
+                    if (d.set) |s| if (s != cur.payload.accessor.set) return null;
+                } else if (!cur.writable) {
                     if (d.writable orelse false) return null; // can't make it writable
                     if (d.has_value) {
                         // a non-writable, non-configurable data prop: only an identical value is allowed
