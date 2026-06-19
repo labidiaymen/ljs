@@ -653,7 +653,32 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         try defineMethod(arena, rp, "toString", .regexp_to_string, "toString"); // §22.2.6.17
         try defineMethod(arena, rp, "exec", .regexp_exec, "exec"); // §22.2.6.2
         try defineMethod(arena, rp, "test", .regexp_test, "test"); // §22.2.6.16
+        // §22.2.6.8/.9/.11/.12/.14 the well-known-Symbol methods. Each is keyed by the realm's
+        // well-known Symbol identity (the SAME one user code reads as `Symbol.match` etc.), so
+        // `String.prototype.match`'s @@-delegation finds them.
+        const sym_methods = [_]struct { sym: []const u8, name: []const u8 }{
+            .{ .sym = "match", .name = "[Symbol.match]" },
+            .{ .sym = "matchAll", .name = "[Symbol.matchAll]" },
+            .{ .sym = "replace", .name = "[Symbol.replace]" },
+            .{ .sym = "search", .name = "[Symbol.search]" },
+            .{ .sym = "split", .name = "[Symbol.split]" },
+        };
+        for (sym_methods) |sm| {
+            if (symbol_fn.get(sm.sym)) |sv| if (sv == .symbol) {
+                const f = try Object.createNative(arena, .regexp_symbol_method, sm.name);
+                f.prototype = function_proto;
+                try f.defineData("name", .{ .string = sm.name }, false, false, true);
+                try rp.defineSymbolData(sv.symbol, .{ .object = f }, true, false, true);
+            };
+        }
     };
+    // §22.2.5.2 get RegExp[Symbol.species] — an accessor (getter returns `this`), non-enumerable.
+    if (symbol_fn.get("species")) |sp| if (sp == .symbol) {
+        const species_get = try Object.createNative(arena, .species_getter, "get [Symbol.species]");
+        species_get.prototype = function_proto;
+        try regexp_fn.defineSymbolAccessorEx(sp.symbol, species_get, null, false);
+    };
+    try defineMethod(arena, regexp_fn, "escape", .regexp_static, "escape"); // §22.2.5.2 RegExp.escape
     try defineConstructorBackref(regexp_fn); // §22.2.6.1 RegExp.prototype.constructor === RegExp
     try env.declare("RegExp", .{ .object = regexp_fn }, true, true);
 

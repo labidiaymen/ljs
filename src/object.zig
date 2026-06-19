@@ -585,6 +585,17 @@ pub const Object = struct {
                 .{ "toUpperCase", 0 }, .{ "toLocaleLowerCase", 0 }, .{ "toLocaleUpperCase", 0 }, .{ "trim", 0 },         .{ "trimEnd", 0 },
                 .{ "trimStart", 0 },   .{ "toString", 0 },          .{ "valueOf", 0 },           .{ "isWellFormed", 0 }, .{ "toWellFormed", 0 },
             }),
+            // §22.2.6 RegExp.prototype methods. The flag/source getters are length 0; exec/test/[Symbol.*]
+            // per spec. toString is length 0.
+            .regexp_proto_getter => 0,
+            .regexp_to_string => 0,
+            .regexp_exec, .regexp_test => 1, // §22.2.6.2/.16 — (string)
+            .regexp_symbol_method => L.pick(name, .{
+                .{ "[Symbol.match]", 1 },  .{ "[Symbol.matchAll]", 1 }, .{ "[Symbol.replace]", 2 },
+                .{ "[Symbol.search]", 1 }, .{ "[Symbol.split]", 2 },
+            }),
+            .regexp_string_iterator_next => 0, // §22.2.9.2.1
+            .regexp_static => 1, // §22.2.5.2 RegExp.escape ( S )
             else => null, // internal natives (resolving functions, combinator elements, test hooks)
         };
     }

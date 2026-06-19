@@ -497,6 +497,9 @@ pub const NativeId = enum {
     regexp_to_string, // RegExp.prototype.toString
     regexp_exec, // RegExp.prototype.exec
     regexp_test, // RegExp.prototype.test
+    regexp_symbol_method, // RegExp.prototype[Symbol.match|matchAll|replace|search|split] (native_name selects)
+    regexp_string_iterator_next, // %RegExpStringIteratorPrototype%.next (§22.2.9.2.1)
+    regexp_static, // RegExp.escape (§22.2.5.2) — native_name selects the static
     promise_ctor, // new Promise(executor)
     promise_then, // Promise.prototype.then
     promise_catch, // Promise.prototype.catch

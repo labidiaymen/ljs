@@ -104,10 +104,32 @@ pub fn construct(it: *Interpreter, args: []const Value) EvalError!Completion {
     const f: Value = if (args.len > 1) args[1] else .undefined;
     var pattern: []const u8 = "";
     var flags: []const u8 = "";
+    // §22.2.4.1 step 1: patternIsRegExp = IsRegExp(pattern) (reads pattern[@@match] — may throw).
+    const pattern_is_regexp = try isRegExp(it, p);
+    if (pattern_is_regexp.isAbrupt()) return pattern_is_regexp;
     if (p == .object and p.object.regexp != null) {
+        // step 3 (native RegExp): reuse the [[OriginalSource]]/[[OriginalFlags]] internal slots.
         pattern = p.object.regexp.?.source;
         if (f == .undefined) {
             flags = p.object.regexp.?.flags;
+        } else {
+            const fc = try it.toStringValuePub(f);
+            if (fc.isAbrupt()) return fc;
+            flags = fc.normal.string;
+        }
+    } else if (pattern_is_regexp.normal.boolean) {
+        // step 6 (RegExp-like, no [[RegExpMatcher]]): P = Get(pattern,"source"); F = flags ?? Get(pattern,"flags").
+        const pc = try it.getProperty2(p, "source");
+        if (pc.isAbrupt()) return pc;
+        const psc = try it.toStringValuePub(pc.normal);
+        if (psc.isAbrupt()) return psc;
+        pattern = psc.normal.string;
+        if (f == .undefined) {
+            const fc = try it.getProperty2(p, "flags");
+            if (fc.isAbrupt()) return fc;
+            const fsc = try it.toStringValuePub(fc.normal);
+            if (fsc.isAbrupt()) return fsc;
+            flags = fsc.normal.string;
         } else {
             const fc = try it.toStringValuePub(f);
             if (fc.isAbrupt()) return fc;
@@ -130,6 +152,131 @@ pub fn construct(it: *Interpreter, args: []const Value) EvalError!Completion {
     return makeRegExp(it, pattern, flags);
 }
 
+// ── §22.2.5.2 RegExp.escape ( S ) + §22.2.5.2.1 EncodeForRegExpEscape ──────────
+
+fn isSyntaxChar(cp: u21) bool {
+    return switch (cp) {
+        '^', '$', '\\', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|' => true,
+        else => false,
+    };
+}
+fn isRegExpWhiteSpaceOrLT(cp: u21) bool {
+    return switch (cp) {
+        0x0A,
+        0x0D,
+        0x2028,
+        0x2029, // LineTerminator
+        0x09,
+        0x0B,
+        0x0C,
+        0x20,
+        0xA0,
+        0x1680,
+        0xFEFF, // WhiteSpace
+        0x2000...0x200A,
+        0x202F,
+        0x205F,
+        0x3000,
+        => true,
+        else => false,
+    };
+}
+fn otherPunctuator(cp: u21) bool {
+    return switch (cp) {
+        ',', '-', '=', '<', '>', '#', '&', '!', '%', ':', ';', '@', '~', '\'', '`', '"' => true,
+        else => false,
+    };
+}
+
+/// Append `\xNN` / `\uNNNN` escapes for a code point that must be hex-escaped. ≤0xFF → `\xNN`; else
+/// each UTF-16 code unit as `\uNNNN` (a code point ≥ U+10000 emits two surrogate `\u` escapes).
+fn appendHexEscape(out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, cp: u21) std.mem.Allocator.Error!void {
+    if (cp <= 0xFF) {
+        try out.appendSlice(arena, try std.fmt.allocPrint(arena, "\\x{x:0>2}", .{cp}));
+        return;
+    }
+    if (cp <= 0xFFFF) {
+        try out.appendSlice(arena, try std.fmt.allocPrint(arena, "\\u{x:0>4}", .{cp}));
+        return;
+    }
+    const v = cp - 0x10000;
+    const hi: u16 = @intCast(0xD800 + (v >> 10));
+    const lo: u16 = @intCast(0xDC00 + (v & 0x3FF));
+    try out.appendSlice(arena, try std.fmt.allocPrint(arena, "\\u{x:0>4}\\u{x:0>4}", .{ hi, lo }));
+}
+
+/// §22.2.5.2.1 EncodeForRegExpEscape — append the escaped form of `cp` to `out`.
+fn encodeForRegExpEscape(out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, cp: u21) std.mem.Allocator.Error!void {
+    if (isSyntaxChar(cp) or cp == '/') {
+        try out.append(arena, '\\');
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cp, &buf) catch 0;
+        try out.appendSlice(arena, buf[0..n]);
+        return;
+    }
+    // Table 64 ControlEscape.
+    const ctrl: ?u8 = switch (cp) {
+        0x09 => 't',
+        0x0A => 'n',
+        0x0B => 'v',
+        0x0C => 'f',
+        0x0D => 'r',
+        else => null,
+    };
+    if (ctrl) |ce| {
+        try out.append(arena, '\\');
+        try out.append(arena, ce);
+        return;
+    }
+    if (otherPunctuator(cp) or isRegExpWhiteSpaceOrLT(cp)) {
+        try appendHexEscape(out, arena, cp);
+        return;
+    }
+    // Default: emit the code point verbatim.
+    var buf: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(cp, &buf) catch 0;
+    try out.appendSlice(arena, buf[0..n]);
+}
+
+/// §22.2.5.2 RegExp.escape ( S ) — S must be a String (else TypeError). The first code point, if an
+/// ASCII alphanumeric, is hex-escaped (`\xNN`); every code point then goes through EncodeForRegExpEscape.
+pub fn escape(it: *Interpreter, args: []const Value) EvalError!Completion {
+    const s: Value = if (args.len > 0) args[0] else .undefined;
+    if (s != .string) return it.throwError("TypeError", "RegExp.escape requires a string");
+    const str = s.string;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    var first = true;
+    while (i < str.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(str[i]) catch 1;
+        const end = @min(i + seq_len, str.len);
+        const cp: u21 = std.unicode.utf8Decode(str[i..end]) catch str[i];
+        if (first and ((cp >= '0' and cp <= '9') or (cp >= 'A' and cp <= 'Z') or (cp >= 'a' and cp <= 'z'))) {
+            try appendHexEscape(&out, it.arena, cp);
+        } else {
+            try encodeForRegExpEscape(&out, it.arena, cp);
+        }
+        first = false;
+        i = end;
+    }
+    return .{ .normal = .{ .string = out.items } };
+}
+
+/// §22.2.7.2 (legacy §7.2.8) IsRegExp ( argument ): not an Object → false; read `argument[@@match]`
+/// (may throw) → if not undefined, ToBoolean(it); else true iff `argument` has a [[RegExpMatcher]].
+/// Returned as a Completion whose normal payload is a boolean (or an abrupt throw).
+fn isRegExp(it: *Interpreter, v: Value) EvalError!Completion {
+    if (v != .object) return .{ .normal = .{ .boolean = false } };
+    if (it.wellKnownSymbol("match")) |sym| {
+        const mc = try it.getSymbolProperty(v, sym);
+        if (mc.isAbrupt()) return mc;
+        if (mc.normal != .undefined) {
+            return .{ .normal = .{ .boolean = @import("abstract_ops.zig").toBoolean(mc.normal) } };
+        }
+    }
+    return .{ .normal = .{ .boolean = v.object.regexp != null } };
+}
+
 /// §22.2.6 the %RegExp.prototype% accessor getters. On the prototype object itself (no [[RegExpMatcher]])
 /// the spec returns "(?:)" for source, "" for flags, and undefined for each flag getter.
 pub fn getter(it: *Interpreter, name: []const u8, this_val: Value) EvalError!Completion {
@@ -143,9 +290,26 @@ pub fn getter(it: *Interpreter, name: []const u8, this_val: Value) EvalError!Com
         return it.throwError("TypeError", "Method get source called on incompatible receiver");
     }
     if (eql(u8, name, "flags")) {
-        if (rd) |r| return .{ .normal = .{ .string = r.flags } };
-        if (is_proto) return .{ .normal = .{ .string = "" } };
-        return it.throwError("TypeError", "Method get flags called on incompatible receiver");
+        // §22.2.6.4 get flags — GENERIC: requires an Object receiver, then reads each flag property
+        // (`hasIndices`/`global`/…) and ToBoolean-coerces it, in the canonical d,g,i,m,s,u,v,y order.
+        if (this_val != .object) return it.throwError("TypeError", "Method get flags called on incompatible receiver");
+        const pairs = [_]struct { prop: []const u8, ch: u8 }{
+            .{ .prop = "hasIndices", .ch = 'd' },
+            .{ .prop = "global", .ch = 'g' },
+            .{ .prop = "ignoreCase", .ch = 'i' },
+            .{ .prop = "multiline", .ch = 'm' },
+            .{ .prop = "dotAll", .ch = 's' },
+            .{ .prop = "unicode", .ch = 'u' },
+            .{ .prop = "unicodeSets", .ch = 'v' },
+            .{ .prop = "sticky", .ch = 'y' },
+        };
+        var fbuf: std.ArrayListUnmanaged(u8) = .empty;
+        for (pairs) |p| {
+            const c = try it.getProperty2(this_val, p.prop);
+            if (c.isAbrupt()) return c;
+            if (@import("abstract_ops.zig").toBoolean(c.normal)) try fbuf.append(it.arena, p.ch);
+        }
+        return .{ .normal = .{ .string = fbuf.items } };
     }
     // Individual flag getters → boolean (undefined on the prototype).
     if (rd) |r| {
@@ -173,7 +337,7 @@ fn builtinExec(it: *Interpreter, this_val: Value, input: []const u8) EvalError!C
         if (nic.isAbrupt()) return nic;
         const n = nic.normal.number;
         if (n < 0 or n > @as(f64, @floatFromInt(input.len))) {
-            const sc = try it.setProperty(this_val, "lastIndex", .{ .number = 0 });
+            const sc = try it.setKeyThrow(this_val.object, "lastIndex", .{ .number = 0 });
             if (sc.isAbrupt()) return sc;
             return .{ .normal = .null };
         }
@@ -182,7 +346,7 @@ fn builtinExec(it: *Interpreter, this_val: Value, input: []const u8) EvalError!C
 
     const m = (try engine.exec(it.arena, prog, input, last_index, rd.sticky)) orelse {
         if (global_or_sticky) {
-            const sc = try it.setProperty(this_val, "lastIndex", .{ .number = 0 });
+            const sc = try it.setKeyThrow(this_val.object, "lastIndex", .{ .number = 0 });
             if (sc.isAbrupt()) return sc;
         }
         return .{ .normal = .null };
@@ -191,7 +355,7 @@ fn builtinExec(it: *Interpreter, this_val: Value, input: []const u8) EvalError!C
     const start = m.saves[0].?;
     const end = m.saves[1].?;
     if (global_or_sticky) {
-        const sc = try it.setProperty(this_val, "lastIndex", .{ .number = @floatFromInt(end) });
+        const sc = try it.setKeyThrow(this_val.object, "lastIndex", .{ .number = @floatFromInt(end) });
         if (sc.isAbrupt()) return sc;
     }
 
@@ -219,7 +383,42 @@ fn builtinExec(it: *Interpreter, this_val: Value, input: []const u8) EvalError!C
     } else {
         try arr.defineData("groups", .undefined, true, true, true);
     }
+    // §22.2.7.2 step 34 + §22.2.7.7 MakeMatchIndicesIndexPairArray — the `d` flag adds an `indices`
+    // array of [start,end] pairs (undefined for unmatched groups) plus `indices.groups` for named caps.
+    if (rd.has_indices) {
+        const indices = (try it.newArray(prog.num_groups + 1)).normal.object;
+        try setIndexPair(it, indices, 0, m.saves[0], m.saves[1]);
+        var ig: usize = 1;
+        while (ig <= prog.num_groups) : (ig += 1) {
+            try setIndexPair(it, indices, ig, m.saves[2 * ig], m.saves[2 * ig + 1]);
+        }
+        if (prog.names.len > 0) {
+            const igroups = try Object.create(it.arena, null);
+            for (prog.names) |ng| {
+                const a = m.saves[2 * ng.index];
+                const b = m.saves[2 * ng.index + 1];
+                const v: Value = if (a != null and b != null) try pairArray(it, a.?, b.?) else .undefined;
+                try igroups.defineData(ng.name, v, true, true, true);
+            }
+            try indices.defineData("groups", .{ .object = igroups }, true, true, true);
+        } else {
+            try indices.defineData("groups", .undefined, true, true, true);
+        }
+        try arr.defineData("indices", .{ .object = indices }, true, true, true);
+    }
     return .{ .normal = .{ .object = arr } };
+}
+
+fn pairArray(it: *Interpreter, a: usize, b: usize) EvalError!Value {
+    const pair = (try it.newArray(2)).normal.object;
+    try pair.arraySet(it.arena, 0, .{ .number = @floatFromInt(a) });
+    try pair.arraySet(it.arena, 1, .{ .number = @floatFromInt(b) });
+    return .{ .object = pair };
+}
+
+fn setIndexPair(it: *Interpreter, indices: *Object, i: usize, a: ?usize, b: ?usize) EvalError!void {
+    const v: Value = if (a != null and b != null) try pairArray(it, a.?, b.?) else .undefined;
+    try indices.arraySet(it.arena, i, v);
 }
 
 /// §22.2.6.2 RegExp.prototype.exec ( string ) — coerce `string`, then run the builtin exec.

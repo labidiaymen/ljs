@@ -21,6 +21,7 @@ const builtin_reflect = @import("builtin_reflect.zig");
 const builtin_bigint = @import("builtin_bigint.zig");
 const builtin_proxy = @import("builtin_proxy.zig");
 const builtin_regexp = @import("builtin_regexp.zig");
+const builtin_regexp_symbol = @import("builtin_regexp_symbol.zig");
 const builtin_arraybuffer = @import("builtin_arraybuffer.zig");
 const builtin_typedarray = @import("builtin_typedarray.zig");
 const builtin_dataview = @import("builtin_dataview.zig");
@@ -364,6 +365,9 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .regexp_to_string => return builtin_regexp.toString(self, this_val), // §22.2.6.17
         .regexp_exec => return builtin_regexp.exec(self, this_val, args), // §22.2.6.2
         .regexp_test => return builtin_regexp.test_(self, this_val, args), // §22.2.6.16
+        .regexp_symbol_method => return builtin_regexp_symbol.method(self, func.native_name, this_val, args), // §22.2.6.8/.9/.11/.12/.14
+        .regexp_string_iterator_next => return builtin_regexp_symbol.stringIteratorNext(self, this_val), // §22.2.9.2.1
+        .regexp_static => return builtin_regexp.escape(self, args), // §22.2.5.2 RegExp.escape
         // §25.1.3.1 a plain `ArrayBuffer(...)` call (no new) throws; construction is in constructNT.
         .array_buffer_ctor => return self.throwError("TypeError", "Constructor ArrayBuffer requires 'new'"),
         .array_buffer_proto_getter => return builtin_arraybuffer.getter(self, func.native_name, this_val), // §25.1.6
@@ -687,7 +691,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .map_method, .set_method, .weakmap_method, .weakset_method => unreachable, // handled in the first switch
         .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .collection_size, .collection_iterator => unreachable, // handled in the first switch
         .proxy_ctor, .proxy_revocable, .proxy_revoke => unreachable, // handled in the first switch
-        .regexp_ctor, .regexp_proto_getter, .regexp_to_string, .regexp_exec, .regexp_test => unreachable, // handled in the first switch
+        .regexp_ctor, .regexp_proto_getter, .regexp_to_string, .regexp_exec, .regexp_test, .regexp_symbol_method, .regexp_string_iterator_next, .regexp_static => unreachable, // handled in the first switch
         // §25.1 ArrayBuffer / §23.2 TypedArray / §25.3 DataView (spec 083) — all handled in the first switch.
         .array_buffer_ctor, .array_buffer_proto_getter, .array_buffer_method, .array_buffer_static => unreachable,
         .typed_array_ctor, .typed_array_abstract_ctor, .typed_array_proto_getter, .typed_array_method, .typed_array_static => unreachable,
