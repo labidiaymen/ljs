@@ -569,12 +569,16 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
             // (SymbolDescriptiveString), so it routes through the infallible ToString, not the
             // throwing coercion. An object operand is ToPrimitive(string)'d first (so a wrapper /
             // `valueOf`/`toString` object stringifies via its own method).
-            const v: Value = if (args.len > 0) args[0] else .undefined;
-            const s: []const u8 = if (v == .object) blk: {
-                const pc = try self.toPrimitive(v, .string);
-                if (pc.isAbrupt()) return pc;
-                break :blk try self.toString(pc.normal);
-            } else try self.toString(v);
+            // §22.1.1.1 step 1: if `value` is not present, s is the empty String (NOT "undefined").
+            const s: []const u8 = if (args.len == 0) "" else blk: {
+                const v = args[0];
+                if (v == .object) {
+                    const pc = try self.toPrimitive(v, .string);
+                    if (pc.isAbrupt()) return pc;
+                    break :blk try self.toString(pc.normal);
+                }
+                break :blk try self.toString(v);
+            };
             return interp_expr.wrapperResult(self, .{ .string = s }, this_val); // §22.1.1.1 box [[StringData]] on new/super
         },
         .number_ctor => { // §21.1.1.1 Number ( value ) — ToNumber (ToPrimitive(number) an object first).

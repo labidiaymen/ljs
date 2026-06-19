@@ -186,9 +186,14 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
                 "toLowerCase",       "split",             "replace",     "replaceAll", "localeCompare",
                 // §22.1.3.21/.22: in a non-Intl engine toLocale{Lower,Upper}Case == to{Lower,Upper}Case.
                 "toLocaleLowerCase", "toLocaleUpperCase",
+                // §22.1.3.11/.12/.17/.19 the @@-delegating methods (forward to regexp[Symbol.x] when the
+                // arg supplies one; else best-effort string fallback). §22.1.3.8/.31 well-formed.
+                // §22.1.3.13 normalize (form validation + identity for already-normalized input).
+                "match",       "matchAll",   "search",
+                "isWellFormed",      "toWellFormed",      "normalize",
                 // §22.1.3.28/.32: toString/valueOf return the [[StringData]] (so a `new String(x)` wrapper
                 // and ToPrimitive recover the string primitive).
-                "toString",    "valueOf",
+                  "toString",   "valueOf",
             };
             for (string_methods) |m| try defineMethod(arena, pv.object, m, .string_method, m);
         }

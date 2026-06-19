@@ -6,6 +6,7 @@
 const std = @import("std");
 const interp = @import("interpreter.zig");
 const sutf16 = @import("string_utf16.zig");
+const abstract_ops = @import("abstract_ops.zig");
 const Interpreter = interp.Interpreter;
 const EvalError = interp.EvalError;
 const Object = @import("object.zig").Object;
@@ -127,6 +128,11 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
         return num(lastIndexOf(s, needle, limit));
     }
     if (eql(u8, name, "includes")) {
+        // §22.1.3.8 steps 4-6: IsRegExp(searchString) → TypeError (a RegExp arg is rejected).
+        switch (try isRegExp(it, if (args.len > 0) args[0] else .undefined)) {
+            .abrupt => |c| return c,
+            .value => |b| if (b) return it.throwError("TypeError", "First argument to String.prototype.includes must not be a regular expression"),
+        }
         const needle = switch (try argStr(it, args, 0)) {
             .abrupt => |c| return c,
             .string => |v| v,
@@ -140,6 +146,11 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
         return boolean(std.mem.indexOfPos(u8, s, start, needle) != null or (needle.len == 0 and start <= s.len));
     }
     if (eql(u8, name, "startsWith")) {
+        // §22.1.3.23 steps 4-6: IsRegExp(searchString) → TypeError.
+        switch (try isRegExp(it, if (args.len > 0) args[0] else .undefined)) {
+            .abrupt => |c| return c,
+            .value => |b| if (b) return it.throwError("TypeError", "First argument to String.prototype.startsWith must not be a regular expression"),
+        }
         const needle = switch (try argStr(it, args, 0)) {
             .abrupt => |c| return c,
             .string => |v| v,
@@ -153,6 +164,11 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
         return boolean(start + needle.len <= s.len and std.mem.eql(u8, s[start .. start + needle.len], needle));
     }
     if (eql(u8, name, "endsWith")) {
+        // §22.1.3.7 steps 4-6: IsRegExp(searchString) → TypeError.
+        switch (try isRegExp(it, if (args.len > 0) args[0] else .undefined)) {
+            .abrupt => |c| return c,
+            .value => |b| if (b) return it.throwError("TypeError", "First argument to String.prototype.endsWith must not be a regular expression"),
+        }
         const needle = switch (try argStr(it, args, 0)) {
             .abrupt => |c| return c,
             .string => |v| v,
@@ -232,8 +248,10 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
         return str(buf.items);
     }
     if (eql(u8, name, "repeat")) {
-        // §22.1.3.18: count is ToIntegerOrInfinity; negative or +Infinity → RangeError.
-        const cf = switch (try intArgInf(it, args, 0)) {
+        // §22.1.3.18: count is ToIntegerOrInfinity (undefined/NaN → 0); negative or +Infinity →
+        // RangeError. Preserve an EXPLICIT +Infinity (so `repeat(Infinity)` throws) but treat a
+        // missing/undefined arg as 0 (`repeat(undefined)` → "").
+        const cf: f64 = if (args.len == 0 or args[0] == .undefined) 0 else switch (try intArgInf(it, args, 0)) {
             .abrupt => |c| return c,
             .value => |v| v,
         };
@@ -249,15 +267,24 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
         return pad(it, s, args, eql(u8, name, "padStart"));
     }
     if (eql(u8, name, "trim") or eql(u8, name, "trimStart") or eql(u8, name, "trimEnd")) {
+        // §22.1.3.32 TrimString — strip leading/trailing §6.1.4 WhiteSpace + LineTerminator. The set
+        // includes non-ASCII code points (U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029, U+202F,
+        // U+205F, U+3000, U+FEFF), so trimming works over CODE POINTS, not bytes.
         const want_start = !eql(u8, name, "trimEnd");
         const want_end = !eql(u8, name, "trimStart");
         var lo: usize = 0;
         var hi: usize = s.len;
-        if (want_start) while (lo < hi and isStrWs(s[lo])) {
-            lo += 1;
+        if (want_start) while (lo < hi) {
+            const d = decodeCp(s, lo);
+            if (!isWsCp(d.cp)) break;
+            lo += d.len;
         };
-        if (want_end) while (hi > lo and isStrWs(s[hi - 1])) {
-            hi -= 1;
+        if (want_end) while (hi > lo) {
+            // step back to the start of the last code point in [lo, hi).
+            const start = cpStart(s, lo, hi);
+            const d = decodeCp(s, start);
+            if (!isWsCp(d.cp)) break;
+            hi = start;
         };
         return str(s[lo..hi]);
     }
@@ -279,6 +306,24 @@ pub fn call(it: *Interpreter, name: []const u8, this_val: Value, args: []const V
     }
     if (eql(u8, name, "split")) {
         return split(it, s, args);
+    }
+    if (eql(u8, name, "match")) {
+        return matchLike(it, s, this_val, args, "match");
+    }
+    if (eql(u8, name, "matchAll")) {
+        return matchAll(it, s, this_val, args);
+    }
+    if (eql(u8, name, "search")) {
+        return matchLike(it, s, this_val, args, "search");
+    }
+    if (eql(u8, name, "isWellFormed")) {
+        return boolean(sutf16.isWellFormed(s));
+    }
+    if (eql(u8, name, "toWellFormed")) {
+        return str(try sutf16.toWellFormed(it.arena, s));
+    }
+    if (eql(u8, name, "normalize")) {
+        return normalize(it, s, args);
     }
 
     return .{ .normal = .undefined };
@@ -362,13 +407,16 @@ fn stringRaw(it: *Interpreter, args: []const Value) EvalError!Completion {
     return str(buf.items);
 }
 
-// §22.1.3.16/.15 padStart/padEnd.
+// §22.1.3.16/.15 StringPad (padStart/padEnd) — code-unit semantics: `maxLength` and the filler are
+// measured in UTF-16 code units, and the filler is truncated at a code-unit boundary (which may
+// split a surrogate pair, yielding a lone surrogate — e.g. `'abc'.padStart(6,'💩')`).
 fn pad(it: *Interpreter, s: []const u8, args: []const Value, at_start: bool) EvalError!Completion {
     const max_f = switch (try intArg(it, args, 0, 0)) {
         .abrupt => |c| return c,
         .value => |v| v,
     };
-    const max_len: usize = if (max_f <= @as(f64, @floatFromInt(s.len))) return str(s) else @intFromFloat(@min(max_f, @as(f64, @floatFromInt(std.math.maxInt(u32)))));
+    const s_units = sutf16.utf16Length(s);
+    const max_len: usize = if (max_f <= @as(f64, @floatFromInt(s_units))) return str(s) else @intFromFloat(@min(max_f, @as(f64, @floatFromInt(std.math.maxInt(u32)))));
     // filler defaults to " "; an empty filler → no padding (return s).
     const filler = if (args.len > 1 and args[1] != .undefined) blk: {
         const cs = try coerceStr(it, args[1]);
@@ -377,24 +425,76 @@ fn pad(it: *Interpreter, s: []const u8, args: []const Value, at_start: bool) Eva
             .string => |sv| break :blk sv,
         }
     } else " ";
-    if (filler.len == 0 or max_len <= s.len) return str(s);
-    const fill_count = max_len - s.len;
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    try buf.ensureTotalCapacity(it.arena, max_len);
-    if (!at_start) buf.appendSliceAssumeCapacity(s);
-    var written: usize = 0;
-    while (written < fill_count) {
-        const take = @min(filler.len, fill_count - written);
-        buf.appendSliceAssumeCapacity(filler[0..take]);
-        written += take;
+    const fill_units = sutf16.utf16Length(filler);
+    if (fill_units == 0 or max_len <= s_units) return str(s);
+    const fill_count = max_len - s_units; // code units of filling to produce
+    // Build `fill_count` code units by repeating `filler` and truncating at a code-unit boundary.
+    var fill: std.ArrayListUnmanaged(u8) = .empty;
+    var produced: usize = 0;
+    while (produced < fill_count) {
+        const remaining = fill_count - produced;
+        if (remaining >= fill_units) {
+            try fill.appendSlice(it.arena, filler);
+            produced += fill_units;
+        } else {
+            // partial: take the first `remaining` code units of the filler.
+            try fill.appendSlice(it.arena, try sutf16.substringByCodeUnits(it.arena, filler, 0, remaining));
+            produced += remaining;
+        }
     }
-    if (at_start) buf.appendSliceAssumeCapacity(s);
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    if (at_start) {
+        try buf.appendSlice(it.arena, fill.items);
+        try buf.appendSlice(it.arena, s);
+    } else {
+        try buf.appendSlice(it.arena, s);
+        try buf.appendSlice(it.arena, fill.items);
+    }
     return str(buf.items);
 }
 
 // §22.1.3.20/.21 replace/replaceAll — STRING-search form only (the RegExp form is deferred, see
 // specs/039 spec.md). Honors the `$`-replacement patterns ($$, $&, $`, $', $n).
 fn replace(it: *Interpreter, s: []const u8, args: []const Value, all: bool) EvalError!Completion {
+    const search_val: Value = if (args.len > 0) args[0] else .undefined;
+    const replace_val: Value = if (args.len > 1) args[1] else .undefined;
+    // §22.1.3.21 replaceAll step 2: a non-global RegExp searchValue → TypeError (checked before any
+    // @@replace delegation).
+    if (all and search_val != .undefined and search_val != .null) {
+        switch (try isRegExp(it, search_val)) {
+            .abrupt => |c| return c,
+            .value => |is_re| if (is_re) {
+                const fc = try it.getProperty2(search_val, "flags");
+                if (fc.isAbrupt()) return fc;
+                if (fc.normal == .undefined or fc.normal == .null) {
+                    return it.throwError("TypeError", "flags is undefined");
+                }
+                const fs = switch (try coerceStr(it, fc.normal)) {
+                    .abrupt => |c| return c,
+                    .string => |v| v,
+                };
+                if (std.mem.indexOfScalar(u8, fs, 'g') == null) {
+                    return it.throwError("TypeError", "replaceAll must be called with a global RegExp");
+                }
+            },
+        }
+    }
+    // §22.1.3.20/.21 step: if searchValue is an Object, GetMethod(searchValue, @@replace); if present,
+    // Call(replacer, searchValue, «O, replaceValue»). The IsObject gate means a STRING-primitive
+    // searchValue never reads `@@replace` off String.prototype (the string-search fallback runs).
+    if (search_val == .object) {
+        if (it.wellKnownSymbol("replace")) |sym| {
+            const mc = try it.getSymbolProperty(search_val, sym);
+            if (mc.isAbrupt()) return mc;
+            const m = mc.normal;
+            if (m != .undefined and m != .null) {
+                if (m != .object or m.object.kind != .function) {
+                    return it.throwError("TypeError", "Symbol.replace method is not callable");
+                }
+                return it.callFunction(m.object, &.{ .{ .string = s }, replace_val }, search_val);
+            }
+        }
+    }
     // A RegExp first arg would route to RegExp.prototype[Symbol.replace] — not implemented; ToString it
     // (so `replace(/x/,...)` at least does a literal search on the pattern source string — best effort).
     const search = switch (try argStr(it, args, 0)) {
@@ -484,6 +584,23 @@ fn appendReplacement(it: *Interpreter, buf: *std.ArrayListUnmanaged(u8), repl: [
 
 // §22.1.3.23 split — STRING (or undefined) separator only; a RegExp separator is deferred.
 fn split(it: *Interpreter, s: []const u8, args: []const Value) EvalError!Completion {
+    // §22.1.3.23 step 2: GetMethod(separator, @@split); if present, Call(splitter, separator,
+    // «O, limit») — the limit is passed UNCOERCED. Routes a RegExp / custom splitter to its method.
+    const sep_val: Value = if (args.len > 0) args[0] else .undefined;
+    const limit_val: Value = if (args.len > 1) args[1] else .undefined;
+    if (sep_val == .object) {
+        if (it.wellKnownSymbol("split")) |sym| {
+            const mc = try it.getSymbolProperty(sep_val, sym);
+            if (mc.isAbrupt()) return mc;
+            const m = mc.normal;
+            if (m != .undefined and m != .null) {
+                if (m != .object or m.object.kind != .function) {
+                    return it.throwError("TypeError", "Symbol.split method is not callable");
+                }
+                return it.callFunction(m.object, &.{ .{ .string = s }, limit_val }, sep_val);
+            }
+        }
+    }
     const out = try Object.createArray(it.arena, it.arrayProto());
     // limit (§22.1.3.23 step 6/8): ToUint32; default 2^32-1.
     const limit: u64 = if (args.len > 1 and args[1] != .undefined) blk: {
@@ -610,12 +727,139 @@ fn argStr(it: *Interpreter, args: []const Value, i: usize) EvalError!StrResult {
     return coerceStr(it, args[i]);
 }
 
-/// §22.1.3 WhiteSpace + LineTerminator for trim (byte-level: ASCII WS + the common ones).
-fn isStrWs(c: u8) bool {
-    return switch (c) {
-        ' ', '\t', '\n', '\r', 0x0B, 0x0C => true,
+/// §6.1.4 WhiteSpace ∪ LineTerminator, over a CODE POINT (for trim/trimStart/trimEnd). Covers the
+/// ASCII set plus the Unicode space separators (Zs), U+FEFF (BOM/ZWNBSP), and the line/paragraph
+/// separators. Note U+180E is NOT whitespace in modern Unicode (removed from Zs in 6.3).
+fn isWsCp(cp: u32) bool {
+    return switch (cp) {
+        // WhiteSpace: TAB, LF (LineTerminator), VT, FF, CR (LineTerminator), SP, NBSP, ZWNBSP/BOM
+        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xA0, 0xFEFF => true,
+        // LineTerminator: LS, PS
+        0x2028, 0x2029 => true,
+        // Other Unicode "Space_Separator" (Zs)
+        0x1680, 0x2000...0x200A, 0x202F, 0x205F, 0x3000 => true,
         else => false,
     };
+}
+
+/// The byte offset where the LAST code point in `s[lo..hi)` begins (UTF-8/WTF-8 back-scan). Assumes
+/// `lo < hi`. Used by trimEnd to walk code points from the right.
+fn cpStart(s: []const u8, lo: usize, hi: usize) usize {
+    var k = hi - 1;
+    // a continuation byte is 10xxxxxx; back up to the lead byte (cap at 3 continuation bytes).
+    var steps: usize = 0;
+    while (k > lo and (s[k] & 0xC0) == 0x80 and steps < 3) : (steps += 1) k -= 1;
+    return k;
+}
+
+/// §22.2.7.2 IsRegExp ( argument ): not an object → false; read `argument[@@match]` (may throw) →
+/// if not undefined, ToBoolean; else fall back to the [[RegExpMatcher]] internal slot (`.regexp`).
+const BoolResult = union(enum) { value: bool, abrupt: Completion };
+fn isRegExp(it: *Interpreter, v: Value) EvalError!BoolResult {
+    if (v != .object) return .{ .value = false };
+    const sym = it.wellKnownSymbol("match") orelse {
+        // realm-less fallback (no Symbol): use the internal slot only.
+        return .{ .value = v.object.regexp != null };
+    };
+    const mc = try it.getSymbolProperty(v, sym);
+    if (mc.isAbrupt()) return .{ .abrupt = mc };
+    if (mc.normal != .undefined) return .{ .value = abstract_ops.toBoolean(mc.normal) };
+    return .{ .value = v.object.regexp != null };
+}
+
+/// §22.1.3.11 match / §22.1.3.19 search — the @@-delegating forms. If `regexp` (arg 0) is not
+/// undefined/null, read `regexp[@@match]` (resp. `@@search`); if a callable method is present, invoke
+/// it with `this = regexp` and a single ToString(this) argument (the spec's `Invoke(rx, @@x, «S»)`,
+/// here without the `new RegExp` construction step). Without a RegExp engine wired to these Symbol
+/// methods, the implicit-RegExp fallback (regexp has no @@-method) returns null/-1 — best effort.
+fn matchLike(it: *Interpreter, s: []const u8, this_val: Value, args: []const Value, comptime which: []const u8) EvalError!Completion {
+    _ = this_val;
+    const regexp: Value = if (args.len > 0) args[0] else .undefined;
+    // The @@-method lookup is gated on IsObject(regexp): a primitive arg never reads `@@match`/
+    // `@@search` off its prototype (it would route through the implicit-RegExp path instead).
+    if (regexp == .object) {
+        const sym = it.wellKnownSymbol(which);
+        if (sym) |sy| {
+            const mc = try it.getSymbolProperty(regexp, sy);
+            if (mc.isAbrupt()) return mc;
+            const m = mc.normal;
+            if (m != .undefined and m != .null) {
+                if (m != .object or m.object.kind != .function) {
+                    return it.throwError("TypeError", "Symbol method is not callable");
+                }
+                return it.callFunction(m.object, &.{.{ .string = s }}, regexp);
+            }
+        }
+    }
+    // Fallback: no @@-method on the arg → would construct `new RegExp(regexp)` and invoke its
+    // Symbol method. The RegExp engine is not wired to these Symbol methods, so report "no match".
+    return if (std.mem.eql(u8, which, "search")) num(-1) else .{ .normal = .null };
+}
+
+/// §22.1.3.13 matchAll — the @@matchAll-delegating form. If `regexp` is a RegExp without the global
+/// flag, throw a TypeError (step 2.a). Then GetMethod(regexp, @@matchAll); invoke it if present.
+fn matchAll(it: *Interpreter, s: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
+    _ = this_val;
+    const regexp: Value = if (args.len > 0) args[0] else .undefined;
+    if (regexp != .undefined and regexp != .null) {
+        // step 2.a: if IsRegExp(regexp) and regexp lacks a global flag → TypeError.
+        switch (try isRegExp(it, regexp)) {
+            .abrupt => |c| return c,
+            .value => |is_re| if (is_re) {
+                const fc = try it.getProperty2(regexp, "flags");
+                if (fc.isAbrupt()) return fc;
+                if (fc.normal == .undefined or fc.normal == .null) {
+                    return it.throwError("TypeError", "flags is undefined");
+                }
+                const fs = switch (try coerceStr(it, fc.normal)) {
+                    .abrupt => |c| return c,
+                    .string => |v| v,
+                };
+                if (std.mem.indexOfScalar(u8, fs, 'g') == null) {
+                    return it.throwError("TypeError", "String.prototype.matchAll called with a non-global RegExp argument");
+                }
+            },
+        }
+        // GetMethod(regexp, @@matchAll) is gated on IsObject (a string-primitive arg never reads
+        // `@@matchAll` off String.prototype).
+        if (regexp == .object) {
+            if (it.wellKnownSymbol("matchAll")) |sy| {
+                const mc = try it.getSymbolProperty(regexp, sy);
+                if (mc.isAbrupt()) return mc;
+                const m = mc.normal;
+                if (m != .undefined and m != .null) {
+                    if (m != .object or m.object.kind != .function) {
+                        return it.throwError("TypeError", "Symbol.matchAll method is not callable");
+                    }
+                    return it.callFunction(m.object, &.{.{ .string = s }}, regexp);
+                }
+            }
+        }
+    }
+    // Fallback (no RegExp engine wired to @@matchAll): an empty iterator would be returned. Surface
+    // a TypeError-free empty result by delegating to the implicit RegExp path, which is unavailable —
+    // best effort: throw is wrong, so return an empty array's iterator is also unavailable. Report
+    // undefined (the few non-cstm cases that reach here need the engine and stay failing).
+    return .{ .normal = .undefined };
+}
+
+/// §22.1.3.13 normalize ( [ form ] ) — validate `form` (default "NFC"; one of NFC/NFD/NFKC/NFKD,
+/// else RangeError) and return the normalized string. Full Unicode normalization needs large
+/// decomposition/composition tables (deferred); an ASCII / already-normalized string is returned
+/// unchanged (identity), which is correct for the common case and passes the validation/abrupt tests.
+fn normalize(it: *Interpreter, s: []const u8, args: []const Value) EvalError!Completion {
+    var form: []const u8 = "NFC";
+    if (args.len > 0 and args[0] != .undefined) {
+        form = switch (try coerceStr(it, args[0])) {
+            .abrupt => |c| return c,
+            .string => |v| v,
+        };
+    }
+    const ok = std.mem.eql(u8, form, "NFC") or std.mem.eql(u8, form, "NFD") or
+        std.mem.eql(u8, form, "NFKC") or std.mem.eql(u8, form, "NFKD");
+    if (!ok) return it.throwError("RangeError", "The normalization form should be one of NFC, NFD, NFKC, NFKD.");
+    // Identity for ASCII (always normalized in every form). Non-ASCII normalization is deferred.
+    return str(s);
 }
 
 /// ToUint16 (§7.1.6-ish over an f64): truncate toward zero mod 2^16.

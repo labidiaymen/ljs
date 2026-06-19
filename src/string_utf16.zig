@@ -190,6 +190,71 @@ pub fn canonicalizeSurrogates(arena: std.mem.Allocator, s: []const u8) std.mem.A
     return out.toOwnedSlice(arena);
 }
 
+/// §22.1.3.8 IsStringWellFormed — true iff `s` contains no UNPAIRED surrogate code unit. In the
+/// WTF-8 store an unpaired surrogate is a 3-byte ED A0..BF sequence not immediately followed by its
+/// pairing half (a high ED A0..AF then a low ED B0..BF). A canonicalized astral scalar is a 4-byte
+/// F0.. sequence and is always well-formed. ASCII fast path: trivially well-formed.
+pub fn isWellFormed(s: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, s, 0xED) == null) return true; // no surrogate-lead byte
+    var i: usize = 0;
+    while (i < s.len) {
+        const d = decodeAt(s, i);
+        if (d.cp >= 0xD800 and d.cp <= 0xDBFF) {
+            // a HIGH surrogate is well-formed only when the NEXT code unit is a LOW surrogate.
+            if (i + d.len >= s.len) return false;
+            const next = decodeAt(s, i + d.len);
+            if (next.cp < 0xDC00 or next.cp > 0xDFFF) return false;
+            i += d.len + next.len; // consume the valid pair
+            continue;
+        }
+        if (d.cp >= 0xDC00 and d.cp <= 0xDFFF) return false; // an UNPAIRED low surrogate
+        i += d.len;
+    }
+    return true;
+}
+
+/// §22.1.3.31 ToWellFormed — replace every UNPAIRED surrogate code unit with U+FFFD (the 3-byte
+/// UTF-8 replacement EF BF BD). Paired surrogates (already canonicalized to a 4-byte astral form
+/// in this store) and all other code points are preserved. Fast path: a well-formed string is
+/// returned unchanged.
+pub fn toWellFormed(arena: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]const u8 {
+    if (std.mem.indexOfScalar(u8, s, 0xED) == null) return s; // no surrogate-lead byte → unchanged
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        const d = decodeAt(s, i);
+        if (d.cp >= 0xD800 and d.cp <= 0xDBFF) {
+            // high surrogate: keep iff immediately followed by a low surrogate (valid pair).
+            if (i + d.len < s.len) {
+                const next = decodeAt(s, i + d.len);
+                if (next.cp >= 0xDC00 and next.cp <= 0xDFFF) {
+                    try out.appendSlice(arena, s[i .. i + d.len + next.len]);
+                    i += d.len + next.len;
+                    continue;
+                }
+            }
+            try out.appendSlice(arena, "\u{FFFD}"); // lone high surrogate
+        } else if (d.cp >= 0xDC00 and d.cp <= 0xDFFF) {
+            try out.appendSlice(arena, "\u{FFFD}"); // lone low surrogate
+        } else {
+            try out.appendSlice(arena, s[i .. i + d.len]);
+        }
+        i += d.len;
+    }
+    return out.toOwnedSlice(arena);
+}
+
+test "isWellFormed / toWellFormed" {
+    const a = std.testing.allocator;
+    try std.testing.expect(isWellFormed("abc"));
+    try std.testing.expect(isWellFormed("\u{1F4A9}")); // astral pair → well-formed
+    const lone = [_]u8{ 'a', 0xED, 0xA0, 0xBD, 'c' }; // a + lone high surrogate + c
+    try std.testing.expect(!isWellFormed(&lone));
+    const fixed = try toWellFormed(a, &lone);
+    defer a.free(fixed);
+    try std.testing.expectEqualSlices(u8, "a\u{FFFD}c", fixed);
+}
+
 test "canonicalize surrogate pairs" {
     const a = std.testing.allocator;
     // 😀 in WTF-8 (6 bytes) → 😀 (4-byte UTF-8 F0 9F 98 80)
