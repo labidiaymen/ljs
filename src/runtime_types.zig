@@ -429,6 +429,7 @@ pub const NativeId = enum {
     // §20.2.3 Function.prototype methods (Cycle 2)
     function_method, // Function.prototype.<native_name> (call/apply/bind)
     function_proto_noop, // %Function.prototype% itself — a callable that returns undefined (§20.2.3)
+    function_has_instance, // §20.2.3.6 Function.prototype[@@hasInstance] — OrdinaryHasInstance(this, V)
     // §21.3 Math — `native_name` is the method (`pow`/`floor`/…). The Math namespace object holds these.
     math_method, // Math.<native_name>
     // §28.1 Reflect — `native_name` is the method (`get`/`apply`/…). The Reflect namespace object holds these.

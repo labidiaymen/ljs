@@ -381,6 +381,12 @@ pub const Interpreter = struct {
         return interp_property.getProperty(self, base, key);
     }
 
+    /// §7.3.21 OrdinaryHasInstance — thin wrapper (used by the recursion in interp_expr and by the
+    /// `instanceof` operator path). Returns `.normal = boolean` or an abrupt `.thrown` to propagate.
+    pub fn ordinaryHasInstance(self: *Interpreter, c: Value, o: Value) EvalError!Completion {
+        return interp_expr.ordinaryHasInstance(self, c, o);
+    }
+
     pub fn stringProto(self: *Interpreter) ?*Object {
         return self.globalProto("String");
     }

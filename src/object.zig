@@ -524,6 +524,7 @@ pub const Object = struct {
             // ── Function.prototype ──
             .function_method => L.pick(name, .{ .{ "apply", 2 }, .{ "bind", 1 }, .{ "call", 1 } }),
             .function_proto_noop => 0,
+            .function_has_instance => 1, // §20.2.3.6 Function.prototype[@@hasInstance] ( V )
             // ── Math / Reflect ──
             .math_method => L.pick(name, .{ .{ "atan2", 2 }, .{ "pow", 2 }, .{ "max", 2 }, .{ "min", 2 }, .{ "hypot", 2 }, .{ "imul", 2 } }) orelse 1,
             .reflect_method => L.pick(name, .{ .{ "apply", 3 }, .{ "construct", 2 }, .{ "defineProperty", 3 }, .{ "deleteProperty", 2 }, .{ "get", 2 }, .{ "getOwnPropertyDescriptor", 2 }, .{ "getPrototypeOf", 1 }, .{ "has", 2 }, .{ "isExtensible", 1 }, .{ "ownKeys", 1 }, .{ "preventExtensions", 1 }, .{ "set", 3 }, .{ "setPrototypeOf", 2 } }),

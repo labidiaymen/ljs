@@ -92,8 +92,13 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         break :blk if (pv == .object) pv.object else null;
     };
     if (function_proto) |fp| {
+        fp.kind = .function; // §20.2.3: %Function.prototype% IS a function object (callable, IsCallable true)
         fp.native = .function_proto_noop; // §20.2.3: %Function.prototype% is itself callable (→ undefined)
         fp.prototype = function_proto; // self-link placeholder; reset to %Object.prototype% below
+        // §20.2.3 the function-prototype object has "length" 0 and "name" "" (data props:
+        // non-writable, non-enumerable, configurable, like every built-in function).
+        try fp.defineData("length", .{ .number = 0 }, false, false, true);
+        try fp.defineData("name", .{ .string = "" }, false, false, true);
         try defineMethod(arena, fp, "call", .function_method, "call");
         try defineMethod(arena, fp, "apply", .function_method, "apply");
         try defineMethod(arena, fp, "bind", .function_method, "bind");
@@ -322,6 +327,15 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         const sym = try newSymbol(arena, desc);
         try symbol_fn.defineData(name, .{ .symbol = sym }, false, false, false);
     }
+    // §20.2.3.6 Function.prototype[@@hasInstance] ( V ) — the OrdinaryHasInstance method. Its property
+    // on %Function.prototype% is non-writable, non-enumerable, NON-configurable (unlike most built-in
+    // methods); the method object itself carries name "[Symbol.hasInstance]" and length 1.
+    if (symbol_fn.get("hasInstance")) |hi| if (hi == .symbol) if (function_proto) |fp| {
+        const him = try Object.createNative(arena, .function_has_instance, "[Symbol.hasInstance]");
+        him.prototype = function_proto;
+        try him.defineData("name", .{ .string = "[Symbol.hasInstance]" }, false, false, true);
+        try fp.defineSymbolData(hi.symbol, .{ .object = him }, false, false, false);
+    };
     // §20.4.3 Symbol.prototype — toString/valueOf, the `description` getter, and [Symbol.toPrimitive].
     if (symbol_fn.get("prototype")) |pv| {
         if (pv == .object) {
@@ -1062,5 +1076,13 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         try tte.defineData("length", .{ .number = 0 }, false, false, false);
         try tte.defineData("name", .{ .string = "" }, false, false, false);
         try env.declare("%ThrowTypeError%", .{ .object = tte }, false, true);
+        // §10.4.4.6 / §20.2.3 AddRestrictedFunctionProperties — %Function.prototype% carries `caller`
+        // and `arguments` accessor properties whose get AND set are both %ThrowTypeError%, with
+        // { [[Enumerable]]: false, [[Configurable]]: true }. Inherited by every function, so reading
+        // `f.caller` / `f.arguments` on a strict function throws a TypeError (poison pills).
+        if (function_proto) |fp| {
+            try fp.defineAccessorEx("caller", tte, tte, false);
+            try fp.defineAccessorEx("arguments", tte, tte, false);
+        }
     }
 }

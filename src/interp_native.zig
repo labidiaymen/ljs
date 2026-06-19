@@ -645,6 +645,11 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         },
         .function_ctor => return interp_expr.functionConstructor(self, args),
         .function_proto_noop => return .{ .normal = .undefined }, // §20.2.3 %Function.prototype%() → undefined
+        // §20.2.3.6 Function.prototype[@@hasInstance] ( V ) → §7.3.21 OrdinaryHasInstance(this, V).
+        .function_has_instance => {
+            const v = if (args.len > 0) args[0] else .undefined;
+            return interp_expr.ordinaryHasInstance(self, this_val, v);
+        },
         // §10.4.4.6 %ThrowTypeError% — always throws, regardless of args/this. Backs the poison
         // `callee` accessor on a strict/unmapped arguments object.
         .throw_type_error => return self.throwError("TypeError", "'callee', 'caller', and 'arguments' properties may not be accessed on strict mode functions"),

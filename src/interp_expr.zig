@@ -1400,10 +1400,16 @@ pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this
     const saved_this = self.this_val;
     self.this_val = if (fd.is_arrow) fd.captured_this else blk: {
         // §10.2.1.2 OrdinaryCallBindThis (this-mode = global): a NON-STRICT ordinary function called
-        // with a `this` of undefined/null uses the global object instead. Strict functions keep the
-        // value as-is; arrows use their captured `this`. (Primitive-`this` boxing in sloppy mode is a
-        // separate refinement, not handled here.)
-        if (!fd.strict and (this_val == .undefined or this_val == .null)) break :blk (globalThisValue(self) orelse this_val);
+        // with a `this` of undefined/null uses the global object; any other PRIMITIVE `this` is
+        // ToObject-boxed (so `sloppy.apply(1)` sees a Number wrapper, and `this.x = …` is observable
+        // on it). Strict functions keep the value as-is; arrows use their captured `this`.
+        if (!fd.strict) {
+            if (this_val == .undefined or this_val == .null) break :blk (globalThisValue(self) orelse this_val);
+            if (this_val != .object) switch (try self.toObjectForArrayLike(this_val)) {
+                .obj => |o| break :blk .{ .object = o },
+                .abrupt => |c| return c,
+            };
+        }
         break :blk this_val;
     };
     defer self.this_val = saved_this;
@@ -1819,19 +1825,62 @@ pub fn functionPrototypeMethod(self: *Interpreter, name: []const u8, this_val: V
             .bound_this = this_arg,
             .bound_args = bound_args,
         });
-        // §20.2.3.2 step 4–8: a bound function's `length` is max(0, target.length - boundArgs)
-        // (target.length coerced to an integer; a non-number/absent → 0); its `name` is
-        // "bound " + target.name (target.name coerced to string; a non-string → "").
+        // §20.2.3.2 step 4–7 SetFunctionLength: if Target HasOwnProperty("length") and Get(Target,
+        // "length") is a Number, L = max(0, ToIntegerOrInfinity(targetLen) − boundArgs); else 0.
+        // ToIntegerOrInfinity preserves +Infinity (uncapped) and maps NaN/−0/−∞ to 0/−∞.
         var target_len: f64 = 0;
-        if (target.get("length")) |lv| if (lv == .number and lv.number > 0 and std.math.isFinite(lv.number)) {
-            target_len = @trunc(lv.number);
-        };
-        const bound_len = @max(0, target_len - @as(f64, @floatFromInt(bound_args.len)));
+        if (target.properties.get("length") != null) {
+            const lv_c = try self.getProperty(this_val, "length");
+            if (lv_c.isAbrupt()) return lv_c;
+            if (lv_c.normal == .number) {
+                const ic = try self.toIntegerOrInfinityPub(lv_c.normal);
+                if (ic.isAbrupt()) return ic;
+                const ti = ic.normal.number; // already an integer or ±Infinity
+                target_len = if (std.math.isPositiveInf(ti)) ti else @max(0, ti);
+            }
+        }
+        const bound_len = if (std.math.isPositiveInf(target_len))
+            target_len
+        else
+            @max(0, target_len - @as(f64, @floatFromInt(bound_args.len)));
         try setFunctionLength(bf, bound_len);
-        const target_name = if (target.get("name")) |nv| (if (nv == .string) nv.string else "") else "";
+        // §20.2.3.2 step 8 SetFunctionName: targetName = Get(Target, "name") (may throw via a getter);
+        // if not a String, use "". The bound name is "bound " + targetName.
+        const name_c = try self.getProperty(this_val, "name");
+        if (name_c.isAbrupt()) return name_c;
+        const target_name = if (name_c.normal == .string) name_c.normal.string else "";
         try self.setFunctionName(bf, target_name, "bound");
         return .{ .normal = .{ .object = bf } };
     }
 
     return self.throwError("TypeError", "unknown Function.prototype method");
+}
+
+/// §7.3.21 OrdinaryHasInstance ( C, O ). Backs `instanceof` and Function.prototype[@@hasInstance].
+/// Returns a Completion: `.normal = boolean` on success, or an abrupt `.thrown` to propagate (a
+/// `C.prototype` getter or a Proxy [[GetPrototypeOf]] trap on O's chain may throw). `false` when C is
+/// not callable; a bound C unwraps to its target; `C.prototype` must be an Object (else TypeError).
+pub fn ordinaryHasInstance(self: *Interpreter, c: Value, o: Value) EvalError!Completion {
+    // §7.3.21 step 1–2: a non-callable C → false; a bound C → recurse on its target function.
+    if (c != .object or c.object.kind != .function) return .{ .normal = .{ .boolean = false } };
+    if (c.object.bound) |bd| return self.ordinaryHasInstance(.{ .object = bd.target }, o);
+    // §7.3.21 step 4: O must be an Object, else false.
+    if (o != .object) return .{ .normal = .{ .boolean = false } };
+    // §7.3.21 step 5: P = ? Get(C, "prototype"); must be an Object (a getter may throw).
+    const p_c = try self.getProperty(c, "prototype");
+    if (p_c.isAbrupt()) return p_c;
+    if (p_c.normal != .object) return self.throwError("TypeError", "Function has non-object prototype in instanceof check");
+    const target = p_c.normal.object;
+    // §7.3.21 step 6: walk O's prototype chain via [[GetPrototypeOf]] (proxy traps may throw).
+    var cur: *Object = o.object;
+    while (true) {
+        switch (try self.ordinaryGetPrototypeOf(cur)) {
+            .abrupt => |ab| return ab,
+            .proto => |pp| {
+                const next = pp orelse return .{ .normal = .{ .boolean = false } };
+                if (next == target) return .{ .normal = .{ .boolean = true } };
+                cur = next;
+            },
+        }
+    }
 }
