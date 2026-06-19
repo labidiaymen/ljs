@@ -1547,6 +1547,10 @@ pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this
     // §10.2.11 (var step): instantiate VarDeclaredNames in the FunctionBody VariableEnvironment,
     // descending through nested blocks/loops/try (no-clobber over params already bound above).
     try self.hoistVarNames(fd.body, call_env);
+    // §10.2.11 (function step): instantiate top-level FunctionDeclarations of the body as initialized
+    // closures BEFORE any statement runs (forward references; `typeof f` before its line). After the
+    // var step so the function binding clobbers a same-named `var`-hoisted `undefined`.
+    try interp_stmt.hoistFunctionDeclarations(self, fd.body, call_env);
     // §ER: a FunctionBody lexically containing a `using`/`await using` disposes its resources on
     // exit (normal return OR throw). Gated on `blockHasUsing` so an ordinary body pays nothing.
     if (blockHasUsing(fd.body)) {

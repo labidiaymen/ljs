@@ -177,6 +177,10 @@ pub const Interpreter = struct {
         // §16.1.7/§19.2.1.3 (var step): instantiate the Script/eval body's VarDeclaredNames in the
         // VariableEnvironment (the global env, or for a direct eval the eval scope — both var scopes).
         try self.hoistVarNames(program.statements, env.varScope());
+        // §16.1.7/§19.2.1.3 (function step): instantiate top-level FunctionDeclarations as
+        // initialized closures BEFORE any statement runs, so a forward reference resolves. Run after
+        // the var step so a function binding clobbers a same-named `var`-hoisted `undefined`.
+        try interp_stmt.hoistFunctionDeclarations(self, program.statements, env.varScope());
         var last: Completion = .{ .normal = .undefined };
         for (program.statements) |stmt| {
             last = try self.evalStmt(stmt, env);

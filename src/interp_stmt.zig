@@ -136,14 +136,13 @@ pub fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError
             return runBlock(self, stmts, env);
         },
         .func_decl => |f| {
-            // §15.2 — bind a function object to its name in the current scope.
-            const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env, .is_generator = f.is_generator, .is_async = f.is_async, .strict = f.strict });
-            obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
-            // §20.2.4.1/.2: a declaration always has a name; install `length` + `name`.
-            try setFunctionLength(obj, paramCount(f.params));
-            try self.setFunctionName(obj, f.name orelse "", "");
-            try setConstructorBackref(obj); // §10.2.4 MakeConstructor: F.prototype.constructor === F
-            try interp_expr.finalizeFunctionPrototype(self, obj); // §10.2.4/§27.5.1 prototype descriptor + proto link
+            // §15.2 — bind a function object to its name in the current scope. At a Script / function
+            // body / block scope entry, `hoistFunctionDeclarations` already created the binding
+            // (initialized to a closure) so a forward reference (`f(); function f(){}`) resolves.
+            // Re-running here refreshes the binding to a closure captured over the CURRENT env — this
+            // matters for a declaration inside a block / loop body that is re-entered with a fresh
+            // scope per iteration (each closure must see that iteration's bindings).
+            const obj = try instantiateFunctionObject(self, f, env);
             if (f.name) |name| try env.declare(name, .{ .object = obj }, true, true);
             return .{ .normal = .undefined };
         },
@@ -373,6 +372,43 @@ pub fn hoistLexicalNames(self: *Interpreter, stmts: []const ast.Stmt, env: *Envi
     };
 }
 
+/// §10.2.5 OrdinaryFunctionCreate + §10.2.4 MakeConstructor for a FunctionDeclaration: build the
+/// closure object capturing `env`, install `length`/`name`/`prototype`. Shared by the §15.2
+/// declaration-statement arm and `hoistFunctionDeclarations` so a hoisted function and the value
+/// re-bound when its declaration line runs are built identically.
+pub fn instantiateFunctionObject(self: *Interpreter, f: *const ast.Function, env: *Environment) EvalError!*Object {
+    const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env, .is_generator = f.is_generator, .is_async = f.is_async, .strict = f.strict });
+    obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
+    // §20.2.4.1/.2: a declaration always has a name; install `length` + `name`.
+    try setFunctionLength(obj, paramCount(f.params));
+    try self.setFunctionName(obj, f.name orelse "", "");
+    try setConstructorBackref(obj); // §10.2.4 MakeConstructor: F.prototype.constructor === F
+    try interp_expr.finalizeFunctionPrototype(self, obj); // §10.2.4/§27.5.1 prototype descriptor + proto link
+    return obj;
+}
+
+/// §10.2.11 / §16.1.7 / §14.2.3 FunctionDeclarationInstantiation (function step): for each
+/// top-level `FunctionDeclaration` of `stmts` (the scope's OWN immediate statements only — NOT
+/// descending into nested blocks/loops/functions), create the closure ONCE and bind its name as an
+/// INITIALIZED binding in `env` BEFORE any statement runs. This is what makes a forward reference
+/// (`f(); function f(){}`) and `typeof f === "function"` before the declaration line work.
+///
+/// A later duplicate top-level declaration of the same name wins (last one is instantiated last),
+/// matching §10.2.11 step 28 (instantiated functions in source order, each overwriting the prior).
+/// Run AFTER `hoistLexicalNames`/`hoistVarNames` at each scope-entry site so the initialized
+/// function binding clobbers any `var`-hoisted `undefined` of the same name (§B.3.3 / step ordering)
+/// and is itself a plain mutable binding (functions are not lexical / no TDZ).
+pub fn hoistFunctionDeclarations(self: *Interpreter, stmts: []const ast.Stmt, env: *Environment) EvalError!void {
+    for (stmts) |s| switch (s) {
+        .func_decl => |f| {
+            const name = f.name orelse continue;
+            const obj = try instantiateFunctionObject(self, f, env);
+            try env.declare(name, .{ .object = obj }, true, true);
+        },
+        else => {},
+    };
+}
+
 /// Pre-declare every BindingIdentifier in a lexical-declaration pattern as uninitialized (TDZ).
 pub fn hoistPatternNames(self: *Interpreter, pattern: *const ast.Pattern, env: *Environment) EvalError!void {
     switch (pattern.*) {
@@ -516,6 +552,10 @@ pub fn runScope(self: *Interpreter, stmts: []const ast.Stmt, env: *Environment) 
     // block that actually has lexical declarations (or a try/catch/finally body), so the hot path
     // (declaration-free blocks via `runBlock`) never reaches here.
     try self.hoistLexicalNames(stmts, env);
+    // §14.2.3 (function step): instantiate this block's top-level FunctionDeclarations as initialized
+    // closures bound in the block's OWN scope before it runs — so a forward reference inside the
+    // block (`{ f(); function f(){} }`) resolves and the binding is block-scoped (does not leak).
+    try hoistFunctionDeclarations(self, stmts, env);
     if (!blockHasUsing(stmts)) return runBlock(self, stmts, env);
     const marker = self.disposables.items.len;
     const c = try runBlock(self, stmts, env);
