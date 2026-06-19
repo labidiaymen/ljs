@@ -22,7 +22,7 @@ const SetRecord = Interpreter.SetRecord;
 /// M-subset) carrying the array + cursor in its native `iter` slot, with a `next` method.
 pub fn makeArrayIterator(self: *Interpreter, this_val: Value, kind: @import("object.zig").IterKind) EvalError!Completion {
     if (this_val != .object) return self.throwError("TypeError", "Array.prototype.values requires an object");
-    const iter = try Object.create(self.arena, self.iteratorProto()); // §23.1.5.1 proto = %Iterator.prototype%
+    const iter = try Object.create(self.arena, self.namedIteratorProto("%ArrayIteratorPrototype%")); // §23.1.5.1
     iter.iter = .{ .array = this_val.object, .cursor = 0, .kind = kind };
     try installIteratorNext(self, iter);
     return .{ .normal = .{ .object = iter } };
@@ -115,7 +115,8 @@ pub fn makeCollectionIterator(self: *Interpreter, this_val: Value, kind: object_
     if (c.kind != home) {
         return self.throwError("TypeError", "method called on an incompatible receiver");
     }
-    const iter = try Object.create(self.arena, self.iteratorProto()); // §24.1.5.1 proto = %Iterator.prototype%
+    const proto_name: []const u8 = if (home == .map) "%MapIteratorPrototype%" else "%SetIteratorPrototype%";
+    const iter = try Object.create(self.arena, self.namedIteratorProto(proto_name)); // §24.1.5.1 / §24.2.5.1
     iter.iter = .{ .collection = this_val.object, .cursor = 0, .kind = kind };
     try installIteratorNext(self, iter);
     return .{ .normal = .{ .object = iter } };
@@ -364,11 +365,15 @@ pub fn setAlgebra(self: *Interpreter, name: []const u8, this_coll: *object_mod.C
 /// §22.1.5.1 CreateStringIterator — a fresh String Iterator object over the primitive string's
 /// code units (M-subset: byte-at-a-time, matching the engine's String indexing model).
 pub fn makeStringIterator(self: *Interpreter, this_val: Value) EvalError!Completion {
-    const s: []const u8 = switch (this_val) {
-        .string => |str| str,
-        else => return self.throwError("TypeError", "String.prototype[Symbol.iterator] requires a string"),
-    };
-    const iter = try Object.create(self.arena, self.iteratorProto()); // §22.1.5.1 proto = %Iterator.prototype%
+    // §22.1.3.36 step 1-2: RequireObjectCoercible(this) then ToString(this). A boxed String object
+    // (or any coercible value) is accepted — Iterator.from(new String('s')) must iterate its chars.
+    if (this_val == .undefined or this_val == .null) {
+        return self.throwError("TypeError", "String.prototype[Symbol.iterator] called on null/undefined");
+    }
+    const sc = try self.toStringValuePub(this_val);
+    if (sc.isAbrupt()) return sc;
+    const s: []const u8 = sc.normal.string;
+    const iter = try Object.create(self.arena, self.namedIteratorProto("%StringIteratorPrototype%")); // §22.1.5.1
     iter.iter = .{ .string = s, .cursor = 0 };
     try installIteratorNext(self, iter);
     return .{ .normal = .{ .object = iter } };

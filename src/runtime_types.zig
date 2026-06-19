@@ -478,6 +478,8 @@ pub const NativeId = enum {
     iterator_from, // §27.1.3.1.1 Iterator.from(O)
     iterator_helper, // %Iterator.prototype%.<native_name>
     iterator_helper_next, // §27.1.4.x an Iterator Helper object's own `next` (drives the lazy transform)
+    iterator_proto_accessor, // §27.1.4.1/.2 %Iterator.prototype% `constructor` & [@@toStringTag] get/set (native_name selects)
+    wrap_for_valid_iterator, // §27.1.3.1.1.1 %WrapForValidIteratorPrototype%.next / .return (native_name selects)
     // §27.5 Generator — %GeneratorPrototype% methods + [Symbol.iterator].
     generator_method, // %GeneratorPrototype%.next / .return / .throw (native_name selects)
     generator_iterator, // %GeneratorPrototype%[Symbol.iterator] — returns `this`

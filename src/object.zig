@@ -554,10 +554,13 @@ pub const Object = struct {
             // §27.1.4 %Iterator.prototype% helpers (all share the `.iterator_helper` id, keyed by the
             // spec method name): the lazy + eager helpers each take one argument (length 1); `toArray`
             // takes none (length 0).
-            .iterator_helper => L.pick(name, .{.{ "toArray", 0 }}) orelse 1,
+            .iterator_helper => L.pick(name, .{ .{ "toArray", 0 }, .{ "@@dispose", 0 } }) orelse 1,
             // An Iterator Helper object's own `next`/`return` (§27.1.4.x): `next` takes no argument,
             // `return` takes one (the value forwarded to the underlying iterator's close).
             .iterator_helper_next => L.pick(name, .{.{ "return", 1 }}) orelse 0,
+            .wrap_for_valid_iterator => 0, // §27.1.3.1.1.1 %WrapForValidIteratorPrototype% next/return both length 0
+            // §27.1.4.1/.2 %Iterator.prototype% `constructor`/[@@toStringTag] accessors: getters take 0, setters take 1.
+            .iterator_proto_accessor => L.pick(name, .{ .{ "set constructor", 1 }, .{ "set [Symbol.toStringTag]", 1 } }) orelse 0,
             .array_values, .array_keys, .array_entries, .string_iterator, .generator_iterator, .async_generator_iterator, .species_getter => 0,
             // ── collections ──
             .collection_size, .collection_iterator => 0,

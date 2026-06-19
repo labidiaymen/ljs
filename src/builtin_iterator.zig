@@ -12,9 +12,61 @@ const ops = @import("abstract_ops.zig");
 const object_mod = @import("object.zig");
 const Object = object_mod.Object;
 
+const Symbol = @import("value.zig").Symbol;
+
 const StepResult = Interpreter.StepResult;
 const toBoolean = ops.toBoolean;
 const isCallable = interp.isCallable;
+
+/// §27.1.4.1 get/set %Iterator.prototype%.constructor and §27.1.4.2 get/set [@@toStringTag] —
+/// these are ACCESSOR properties (not data). The getter returns %Iterator% / "Iterator"; the setter
+/// implements SetterThatIgnoresPrototypeProperties(%Iterator.prototype%, key, v): a non-Object `this`
+/// throws, `this === %Iterator.prototype%` throws, otherwise an own property is overwritten / a fresh
+/// data property created on `this`. `native_name` selects the four cases.
+pub fn iteratorProtoAccessor(it: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
+    const eql = std.mem.eql;
+    const is_tag = std.mem.indexOf(u8, name, "toStringTag") != null;
+    if (std.mem.startsWith(u8, name, "get")) {
+        if (is_tag) return .{ .normal = .{ .string = "Iterator" } };
+        // get constructor → %Iterator%
+        const g = it.globals orelse return .{ .normal = .undefined };
+        const b = g.lookup("Iterator") orelse return .{ .normal = .undefined };
+        return .{ .normal = b.value };
+    }
+    // ── the setter (SetterThatIgnoresPrototypeProperties) ──
+    const v: Value = if (args.len > 0) args[0] else .undefined;
+    if (this_val != .object) return it.throwError("TypeError", "Iterator.prototype setter requires an object receiver");
+    const o = this_val.object;
+    const iproto = it.iteratorProto() orelse return it.throwError("TypeError", "no %Iterator.prototype%");
+    if (o == iproto) return it.throwError("TypeError", "cannot set on %Iterator.prototype% itself");
+    if (is_tag) {
+        const tag_sym = wellKnownSymbol(it, "toStringTag") orelse return it.throwError("TypeError", "no Symbol.toStringTag");
+        const has_own = blk: {
+            for (o.symbol_props.items) |sp| if (sp.key == tag_sym) break :blk true;
+            break :blk false;
+        };
+        if (has_own) {
+            const sc = try it.setPropertyV(this_val, .{ .symbol = tag_sym }, v);
+            if (sc.isAbrupt()) return sc;
+        } else try o.defineSymbolData(tag_sym, v, true, true, true);
+        return .{ .normal = .undefined };
+    }
+    _ = eql;
+    // constructor (string key)
+    if (o.properties.get("constructor") != null) {
+        const sc = try it.setPropertyV(this_val, .{ .string = "constructor" }, v);
+        if (sc.isAbrupt()) return sc;
+    } else try o.defineData("constructor", v, true, true, true);
+    return .{ .normal = .undefined };
+}
+
+fn wellKnownSymbol(it: *Interpreter, comptime field: []const u8) ?*Symbol {
+    const g = it.globals orelse return null;
+    const b = g.lookup("Symbol") orelse return null;
+    if (b.value != .object) return null;
+    const pv = b.value.object.get(field) orelse return null;
+    return if (pv == .symbol) pv.symbol else null;
+}
 
 /// §7.4.11 IteratorClose for a NORMAL completion (the value the helper carries is non-abrupt), so a
 /// throwing `return` (or a throwing `return` GETTER, or a non-Object `return()` result) PROPAGATES —
@@ -58,6 +110,19 @@ pub fn iteratorHelper(it: *Interpreter, name: []const u8, this_val: Value, args:
     const eql = std.mem.eql;
     if (this_val != .object) return it.throwError("TypeError", "Iterator.prototype method called on a non-object");
     const o = this_val.object;
+
+    if (eql(u8, name, "@@dispose")) {
+        // §27.1.4.x %Iterator.prototype%[@@dispose]: GetMethod(O, "return"); if not undefined, Call it.
+        const rc = try it.getProperty(this_val, "return"); // may throw (getter)
+        if (rc.isAbrupt()) return rc;
+        if (rc.normal == .undefined or rc.normal == .null) return .{ .normal = .undefined };
+        if (rc.normal != .object or !isCallable(rc.normal.object)) {
+            return it.throwError("TypeError", "iterator 'return' is not a function");
+        }
+        const res = try it.callFunction(rc.normal.object, &.{}, this_val);
+        if (res.isAbrupt()) return res;
+        return .{ .normal = .undefined };
+    }
 
     if (eql(u8, name, "toArray")) {
         // §27.1.4.x toArray: O-is-Object check, then GetIteratorDirect (reads `next`), then drain.
@@ -128,16 +193,21 @@ pub fn iteratorHelper(it: *Interpreter, name: []const u8, this_val: Value, args:
                     }
                     i += 1;
                     const t = toBoolean(r.normal);
+                    // §27.1.4.x short-circuit: `Return ? IteratorClose(iterated, NormalCompletion(result))`
+                    // — a throwing `return` (or `return` GETTER) PROPAGATES (use closeIteratorNormal).
                     if (is_find and t) {
-                        try it.iteratorClose(o);
+                        const cc = try closeIteratorNormal(it, o);
+                        if (cc.isAbrupt()) return cc;
                         return .{ .normal = v };
                     }
                     if (is_some and t) {
-                        try it.iteratorClose(o);
+                        const cc = try closeIteratorNormal(it, o);
+                        if (cc.isAbrupt()) return cc;
                         return .{ .normal = .{ .boolean = true } };
                     }
                     if (!is_some and !is_find and !t) { // every: a falsy → false
-                        try it.iteratorClose(o);
+                        const cc = try closeIteratorNormal(it, o);
+                        if (cc.isAbrupt()) return cc;
                         return .{ .normal = .{ .boolean = false } };
                     }
                 },
@@ -262,7 +332,8 @@ fn getIteratorFlattenable(it: *Interpreter, obj: Value, allow_string: bool) Eval
 }
 
 /// §27.1.3.1.1 Iterator.from ( O ) — wrap O's iterator so it inherits %Iterator.prototype%. If the
-/// iterator already does, it is returned as-is; otherwise a `wrap` helper delegates to it.
+/// iterator already does, it is returned as-is; otherwise a fresh object with [[Prototype]]
+/// %WrapForValidIteratorPrototype% (whose proto is %Iterator.prototype%) delegates to it.
 pub fn iteratorFrom(it: *Interpreter, args: []const Value) EvalError!Completion {
     const obj: Value = if (args.len > 0) args[0] else .undefined;
     const flat = switch (try getIteratorFlattenable(it, obj, true)) {
@@ -275,7 +346,40 @@ pub fn iteratorFrom(it: *Interpreter, args: []const Value) EvalError!Completion 
     while (p) |pp| : (p = pp.prototype) {
         if (pp == iproto) return .{ .normal = .{ .object = flat.obj } };
     }
-    return .{ .normal = .{ .object = try makeHelper(it, .wrap, flat.obj, flat.next_fn, .undefined, 0) } };
+    // §27.1.3.1.1 step 5: a WrapForValidIterator with [[Iterated]] = (flat.obj, flat.next_fn),
+    // [[Prototype]] = %WrapForValidIteratorPrototype%.
+    const wrap_proto = it.namedIteratorProto("%WrapForValidIteratorPrototype%");
+    const w = try Object.create(it.arena, wrap_proto);
+    const st = try it.arena.create(object_mod.HelperState);
+    st.* = .{ .kind = .wrap, .underlying = flat.obj, .next_fn = flat.next_fn, .callback = .undefined, .remaining = 0 };
+    w.iter_helper = st;
+    return .{ .normal = .{ .object = w } };
+}
+
+/// §27.1.3.1.1.1 %WrapForValidIteratorPrototype%.next / .return — `next` calls the wrapped iterator's
+/// [[NextMethod]] and returns its result OBJECT as-is; `return` delegates to the wrapped iterator's
+/// `return` method (returning a `{value:undefined,done:true}` result when it is absent).
+pub fn wrapForValidIterator(it: *Interpreter, name: []const u8, this_val: Value) EvalError!Completion {
+    if (this_val != .object or this_val.object.iter_helper == null) {
+        return it.throwError("TypeError", "not a WrapForValidIterator");
+    }
+    const st = this_val.object.iter_helper.?;
+    const under: Value = .{ .object = st.underlying };
+    if (std.mem.eql(u8, name, "next")) {
+        // §27.1.3.1.1.1.1: Return ? Call([[NextMethod]], [[Iterator]]). Result returned as-is.
+        if (st.next_fn != .object or !isCallable(st.next_fn.object)) {
+            return it.throwError("TypeError", "iterator.next is not a function");
+        }
+        return it.callFunction(st.next_fn.object, &.{}, under);
+    }
+    // return(): GetMethod(iterator, "return"); undefined → {value:undefined,done:true}; else Call.
+    const rc = try it.getProperty(under, "return");
+    if (rc.isAbrupt()) return rc;
+    if (rc.normal == .undefined or rc.normal == .null) return iterResultObjectC(it, .undefined, true);
+    if (rc.normal != .object or !isCallable(rc.normal.object)) {
+        return it.throwError("TypeError", "iterator 'return' is not a function");
+    }
+    return it.callFunction(rc.normal.object, &.{}, under);
 }
 
 /// §27.1.4.x an Iterator Helper's own `next` / `return` — drives the lazy transform, pulling from

@@ -421,6 +421,8 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
             return builtin_iterator.iteratorHelper(self, func.native_name, this_val, args);
         },
         .iterator_helper_next => return builtin_iterator.helperNext(self, func.native_name, this_val, args), // §27.1.4.x lazy next/return
+        .iterator_proto_accessor => return builtin_iterator.iteratorProtoAccessor(self, func.native_name, this_val, args), // §27.1.4.1/.2 constructor & @@toStringTag get/set
+        .wrap_for_valid_iterator => return builtin_iterator.wrapForValidIterator(self, func.native_name, this_val), // §27.1.3.1.1.1 next/return
         .iterator_from => return builtin_iterator.iteratorFrom(self, args), // §27.1.3.1.1
         .iterator_ctor => {
             // §27.1.3.1: the abstract `Iterator` constructor — a direct call (no new_target) or
@@ -705,7 +707,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .data_view_ctor, .data_view_proto_getter, .data_view_method => unreachable,
         .date_ctor, .date_static, .date_proto_method => unreachable, // §21.4 handled in the first switch
         .json_parse, .json_stringify => unreachable, // handled in the first switch
-        .iterator_helper, .iterator_helper_next, .iterator_from, .iterator_ctor => unreachable, // handled in the first switch
+        .iterator_helper, .iterator_helper_next, .iterator_from, .iterator_ctor, .iterator_proto_accessor, .wrap_for_valid_iterator => unreachable, // handled in the first switch
         .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch
         .promise_with_resolvers, .promise_capability_executor => unreachable, // handled in the first switch
         .promise_all, .promise_all_settled, .promise_any, .promise_race, .promise_combinator_element => unreachable, // handled in the first switch

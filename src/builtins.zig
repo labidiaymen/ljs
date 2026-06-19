@@ -441,10 +441,65 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         const self_fn = try Object.createNative(arena, .generator_iterator, "[Symbol.iterator]");
         self_fn.prototype = function_proto;
         try ip.defineSymbolData(iter_sym, .{ .object = self_fn }, true, false, true);
+        // §27.1.4.2 `constructor` is an ACCESSOR (get → %Iterator%; set → SetterThatIgnoresPrototypeProperties),
+        // non-enumerable/configurable. NOT a data property.
+        {
+            const cget = try Object.createNative(arena, .iterator_proto_accessor, "get constructor");
+            cget.prototype = function_proto;
+            try cget.defineData("name", .{ .string = "get constructor" }, false, false, true);
+            const cset = try Object.createNative(arena, .iterator_proto_accessor, "set constructor");
+            cset.prototype = function_proto;
+            try cset.defineData("name", .{ .string = "set constructor" }, false, false, true);
+            try ip.defineAccessorEx("constructor", cget, cset, false);
+        }
+        // §27.1.4.1 [@@toStringTag] is an ACCESSOR (get → "Iterator"; set → SetterThatIgnoresPrototypeProperties),
+        // non-enumerable/configurable.
+        if (symbol_fn.get("toStringTag")) |tag| if (tag == .symbol) {
+            const tget = try Object.createNative(arena, .iterator_proto_accessor, "get [Symbol.toStringTag]");
+            tget.prototype = function_proto;
+            try tget.defineData("name", .{ .string = "get [Symbol.toStringTag]" }, false, false, true);
+            const tset = try Object.createNative(arena, .iterator_proto_accessor, "set [Symbol.toStringTag]");
+            tset.prototype = function_proto;
+            try tset.defineData("name", .{ .string = "set [Symbol.toStringTag]" }, false, false, true);
+            try ip.defineSymbolAccessorEx(tag.symbol, tget, tset, false);
+        };
+        // §27.1.4.x %Iterator.prototype%[@@dispose] (explicit-resource-management): a data-property
+        // method (writable/non-enum/configurable) calling GetMethod(this,"return") then Call. name
+        // "[Symbol.dispose]", length 0.
+        if (symbol_fn.get("dispose")) |dsym| if (dsym == .symbol) {
+            const df = try Object.createNative(arena, .iterator_helper, "@@dispose");
+            df.prototype = function_proto;
+            try df.defineData("name", .{ .string = "[Symbol.dispose]" }, false, false, true);
+            try ip.defineSymbolData(dsym.symbol, .{ .object = df }, true, false, true);
+        };
         try env.declare("%IteratorPrototype%", .{ .object = ip }, false, true);
+        // §23.1.5.2 / §22.1.5.2 / §24.1.5.2 / §24.2.5.2 the per-kind built-in iterator prototypes
+        // (%ArrayIteratorPrototype% etc.) — proto = %Iterator.prototype% so the §27.1.4 helpers are
+        // inherited, each carrying [@@toStringTag] (non-writable/non-enum/configurable). This intermediate
+        // layer makes `Object.getPrototypeOf(Object.getPrototypeOf(arr[Symbol.iterator]()))` resolve to
+        // %Iterator.prototype% (the spec chain). The instances' `next` stays own (M-subset).
+        const kind_protos = [_]struct { gname: []const u8, tag: []const u8 }{
+            .{ .gname = "%ArrayIteratorPrototype%", .tag = "Array Iterator" },
+            .{ .gname = "%StringIteratorPrototype%", .tag = "String Iterator" },
+            .{ .gname = "%MapIteratorPrototype%", .tag = "Map Iterator" },
+            .{ .gname = "%SetIteratorPrototype%", .tag = "Set Iterator" },
+        };
+        for (kind_protos) |kp| {
+            const kproto = try Object.create(arena, ip);
+            if (symbol_fn.get("toStringTag")) |tag| if (tag == .symbol)
+                try kproto.defineSymbolData(tag.symbol, .{ .string = kp.tag }, false, false, true);
+            try env.declare(kp.gname, .{ .object = kproto }, false, true);
+        }
+        // §27.1.3.1.1.1 %WrapForValidIteratorPrototype% — proto = %Iterator.prototype%, carries
+        // `next`/`return` (each length 0, non-enum/configurable). The [[Prototype]] of Iterator.from's wrapper.
+        {
+            const wproto = try Object.create(arena, ip);
+            try defineMethod(arena, wproto, "next", .wrap_for_valid_iterator, "next");
+            try defineMethod(arena, wproto, "return", .wrap_for_valid_iterator, "return");
+            try env.declare("%WrapForValidIteratorPrototype%", .{ .object = wproto }, false, true);
+        }
     }
     try defineMethod(arena, iterator_fn, "from", .iterator_from, "from"); // §27.1.3.1.1 Iterator.from
-    try defineConstructorBackref(iterator_fn); // §27.1.4.2 Iterator.prototype.constructor === Iterator
     try env.declare("Iterator", .{ .object = iterator_fn }, true, true);
 
     // §27.5 %GeneratorPrototype% — the [[Prototype]] of every Generator object (made by calling a

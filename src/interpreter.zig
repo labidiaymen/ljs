@@ -956,6 +956,16 @@ pub const Interpreter = struct {
         return if (b.value == .object) b.value.object else self.objectProto();
     }
 
+    /// A per-kind built-in iterator prototype (`%ArrayIteratorPrototype%` etc.), whose [[Prototype]] is
+    /// `%Iterator.prototype%` so the §27.1.4 helpers are inherited. Falls back to `%Iterator.prototype%`
+    /// itself when the named proto is absent (realm-less eval). The intermediate layer is required so
+    /// `Object.getPrototypeOf(Object.getPrototypeOf(arr[Symbol.iterator]())) === %Iterator.prototype%`.
+    pub fn namedIteratorProto(self: *Interpreter, name: []const u8) ?*Object {
+        const g = self.globals orelse return self.iteratorProto();
+        const b = g.lookup(name) orelse return self.iteratorProto();
+        return if (b.value == .object) b.value.object else self.iteratorProto();
+    }
+
     // ── §20.1.2 / §20.1.3 Object reflection ─────────────────────────────────
 
     /// §6.2.6 ToPropertyDescriptor — read a descriptor object's own `value`/`writable`/`get`/`set`/
