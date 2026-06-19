@@ -20,6 +20,7 @@ const builtin_iterator = @import("builtin_iterator.zig");
 const builtin_object = @import("builtin_object.zig");
 const builtin_reflect = @import("builtin_reflect.zig");
 const builtin_bigint = @import("builtin_bigint.zig");
+const bigint = @import("bigint.zig");
 const builtin_proxy = @import("builtin_proxy.zig");
 const builtin_regexp = @import("builtin_regexp.zig");
 const builtin_regexp_symbol = @import("builtin_regexp_symbol.zig");
@@ -377,8 +378,15 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .regexp_symbol_method => return builtin_regexp_symbol.method(self, func.native_name, this_val, args), // §22.2.6.8/.9/.11/.12/.14
         .regexp_string_iterator_next => return builtin_regexp_symbol.stringIteratorNext(self, this_val), // §22.2.9.2.1
         .regexp_static => return builtin_regexp.escape(self, args), // §22.2.5.2 RegExp.escape
-        // §25.1.3.1 a plain `ArrayBuffer(...)` call (no new) throws; construction is in constructNT.
-        .array_buffer_ctor => return self.throwError("TypeError", "Constructor ArrayBuffer requires 'new'"),
+        // §25.1.3.1 a plain `ArrayBuffer(...)` call (no new) throws; a `super(...)` from a subclass
+        // (`class X extends ArrayBuffer`) reaches here with new_target defined + `this_val` the derived
+        // instance to initialize — route it through `construct` (the no-new case still throws).
+        .array_buffer_ctor => {
+            if (self.native_new_target == .undefined or this_val != .object) {
+                return self.throwError("TypeError", "Constructor ArrayBuffer requires 'new'");
+            }
+            return builtin_arraybuffer.construct(self, this_val, args);
+        },
         .array_buffer_proto_getter => return builtin_arraybuffer.getter(self, func.native_name, this_val), // §25.1.6
         .array_buffer_method => return builtin_arraybuffer.method(self, func.native_name, this_val, args), // §25.1.6.7 slice / resize
         .array_buffer_static => return builtin_arraybuffer.static(self, func.native_name, args), // §25.1.4.1 isView
@@ -386,13 +394,32 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         // §23.2 TypedArray (spec 083 Phase 2-B). A concrete `<Type>Array(...)` plain call (no new) throws
         // (§23.2.5.1 step 1); the abstract %TypedArray%() always throws (§23.2.1.1). Construction is in
         // constructNT. The prototype getters / methods / statics dispatch by `native_name`.
-        .typed_array_ctor => return self.throwError("TypeError", "Constructor TypedArray requires 'new'"),
+        .typed_array_ctor => {
+            // A plain `<Type>Array(...)` call (no new) throws; a `super(...)` from a subclass reaches
+            // here with new_target defined + `this_val` the derived instance — initialize its slot.
+            if (self.native_new_target == .undefined or this_val != .object) {
+                return self.throwError("TypeError", "Constructor TypedArray requires 'new'");
+            }
+            const elem = blk: {
+                for (builtin_typedarray.all_elems) |e| {
+                    if (std.mem.eql(u8, e.constructorName(), func.native_name)) break :blk e;
+                }
+                return self.throwError("TypeError", "Unknown TypedArray constructor");
+            };
+            return builtin_typedarray.construct(self, this_val.object, elem, args);
+        },
         .typed_array_abstract_ctor => return builtin_typedarray.constructAbstract(self),
         .typed_array_proto_getter => return builtin_typedarray.getter(self, func.native_name, this_val),
         .typed_array_method => return builtin_typedarray.method(self, func.native_name, this_val, args),
         .typed_array_static => return builtin_typedarray.static(self, func.native_name, this_val, args),
-        // §25.3.2.1 a plain `DataView(...)` call (no new) throws; construction is in constructNT.
-        .data_view_ctor => return self.throwError("TypeError", "Constructor DataView requires 'new'"),
+        // §25.3.2.1 a plain `DataView(...)` call (no new) throws; a `super(...)` from a subclass reaches
+        // here with new_target defined + `this_val` the derived instance to initialize.
+        .data_view_ctor => {
+            if (self.native_new_target == .undefined or this_val != .object) {
+                return self.throwError("TypeError", "Constructor DataView requires 'new'");
+            }
+            return builtin_dataview.construct(self, this_val, args);
+        },
         .data_view_proto_getter => return builtin_dataview.getter(self, func.native_name, this_val), // §25.3.4.1–.3
         .data_view_method => return builtin_dataview.method(self, func.native_name, this_val, args), // §25.3.4.5–.24
         // §21.4 Date. A plain `Date(...)` call (no new) returns the current-time STRING (§21.4.2.1
@@ -699,10 +726,15 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
             };
             return interp_expr.wrapperResult(self, .{ .string = s }, this_val); // §22.1.1.1 box [[StringData]] on new/super
         },
-        .number_ctor => { // §21.1.1.1 Number ( value ) — ToNumber (ToPrimitive(number) an object first).
+        .number_ctor => { // §21.1.1.1 Number ( value ) — ToNumeric, then a BigInt is converted to Number.
             const v: Value = if (args.len > 0) args[0] else .undefined;
             const prim: Value = if (args.len == 0) .{ .number = 0 } else blk: {
-                const nc = try self.toNumberV(v);
+                // §21.1.1.1 step 1: prim = ToNumeric(value). step 2: if prim is a BigInt, return
+                // ℝ(prim) as a Number (an EXPLICIT BigInt→Number bridge — generic ToNumber throws).
+                const pc = try self.toPrimitive(v, .number);
+                if (pc.isAbrupt()) return pc;
+                if (pc.normal == .bigint) break :blk .{ .number = bigint.toF64(pc.normal.bigint) };
+                const nc = try self.toNumberV(pc.normal);
                 if (nc.isAbrupt()) return nc;
                 break :blk nc.normal;
             };
