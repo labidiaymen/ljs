@@ -1,8 +1,11 @@
 # Tasks 085 — Built-ins to 70%
 
 ## Wave 1 (parallel: distinct files)
-- [ ] W1-Date `Date` (§21.4) — new `src/builtin_date.zig`: constructor (all overloads), now(), parse,
+- [x] W1-Date `Date` (§21.4) — new `src/builtin_date.zig`: constructor (all overloads), now(), parse,
   UTC, the get/set/toXxx prototype methods, toISOString/toJSON, Symbol.toPrimitive. (~1,188 fails)
+  → DONE: built-ins/Date 0→1156/1188 (97.3%), 0 panics. UTC==local; getTimezoneOffset 0. Deferred:
+  toTemporalInstant (Temporal, out of scope), proto-from-ctor-realm / subclassing / is-a-constructor
+  (shared cross-realm NewTarget limitation), toJSON.call(primitive) (shared boxing-vs-live-prototype gap).
 - [ ] W1-Object `Object` (§20.1) — fill the prototype/static method gaps in `src/builtin_object.zig`
   (getOwnPropertyDescriptors, fromEntries, hasOwn, groupBy, accessor-defaults, etc.). (~1,173)
 - [ ] W1-Array `Array` (§23.1) — method-family gaps in `src/builtin_array.zig` (flat/flatMap, at,

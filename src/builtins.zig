@@ -816,6 +816,61 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     if (tag_sym) |s| try json_obj.defineSymbolData(s, .{ .string = "JSON" }, false, false, true); // §25.5.3
     try env.declare("JSON", .{ .object = json_obj }, true, true);
 
+    // §21.4 Date — the constructor (new + plain-call), the statics now/parse/UTC, and the full
+    // %Date.prototype% getter/setter/conversion surface + [Symbol.toPrimitive]. Construction (and the
+    // [[DateValue]] computation) is handled in `constructNT`; a plain `Date(...)` call returns the
+    // current-time STRING (§21.4.2.1 step 1).
+    const to_primitive_sym: ?*Symbol = if (symbol_fn.get("toPrimitive")) |tp| (if (tp == .symbol) tp.symbol else null) else null;
+    const date_fn = try Object.createNative(arena, .date_ctor, "Date");
+    date_fn.prototype = function_proto; // §20.2.3 the ctor function object → %Function.prototype%
+    // §21.4.3 Date.now / Date.parse / Date.UTC statics.
+    try defineMethodLen(arena, date_fn, "now", .date_static, "now", 0); // §21.4.3.1
+    try defineMethodLen(arena, date_fn, "parse", .date_static, "parse", 1); // §21.4.3.2
+    try defineMethodLen(arena, date_fn, "UTC", .date_static, "UTC", 7); // §21.4.3.4
+    if (date_fn.get("prototype")) |pv| if (pv == .object) {
+        const dp = pv.object;
+        dp.prototype = object_proto; // §21.4.4 Date.prototype inherits %Object.prototype%
+        // §21.4.4 getters (length 0) + getTime/valueOf/getTimezoneOffset.
+        const getters = [_][]const u8{
+            "getTime",            "valueOf",        "getTimezoneOffset",
+            "getFullYear",        "getUTCFullYear", "getMonth",
+            "getUTCMonth",        "getDate",        "getUTCDate",
+            "getDay",             "getUTCDay",      "getHours",
+            "getUTCHours",        "getMinutes",     "getUTCMinutes",
+            "getSeconds",         "getUTCSeconds",  "getMilliseconds",
+            "getUTCMilliseconds",
+        };
+        for (getters) |m| try defineMethod(arena, dp, m, .date_proto_method, m);
+        // §21.4.4 setters (length per object.zig nativeLength) — installed via defineMethod which keys
+        // `length` off the method name.
+        const setters = [_][]const u8{
+            "setTime",       "setMilliseconds", "setUTCMilliseconds",
+            "setSeconds",    "setUTCSeconds",   "setMinutes",
+            "setUTCMinutes", "setHours",        "setUTCHours",
+            "setDate",       "setUTCDate",      "setMonth",
+            "setUTCMonth",   "setFullYear",     "setUTCFullYear",
+        };
+        for (setters) |m| try defineMethod(arena, dp, m, .date_proto_method, m);
+        // §21.4.4 conversions.
+        const conversions = [_][]const u8{
+            "toISOString",        "toJSON",      "toString",       "toDateString",
+            "toTimeString",       "toUTCString", "toLocaleString", "toLocaleDateString",
+            "toLocaleTimeString",
+        };
+        for (conversions) |m| try defineMethod(arena, dp, m, .date_proto_method, m);
+        // §21.4.4.45 Date.prototype[Symbol.toPrimitive] — non-writable/non-enumerable/configurable,
+        // name "[Symbol.toPrimitive]", length 1.
+        if (to_primitive_sym) |s| {
+            const tpf = try Object.createNative(arena, .date_proto_method, "[Symbol.toPrimitive]");
+            tpf.prototype = function_proto;
+            try tpf.defineData("name", .{ .string = "[Symbol.toPrimitive]" }, false, false, true);
+            try tpf.defineData("length", .{ .number = 1 }, false, false, true);
+            try dp.defineSymbolData(s, .{ .object = tpf }, false, false, true);
+        }
+    };
+    try defineConstructorBackref(date_fn); // §21.4.4.1 Date.prototype.constructor === Date
+    try env.declare("Date", .{ .object = date_fn }, true, true);
+
     // §19.2.1 eval — the global `eval` intrinsic (%eval%). A native function object so it is reachable
     // both as the `eval` global binding and (mirrored below) as `globalThis.eval`. Its behavior lives in
     // the interpreter: `callNative(.eval_fn)` is INDIRECT eval (global env, global this); the

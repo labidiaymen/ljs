@@ -24,6 +24,7 @@ const builtin_regexp = @import("builtin_regexp.zig");
 const builtin_arraybuffer = @import("builtin_arraybuffer.zig");
 const builtin_typedarray = @import("builtin_typedarray.zig");
 const builtin_dataview = @import("builtin_dataview.zig");
+const builtin_date = @import("builtin_date.zig");
 const interpreter = @import("interpreter.zig");
 const Interpreter = interpreter.Interpreter;
 const EvalError = interpreter.EvalError;
@@ -380,6 +381,11 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .data_view_ctor => return self.throwError("TypeError", "Constructor DataView requires 'new'"),
         .data_view_proto_getter => return builtin_dataview.getter(self, func.native_name, this_val), // §25.3.4.1–.3
         .data_view_method => return builtin_dataview.method(self, func.native_name, this_val, args), // §25.3.4.5–.24
+        // §21.4 Date. A plain `Date(...)` call (no new) returns the current-time STRING (§21.4.2.1
+        // step 1); `new Date(...)` is handled in constructNT. Statics + prototype methods by name.
+        .date_ctor => return builtin_date.callAsFunction(self, args),
+        .date_static => return builtin_date.static(self, func.native_name, args),
+        .date_proto_method => return builtin_date.method(self, func.native_name, this_val, args),
         .collection_size => return interp_collection.collectionSize(self, func.native_name, this_val),
         .collection_iterator => {
             // `native_name` is "<home>:<which>" — <home> ("map"/"set") brands the receiver, <which>
@@ -676,6 +682,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .array_buffer_ctor, .array_buffer_proto_getter, .array_buffer_method, .array_buffer_static => unreachable,
         .typed_array_ctor, .typed_array_abstract_ctor, .typed_array_proto_getter, .typed_array_method, .typed_array_static => unreachable,
         .data_view_ctor, .data_view_proto_getter, .data_view_method => unreachable,
+        .date_ctor, .date_static, .date_proto_method => unreachable, // §21.4 handled in the first switch
         .json_parse, .json_stringify => unreachable, // handled in the first switch
         .iterator_helper, .iterator_helper_next, .iterator_from, .iterator_ctor => unreachable, // handled in the first switch
         .promise_then, .promise_catch, .promise_finally, .promise_resolve, .promise_reject => unreachable, // handled in the first switch

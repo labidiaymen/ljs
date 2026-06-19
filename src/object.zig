@@ -202,6 +202,10 @@ pub const Object = struct {
     /// `array_buffer` Object, read/written at explicit byte offsets with explicit endianness. Null
     /// otherwise (zero cost). Phase 2-C drives the getXxx/setXxx surface.
     data_view: ?DataViewData = null,
+    /// §21.4.1 [[DateValue]] — present iff `kind == .date`. The time value (ms since the Unix epoch) of
+    /// a Date instance, or NaN for an invalid Date (TimeClip out of range / unparsable). Null for every
+    /// other object (zero cost). %Date.prototype% itself is an ordinary object (no [[DateValue]]).
+    date_value: ?f64 = null,
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);
@@ -489,6 +493,19 @@ pub const Object = struct {
             // §25.1.1 ArrayBuffer ( length [ , options ] ) — length 1. §23.2.7.1 a concrete TypedArray
             // constructor has length 3 (typedArray, byteOffset, length); §25.3.2.1 DataView length 1.
             .array_buffer_ctor, .data_view_ctor => 1,
+            // §21.4.2 Date ( ... ) — length 7 (year..ms). §21.4.3 statics: now 0, parse 1, UTC 7.
+            .date_ctor => 7,
+            .date_static => L.pick(name, .{ .{ "now", 0 }, .{ "parse", 1 }, .{ "UTC", 7 } }),
+            // §21.4.4 Date.prototype methods — setHours 4 / setMinutes 3 / setSeconds 2 / setMilliseconds 1,
+            // setFullYear 3 / setMonth 2 / setDate 1 / setTime 1; the UTC variants match; getters length 0.
+            .date_proto_method => L.pick(name, .{
+                .{ "setTime", 1 },              .{ "setMilliseconds", 1 }, .{ "setUTCMilliseconds", 1 },
+                .{ "setSeconds", 2 },           .{ "setUTCSeconds", 2 },   .{ "setMinutes", 3 },
+                .{ "setUTCMinutes", 3 },        .{ "setHours", 4 },        .{ "setUTCHours", 4 },
+                .{ "setDate", 1 },              .{ "setUTCDate", 1 },      .{ "setMonth", 2 },
+                .{ "setUTCMonth", 2 },          .{ "setFullYear", 3 },     .{ "setUTCFullYear", 3 },
+                .{ "[Symbol.toPrimitive]", 1 }, .{ "toJSON", 1 },
+            }) orelse 0,
             .typed_array_ctor => 3,
             .typed_array_abstract_ctor => 0, // §23.2.1 %TypedArray% takes no declared parameters
             .array_buffer_proto_getter, .typed_array_proto_getter, .data_view_proto_getter => 0,

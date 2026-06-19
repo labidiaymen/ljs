@@ -113,7 +113,7 @@ pub const SymbolProperty = struct {
     pv: PropertyValue,
 };
 
-pub const Kind = enum { ordinary, function, array, array_buffer, typed_array, data_view };
+pub const Kind = enum { ordinary, function, array, array_buffer, typed_array, data_view, date };
 
 // ── §25.1 / §23.2 / §25.3 Typed-array data model ────────────────────────────
 // Three exotic object kinds back the binary stack. An `array_buffer` owns a heap byte block; a
@@ -559,6 +559,11 @@ pub const NativeId = enum {
     data_view_ctor, // new DataView(buffer[, byteOffset[, byteLength]])
     data_view_proto_getter, // get DataView.prototype.<buffer|byteLength|byteOffset>
     data_view_method, // DataView.prototype.<getInt8|setUint16|...>
+    // §21.4 Date — the constructor (new + plain-call), the statics (now/parse/UTC), and the prototype
+    // getter/setter/conversion methods. `native_name` selects the concrete method within each family.
+    date_ctor, // new Date(...) / Date(...) (plain call → current-time string)
+    date_static, // Date.<now|parse|UTC>
+    date_proto_method, // Date.prototype.<getTime|setFullYear|toISOString|[Symbol.toPrimitive]|...>
 };
 
 /// §10.4.1 A Bound Function Exotic Object's internal slots: the wrapped target, the bound `this`, and
