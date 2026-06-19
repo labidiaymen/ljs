@@ -440,8 +440,11 @@ pub const Parser = struct {
             switch (self.peek().kind) {
                 .dot => {
                     _ = self.advance();
-                    const name = try self.expect(.identifier);
-                    callee = try self.alloc(.{ .member = .{ .object = callee, .name = name.lexeme } });
+                    // §13.3.1 MemberExpression `.` IdentifierName — the property name after `.` may be
+                    // any IdentifierName, INCLUDING reserved words (`new m.delete`, `new a.for`). Use
+                    // `expectPropertyName` (not `expect(.identifier)`), matching the non-`new` member path.
+                    const name = try self.expectPropertyName();
+                    callee = try self.alloc(.{ .member = .{ .object = callee, .name = name } });
                 },
                 .lbracket => {
                     _ = self.advance();

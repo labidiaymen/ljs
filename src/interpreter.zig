@@ -630,6 +630,10 @@ pub const Interpreter = struct {
         return interp_iter.iteratorStep(self, iterator);
     }
 
+    pub fn iteratorStepWithNext(self: *Interpreter, iterator: *Object, next_method: *Object) EvalError!StepResult {
+        return interp_iter.iteratorStepWithNext(self, iterator, next_method);
+    }
+
     /// §7.4.11 IteratorClose ( iterator, completion ) — best-effort: call `iterator.return()` if it
     /// exists, ignoring its result (the original completion is what matters). Called on an early exit
     /// from a for-of loop (`break`/`return`/`throw`). A missing/non-callable `return` is a no-op.
@@ -800,7 +804,10 @@ pub const Interpreter = struct {
     pub const ArrOrAbrupt = union(enum) { array: *Object, abrupt: Completion };
     pub const DriverOrAbrupt = union(enum) { driver: ArrayDestr, abrupt: Completion };
     pub const SetRecOrAbrupt = union(enum) { rec: SetRecord, abrupt: Completion };
-    pub const IterObjOrAbrupt = union(enum) { iter: *Object, abrupt: Completion };
+    /// A keys-iterator record: the iterator object + its `next` method, captured ONCE (§7.4.1) so the
+    /// §24.2.3 set-algebra walks it without re-reading `next` per step (the spec's observable order).
+    pub const KeysIterRecord = struct { iter: *Object, next: *Object };
+    pub const KeysIterOrAbrupt = union(enum) { rec: KeysIterRecord, abrupt: Completion };
 
     // ── §10.1 Ordinary internal methods on a target *Object (used by the Proxy forwarding path and
     //    by the proxy-aware Object/Reflect routing). Each is Array/String-exotic aware and proxy-aware:
@@ -1084,8 +1091,11 @@ pub fn isConstructor(obj: *Object) bool {
     }
     // A native with no AST body: only the genuine built-in constructors qualify.
     if (obj.native == .none) return true; // a bound function wrapping a constructible target
+    // Must mirror the constructible whitelist in interp_expr.zig `constructNT` (the actual [[Construct]]
+    // dispatch) — every genuine built-in constructor, so `Reflect.construct` / `new.target` IsConstructor
+    // checks agree with what `new` accepts. (Symbol/BigInt are callable-but-not-`new` → excluded.)
     return switch (obj.native) {
-        .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .disposable_stack_ctor, .async_disposable_stack_ctor => true,
+        .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor, .proxy_ctor, .regexp_ctor, .array_buffer_ctor, .typed_array_ctor, .typed_array_abstract_ctor, .data_view_ctor, .date_ctor, .weakref_ctor, .finalization_registry_ctor, .disposable_stack_ctor, .async_disposable_stack_ctor => true,
         else => false,
     };
 }

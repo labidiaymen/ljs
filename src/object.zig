@@ -24,6 +24,8 @@ pub const IterKind = rt.IterKind;
 pub const HelperKind = rt.HelperKind;
 pub const HelperState = rt.HelperState;
 pub const ProxyData = rt.ProxyData;
+pub const FinalizationRegistryData = rt.FinalizationRegistryData;
+pub const FinalizationRegistryCell = rt.FinalizationRegistryCell;
 pub const RegExpData = rt.RegExpData;
 pub const CollectionKind = rt.CollectionKind;
 pub const CollectionEntry = rt.CollectionEntry;
@@ -221,6 +223,15 @@ pub const Object = struct {
     /// stack disposes, the wrapper calls `onDispose(value)`. Meaningless on every other object.
     adopt_value: Value = .undefined,
     adopt_on_dispose: ?*Object = null,
+    /// §26.1 [[WeakRefTarget]] — present iff this object is a WeakRef instance. Holds the referent
+    /// (an Object or a non-registered Symbol). The engine's arena never reclaims, so the target is
+    /// never cleared (`deref` always returns it). `.undefined` distinguishes "not a WeakRef" — a real
+    /// WeakRef's target is always weak-holdable, never undefined. Null for every other object.
+    weak_ref: ?Value = null,
+    /// §26.2 [[Cells]] + [[CleanupCallback]] — present iff this object is a FinalizationRegistry. Since
+    /// GC finalization is unobservable in the arena model, this only records registrations so that
+    /// `register`/`unregister` behave per spec. Null for every other object (zero cost).
+    finalization_registry: ?*FinalizationRegistryData = null,
 
     pub fn create(arena: std.mem.Allocator, prototype: ?*Object) std.mem.Allocator.Error!*Object {
         const obj = try arena.create(Object);
@@ -588,6 +599,14 @@ pub const Object = struct {
             .set_method => L.pick(name, .{ .{ "add", 1 }, .{ "has", 1 }, .{ "delete", 1 }, .{ "clear", 0 }, .{ "forEach", 1 }, .{ "union", 1 }, .{ "intersection", 1 }, .{ "difference", 1 }, .{ "symmetricDifference", 1 }, .{ "isSubsetOf", 1 }, .{ "isSupersetOf", 1 }, .{ "isDisjointFrom", 1 } }),
             .weakmap_method => L.pick(name, .{ .{ "get", 1 }, .{ "set", 2 }, .{ "has", 1 }, .{ "delete", 1 } }),
             .weakset_method => L.pick(name, .{ .{ "add", 1 }, .{ "has", 1 }, .{ "delete", 1 } }),
+            // §24.1.1.2 Map.groupBy ( items, callbackfn ) — length 2.
+            .map_group_by => 2,
+            // §26.1 WeakRef ( target ) — length 1; deref length 0. §26.2 FinalizationRegistry ( cb ) —
+            // length 1; register length 2 (target, heldValue [, token]), unregister length 1 (token).
+            .weakref_ctor => 1,
+            .weakref_deref => 0,
+            .finalization_registry_ctor => 1,
+            .finalization_registry_method => L.pick(name, .{ .{ "register", 2 }, .{ "unregister", 1 } }),
             // ── JSON ──
             .json_parse => 2,
             .json_stringify => 3,

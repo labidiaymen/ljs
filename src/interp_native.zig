@@ -11,6 +11,7 @@ const builtin_array = @import("builtin_array.zig");
 const builtin_array_static = @import("builtin_array_static.zig");
 const builtin_string = @import("builtin_string.zig");
 const builtin_collection = @import("builtin_collection.zig");
+const builtin_weakref = @import("builtin_weakref.zig");
 const builtin_json = @import("builtin_json.zig");
 const builtin_math = @import("builtin_math.zig");
 const builtin_number = @import("builtin_number.zig");
@@ -342,6 +343,13 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .set_method => return builtin_collection.setMethod(self, func.native_name, this_val, args),
         .weakmap_method => return builtin_collection.weakMapMethod(self, func.native_name, this_val, args),
         .weakset_method => return builtin_collection.weakSetMethod(self, func.native_name, this_val, args),
+        .map_group_by => return builtin_collection.mapGroupBy(self, args), // §24.1.1.2 Map.groupBy
+        // §26.1/§26.2: WeakRef.prototype.deref + FinalizationRegistry.prototype.register/unregister. The
+        // two constructors are new-only — a plain call throws (construction runs in constructNT).
+        .weakref_deref => return builtin_weakref.deref(self, this_val),
+        .finalization_registry_method => return builtin_weakref.method(self, func.native_name, this_val, args),
+        .weakref_ctor => return self.throwError("TypeError", "Constructor WeakRef requires 'new'"),
+        .finalization_registry_ctor => return self.throwError("TypeError", "Constructor FinalizationRegistry requires 'new'"),
         .json_parse => return builtin_json.parse(self, args),
         .json_stringify => return builtin_json.stringify(self, args),
         // §24.1.1.1 / §24.2.1.1 / §24.3.1.1 / §24.4.1.1: a collection constructor. A top-level `new`
@@ -801,6 +809,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .async_generator_method, .async_generator_iterator, .async_from_sync_method, .async_from_sync_wrap => unreachable, // handled in the first switch
         .map_method, .set_method, .weakmap_method, .weakset_method => unreachable, // handled in the first switch
         .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .collection_size, .collection_iterator => unreachable, // handled in the first switch
+        .map_group_by, .weakref_ctor, .weakref_deref, .finalization_registry_ctor, .finalization_registry_method => unreachable, // handled in the first switch
         .proxy_ctor, .proxy_revocable, .proxy_revoke => unreachable, // handled in the first switch
         .regexp_ctor, .regexp_proto_getter, .regexp_to_string, .regexp_exec, .regexp_test, .regexp_symbol_method, .regexp_string_iterator_next, .regexp_static => unreachable, // handled in the first switch
         // §25.1 ArrayBuffer / §23.2 TypedArray / §25.3 DataView (spec 083) — all handled in the first switch.

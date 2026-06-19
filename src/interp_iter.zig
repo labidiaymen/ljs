@@ -111,6 +111,25 @@ pub fn iteratorStep(self: *Interpreter, iterator: *Object) EvalError!StepResult 
     return .{ .value = vc.normal };
 }
 
+/// Like `iteratorStep`, but with the `next` method fetched ONCE up front (§7.4.1 GetIterator caches
+/// [[NextMethod]]; subsequent IteratorNext calls reuse it — they do NOT re-`Get(iterator, "next")`).
+/// Used by the §24.2.3 Set-algebra methods, whose spec captures the keys-iterator's `next` exactly
+/// once and observes a single `getting next` regardless of element count.
+pub fn iteratorStepWithNext(self: *Interpreter, iterator: *Object, next_method: *Object) EvalError!StepResult {
+    const rc = try self.callFunction(next_method, &.{}, .{ .object = iterator });
+    if (rc.isAbrupt()) return .{ .abrupt = rc };
+    if (rc.normal != .object) {
+        return .{ .abrupt = try self.throwError("TypeError", "Iterator result is not an object") };
+    }
+    const result = rc.normal.object;
+    const dc = try self.getProperty(.{ .object = result }, "done");
+    if (dc.isAbrupt()) return .{ .abrupt = dc };
+    if (toBoolean(dc.normal)) return .done;
+    const vc = try self.getProperty(.{ .object = result }, "value");
+    if (vc.isAbrupt()) return .{ .abrupt = vc };
+    return .{ .value = vc.normal };
+}
+
 /// §7.4.11 IteratorClose ( iterator, completion ) — best-effort: call `iterator.return()` if it
 /// exists, ignoring its result (the original completion is what matters). Called on an early exit
 /// from a for-of loop (`break`/`return`/`throw`). A missing/non-callable `return` is a no-op.

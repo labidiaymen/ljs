@@ -16,6 +16,7 @@ const builtin_regexp = @import("builtin_regexp.zig");
 const builtin_arraybuffer = @import("builtin_arraybuffer.zig");
 const builtin_typedarray = @import("builtin_typedarray.zig");
 const builtin_dataview = @import("builtin_dataview.zig");
+const builtin_weakref = @import("builtin_weakref.zig");
 const builtin_date = @import("builtin_date.zig");
 const builtin_disposable = @import("builtin_disposable.zig");
 const interpreter = @import("interpreter.zig");
@@ -727,18 +728,38 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
     // functions / bound functions / classes have `native == .none` and a `call` body, so they pass.
     if (ctor.call == null and ctor.native != .none) {
         const constructible = switch (ctor.native) {
-            .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor, .proxy_ctor, .regexp_ctor, .array_buffer_ctor, .typed_array_ctor, .data_view_ctor, .date_ctor, .disposable_stack_ctor, .async_disposable_stack_ctor => true,
+            .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor, .proxy_ctor, .regexp_ctor, .array_buffer_ctor, .typed_array_ctor, .data_view_ctor, .date_ctor, .disposable_stack_ctor, .async_disposable_stack_ctor, .weakref_ctor, .finalization_registry_ctor => true,
             else => false,
         };
         if (!constructible) return self.throwError("TypeError", "value is not a constructor");
     }
-    // §10.1.13 OrdinaryCreateFromConstructor: the instance proto is `new_target.prototype` if an
-    // object, else the realm's %Object.prototype% intrinsic (matched here by leaving it null when
-    // `new_target.prototype` is absent — Object.create(null) then inherits nothing, but a non-object
-    // `.prototype` falls back to %Object.prototype%). For `new C()` new_target === ctor.
-    var proto: ?*Object = self.objectProto();
-    if (new_target.get("prototype")) |pv| {
-        if (pv == .object) proto = pv.object;
+    // §10.1.13 OrdinaryCreateFromConstructor → §10.1.14 GetPrototypeFromConstructor: read
+    // `Get(new_target, "prototype")` (invoking any accessor — a `prototype` getter may run / throw),
+    // and if the result is not an Object fall back to `ctor`'s intrinsic default prototype (its own
+    // `.prototype`), NOT bare %Object.prototype%. For `new C()` new_target === ctor. The data fast path
+    // (`new_target.get`) avoids the Completion machinery when `prototype` is a plain data property
+    // (the overwhelmingly common case — every built-in + ordinary function); only an accessor
+    // `prototype` (rare: a bound/Proxy/defineProperty'd newTarget) takes the getter-invoking branch.
+    var proto: ?*Object = null;
+    if (new_target.getProp("prototype")) |loc| {
+        if (loc.pv.payload == .data) {
+            // Plain data `prototype` (the common case): use it directly when it's an Object.
+            if (loc.pv.payload.data == .object) proto = loc.pv.payload.data.object;
+        } else {
+            // An accessor `prototype` (a bound/Proxy/defineProperty'd newTarget): invoke the getter
+            // (§10.1.14 step 3) — it may run user code or throw (propagated as an abrupt completion).
+            const pc = try self.getProperty(.{ .object = new_target }, "prototype");
+            if (pc.isAbrupt()) return pc;
+            if (pc.normal == .object) proto = pc.normal.object;
+        }
+    }
+    // Fallback (non-object prototype): the constructor's intrinsic default proto (its `.prototype`),
+    // else %Object.prototype% (a realm-less eval or an exotic ctor without one).
+    if (proto == null) {
+        if (ctor.get("prototype")) |cp| {
+            if (cp == .object) proto = cp.object;
+        }
+        if (proto == null) proto = self.objectProto();
     }
     const new_obj = try Object.create(self.arena, proto);
 
@@ -778,6 +799,8 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
             try builtin_disposable.initInstance(self, new_obj, is_async);
             return .{ .normal = .{ .object = new_obj } };
         },
+        .weakref_ctor => return builtin_weakref.constructWeakRef(self, new_obj, args), // §26.1.1 (new WeakRef)
+        .finalization_registry_ctor => return builtin_weakref.constructFinalizationRegistry(self, new_obj, args), // §26.2.1 (new FinalizationRegistry)
         else => {},
     }
 

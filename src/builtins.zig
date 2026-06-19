@@ -669,6 +669,8 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         sg.prototype = function_proto;
         try map_fn.defineSymbolAccessorEx(s, sg, null, false); // §24.1.3.10
     }
+    // §24.1.1.2 Map.groupBy ( items, callbackfn ) — a static (length 2, name "groupBy").
+    try defineMethod(arena, map_fn, "groupBy", .map_group_by, "groupBy");
     try defineConstructorBackref(map_fn); // §24.1.3.2 Map.prototype.constructor === Map
     try env.declare("Map", .{ .object = map_fn }, true, true);
 
@@ -744,6 +746,34 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     };
     try defineConstructorBackref(weakset_fn); // §24.4.3.2 WeakSet.prototype.constructor === WeakSet
     try env.declare("WeakSet", .{ .object = weakset_fn }, true, true);
+
+    // §26.1 WeakRef — `new WeakRef(target)` (new-only; plain call throws). The prototype carries
+    // `deref`, [Symbol.toStringTag] "WeakRef". GC is unobservable here so the target is never cleared.
+    const weakref_fn = try Object.createNative(arena, .weakref_ctor, "WeakRef");
+    weakref_fn.prototype = function_proto;
+    if (weakref_fn.get("prototype")) |pv| if (pv == .object) {
+        const wp = pv.object;
+        wp.prototype = object_proto; // §26.1.3 WeakRef.prototype inherits %Object.prototype%
+        try defineMethod(arena, wp, "deref", .weakref_deref, "deref"); // §26.1.3.2
+        if (tag_sym) |s| try wp.defineSymbolData(s, .{ .string = "WeakRef" }, false, false, true); // §26.1.3.3
+    };
+    try defineConstructorBackref(weakref_fn); // §26.1.3.1 WeakRef.prototype.constructor === WeakRef
+    try env.declare("WeakRef", .{ .object = weakref_fn }, true, true);
+
+    // §26.2 FinalizationRegistry — `new FinalizationRegistry(cleanupCallback)` (new-only). The prototype
+    // carries `register` (length 2) / `unregister` (length 1) + [Symbol.toStringTag]. The cleanup
+    // callback is never invoked (finalization is unobservable in the arena model).
+    const fr_fn = try Object.createNative(arena, .finalization_registry_ctor, "FinalizationRegistry");
+    fr_fn.prototype = function_proto;
+    if (fr_fn.get("prototype")) |pv| if (pv == .object) {
+        const fp = pv.object;
+        fp.prototype = object_proto; // §26.2.3 FinalizationRegistry.prototype inherits %Object.prototype%
+        try defineMethod(arena, fp, "register", .finalization_registry_method, "register"); // §26.2.3.1
+        try defineMethod(arena, fp, "unregister", .finalization_registry_method, "unregister"); // §26.2.3.2
+        if (tag_sym) |s| try fp.defineSymbolData(s, .{ .string = "FinalizationRegistry" }, false, false, true); // §26.2.3.4
+    };
+    try defineConstructorBackref(fr_fn); // §26.2.3.3 FinalizationRegistry.prototype.constructor === FinalizationRegistry
+    try env.declare("FinalizationRegistry", .{ .object = fr_fn }, true, true);
 
     // §28.2 Proxy — the constructor (new-only) + Proxy.revocable. A Proxy has NO own `.prototype`
     // property (§28.2.2 lists only `revocable`), so the carrier createNative made is removed.

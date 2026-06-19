@@ -47,6 +47,19 @@ pub const ProxyData = struct {
     revoked: bool = false,
 };
 
+/// §26.2 FinalizationRegistry [[Cells]] + [[CleanupCallback]]. Each cell records a registration's
+/// [[WeakRefTarget]] (unused — never collected in the arena model), [[HeldValue]], and the optional
+/// [[UnregisterToken]]. `cleanup_callback` is the callable passed to the constructor. GC finalization
+/// is unobservable here; this exists only so `register`/`unregister` are spec-correct.
+pub const FinalizationRegistryCell = struct {
+    held_value: Value,
+    unregister_token: ?Value = null, // null ⇒ no token; a Value ⇒ the token (Object/Symbol)
+};
+pub const FinalizationRegistryData = struct {
+    cleanup_callback: *Object,
+    cells: std.ArrayListUnmanaged(FinalizationRegistryCell) = .empty,
+};
+
 /// §22.2 a RegExp instance's internal slots: [[OriginalSource]] / [[OriginalFlags]] + the parsed flag
 /// booleans. `last_index` is mirrored as an own writable `lastIndex` data property. Present iff
 /// `Object.regexp != null`. (M1: source/flags/getters/toString; the matcher arrives in M2.)
@@ -522,6 +535,13 @@ pub const NativeId = enum {
     weakset_method, // WeakSet.prototype.<native_name> (add/has/delete)
     collection_size, // get Map.prototype.size / get Set.prototype.size
     collection_iterator, // Map/Set.prototype.keys/values/entries — returns a collection iterator
+    map_group_by, // §24.1.1.2 Map.groupBy(items, callbackfn) — SameValueZero-keyed grouping into a Map
+    // §26.1 WeakRef — the constructor (new-only) + deref. §26.2 FinalizationRegistry — the constructor
+    // + register/unregister. GC finalization is unobservable in the arena model (targets never cleared).
+    weakref_ctor, // new WeakRef(target)
+    weakref_deref, // WeakRef.prototype.deref()
+    finalization_registry_ctor, // new FinalizationRegistry(cleanupCallback)
+    finalization_registry_method, // FinalizationRegistry.prototype.<register|unregister>(...)
     // §25.5 JSON — the namespace object's two methods.
     json_parse, // JSON.parse(text[, reviver])
     json_stringify, // JSON.stringify(value[, replacer[, space]])

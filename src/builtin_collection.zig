@@ -186,9 +186,58 @@ pub fn mapMethod(it: *Interpreter, name: []const u8, this_val: Value, args: []co
     unreachable;
 }
 
+/// §24.1.1.2 Map.groupBy ( items, callbackfn ) — §7.3.36 GroupBy(items, callbackfn, ~collection~):
+/// iterate `items`, key each element by CanonicalizeKeyedCollectionKey(callbackfn(item, index)) using
+/// SameValueZero (NOT ToPropertyKey, unlike Object.groupBy — so `1` and `'1'` are distinct keys and
+/// `-0`/`+0` collapse), collect items into per-key arrays, and return a fresh Map of key → array.
+pub fn mapGroupBy(it: *Interpreter, args: []const Value) EvalError!Completion {
+    const items: Value = if (args.len > 0) args[0] else .undefined;
+    const callback: Value = if (args.len > 1) args[1] else .undefined;
+    // §7.3.36 step 1: callbackfn must be callable. (Checked before iterating per spec.)
+    if (callback != .object or !interp.isCallable(callback.object)) {
+        return it.throwError("TypeError", "Map.groupBy callback is not a function");
+    }
+    // §7.3.36 step 2: items must be coercible to an iterable (undefined/null throw on GetIterator).
+    if (items == .undefined or items == .null) {
+        return it.throwError("TypeError", "Map.groupBy: items is not iterable");
+    }
+    // Fresh Map instance: proto = %Map.prototype% (looked up from the global Map.prototype).
+    const map_proto: ?*object_mod.Object = blk: {
+        const g = it.globals orelse break :blk null;
+        const b = g.lookup("Map") orelse break :blk null;
+        if (b.value != .object) break :blk null;
+        const pv = b.value.object.get("prototype") orelse break :blk null;
+        break :blk if (pv == .object) pv.object else null;
+    };
+    const map_obj = try object_mod.Object.create(it.arena, map_proto);
+    const coll = try it.arena.create(Collection);
+    coll.* = .{ .kind = .map };
+    map_obj.collection = coll;
+
+    var list: std.ArrayListUnmanaged(Value) = .empty;
+    const lc = try it.iterateToList(items, &list);
+    if (lc.isAbrupt()) return lc;
+    for (list.items, 0..) |item, i| {
+        const kc = try it.callFunction(callback.object, &.{ item, .{ .number = @floatFromInt(i) } }, .undefined);
+        if (kc.isAbrupt()) return kc;
+        const key = normKey(kc.normal); // CanonicalizeKeyedCollectionKey: -0 → +0
+        if (findIndex(coll, key)) |idx| {
+            // Existing group: append to its array (the stored value is the per-key Array).
+            const grp = coll.entries.items[idx].value;
+            try grp.object.elements.append(it.arena, item);
+        } else {
+            const fresh = try object_mod.Object.createArray(it.arena, it.arrayProto());
+            try fresh.elements.append(it.arena, item);
+            try coll.entries.append(it.arena, .{ .key = key, .value = .{ .object = fresh } });
+            coll.size += 1;
+        }
+    }
+    return .{ .normal = .{ .object = map_obj } };
+}
+
 /// §7.3.x CanBeHeldWeakly ( v ) — a WeakMap/WeakSet key must be an Object or a Symbol that is not in
 /// the GlobalSymbolRegistry. The engine has no `Symbol.for` registry, so every Symbol qualifies.
-fn canBeHeldWeakly(v: Value) bool {
+pub fn canBeHeldWeakly(v: Value) bool {
     // §7.3: an Object, or a Symbol NOT in the GlobalSymbolRegistry (a `Symbol.for` result is excluded).
     return v == .object or (v == .symbol and v.symbol.registry_key == null);
 }

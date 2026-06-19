@@ -183,12 +183,20 @@ pub fn cloneSet(self: *Interpreter, src: *object_mod.Collection) EvalError!*Obje
     return o;
 }
 
-/// Call `other.keys()` and require an object result — the iterator for the set-algebra walks.
-pub fn setRecordKeysIter(self: *Interpreter, rec: SetRecord) EvalError!Interpreter.IterObjOrAbrupt {
+/// Call `other.keys()` (requiring an object result), then read its `next` method ONCE — the
+/// §24.2.1.2 GetSetRecord / §7.4.1 GetIterator behavior the set-algebra observes (a single
+/// `Get(iter, "next")` regardless of how many elements are walked). Returns both for stepping.
+pub fn setRecordKeysIter(self: *Interpreter, rec: SetRecord) EvalError!Interpreter.KeysIterOrAbrupt {
     const kc = try self.callFunction(rec.keys, &.{}, rec.obj);
     if (kc.isAbrupt()) return .{ .abrupt = kc };
     if (kc.normal != .object) return .{ .abrupt = try self.throwError("TypeError", "keys() did not return an object") };
-    return .{ .iter = kc.normal.object };
+    const iter = kc.normal.object;
+    const nc = try self.getProperty(.{ .object = iter }, "next"); // §7.4.1 step: cache [[NextMethod]]
+    if (nc.isAbrupt()) return .{ .abrupt = nc };
+    if (nc.normal != .object or nc.normal.object.kind != .function) {
+        return .{ .abrupt = try self.throwError("TypeError", "keys() iterator has no next method") };
+    }
+    return .{ .rec = .{ .iter = iter, .next = nc.normal.object } };
 }
 
 /// §24.2.3 union/intersection/difference/symmetricDifference/isSubsetOf/isSupersetOf/isDisjointFrom.
@@ -205,12 +213,12 @@ pub fn setAlgebra(self: *Interpreter, name: []const u8, this_coll: *object_mod.C
     if (eql(u8, name, "union")) {
         // §24.2.3.x: result = clone(O); add each of other's keys.
         const result = try cloneSet(self, this_coll);
-        const iter = switch (try setRecordKeysIter(self, rec)) {
-            .iter => |x| x,
+        const kir = switch (try setRecordKeysIter(self, rec)) {
+            .rec => |x| x,
             .abrupt => |c| return c,
         };
         while (true) {
-            switch (try self.iteratorStep(iter)) {
+            switch (try self.iteratorStepWithNext(kir.iter, kir.next)) {
                 .done => break,
                 .abrupt => |c| return c,
                 .value => |v| try builtin_collection.addElement(self, result.collection.?, v),
@@ -233,12 +241,12 @@ pub fn setAlgebra(self: *Interpreter, name: []const u8, this_coll: *object_mod.C
                 }
             }
         } else {
-            const iter = switch (try setRecordKeysIter(self, rec)) {
-                .iter => |x| x,
+            const kir = switch (try setRecordKeysIter(self, rec)) {
+                .rec => |x| x,
                 .abrupt => |c| return c,
             };
             while (true) {
-                switch (try self.iteratorStep(iter)) {
+                switch (try self.iteratorStepWithNext(kir.iter, kir.next)) {
                     .done => break,
                     .abrupt => |c| return c,
                     .value => |v| if (builtin_collection.contains(this_coll, v)) try builtin_collection.addElement(self, result.collection.?, v),
@@ -260,12 +268,12 @@ pub fn setAlgebra(self: *Interpreter, name: []const u8, this_coll: *object_mod.C
                 if (toBoolean(hc.normal)) builtin_collection.removeElement(result.collection.?, e);
             }
         } else {
-            const iter = switch (try setRecordKeysIter(self, rec)) {
-                .iter => |x| x,
+            const kir = switch (try setRecordKeysIter(self, rec)) {
+                .rec => |x| x,
                 .abrupt => |c| return c,
             };
             while (true) {
-                switch (try self.iteratorStep(iter)) {
+                switch (try self.iteratorStepWithNext(kir.iter, kir.next)) {
                     .done => break,
                     .abrupt => |c| return c,
                     .value => |v| builtin_collection.removeElement(result.collection.?, v),
@@ -277,12 +285,12 @@ pub fn setAlgebra(self: *Interpreter, name: []const u8, this_coll: *object_mod.C
 
     if (eql(u8, name, "symmetricDifference")) {
         const result = try cloneSet(self, this_coll);
-        const iter = switch (try setRecordKeysIter(self, rec)) {
-            .iter => |x| x,
+        const kir = switch (try setRecordKeysIter(self, rec)) {
+            .rec => |x| x,
             .abrupt => |c| return c,
         };
         while (true) {
-            switch (try self.iteratorStep(iter)) {
+            switch (try self.iteratorStepWithNext(kir.iter, kir.next)) {
                 .done => break,
                 .abrupt => |c| return c,
                 .value => |v| {
@@ -313,16 +321,16 @@ pub fn setAlgebra(self: *Interpreter, name: []const u8, this_coll: *object_mod.C
 
     if (eql(u8, name, "isSupersetOf")) {
         if (this_size < rec.size) return .{ .normal = .{ .boolean = false } };
-        const iter = switch (try setRecordKeysIter(self, rec)) {
-            .iter => |x| x,
+        const kir = switch (try setRecordKeysIter(self, rec)) {
+            .rec => |x| x,
             .abrupt => |c| return c,
         };
         while (true) {
-            switch (try self.iteratorStep(iter)) {
+            switch (try self.iteratorStepWithNext(kir.iter, kir.next)) {
                 .done => break,
                 .abrupt => |c| return c,
                 .value => |v| if (!builtin_collection.contains(this_coll, v)) {
-                    try self.iteratorClose(iter); // §24.2.3 IteratorClose(_, false)
+                    try self.iteratorClose(kir.iter); // §24.2.3 IteratorClose(_, false)
                     return .{ .normal = .{ .boolean = false } };
                 },
             }
@@ -341,16 +349,16 @@ pub fn setAlgebra(self: *Interpreter, name: []const u8, this_coll: *object_mod.C
                 if (toBoolean(hc.normal)) return .{ .normal = .{ .boolean = false } };
             }
         } else {
-            const iter = switch (try setRecordKeysIter(self, rec)) {
-                .iter => |x| x,
+            const kir = switch (try setRecordKeysIter(self, rec)) {
+                .rec => |x| x,
                 .abrupt => |c| return c,
             };
             while (true) {
-                switch (try self.iteratorStep(iter)) {
+                switch (try self.iteratorStepWithNext(kir.iter, kir.next)) {
                     .done => break,
                     .abrupt => |c| return c,
                     .value => |v| if (builtin_collection.contains(this_coll, v)) {
-                        try self.iteratorClose(iter);
+                        try self.iteratorClose(kir.iter);
                         return .{ .normal = .{ .boolean = false } };
                     },
                 }
