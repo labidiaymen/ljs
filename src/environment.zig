@@ -14,6 +14,12 @@ pub const Binding = struct {
     /// value after). Resolved by name+env (not a raw `*Binding`) so a rehash of the source map can't
     /// dangle the alias. Null for every ordinary binding (the hot declarative path is unchanged).
     alias: ?ImportAlias = null,
+    /// §19.2.1.3 / §9.1.1.1.2 CreateMutableBinding(N, D): the `deletable` (D) flag. A var/function
+    /// binding introduced into a function VariableEnvironment by a (sloppy) direct eval is created
+    /// DELETABLE (`true`), so a subsequent `delete x` removes it and a later read throws
+    /// ReferenceError. Ordinary `var`/`let`/`const`/function/parameter bindings are non-deletable
+    /// (`false`, the default). Only the slow `delete <identifier>` and eval-hoist paths read/set it.
+    deletable: bool = false,
 };
 
 pub const ImportAlias = struct { env: *Environment, name: []const u8 };

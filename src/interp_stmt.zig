@@ -143,7 +143,23 @@ pub fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError
             // matters for a declaration inside a block / loop body that is re-entered with a fresh
             // scope per iteration (each closure must see that iteration's bindings).
             const obj = try instantiateFunctionObject(self, f, env);
-            if (f.name) |name| try env.declare(name, .{ .object = obj }, true, true);
+            if (f.name) |name| {
+                // §19.2.1.3: inside a sloppy direct eval body (non-var-scope eval env), a TOP-LEVEL
+                // FunctionDeclaration's binding was already instantiated in the caller's var scope by
+                // the hoist (as a DELETABLE binding). The declaration STATEMENT must NOT re-bind into
+                // the eval env (that would shadow / resurrect a name a prior `delete` removed) — refresh
+                // the existing var-scope binding in place if present, else do nothing (it was deleted).
+                // Gated on `eval_var_deletable`, so ordinary block-scoped / B.3.3 functions are untouched.
+                if (self.eval_var_deletable and !env.is_var_scope and env.parent != null and env.parent.?.is_var_scope) {
+                    if (env.varScope().lookupLocal(name)) |b| {
+                        b.value = .{ .object = obj };
+                        b.mutable = true;
+                        b.initialized = true;
+                    }
+                    return .{ .normal = .undefined };
+                }
+                try env.declare(name, .{ .object = obj }, true, true);
+            }
             return .{ .normal = .undefined };
         },
         .class_decl => |c| {
@@ -404,6 +420,11 @@ pub fn hoistFunctionDeclarations(self: *Interpreter, stmts: []const ast.Stmt, en
             const name = f.name orelse continue;
             const obj = try instantiateFunctionObject(self, f, env);
             try env.declare(name, .{ .object = obj }, true, true);
+            // §19.2.1.3: a top-level function declared by a direct eval in a function var scope is a
+            // DELETABLE binding (only at the eval's var scope — not block-level function hoists).
+            if (self.eval_var_deletable and env.is_var_scope) if (env.lookupLocal(name)) |b| {
+                b.deletable = true;
+            };
         },
         else => {},
     };
@@ -435,6 +456,78 @@ pub fn hoistPatternNames(self: *Interpreter, pattern: *const ast.Pattern, env: *
 /// per Function/Script/eval entry, after `hoistLexicalNames`.
 pub fn hoistVarNames(self: *Interpreter, stmts: []const ast.Stmt, scope: *Environment) EvalError!void {
     for (stmts) |s| try hoistVarNamesStmt(self, s, scope);
+}
+
+/// §19.2.1.3 helper: does this Script/eval body var-declare (descending into nested non-function
+/// statements, §10.2.11 VarDeclaredNames) or top-level FunctionDeclaration-declare `name`? Used by
+/// `performEval` to detect a parameter-scope direct eval declaring `arguments` (a §19.2.1.3 step 3.d
+/// SyntaxError). A read-only AST scan — mirrors `hoistVarNames` + `hoistFunctionDeclarations`.
+pub fn declaresVarOrFuncName(stmts: []const ast.Stmt, name: []const u8) bool {
+    for (stmts) |s| {
+        if (s == .func_decl) {
+            if (s.func_decl.name) |fn_name| if (std.mem.eql(u8, fn_name, name)) return true;
+        }
+        if (varNameDeclaredInStmt(s, name)) return true;
+    }
+    return false;
+}
+
+fn varNameDeclaredInStmt(stmt: ast.Stmt, name: []const u8) bool {
+    switch (stmt) {
+        .declaration => |d| {
+            if (d.kind == .var_decl) for (d.decls) |dec| if (patternBindsName(dec.target, name)) return true;
+        },
+        .block => |stmts| return declaresVarNameList(stmts, name),
+        .if_stmt => |s| {
+            if (varNameDeclaredInStmt(s.then.*, name)) return true;
+            if (s.otherwise) |e| if (varNameDeclaredInStmt(e.*, name)) return true;
+        },
+        .while_stmt => |s| return varNameDeclaredInStmt(s.body.*, name),
+        .do_while_stmt => |s| return varNameDeclaredInStmt(s.body.*, name),
+        .for_stmt => |s| {
+            if (s.init) |i| if (i.* == .declaration and i.declaration.kind == .var_decl)
+                for (i.declaration.decls) |dec| if (patternBindsName(dec.target, name)) return true;
+            return varNameDeclaredInStmt(s.body.*, name);
+        },
+        .for_in_stmt => |s| {
+            if (s.head == .decl and s.head.decl.kind == .var_decl and patternBindsName(s.head.decl.target, name)) return true;
+            return varNameDeclaredInStmt(s.body.*, name);
+        },
+        .for_of_stmt => |s| {
+            if (s.head == .decl and s.head.decl.kind == .var_decl and patternBindsName(s.head.decl.target, name)) return true;
+            return varNameDeclaredInStmt(s.body.*, name);
+        },
+        .try_stmt => |s| {
+            if (declaresVarNameList(s.block, name)) return true;
+            if (s.catch_block) |cb| if (declaresVarNameList(cb, name)) return true;
+            if (s.finally_block) |fb| if (declaresVarNameList(fb, name)) return true;
+        },
+        .with_stmt => |s| return varNameDeclaredInStmt(s.body.*, name),
+        .switch_stmt => |s| for (s.cases) |cs| if (declaresVarNameList(cs.body, name)) return true,
+        .labeled_stmt => |s| return varNameDeclaredInStmt(s.body.*, name),
+        else => {},
+    }
+    return false;
+}
+
+fn declaresVarNameList(stmts: []const ast.Stmt, name: []const u8) bool {
+    for (stmts) |s| if (varNameDeclaredInStmt(s, name)) return true;
+    return false;
+}
+
+fn patternBindsName(pattern: *const ast.Pattern, name: []const u8) bool {
+    switch (pattern.*) {
+        .identifier => |n| return std.mem.eql(u8, n, name),
+        .array => |ap| {
+            for (ap.elements) |el| if (el.target) |t| if (patternBindsName(t, name)) return true;
+            if (ap.rest) |r| if (patternBindsName(r, name)) return true;
+        },
+        .object => |op| {
+            for (op.properties) |prop| if (patternBindsName(prop.target, name)) return true;
+            if (op.rest) |r| if (std.mem.eql(u8, r, name)) return true;
+        },
+    }
+    return false;
 }
 
 pub fn hoistVarNamesStmt(self: *Interpreter, stmt: ast.Stmt, scope: *Environment) EvalError!void {
@@ -480,7 +573,13 @@ pub fn hoistVarNamesStmt(self: *Interpreter, stmt: ast.Stmt, scope: *Environment
 pub fn hoistVarPattern(self: *Interpreter, pattern: *const ast.Pattern, scope: *Environment) EvalError!void {
     switch (pattern.*) {
         .identifier => |n| {
-            if (scope.lookupLocal(n) == null) try scope.declare(n, .undefined, true, true);
+            if (scope.lookupLocal(n) == null) {
+                try scope.declare(n, .undefined, true, true);
+                // §19.2.1.3: an eval-introduced var binding in a function var scope is DELETABLE.
+                if (self.eval_var_deletable) if (scope.lookupLocal(n)) |b| {
+                    b.deletable = true;
+                };
+            }
         },
         .array => |ap| {
             for (ap.elements) |el| if (el.target) |t| try hoistVarPattern(self, t, scope);
@@ -488,7 +587,12 @@ pub fn hoistVarPattern(self: *Interpreter, pattern: *const ast.Pattern, scope: *
         },
         .object => |op| {
             for (op.properties) |prop| try hoistVarPattern(self, prop.target, scope);
-            if (op.rest) |r| if (scope.lookupLocal(r) == null) try scope.declare(r, .undefined, true, true);
+            if (op.rest) |r| if (scope.lookupLocal(r) == null) {
+                try scope.declare(r, .undefined, true, true);
+                if (self.eval_var_deletable) if (scope.lookupLocal(r)) |b| {
+                    b.deletable = true;
+                };
+            };
         },
     }
 }

@@ -1317,7 +1317,7 @@ pub fn evalCall(self: *Interpreter, c: anytype, env: *Environment) EvalError!Com
         const eval_env = try Environment.create(self.arena, env);
         // §19.2.1.1: a DIRECT eval inherits the caller's strictness. (Whether the eval scope is a
         // VariableEnvironment depends on the eval body's OWN strictness — set in `performEval`.)
-        return performEval(self, arg.string, eval_env, self.strict);
+        return performEval(self, arg.string, eval_env, self.strict, true);
     }
 
     if (callee != .object or callee.object.kind != .function) {
@@ -1489,6 +1489,15 @@ pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this
     const saved_new_target = self.new_target;
     if (!fd.is_arrow) self.new_target = pending_new_target;
     defer self.new_target = saved_new_target;
+    // §19.2.1.3 step 3.d window: true iff the parameter env HasBinding("arguments"). An ordinary
+    // function always binds the `arguments` exotic (§10.2.11 step 22); an ARROW has no own
+    // `arguments` (it inherits lexically) UNLESS one of its own parameters is literally named
+    // `arguments`. Either way a direct eval here that var/function-declares `arguments` collides and
+    // is a SyntaxError (checked in `performEval`). Saved/restored — a nested call reached from a
+    // default initializer runs its OWN body with the flag re-derived; cleared once params are bound.
+    const saved_in_param_init = self.in_param_init;
+    self.in_param_init = !fd.is_arrow or interp_async.paramsBindName(fd, "arguments");
+    defer self.in_param_init = saved_in_param_init;
     for (fd.params, 0..) |param, i| {
         var v: Value = if (i < args.len) args[i] else .undefined; // missing args → undefined
         var defaulted = false;
@@ -1524,6 +1533,9 @@ pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this
             if (bc.isAbrupt()) return bc;
         }
     }
+    // Formal-parameter evaluation is done — the body's own direct evals are no longer in the
+    // parameter-init window (§19.2.1.3 conflict-scan), so a body `var arguments` is legal again.
+    self.in_param_init = false;
     // §10.4.4 / §15.1: an ordinary (non-arrow) function gets an `arguments` exotic binding holding
     // the call-site args (indexed data properties + a non-enumerable `length`). M-subset: an
     // ordinary object (NOT an Array exotic, so `Array.isArray(arguments)` is false) supporting
@@ -1765,6 +1777,23 @@ pub fn evalDelete(self: *Interpreter, operand: *const ast.Node, env: *Environmen
         // (no configurable global-object property) keep the M-subset deviation of returning true
         // without removing. Strict `delete x` is a §13.5.1.1 SyntaxError (parse-rejected upstream).
         .identifier => |name| {
+            // §9.1.1.4.18 DeleteBinding: a declarative binding marked DELETABLE (introduced into a
+            // function var scope by a sloppy direct eval, §19.2.1.3) is removed from its environment;
+            // a later read of `name` then throws ReferenceError. Walk the scope chain to the binding's
+            // own env. Non-deletable bindings fall through (the global-object / M-subset path below).
+            {
+                var e: ?*Environment = env;
+                while (e) |cur| {
+                    if (cur.vars.getPtr(name)) |b| {
+                        if (b.deletable) {
+                            _ = cur.vars.remove(name);
+                            return .{ .normal = .{ .boolean = true } };
+                        }
+                        break; // a non-deletable binding shadows — handled below / not deletable
+                    }
+                    e = cur.parent;
+                }
+            }
             if (self.globals) |g| {
                 if (g.lookup("%GlobalThis%")) |gb| if (gb.value == .object) {
                     const o = gb.value.object;
@@ -1829,10 +1858,10 @@ pub fn functionConstructor(self: *Interpreter, args: []const Value) EvalError!Co
     }
     self.this_val = if (genv.lookup("%GlobalThis%")) |b| b.value else .undefined;
     self.home_object = null;
-    return performEval(self, source, genv, false);
+    return performEval(self, source, genv, false, false);
 }
 
-pub fn performEval(self: *Interpreter, source: []const u8, target_env: *Environment, inherit_strict: bool) EvalError!Completion {
+pub fn performEval(self: *Interpreter, source: []const u8, target_env: *Environment, inherit_strict: bool, is_direct: bool) EvalError!Completion {
     // §19.2.1.1: the eval code is strict iff it carries its own `"use strict"` prologue OR (DIRECT
     // eval only) the calling context is strict (`inherit_strict`). Parsing with the inherited flag
     // folds both into `program.strict`, which `run` installs as the eval body's runtime strictness.
@@ -1841,11 +1870,30 @@ pub fn performEval(self: *Interpreter, source: []const u8, target_env: *Environm
         // §19.2.1 step 7: a parse failure throws a SyntaxError (a real, catchable error object).
         else => return self.throwError("SyntaxError", "eval: invalid source"),
     };
+    // §19.2.1.3 step 3.d: a SLOPPY direct eval evaluated inside a function's formal-parameter list
+    // (`f(p = eval("var arguments"))`) hoists its `var`/function declarations into the caller's var
+    // scope, but the parameter env's `arguments` binding (§10.2.11 step 22) sits between the eval's
+    // lexical env and that var scope. A var- or function-declaration of `arguments` therefore collides
+    // with it and is a SyntaxError. A STRICT eval gets its own var scope (declarations stay eval-local,
+    // no collision), and an indirect eval runs in global scope — neither triggers this.
+    if (is_direct and self.in_param_init and !program.strict and
+        interp_stmt.declaresVarOrFuncName(program.statements, "arguments"))
+    {
+        return self.throwError("SyntaxError", "eval cannot declare 'arguments' in a parameter-scope direct eval");
+    }
     // §19.2.1.3: a STRICT eval gets its OWN VariableEnvironment (its `var`s are eval-local); a
     // SLOPPY direct eval's `var`s hoist to the caller's var scope (its fresh eval env is left a
     // non-var-scope so `varScope()` climbs past it). An indirect eval / Function-body eval already
     // targets the global var scope, which this preserves (`or`-ing keeps an existing var scope).
     target_env.is_var_scope = target_env.is_var_scope or program.strict;
+    // §19.2.1.3 step 9.d.ii.2 / 12.b.ii.2: a (sloppy) direct eval whose `var`/function declarations
+    // hoist into a NON-GLOBAL function VariableEnvironment creates them DELETABLE, so a later
+    // `delete x` removes them (`var-env-*-local-new-delete`). A strict eval (own var scope), an
+    // indirect eval, or a global-scoped eval do not get this flag (the global path keeps ljs's
+    // existing global-binding semantics). The flag is read by the var/function hoist in `run`.
+    const saved_eval_deletable = self.eval_var_deletable;
+    self.eval_var_deletable = is_direct and !program.strict and target_env.varScope() != self.globals;
+    defer self.eval_var_deletable = saved_eval_deletable;
     // Reuse `run` (ReturnIfAbrupt over the statement list); the completion value is the last
     // statement's value. Counters are the interpreter's own — not reset, so limits still apply.
     return self.run(program, target_env);

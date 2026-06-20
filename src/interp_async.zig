@@ -214,6 +214,14 @@ pub fn instantiateGeneratorParams(self: *Interpreter, gen: *object_mod.Generator
         const ao = try interp_native.makeArgumentsObject(self, args, gen.func, call_env, fd);
         try call_env.declare("arguments", .{ .object = ao }, true, true);
     }
+    // §19.2.1.3 step 3.d: mark the formal-parameter-evaluation window so a direct eval that
+    // `var`/function-declares `arguments` throws a SyntaxError (the parameter env's `arguments`
+    // binding, created above, sits between the eval's lexEnv and the body var scope). A generator /
+    // async-generator is never an arrow, so the parameter env always holds `arguments` here.
+    // Saved/restored; cleared once parameter evaluation completes so a body `var arguments` is legal.
+    const saved_in_param_init = self.in_param_init;
+    self.in_param_init = true;
+    defer self.in_param_init = saved_in_param_init;
     for (fd.params, 0..) |param, i| {
         var v: Value = if (i < args.len) args[i] else .undefined;
         var defaulted = false;
@@ -255,6 +263,7 @@ pub fn instantiateGeneratorParams(self: *Interpreter, gen: *object_mod.Generator
             }
         }
     }
+    self.in_param_init = false; // parameter evaluation complete — body evals are no longer param-init
     return call_env;
 }
 

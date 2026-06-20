@@ -117,6 +117,20 @@ pub const Interpreter = struct {
     /// common case) identifier resolution takes the fast declarative path unchanged; when >0,
     /// resolution consults object Environment Records (the `with` binding objects) first.
     with_depth: u32 = 0,
+    /// §10.2.11 / §19.2.1.3 step 3.d: true while evaluating a function's formal-parameter list
+    /// (default-value initializers). The parameter Environment Record already holds the `arguments`
+    /// binding (§10.2.11 step 22), which sits BETWEEN a direct eval's running lexical env and the body
+    /// VariableEnvironment. So a direct eval here that `var`/function-declares `arguments` hits the
+    /// §19.2.1.3 lexEnv→varEnv conflict scan and must throw a SyntaxError. ljs shares one `call_env`
+    /// for params and body, so this flag — set only for the param-init window — stands in for that
+    /// scan. Zero cost off the param-eval path (a plain `var arguments` in a body sees it false).
+    in_param_init: bool = false,
+    /// §19.2.1.3 step 9.d.ii.2 / step 12.b.ii.2: while running a direct eval whose declarations hoist
+    /// into a (non-global) function VariableEnvironment, newly-created `var`/function bindings are made
+    /// DELETABLE (CreateMutableBinding(N, true)) so a later `delete x` removes them. Set only for the
+    /// hoist+body of such an eval (`performEval`); false everywhere else, so ordinary var/function
+    /// hoisting creates non-deletable bindings unchanged.
+    eval_var_deletable: bool = false,
     /// §27.5 the generator whose body THIS interpreter is currently executing (set on the per-generator
     /// body interpreter spawned for a `function*`; null for the main interpreter and ordinary calls).
     /// A `yield` is legal only when this is non-null; evaluating `yield x` reaches the handoff via it.

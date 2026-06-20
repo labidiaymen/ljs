@@ -542,8 +542,13 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
             }
             self.this_val = if (genv.lookup("%GlobalThis%")) |b| b.value else .undefined;
             self.home_object = null;
-            // §19.2.1.1: INDIRECT eval runs in the global context — sloppy unless its own prologue.
-            return interp_expr.performEval(self, arg.string, genv, false);
+            // §19.2.1.1 steps 11–12: an indirect eval gets a FRESH (declarative) LexicalEnvironment
+            // that is a child of the global env — its `let`/`const`/`class` are eval-local (a later
+            // outside reference is a ReferenceError, `lex-env-distinct-*`). It is NOT a var scope, so
+            // sloppy `var`s still hoist past it to the global var environment (`performEval` promotes
+            // it to its own var scope only for a strict eval). `varScope()` reaching genv is preserved.
+            const lexenv = try Environment.create(self.arena, genv);
+            return interp_expr.performEval(self, arg.string, lexenv, false, false);
         },
         else => {},
     }
