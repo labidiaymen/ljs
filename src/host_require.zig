@@ -296,7 +296,7 @@ pub fn installEntryRequire(self: *Interpreter, script_path: []const u8, script_d
 //  core module registry: path / fs / os
 // ════════════════════════════════════════════════════════════════════════════
 
-const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "url", "assert", "assert/strict", "buffer" };
+const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring" };
 
 /// Strip a `node:` prefix (Node accepts `node:path` etc.).
 fn coreName(spec: []const u8) []const u8 {
@@ -340,6 +340,16 @@ fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
         if (v != .object) return error.OutOfMemory;
         return v.object;
     }
+    // HOST (spec 105): `require('util/types')` IS `require('util').types` (identity must match).
+    if (std.mem.eql(u8, name, "util/types")) {
+        const util_c = try loadCoreModule(self, "util");
+        if (util_c.normal == .object) {
+            if (util_c.normal.object.get("types")) |tv| if (tv == .object) return tv.object;
+        }
+        return Object.create(self.arena, self.objectProto());
+    }
+    // HOST (spec 105): `require('querystring')` → parse/decode/stringify/encode/escape/unescape.
+    if (std.mem.eql(u8, name, "querystring")) return @import("host_querystring.zig").build(self);
     const obj = try Object.create(arena, self.objectProto());
     if (std.mem.eql(u8, name, "fs")) {
         for ([_][]const u8{ "readFileSync", "existsSync", "writeFileSync", "statSync", "readdirSync", "mkdirSync" }) |m|

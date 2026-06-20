@@ -124,8 +124,11 @@ fn storeOf(emitter: *Object) ?*Object {
     return null;
 }
 
-/// Coerce an event-name argument to its string key.
+/// Coerce an event-name argument to its string key. A Symbol event name is kept AS a symbol (Node
+/// allows symbol event types) — see `eventArrayGet`/`eventArrayEnsure`; only non-symbol names go
+/// through ToString.
 fn eventKey(self: *Interpreter, v: Value) EvalError!Completion {
+    if (v == .symbol) return .{ .normal = v };
     return self.toStringValuePub(v);
 }
 
@@ -133,6 +136,33 @@ fn eventKey(self: *Interpreter, v: Value) EvalError!Completion {
 fn arrayFor(store: *Object, key: []const u8) ?*Object {
     if (store.get(key)) |v| if (v == .object) return v.object;
     return null;
+}
+
+/// The listener-array for an event-name VALUE (string or symbol) in `store`, or null. A symbol name
+/// is looked up in the store's symbol-keyed slots; any other value uses its string key.
+fn eventArrayGet(store: *Object, name: Value) ?*Object {
+    if (name == .symbol) {
+        if (store.getSymbolProp(name.symbol)) |loc| {
+            if (loc.pv.payload == .data and loc.pv.payload.data == .object) return loc.pv.payload.data.object;
+        }
+        return null;
+    }
+    if (name == .string) return arrayFor(store, name.string);
+    return null;
+}
+
+/// Get-or-create the listener-array for an event-name VALUE in `store`. A symbol name is stored in a
+/// symbol-keyed slot; a string name (arena-duped) in a string slot.
+fn eventArrayEnsure(self: *Interpreter, store: *Object, name: Value) EvalError!*Object {
+    if (eventArrayGet(store, name)) |a| return a;
+    const a = Object.createArray(self.arena, self.arrayProto()) catch return error.OutOfMemory;
+    if (name == .symbol) {
+        try store.defineSymbolData(name.symbol, .{ .object = a }, true, false, false);
+    } else {
+        const key = self.arena.dupe(u8, name.string) catch return error.OutOfMemory;
+        try store.defineData(key, .{ .object = a }, true, false, false);
+    }
+    return a;
 }
 
 /// Make a holder object wrapping `listener` with the `once` flag.
@@ -153,14 +183,7 @@ fn addImpl(self: *Interpreter, emitter: *Object, this_val: Value, args: []const 
         return self.throwError("TypeError", "The \"listener\" argument must be of type function");
 
     const store = try ensureStore(self, emitter);
-    // Copy the key into arena-owned memory (the toString result may alias a transient buffer).
-    const key = self.arena.dupe(u8, key_c.normal.string) catch return error.OutOfMemory;
-
-    const arr = if (arrayFor(store, key)) |a| a else blk: {
-        const a = Object.createArray(self.arena, self.arrayProto()) catch return error.OutOfMemory;
-        try store.defineData(key, .{ .object = a }, true, false, false);
-        break :blk a;
-    };
+    const arr = try eventArrayEnsure(self, store, key_c.normal);
     const holder = try makeHolder(self, listener_v.object, once);
 
     if (prepend) {
@@ -183,7 +206,7 @@ fn removeListener(self: *Interpreter, emitter: *Object, this_val: Value, args: [
     if (key_c.isAbrupt()) return key_c;
     const listener_v: Value = if (args.len > 1) args[1] else .undefined;
     const store = storeOf(emitter) orelse return .{ .normal = this_val };
-    const arr = arrayFor(store, key_c.normal.string) orelse return .{ .normal = this_val };
+    const arr = eventArrayGet(store, key_c.normal) orelse return .{ .normal = this_val };
 
     // Remove the LAST matching holder (Node removes at most one, the most recently-added match).
     const n = arr.array_length;
@@ -214,14 +237,20 @@ fn removeAllListeners(self: *Interpreter, emitter: *Object, this_val: Value, arg
     if (args.len > 0 and args[0] != .undefined) {
         const key_c = try eventKey(self, args[0]);
         if (key_c.isAbrupt()) return key_c;
-        if (arrayFor(store, key_c.normal.string)) |arr| try arr.arraySetLen(0);
+        if (eventArrayGet(store, key_c.normal)) |arr| try arr.arraySetLen(0);
     } else {
-        // Clear every event: empty each listener array.
+        // Clear every event: empty each listener array (string- AND symbol-keyed slots).
         var it = store.properties.iterator();
         while (it.next()) |entry| {
             const pv = entry.value_ptr.*;
             if (pv.payload == .data and pv.payload.data == .object) {
                 const arr = pv.payload.data.object;
+                if (arr.kind == .array) try arr.arraySetLen(0);
+            }
+        }
+        for (store.symbol_props.items) |*sp| {
+            if (sp.pv.payload == .data and sp.pv.payload.data == .object) {
+                const arr = sp.pv.payload.data.object;
                 if (arr.kind == .array) try arr.arraySetLen(0);
             }
         }
@@ -234,11 +263,10 @@ fn removeAllListeners(self: *Interpreter, emitter: *Object, this_val: Value, arg
 fn emit(self: *Interpreter, emitter: *Object, this_val: Value, args: []const Value) EvalError!Completion {
     const key_c = try eventKey(self, if (args.len > 0) args[0] else .undefined);
     if (key_c.isAbrupt()) return key_c;
-    const key = key_c.normal.string;
-    const is_error = std.mem.eql(u8, key, "error");
+    const is_error = key_c.normal == .string and std.mem.eql(u8, key_c.normal.string, "error");
 
     const store = storeOf(emitter);
-    const arr = if (store) |s| arrayFor(s, key) else null;
+    const arr = if (store) |s| eventArrayGet(s, key_c.normal) else null;
     const have = arr != null and arr.?.array_length > 0;
 
     if (!have) {
@@ -308,7 +336,7 @@ fn listeners(self: *Interpreter, emitter: *Object, args: []const Value, raw: boo
     const key_c = try eventKey(self, if (args.len > 0) args[0] else .undefined);
     if (key_c.isAbrupt()) return key_c;
     const store = storeOf(emitter) orelse return .{ .normal = .{ .object = out } };
-    const arr = arrayFor(store, key_c.normal.string) orelse return .{ .normal = .{ .object = out } };
+    const arr = eventArrayGet(store, key_c.normal) orelse return .{ .normal = .{ .object = out } };
     const n = arr.array_length;
     var i: usize = 0;
     var o: usize = 0;
@@ -322,20 +350,38 @@ fn listeners(self: *Interpreter, emitter: *Object, args: []const Value, raw: boo
     return .{ .normal = .{ .object = out } };
 }
 
+/// `listenerCount(type[, listener])` — the number of listeners for `type`. With a `listener` arg,
+/// count only holders wrapping that exact function (Node ≥ 19.8 / counts once-wrappers too).
 fn listenerCount(self: *Interpreter, emitter: *Object, args: []const Value) EvalError!Completion {
     const key_c = try eventKey(self, if (args.len > 0) args[0] else .undefined);
     if (key_c.isAbrupt()) return key_c;
     const store = storeOf(emitter) orelse return .{ .normal = .{ .number = 0 } };
-    const arr = arrayFor(store, key_c.normal.string) orelse return .{ .normal = .{ .number = 0 } };
-    return .{ .normal = .{ .number = @floatFromInt(arr.array_length) } };
+    const arr = eventArrayGet(store, key_c.normal) orelse return .{ .normal = .{ .number = 0 } };
+
+    // No `listener` filter → the whole count.
+    const filter_v: Value = if (args.len > 1) args[1] else .undefined;
+    if (filter_v != .object) return .{ .normal = .{ .number = @floatFromInt(arr.array_length) } };
+
+    var count: usize = 0;
+    const n = arr.array_length;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const h = arr.arrayGet(i);
+        if (h == .object) if (h.object.get(FN_KEY)) |fv| {
+            if (fv == .object and fv.object == filter_v.object) count += 1;
+        };
+    }
+    return .{ .normal = .{ .number = @floatFromInt(count) } };
 }
 
-/// `eventNames()` — an Array of the event names that currently have at least one listener.
+/// `eventNames()` — an Array of the event names (strings AND symbols) that currently have ≥ 1
+/// listener, in registration order (string slots first, then symbol slots — matching Node's
+/// `Reflect.ownKeys` ordering of the events store).
 fn eventNames(self: *Interpreter, emitter: *Object) EvalError!Completion {
     const out = Object.createArray(self.arena, self.arrayProto()) catch return error.OutOfMemory;
     const store = storeOf(emitter) orelse return .{ .normal = .{ .object = out } };
-    var it = store.properties.iterator();
     var o: usize = 0;
+    var it = store.properties.iterator();
     while (it.next()) |entry| {
         const pv = entry.value_ptr.*;
         if (pv.payload == .data and pv.payload.data == .object) {
@@ -343,6 +389,15 @@ fn eventNames(self: *Interpreter, emitter: *Object) EvalError!Completion {
             if (arr.kind == .array and arr.array_length > 0) {
                 const name = self.arena.dupe(u8, entry.key_ptr.*) catch return error.OutOfMemory;
                 try out.arraySet(self.arena, o, .{ .string = name });
+                o += 1;
+            }
+        }
+    }
+    for (store.symbol_props.items) |*sp| {
+        if (sp.pv.payload == .data and sp.pv.payload.data == .object) {
+            const arr = sp.pv.payload.data.object;
+            if (arr.kind == .array and arr.array_length > 0) {
+                try out.arraySet(self.arena, o, .{ .symbol = sp.key });
                 o += 1;
             }
         }

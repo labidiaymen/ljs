@@ -435,30 +435,71 @@ fn callbackify(self: *Interpreter, args: []const Value) EvalError!Completion {
 // ── inherits ────────────────────────────────────────────────────────────────────
 
 /// `util.inherits(ctor, superCtor)` — set `ctor.super_ = superCtor` and
-/// `ctor.prototype = Object.create(superCtor.prototype)` with a `constructor` back-reference.
+/// `ctor.prototype = Object.create(superCtor.prototype)` with a `constructor` back-reference. Node's
+/// validation order: `ctor` non-null, `superCtor` non-null, then `superCtor.prototype` is an object
+/// (each failure → an `ERR_INVALID_ARG_TYPE` TypeError with Node's exact message).
 fn inherits(self: *Interpreter, args: []const Value) EvalError!Completion {
-    const arena = self.arena;
     const ctor_v: Value = if (args.len > 0) args[0] else .undefined;
     const super_v: Value = if (args.len > 1) args[1] else .undefined;
-    if (ctor_v != .object or ctor_v.object.kind != .function)
-        return self.throwError("TypeError", "The \"ctor\" argument must be of type function");
-    if (super_v != .object or super_v.object.kind != .function)
-        return self.throwError("TypeError", "The \"superCtor\" argument must be of type function");
+    if (ctor_v == .undefined or ctor_v == .null)
+        return invalidArgType(self, "ctor", "Function", ctor_v);
+    if (super_v == .undefined or super_v == .null)
+        return invalidArgType(self, "superCtor", "Function", super_v);
 
-    const ctor = ctor_v.object;
-    const super = super_v.object;
+    // Node requires `superCtor.prototype` to be an object (not that superCtor be a function).
+    const super_proto_v: Value = if (super_v == .object) (super_v.object.get("prototype") orelse .undefined) else .undefined;
+    if (super_proto_v != .object)
+        return invalidArgType(self, "superCtor.prototype", "Object", super_proto_v);
 
-    // ctor.super_ = superCtor.
+    const ctor: *Object = if (ctor_v == .object) ctor_v.object else return invalidArgType(self, "ctor", "Function", ctor_v);
+
+    // ctor.super_ = superCtor (writable, configurable, NON-enumerable — Node uses an ordinary
+    // assignment which yields a default data prop; the test asserts writable+configurable+!enumerable).
     try ctor.defineData("super_", super_v, true, false, true);
 
-    // ctor.prototype = Object.create(superCtor.prototype) with a non-enumerable `constructor`.
-    const super_proto_v = super.get("prototype");
-    const super_proto: ?*Object = if (super_proto_v) |spv| (if (spv == .object) spv.object else null) else null;
-    const new_proto = try Object.create(arena, super_proto);
-    try new_proto.defineData("constructor", ctor_v, true, false, true);
-    try ctor.defineData("prototype", .{ .object = new_proto }, false, false, false);
+    // Modern Node: `Object.setPrototypeOf(ctor.prototype, superCtor.prototype)` — re-parent the
+    // EXISTING `ctor.prototype` (so a class's own methods survive), rather than replacing it.
+    const ctor_proto_v = ctor.get("prototype");
+    if (ctor_proto_v) |cpv| if (cpv == .object) {
+        cpv.object.prototype = super_proto_v.object;
+    };
 
     return .{ .normal = .undefined };
+}
+
+/// Build + throw a Node `ERR_INVALID_ARG_TYPE` TypeError: `The "<name>" <kind> must be of type
+/// <expected>. Received <typeOf(v)>` where `kind` is "property" for a dotted name, else "argument",
+/// and `<expected>` is lower-cased ("Function" → "function").
+fn invalidArgType(self: *Interpreter, name: []const u8, expected: []const u8, v: Value) EvalError!Completion {
+    const arena = self.arena;
+    const kind = if (std.mem.indexOfScalar(u8, name, '.') != null) "property" else "argument";
+    const exp_lower = std.ascii.allocLowerString(arena, expected) catch return error.OutOfMemory;
+    const msg = std.fmt.allocPrint(
+        arena,
+        "The \"{s}\" {s} must be of type {s}. Received {s}",
+        .{ name, kind, exp_lower, argTypeName(v) },
+    ) catch return error.OutOfMemory;
+    const err = try Object.create(arena, self.errorProto("TypeError"));
+    err.error_data = true;
+    try err.set("name", .{ .string = "TypeError" });
+    try err.set("message", .{ .string = msg });
+    try err.defineData("code", .{ .string = "ERR_INVALID_ARG_TYPE" }, true, false, true);
+    return .{ .throw = .{ .object = err } };
+}
+
+/// The token Node's `ERR_INVALID_ARG_TYPE` prints for a received value's type (the simple cases the
+/// host tests exercise: `null`, `undefined`, and the primitive `typeof`s).
+fn argTypeName(v: Value) []const u8 {
+    return switch (v) {
+        .null => "null",
+        .undefined => "undefined",
+        .boolean => "type boolean",
+        .number => "type number",
+        .string => "type string",
+        .symbol => "type symbol",
+        .object => "an instance of Object",
+        else => "an instance of Object",
+    };
 }
 
 // ── deprecate ───────────────────────────────────────────────────────────────────

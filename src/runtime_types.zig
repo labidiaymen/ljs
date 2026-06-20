@@ -684,6 +684,9 @@ pub const NativeId = enum {
     /// HOST (Node axis, spec 103 — NOT ECMA-262): a `util` core-module method (format/inspect/
     /// promisify/inherits/deprecate/types.*) — selected by `native_name`. Inert on the Test262 path.
     util_method,
+    /// HOST (Node axis, spec 105 — NOT ECMA-262): a `querystring` core-module method (parse/decode/
+    /// stringify/encode/escape/unescape) — selected by `native_name`. Inert on the Test262 path.
+    qs_method,
     /// HOST (Node axis, spec 104 — NOT ECMA-262): an `assert` core-module method (ok/equal/
     /// strictEqual/deepStrictEqual/throws/rejects/match/... + the `AssertionError` constructor and
     /// the rejects/doesNotReject promise-reaction natives) — selected by `native_name` / hidden
