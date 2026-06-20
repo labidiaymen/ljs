@@ -651,6 +651,11 @@ pub const Parser = struct {
         _ = try self.expect(.lparen);
         const object = try self.parseExpression();
         _ = try self.expect(.rparen);
+        // §14.11.1 early error: the `with` body is a Statement, which is NOT a FunctionDeclaration —
+        // and unlike `if`/`else` (Annex B B.3.4) there is no legacy carve-out for `with`. So
+        // `with ({}) function f(){}` is a SyntaxError even in sloppy mode (`parseSubStmt` accepts a
+        // sloppy non-iteration `function` body for `if`, so reject it here before delegating).
+        if (self.peek().kind == .kw_function) return ParseError.UnexpectedToken;
         const body = try self.allocStmt(try self.parseSubStmt(false));
         return .{ .with_stmt = .{ .object = object, .body = body } };
     }

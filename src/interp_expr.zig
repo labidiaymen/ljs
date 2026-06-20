@@ -60,8 +60,9 @@ pub fn evalExpr(self: *Interpreter, node: *const ast.Node, env: *Environment) Ev
         .regex_literal => |r| return builtin_regexp.makeRegExp(self, r.pattern, r.flags), // §13.2.7
         .identifier => |name| {
             // §9.4.2 ResolveBinding + §6.2.5.5 GetValue + §9.1.1.1.6 GetBindingValue.
-            if (self.with_depth > 0) switch (interp_stmt.resolveIdRef(self, env, name)) {
-                .with_object => |o| return self.getProperty(.{ .object = o }, name),
+            if (self.with_depth > 0) switch (try interp_stmt.resolveIdRef(self, env, name)) {
+                .abrupt => |c| return c, // §9.1.1.2.1 HasBinding threw (proxy `has` / @@unscopables getter)
+                .with_object => |o| return interp_stmt.withGetBindingValue(self, o, name), // §9.1.1.2.6
                 .binding => |b| {
                     if (!b.initialized) return self.throwError("ReferenceError", name);
                     return .{ .normal = b.value };
@@ -88,8 +89,9 @@ pub fn evalExpr(self: *Interpreter, node: *const ast.Node, env: *Environment) Ev
             if (c.isAbrupt()) return c;
             // §13.15.2 / §8.4: `f = function(){}` (anonymous RHS, identifier LHS) → NamedEvaluation.
             try self.maybeSetAnonName(a.value, c.normal, a.name);
-            if (self.with_depth > 0) switch (interp_stmt.resolveIdRef(self, env, a.name)) {
-                .with_object => |o| return self.setProperty(.{ .object = o }, a.name, c.normal),
+            if (self.with_depth > 0) switch (try interp_stmt.resolveIdRef(self, env, a.name)) {
+                .abrupt => |ac| return ac, // §9.1.1.2.1 HasBinding threw (proxy `has` / @@unscopables getter)
+                .with_object => |o| return interp_stmt.withSetMutableBinding(self, o, a.name, c.normal), // §9.1.1.2.5
                 .binding => |b| {
                     if (!b.initialized) return self.throwError("ReferenceError", a.name); // §13.x TDZ
                     if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
@@ -258,6 +260,25 @@ pub fn evalExpr(self: *Interpreter, node: *const ast.Node, env: *Environment) Ev
             const delta: f64 = if (u.op == .inc) 1 else -1;
             switch (u.target.*) {
                 .identifier => |name| {
+                    // §13.4 step 1: evaluate LeftHandSideExpression to a Reference ONCE (so §9.1.1.2.1
+                    // HasBinding — and its @@unscopables Get — runs exactly once), then GetValue/PutValue
+                    // through that single resolved holder. With a `with` in scope the holder may be a with
+                    // object's object Environment Record (`unscopables-inc-dec`).
+                    if (self.with_depth > 0) switch (try interp_stmt.resolveIdRef(self, env, name)) {
+                        .abrupt => |c| return c, // HasBinding threw (proxy `has` / @@unscopables getter)
+                        .with_object => |o| {
+                            const cur = try interp_stmt.withGetBindingValue(self, o, name); // §9.1.1.2.6
+                            if (cur.isAbrupt()) return cur;
+                            const oldc = try self.toNumberV(cur.normal);
+                            if (oldc.isAbrupt()) return oldc;
+                            const old = oldc.normal.number;
+                            const sc = try interp_stmt.withSetMutableBinding(self, o, name, .{ .number = old + delta }); // §9.1.1.2.5
+                            if (sc.isAbrupt()) return sc;
+                            return .{ .normal = .{ .number = if (u.prefix) old + delta else old } };
+                        },
+                        .binding => {}, // fall through to the lexical path below
+                        .unresolved => return self.throwError("ReferenceError", name),
+                    };
                     const b = env.lookup(name) orelse return self.throwError("ReferenceError", name);
                     // §16.2.1.6: an import binding is immutable — `++`/`--` on it is a TypeError.
                     if (b.alias != null) return self.throwError("TypeError", "Assignment to constant variable.");
@@ -585,9 +606,10 @@ pub fn evalCompoundAssign(self: *Interpreter, ca: anytype, env: *Environment) Ev
             // `with` in scope the reference is re-resolved at write time (matching §9.1.1.2.5: a
             // getter that deletes its own binding makes the strict-mode PutValue a ReferenceError).
             if (self.with_depth > 0) {
-                const cur: Value = switch (interp_stmt.resolveIdRef(self, env, name)) {
+                const cur: Value = switch (try interp_stmt.resolveIdRef(self, env, name)) {
+                    .abrupt => |c| return c, // §9.1.1.2.1 HasBinding threw (proxy `has` / @@unscopables getter)
                     .with_object => |o| blk: {
-                        const c = try self.getProperty(.{ .object = o }, name);
+                        const c = try interp_stmt.withGetBindingValue(self, o, name); // §9.1.1.2.6
                         if (c.isAbrupt()) return c;
                         break :blk c.normal;
                     },
@@ -601,9 +623,10 @@ pub fn evalCompoundAssign(self: *Interpreter, ca: anytype, env: *Environment) Ev
                 if (rc.isAbrupt()) return rc;
                 const res = try interp_ops.applyNumericOrStringOp(self, ca.op, cur, rc.normal);
                 if (res.isAbrupt()) return res;
-                switch (interp_stmt.resolveIdRef(self, env, name)) { // §6.2.5.6 PutValue: re-resolve the reference
+                switch (try interp_stmt.resolveIdRef(self, env, name)) { // §6.2.5.6 PutValue: re-resolve the reference
+                    .abrupt => |c| return c,
                     .with_object => |o| {
-                        const sc = try self.setProperty(.{ .object = o }, name, res.normal);
+                        const sc = try interp_stmt.withSetMutableBinding(self, o, name, res.normal); // §9.1.1.2.5
                         if (sc.isAbrupt()) return sc;
                     },
                     .binding => |b| {
@@ -1724,7 +1747,12 @@ pub fn evalUnary(self: *Interpreter, op: ast.UnaryOp, operand: *const ast.Node, 
         // record; otherwise fall through to evaluate it (and report its real type).
         if (operand.* == .identifier and env.lookup(operand.identifier) == null) {
             const nm = operand.identifier;
-            const in_with = self.with_depth > 0 and interp_stmt.resolveIdRef(self, env, nm) != .unresolved;
+            var in_with = false;
+            if (self.with_depth > 0) switch (try interp_stmt.resolveIdRef(self, env, nm)) {
+                .abrupt => |c| return c, // §9.1.1.2.1 HasBinding threw (proxy `has` / @@unscopables getter)
+                .unresolved => {},
+                else => in_with = true,
+            };
             if (!in_with and !globalObjectHas(self, nm)) return .{ .normal = .{ .string = "undefined" } };
         }
         const c = try self.evalExpr(operand, env);
@@ -1819,6 +1847,19 @@ pub fn evalDelete(self: *Interpreter, operand: *const ast.Node, env: *Environmen
         // (no configurable global-object property) keep the M-subset deviation of returning true
         // without removing. Strict `delete x` is a §13.5.1.1 SyntaxError (parse-rejected upstream).
         .identifier => |name| {
+            // §13.5.1.2 step 5 / §9.1.1.4.18 DeleteBinding for an object Environment Record (a `with`
+            // binding object): when the reference resolves through an enclosing `with`, `delete name`
+            // is the binding object's [[Delete]] of `name`. Resolution uses the same @@unscopables-aware
+            // §9.1.1.2.1 HasBinding as reads/writes — a blocked or absent name falls through to the
+            // outer scope (and `delete` of an unresolvable name returns true).
+            if (self.with_depth > 0) switch (try interp_stmt.resolveIdRef(self, env, name)) {
+                .abrupt => |c| return c, // HasBinding threw (proxy `has` / @@unscopables getter)
+                .with_object => |o| {
+                    const dc = try self.deleteProperty(.{ .object = o }, name);
+                    return finishStrictDelete(self, dc);
+                },
+                .binding, .unresolved => {}, // fall through to the declarative / global path below
+            };
             // §9.1.1.4.18 DeleteBinding: a declarative binding marked DELETABLE (introduced into a
             // function var scope by a sloppy direct eval, §19.2.1.3) is removed from its environment;
             // a later read of `name` then throws ReferenceError. Walk the scope chain to the binding's

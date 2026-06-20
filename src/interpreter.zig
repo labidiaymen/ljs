@@ -261,10 +261,17 @@ pub const Interpreter = struct {
     }
 
     /// §9.1.1.1 / §9.1.1.2 with-aware identifier resolution. Walks the scope chain consulting object
-    /// Environment Records (the `with` binding objects, via `HasProperty`) and declarative records.
-    /// ONLY used when `with_depth > 0`; the no-`with` path keeps the fast `env.lookup`. Returns the
-    /// holding object (for a with binding), the declarative binding, or `.unresolved`.
-    pub const IdRef = union(enum) { with_object: *Object, binding: *@import("environment.zig").Binding, unresolved };
+    /// Environment Records (the `with` binding objects, via §9.1.1.2.1 HasBinding) and declarative
+    /// records. ONLY used when `with_depth > 0`; the no-`with` path keeps the fast `env.lookup`.
+    /// Returns the holding object (for a with binding), the declarative binding, `.unresolved`, or
+    /// `.abrupt` — HasBinding runs JS-observable steps (`HasProperty`, the `@@unscopables` getter and
+    /// its property `Get`) which can throw (a proxy trap / accessor), so resolution is a Completion.
+    pub const IdRef = union(enum) {
+        with_object: *Object,
+        binding: *@import("environment.zig").Binding,
+        unresolved,
+        abrupt: Completion,
+    };
 
     /// §8.2.6 / §14.2.3 / §10.2.11 lexical pre-declaration (the §10/§14 *DeclarationInstantiation*
     /// step for lexical names): create each top-level `let`/`const`/`class` BoundName of `stmts` in

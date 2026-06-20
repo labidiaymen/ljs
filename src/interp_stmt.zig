@@ -349,19 +349,74 @@ pub fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError
     }
 }
 
-pub fn resolveIdRef(self: *Interpreter, env: *Environment, name: []const u8) IdRef {
-    _ = self;
+/// §9.1.1.2.1 ObjectEnvironmentRecord.HasBinding ( N ): is `name` bound on the with binding object
+/// `obj`? `foundBinding = HasProperty(obj, N)` (proto chain; a proxy `has` trap may throw — §7.3.12).
+/// If absent → false. If present, consult `@@unscopables` (the `withEnvironment` flag is always set
+/// for a `with` env): `unscopables = Get(obj, @@unscopables)`; when that is an Object, the binding is
+/// hidden (return false, so resolution falls through to the outer scope) iff `ToBoolean(Get(
+/// unscopables, N))` is true. Both Gets are JS-observable (a getter/proxy trap may throw), so the
+/// result is a Completion: `.abrupt` propagates the throw; otherwise a boolean `found`.
+const HasBinding = union(enum) { found: bool, abrupt: Completion };
+fn withHasBinding(self: *Interpreter, obj: *Object, name: []const u8) EvalError!HasBinding {
+    const base: Value = .{ .object = obj };
+    const hc = try self.hasPropertyVC(base, .{ .string = name }); // §7.3.12 HasProperty (proxy `has` may throw)
+    if (hc.isAbrupt()) return .{ .abrupt = hc };
+    if (!hc.normal.boolean) return .{ .found = false };
+    // §9.1.1.2.1 step 6: unscopables = ? Get(bindings, @@unscopables).
+    const us_sym = self.wellKnownSymbol("unscopables") orelse return .{ .found = true };
+    const usc = try self.getSymbolProperty(base, us_sym);
+    if (usc.isAbrupt()) return .{ .abrupt = usc };
+    if (usc.normal == .object) {
+        // step 7: blocked = ToBoolean(? Get(unscopables, N)); if blocked, the binding is hidden.
+        const bc = try self.getProperty(.{ .object = usc.normal.object }, name);
+        if (bc.isAbrupt()) return .{ .abrupt = bc };
+        if (toBoolean(bc.normal)) return .{ .found = false };
+    }
+    return .{ .found = true };
+}
+
+pub fn resolveIdRef(self: *Interpreter, env: *Environment, name: []const u8) EvalError!IdRef {
     var e: ?*Environment = env;
     while (e) |cur| {
         if (cur.with_object) |opaque_obj| {
             const obj: *Object = @ptrCast(@alignCast(opaque_obj));
-            if (obj.get(name) != null) return .{ .with_object = obj }; // §9.1.1.2.1 HasProperty (proto chain)
+            switch (try withHasBinding(self, obj, name)) { // §9.1.1.2.1 HasBinding (@@unscopables-aware)
+                .abrupt => |c| return .{ .abrupt = c },
+                .found => |f| if (f) return .{ .with_object = obj },
+            }
         } else if (cur.vars.getPtr(name)) |b| {
             return .{ .binding = b };
         }
         e = cur.parent;
     }
     return .unresolved;
+}
+
+/// §9.1.1.2.6 ObjectEnvironmentRecord.GetBindingValue ( N, S ) — read `name` through a `with` binding
+/// object resolved by `resolveIdRef`. Step 2 re-runs `HasProperty(bindingObject, N)` (a SECOND query,
+/// distinct from HasBinding's — a proxy logs both, and the property may have vanished since): when it
+/// is false, return undefined (S=false) or throw ReferenceError (S=true); otherwise `Get(obj, N)`.
+pub fn withGetBindingValue(self: *Interpreter, obj: *Object, name: []const u8) EvalError!Completion {
+    const base: Value = .{ .object = obj };
+    const hc = try self.hasPropertyVC(base, .{ .string = name }); // step 2
+    if (hc.isAbrupt()) return hc;
+    if (!hc.normal.boolean) { // step 3
+        if (self.strict) return self.throwError("ReferenceError", name);
+        return .{ .normal = .undefined };
+    }
+    return self.getProperty(base, name); // step 4
+}
+
+/// §9.1.1.2.5 ObjectEnvironmentRecord.SetMutableBinding ( N, V, S ) — write `value` through a `with`
+/// binding object resolved by `resolveIdRef`. Step 2 re-runs `HasProperty(bindingObject, N)`: if false
+/// and S=true → ReferenceError (the binding was deleted between HasBinding and the write); otherwise
+/// `Set(obj, N, V, S)`.
+pub fn withSetMutableBinding(self: *Interpreter, obj: *Object, name: []const u8, value: Value) EvalError!Completion {
+    const base: Value = .{ .object = obj };
+    const hc = try self.hasPropertyVC(base, .{ .string = name }); // step 2
+    if (hc.isAbrupt()) return hc;
+    if (!hc.normal.boolean and self.strict) return self.throwError("ReferenceError", name); // step 3
+    return self.setProperty(base, name, value); // step 4
 }
 
 /// §8.2.6 / §14.2.3 / §10.2.11 lexical pre-declaration (the §10/§14 *DeclarationInstantiation*
@@ -611,6 +666,19 @@ pub fn varInitTarget(env: *Environment) *Environment {
     while (true) {
         if (e.with_object != null) return env; // lexically inside a `with` → current scope
         if (e.is_var_scope) return e; // reached the VariableEnvironment
+        e = e.parent orelse return e;
+    }
+}
+
+/// The nearest VariableEnvironment, ALWAYS skipping intervening `with` object Environment Records.
+/// Used for a `for (var x in/of …)` head: §14.7.5.7 ForIn/OfBodyEvaluation binds the loop variable
+/// directly in the VariableEnvironment (BindingInitialization, NOT a PutValue routed through `with`),
+/// so unlike `varInitTarget` the binding must NOT land on the throwaway with-env (whose declarative
+/// `vars` are invisible to `resolveIdRef`, which treats a with-env as an object record only).
+pub fn varScopeSkipWith(env: *Environment) *Environment {
+    var e: *Environment = env;
+    while (true) {
+        if (e.is_var_scope and e.with_object == null) return e;
         e = e.parent orelse return e;
     }
 }
@@ -875,7 +943,7 @@ pub fn bindForHead(self: *Interpreter, head: ast.ForHead, item: Value, env: *Env
             // binding (visible after the loop); the body still runs in the loop env `env` (no
             // per-iteration scope). let/const/using instead get a FRESH per-iteration scope.
             if (d.kind == .var_decl) {
-                const vs = varInitTarget(env);
+                const vs = varScopeSkipWith(env); // §14.7.5.7: bind in the VariableEnvironment, not a with-env
                 if (d.target.* == .identifier) {
                     try vs.declare(d.target.identifier, item, true, true);
                 } else {
@@ -943,8 +1011,9 @@ pub fn assignUnresolved(self: *Interpreter, name: []const u8, value: Value) Eval
 /// object Environment Record (HasBinding consults HasProperty over the proto chain) before falling
 /// back to lexical bindings; an unresolved write creates/sets a global per §6.2.5.6 step 5.b.
 pub fn putWithAwareIdentifier(self: *Interpreter, name: []const u8, value: Value, env: *Environment) EvalError!Completion {
-    if (self.with_depth > 0) switch (resolveIdRef(self, env, name)) {
-        .with_object => |o| return self.setProperty(.{ .object = o }, name, value),
+    if (self.with_depth > 0) switch (try resolveIdRef(self, env, name)) {
+        .abrupt => |c| return c, // §9.1.1.2.1 HasBinding threw (proxy `has` / @@unscopables getter)
+        .with_object => |o| return withSetMutableBinding(self, o, name, value), // §9.1.1.2.5
         .binding => |b| {
             if (!b.initialized) return self.throwError("ReferenceError", name); // §13.x TDZ
             if (!b.mutable) return self.throwError("TypeError", "Assignment to constant variable.");
