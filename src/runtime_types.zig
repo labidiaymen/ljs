@@ -700,10 +700,10 @@ pub const NativeId = enum {
     /// HOST (Node axis, spec 103 — NOT ECMA-262): the WHATWG `URL`/`URLSearchParams` + `TextEncoder`/
     /// `TextDecoder`. Family via a hidden own `"%kind%"`, operation via `native_name`. Inert on Test262.
     url_method,
-    /// HOST (Node axis, spec 106 — NOT ECMA-262): a `node:test` runner method (test/describe/it/hook/
-    /// skip/todo/mock/diagnostic + the `%exit%` / `%fail_reaction%` internal natives) — selected by
-    /// `native_name`. Inert on the Test262 path (host core modules are not requireable there).
+    /// HOST (Node axis, spec 106): `node:test` runner method (test/describe/it/hook/skip/todo/mock).
     nodetest_method,
+    /// HOST (Node axis, spec 106): `vm` module fns + `vm.Script` (Script ctor is constructible).
+    vm_method,
     /// §10.4.4.6 %ThrowTypeError% — the unique per-realm function that unconditionally throws a
     /// TypeError. Used as the poison `get`/`set` for `callee` (and historically `caller`) on a
     /// strict / unmapped arguments object. Never returns normally.

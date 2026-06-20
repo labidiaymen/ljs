@@ -779,6 +779,9 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
             .events_method => std.mem.eql(u8, ctor.native_name, "EventEmitter"),
             // HOST (spec 103): the WHATWG URL/URLSearchParams + TextEncoder/TextDecoder constructors.
             .url_method => true,
+            // HOST (spec 106): `new vm.Script(...)` is `new`-able; the module fns / prototype methods
+            // share the NativeId but a different `native_name`, so they are not.
+            .vm_method => std.mem.eql(u8, ctor.native_name, "Script"),
             // HOST (spec 105): `new Buffer(...)` (the deprecated constructor) is `new`-able; the
             // shared `.buffer_fn` prototype/static methods are not.
             .buffer_fn => std.mem.eql(u8, ctor.native_name, "Buffer"),
