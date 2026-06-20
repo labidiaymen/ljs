@@ -23349,8 +23349,6 @@
   "expressions/call/S11.2.4_A1.1_T1.js#sloppy",
   "expressions/call/spread-mult-empty.js#strict",
   "expressions/call/spread-mult-empty.js#sloppy",
-  "expressions/tagged-template/tco-call.js#strict",
-  "expressions/tagged-template/tco-member.js#strict",
   "expressions/greater-than/S11.8.2_A3.1_T2.2.js#strict",
   "expressions/greater-than/S11.8.2_A3.1_T2.2.js#sloppy",
   "expressions/greater-than/S11.8.2_A4.4.js#strict",

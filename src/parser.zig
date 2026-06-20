@@ -159,6 +159,13 @@ pub const Parser = struct {
     /// a Syntax Error even inside a block-bearing switch — but a `{}`-wrapped clause body re-allows it.)
     using_allowed: bool = false,
 
+    /// §12.9.6.1 / §13.2.8.3: set by `parseTemplate` when a TemplateLiteral it just parsed contained a
+    /// NotEscapeSequence (an illegal escape, so a cooked segment is `null`). An UNTAGGED template with
+    /// an illegal escape is a SyntaxError; a TAGGED template tolerates it (cooked → `undefined`). The
+    /// `.template` primary checks-and-clears this flag and rejects when the template was not tagged
+    /// (the tagged path consumes the `.template` token in `continuePostfix`, bypassing the check).
+    template_invalid_escape: bool = false,
+
     pub const ParamList = struct { params: []const ast.Param, rest: ?*const ast.Pattern };
     pub const PropName = struct { key: []const u8, computed: ?*const ast.Node = null, is_ident: bool = false, had_escape: bool = false };
 
@@ -365,28 +372,52 @@ pub const Parser = struct {
         return self.allocPattern(.{ .object = .{ .properties = props.items, .rest = rest } });
     }
 
-    /// §13.2.8 Template literal: split raw inner text into cooked quasis + expression sources,
-    /// sub-parsing each `${...}`. quasis.len == exprs.len + 1.
+    /// §13.2.8 / §12.9.6 Template literal: split the raw inner text (between the back-ticks, with
+    /// `${ … }` substitutions kept raw) into per-segment COOKED (TV) and RAW (TRV) strings plus the
+    /// sub-parsed substitution Expressions. `quasis.len == raw.len == exprs.len + 1`.
+    ///
+    /// A cooked segment is `null` when the segment contains a NotEscapeSequence (illegal escape, e.g.
+    /// `\x`/`\u`/legacy-octal). For an UNTAGGED template that is a §12.9.6.1 Early Error (SyntaxError):
+    /// `parsePrimary` checks `template_invalid_escape` and rejects. For a TAGGED template the null is
+    /// kept and surfaces as `undefined` in the template object (§13.2.8.3). The RAW segment is the
+    /// verbatim source with line terminators normalized to <LF> (§12.9.6 TRV: <CR> / <CR><LF> → <LF>).
     pub fn parseTemplate(self: *Parser, raw: []const u8) ParseError!*const ast.Node {
-        var quasis: std.ArrayList([]const u8) = .empty;
+        var quasis: std.ArrayList(?[]const u8) = .empty;
+        var raws: std.ArrayList([]const u8) = .empty;
         var exprs: std.ArrayList(*const ast.Node) = .empty;
         var cooked: std.ArrayList(u8) = .empty;
+        var raw_seg: std.ArrayList(u8) = .empty;
+        var cooked_ok = true; // becomes false once a NotEscapeSequence is seen in THIS segment
         var i: usize = 0;
         while (i < raw.len) {
             if (raw[i] == '\\' and i + 1 < raw.len) {
                 // §12.9.6 TemplateCharacter escape: shares §12.9.4.1 Character/Hex/Unicode escapes with
                 // string literals (UTF-8-encoded), plus `\0` NUL and LineContinuation; templates FORBID
-                // legacy octal / `\8` / `\9` (handled leniently — see spec). Find the end of this one
-                // escape (up to the next backslash / `${` / end) and decode the slice via the lexer.
+                // legacy octal / `\8` / `\9` (a NotEscapeSequence → cooked = undefined). Find the end of
+                // this one escape (up to the next backslash / `${` / end) and decode the slice.
                 var j = i + 2;
                 while (j < raw.len and raw[j] != '\\' and !(raw[j] == '$' and j + 1 < raw.len and raw[j + 1] == '{')) j += 1;
-                try lex.Lexer.decodeEscapesInto(self.arena, &cooked, raw[i..j], true);
+                // TRV: the raw segment keeps the escape verbatim (line terminators normalized below).
+                appendRawNormalized(self, &raw_seg, raw[i..j]) catch return ParseError.OutOfMemory;
+                if (cooked_ok) {
+                    lex.Lexer.decodeEscapesInto(self.arena, &cooked, raw[i..j], true) catch |e| switch (e) {
+                        error.OutOfMemory => return ParseError.OutOfMemory,
+                        else => {
+                            // §12.9.6.1 NotEscapeSequence → no cooked value for this segment.
+                            cooked_ok = false;
+                            self.template_invalid_escape = true;
+                        },
+                    };
+                }
                 i = j;
                 continue;
             }
             if (raw[i] == '$' and i + 1 < raw.len and raw[i + 1] == '{') {
-                try quasis.append(self.arena, cooked.items);
+                try quasis.append(self.arena, if (cooked_ok) cooked.items else null);
+                try raws.append(self.arena, raw_seg.items);
                 cooked = .empty;
+                raw_seg = .empty;
+                cooked_ok = true;
                 i += 2;
                 const expr_start = i;
                 var depth: usize = 1;
@@ -397,20 +428,70 @@ pub const Parser = struct {
                     }
                     i += 1;
                 }
-                const prog = try Parser.parseMode(self.arena, raw[expr_start..i], self.strict);
-                const node = if (prog.statements.len > 0 and prog.statements[0] == .expr)
-                    prog.statements[0].expr
-                else
-                    try self.alloc(.{ .string = "" });
+                const node = try self.parseSubstitution(raw[expr_start..i]);
                 try exprs.append(self.arena, node);
                 i += 1; // skip closing }
                 continue;
             }
+            // §12.9.6 TRV/TV LineTerminatorSequence normalization: a raw <CR> or <CR><LF> in the
+            // source becomes a single <LF> in BOTH the cooked and raw segment.
+            if (raw[i] == '\r') {
+                try cooked.append(self.arena, '\n');
+                try raw_seg.append(self.arena, '\n');
+                i += if (i + 1 < raw.len and raw[i + 1] == '\n') 2 else 1;
+                continue;
+            }
             try cooked.append(self.arena, raw[i]);
+            try raw_seg.append(self.arena, raw[i]);
             i += 1;
         }
-        try quasis.append(self.arena, cooked.items);
-        return self.alloc(.{ .template = .{ .quasis = quasis.items, .exprs = exprs.items } });
+        try quasis.append(self.arena, if (cooked_ok) cooked.items else null);
+        try raws.append(self.arena, raw_seg.items);
+        return self.alloc(.{ .template = .{ .quasis = quasis.items, .raw = raws.items, .exprs = exprs.items } });
+    }
+
+    /// §12.9.6 append `src` to a TRV raw segment, normalizing a <CR> / <CR><LF> LineTerminatorSequence
+    /// to a single <LF> (so a `\`-LineContinuation's raw value is `\\` + `\n`, per the spec).
+    fn appendRawNormalized(self: *Parser, out: *std.ArrayList(u8), src: []const u8) std.mem.Allocator.Error!void {
+        var k: usize = 0;
+        while (k < src.len) {
+            if (src[k] == '\r') {
+                try out.append(self.arena, '\n');
+                k += if (k + 1 < src.len and src[k + 1] == '\n') 2 else 1;
+                continue;
+            }
+            try out.append(self.arena, src[k]);
+            k += 1;
+        }
+    }
+
+    /// §13.2.8 sub-parse the source of a `${ Expression }` substitution. The inner text is an
+    /// Expression (NOT a Program / StatementList), so a leading `function`/`class`/`{` is the start of
+    /// an expression (`${ function(){}() }`, `${ {a:1} }`), never a declaration / block. The inner
+    /// parse inherits the current parser's context (strictness + whether `await`/`yield`/`new.target`/
+    /// `super` are in scope) so `` `${ await x }` `` inside an async body parses the operator form.
+    fn parseSubstitution(self: *Parser, src: []const u8) ParseError!*const ast.Node {
+        var lexer = lex.Lexer.init(self.arena, src);
+        var toks: std.ArrayList(lex.Token) = .empty;
+        while (true) {
+            const t = try lexer.next();
+            try toks.append(self.arena, t);
+            if (t.kind == .eof) break;
+        }
+        var sub = Parser{
+            .tokens = toks.items,
+            .arena = self.arena,
+            .strict = self.strict,
+            .in_function = self.in_function,
+            .in_method = self.in_method,
+            .in_class_body = self.in_class_body,
+            .in_generator = self.in_generator,
+            .in_async = self.in_async,
+            .private_names = self.private_names,
+        };
+        const node = try sub.parseExpression();
+        _ = try sub.expect(.eof);
+        return node;
     }
 
     /// §13.3.5 `new Callee(args)`. Callee is a member expression (no call); the argument list
@@ -451,6 +532,15 @@ pub const Parser = struct {
                     const key = try self.parseAssignmentInBrackets();
                     _ = try self.expect(.rbracket);
                     callee = try self.alloc(.{ .index = .{ .object = callee, .key = key } });
+                },
+                .template => {
+                    // §13.2.8: a TaggedTemplate is a MemberExpression, so `new tag\`x\`` constructs the
+                    // RESULT of the tagged-template call (application binds tighter than `new`), and a
+                    // following `(args)` binds to the `new`. (`new tag\`x\`('a')` ⇒ `new (tag\`x\`)('a')`.)
+                    const tok = self.advance();
+                    const quasi = try self.parseTemplate(tok.string_value);
+                    self.template_invalid_escape = false; // tagged tolerates illegal escapes (cooked → undefined)
+                    callee = try self.alloc(.{ .tagged_template = .{ .tag = callee, .quasi = quasi } });
                 },
                 else => break,
             }

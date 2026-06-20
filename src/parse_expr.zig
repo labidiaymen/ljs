@@ -566,6 +566,17 @@ pub fn continuePostfix(self: *Parser, base: *const ast.Node, started_in_chain: b
                 else
                     try self.alloc(.{ .call = .{ .callee = expr, .args = args } });
             },
+            .template => { // §13.2.8 TaggedTemplate `expr\`…\``
+                // §13.3.9.1 Early Error: a tagged template may not be applied to an OptionalChain
+                // (`a?.b\`x\``) — the chain result is not a callable Reference. Reject inside a chain.
+                if (in_chain) return ParseError.UnexpectedToken;
+                const tok = self.advance();
+                const quasi = try self.parseTemplate(tok.string_value);
+                // §13.2.8.3: a TAGGED template TOLERATES a NotEscapeSequence (cooked → undefined), so
+                // clear the flag the untagged `.template` primary would reject on.
+                self.template_invalid_escape = false;
+                expr = try self.alloc(.{ .tagged_template = .{ .tag = expr, .quasi = quasi } });
+            },
             else => break,
         }
     }
@@ -1090,7 +1101,15 @@ pub fn parsePrimary(self: *Parser) ParseError!*const ast.Node {
         },
         .template => {
             _ = self.advance();
-            return self.parseTemplate(t.string_value);
+            const node = try self.parseTemplate(t.string_value);
+            // §12.9.6.1 Early Error: an UNTAGGED TemplateLiteral with a NotEscapeSequence (illegal
+            // escape) is a SyntaxError. (A TAGGED template tolerates it — but the tagged form consumes
+            // the `.template` token in `continuePostfix` before reaching this untagged primary path.)
+            if (self.template_invalid_escape) {
+                self.template_invalid_escape = false;
+                return ParseError.UnexpectedToken;
+            }
+            return node;
         },
         .kw_new => return self.parseNew(),
         // §13.3.10 ImportCall `import ( AssignmentExpression [, AssignmentExpression] [,] )`.

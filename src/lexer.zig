@@ -818,17 +818,16 @@ pub const Lexer = struct {
             // §12.9.4.1 `\0` (and, Annex B, LegacyOctalEscapeSequence) + NonOctalDecimalEscape.
             '0'...'9' => {
                 if (is_template) {
-                    // §12.9.6: templates forbid legacy octal / `\8` / `\9`; only `\0` (not followed by a
-                    // digit) is the NUL escape. We decode `\0`→NUL leniently and copy others as identity
-                    // (the strict `cooked = undefined` refinement is deferred — see spec Out of scope).
+                    // §12.9.6 TemplateEscapeSequence: a template forbids legacy octal / `\8` / `\9`; only
+                    // `\0` (NOT followed by a DecimalDigit) is the NUL escape. Anything else here is a
+                    // NotEscapeSequence — an InvalidEscape. For an UNTAGGED template the caller surfaces
+                    // this as a SyntaxError; for a TAGGED template the cooked value becomes `undefined`.
                     if (esc == '0' and !(self.pos + 1 < self.src.len and isDigit(self.src[self.pos + 1]))) {
                         try buf.append(self.arena, 0);
                         self.pos += 1;
                         return;
                     }
-                    try buf.append(self.arena, esc);
-                    self.pos += 1;
-                    return;
+                    return LexError.InvalidEscape;
                 }
                 // NonOctalDecimalEscapeSequence (Annex B.1.2): `\8` / `\9` → the digit char `8`/`9`.
                 if (esc == '8' or esc == '9') {

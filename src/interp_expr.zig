@@ -30,6 +30,7 @@ const interp_ops = @import("interp_ops.zig");
 const interp_async = @import("interp_async.zig");
 const interp_native = @import("interp_native.zig");
 const interp_module = @import("interp_module.zig");
+const interp_template = @import("interp_template.zig");
 const interp_collection = @import("interp_collection.zig");
 
 const toNumber = ops.toNumber;
@@ -330,10 +331,14 @@ pub fn evalExpr(self: *Interpreter, node: *const ast.Node, env: *Environment) Ev
                 else => return self.throwError("SyntaxError", "Invalid update expression target"),
             }
         },
+        .tagged_template => |tt| return interp_template.evalTaggedTemplate(self, tt.tag, tt.quasi, env),
         .template => |t| {
-            // §13.2.8 — concatenate quasis with ToString of each substitution.
+            // §13.2.8 — concatenate quasis with ToString of each substitution. An UNTAGGED template's
+            // cooked segment is never null (the parser rejects an illegal escape as a SyntaxError), so
+            // the `orelse ""` is unreachable in practice (keeps the type honest for the tagged path).
             var buf: std.ArrayList(u8) = .empty;
-            for (t.quasis, 0..) |q, idx| {
+            for (t.quasis, 0..) |q_opt, idx| {
+                const q = q_opt orelse "";
                 try buf.appendSlice(self.arena, q);
                 if (idx < t.exprs.len) {
                     const c = try self.evalExpr(t.exprs[idx], env);

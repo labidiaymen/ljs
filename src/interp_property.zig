@@ -449,8 +449,10 @@ pub fn setProperty(self: *Interpreter, base: Value, key: []const u8, value: Valu
             }
             // §10.1.9.2 → §10.1.6.3: creating a NEW own property on a non-extensible object is
             // rejected ([[Set]] returns false → throw in strict). An EXISTING own (writable) property
-            // is still overwritten. Array indices are handled by the dense path above.
-            if (!o.extensible and o.kind != .array and o.properties.get(key) == null) {
+            // is still overwritten. Array `length`/indices are handled by the dense path above, so any
+            // array key reaching here is a NEW non-index string property (e.g. `frozenTemplate.x = 1`)
+            // — also rejected on a non-extensible array.
+            if (!o.extensible and o.properties.get(key) == null) {
                 if (self.strict) return self.throwError("TypeError", "Cannot add property, object is not extensible");
                 return .{ .normal = value };
             }

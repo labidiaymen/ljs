@@ -89,7 +89,17 @@ pub const Node = union(enum) {
     logical: struct { op: LogicalOp, left: *const Node, right: *const Node }, // §13.13
     conditional: struct { cond: *const Node, then: *const Node, otherwise: *const Node }, // §13.14 ?:
     update: struct { op: UpdateOp, prefix: bool, target: *const Node }, // §13.4 ++ / --
-    template: struct { quasis: []const []const u8, exprs: []const *const Node }, // §13.2.8 `a${x}b`
+    /// §13.2.8 TemplateLiteral `a${x}b`. `quasis` are the COOKED (TV) string segments (one more than
+    /// `exprs`); `raw` are the matching TRV raw segments (§12.9.6). For an UNTAGGED template a cooked
+    /// segment is always present; for a TAGGED template a quasi whose escape sequence was illegal has
+    /// `cooked = null` (§12.9.6.1 — the array slot becomes `undefined`), so cooked segments are
+    /// `?[]const u8`. Untagged evaluation never sees a null (the parser rejects an invalid escape in a
+    /// non-tagged template as a SyntaxError); only `GetTemplateObject` reads `null` as `undefined`.
+    template: struct { quasis: []const ?[]const u8, raw: []const []const u8, exprs: []const *const Node }, // §13.2.8 `a${x}b`
+    /// §13.2.8.3 TaggedTemplate `tag\`a${x}b\``. `tag` is the function being applied; `quasi` is the
+    /// `.template` node it is applied to (its AST identity is the §13.2.8.3 cache key — the same source
+    /// site yields the SAME frozen template object on every evaluation within a realm).
+    tagged_template: struct { tag: *const Node, quasi: *const Node },
     spread: *const Node, // §13.2.4 / §13.3 spread element `...expr` (in array literals & call args)
     this, // §13.2.1 ThisExpression
     /// §13.3.12 NewTarget MetaProperty `new` `.` `target` — evaluates to the active function's

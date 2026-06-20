@@ -100,6 +100,12 @@ pub const Interpreter = struct {
     /// §20.4.2.2 the GlobalSymbolRegistry — `Symbol.for(key)` returns the same Symbol for a given key
     /// string (creating it on first use). Lives for the realm's lifetime (arena-allocated).
     symbol_registry: std.StringHashMapUnmanaged(*Symbol) = .{},
+    /// §13.2.8.3 realm [[TemplateMap]] — the per-realm registry of GetTemplateObject results, keyed by
+    /// the TemplateLiteral's AST node identity (a stable per-parse pointer that stands in for "the same
+    /// Parse Node": the same source site re-uses the same key). A tagged template at one site therefore
+    /// returns the SAME frozen template object on every evaluation; different sites (or different realms,
+    /// since the map is per-`Interpreter`) get distinct objects. Lives for the realm's lifetime.
+    template_map: std.AutoHashMapUnmanaged(*const ast.Node, *object_mod.Object) = .{},
     /// §11.2.2 the running execution context's strict-mode flag. Set from the Script's strictness on
     /// `run`, and saved/restored to the active function's `FunctionData.strict` around each body
     /// (`callFunction`). Gates §6.2.5.6 PutValue to an UNRESOLVED IdentifierReference: in sloppy mode

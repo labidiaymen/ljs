@@ -518,6 +518,7 @@ pub fn containsArguments(node: *const ast.Node) bool {
             for (t.exprs) |e| if (containsArguments(e)) return true;
             return false;
         },
+        .tagged_template => |tt| return containsArguments(tt.tag) or containsArguments(tt.quasi),
         .optional => |o| {
             if (containsArguments(o.base)) return true;
             switch (o.link) {
@@ -1024,6 +1025,10 @@ pub fn descendNode(node: *const ast.Node, strict: bool) ParseError!void {
             try descendNode(p.value, strict);
         },
         .template => |t| for (t.exprs) |e| try descendNode(e, strict),
+        .tagged_template => |tt| {
+            try descendNode(tt.tag, strict);
+            try descendNode(tt.quasi, strict);
+        },
         .yield_expr => |y| if (y.argument) |e| try descendNode(e, strict),
         .optional => |o| {
             try descendNode(o.base, strict);
