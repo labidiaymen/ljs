@@ -1,0 +1,566 @@
+//! HOST runtime (Node axis, spec 103 Unit B — NOT ECMA-262): Node's `util` core module —
+//! `require('util')`. Provides `format`, `inspect`, `promisify`, `inherits`, `deprecate`, and a
+//! `types` predicate object. Installed host-only via the `host_require` core-module registry; never
+//! on the Test262 engine surface (host globals are not installed there).
+//!
+//! Mechanics mirror the other host modules: the module's exports are a plain object of
+//! `.util_method` natives (built once per run, cached by `host_require`). Per-instance state for the
+//! `promisify` wrapper / its callback (and `deprecate`) rides on hidden own `"%…%"` properties read
+//! off `func` in dispatch (`callNative` hands us `func`).
+const std = @import("std");
+const Value = @import("value.zig").Value;
+const object_mod = @import("object.zig");
+const Object = object_mod.Object;
+const Completion = @import("completion.zig").Completion;
+const interpreter = @import("interpreter.zig");
+const Interpreter = interpreter.Interpreter;
+const EvalError = interpreter.EvalError;
+const async_mod = @import("interp_async.zig");
+
+const eql = std.mem.eql;
+
+// ── build ──────────────────────────────────────────────────────────────────────
+
+/// Build the `util` module exports object (the `.core_module_cache` caller caches it).
+pub fn build(self: *Interpreter) EvalError!*Object {
+    const arena = self.arena;
+    const obj = try Object.create(arena, self.objectProto());
+
+    for ([_][]const u8{
+        "format",      "formatWithOptions", "inspect",   "promisify",
+        "callbackify", "inherits",          "deprecate", "isDeepStrictEqual",
+    }) |m|
+        try defineMethod(self, obj, m);
+
+    // util.types — a sub-object of predicate natives.
+    const types = try Object.create(arena, self.objectProto());
+    for ([_][]const u8{
+        "isDate",          "isRegExp",     "isNativeError", "isPromise",
+        "isArrayBuffer",   "isTypedArray", "isMap",         "isSet",
+        "isAsyncFunction",
+    }) |m|
+        try defineMethod(self, types, m);
+    try obj.defineData("types", .{ .object = types }, true, true, true);
+
+    return obj;
+}
+
+fn defineMethod(self: *Interpreter, target: *Object, name: []const u8) EvalError!void {
+    const arena = self.arena;
+    const fn_obj = try Object.createNative(arena, .util_method, name);
+    fn_obj.prototype = self.functionProto();
+    _ = fn_obj.properties.orderedRemove("prototype");
+    try fn_obj.defineData("name", .{ .string = name }, false, false, true);
+    try target.defineData(name, .{ .object = fn_obj }, true, true, true);
+}
+
+// ── dispatch ────────────────────────────────────────────────────────────────────
+
+/// Dispatch a `.util_method` native by its `native_name` (or by its hidden per-instance state for
+/// the promisify/deprecate wrappers).
+pub fn method(self: *Interpreter, func: *Object, this_val: Value, args: []const Value) EvalError!Completion {
+    _ = this_val;
+    const name = func.native_name;
+
+    // The promisify wrapper / its callback / the deprecate wrapper are `.util_method` natives
+    // distinguished by a hidden own state property.
+    if (func.get("%promisify_fn%") != null) return promisifyWrapper(self, func, args);
+    if (func.get("%promisify_promise%") != null) return promisifyCallback(self, func, args);
+    if (func.get("%deprecated_fn%") != null) return deprecateWrapper(self, func, args);
+
+    if (eql(u8, name, "format")) return format(self, args, 0);
+    if (eql(u8, name, "formatWithOptions")) return format(self, args, 1);
+    if (eql(u8, name, "inspect")) {
+        const v: Value = if (args.len > 0) args[0] else .undefined;
+        const s = try inspectValue(self, v, 0, false);
+        return .{ .normal = .{ .string = s } };
+    }
+    if (eql(u8, name, "promisify")) return promisify(self, args);
+    if (eql(u8, name, "callbackify")) return callbackify(self, args);
+    if (eql(u8, name, "inherits")) return inherits(self, args);
+    if (eql(u8, name, "deprecate")) return deprecate(self, args);
+    if (eql(u8, name, "isDeepStrictEqual")) {
+        const a: Value = if (args.len > 0) args[0] else .undefined;
+        const b: Value = if (args.len > 1) args[1] else .undefined;
+        return .{ .normal = .{ .boolean = try deepEqual(self, a, b) } };
+    }
+    // util.types.* predicates.
+    return typesPredicate(name, args);
+}
+
+// ── format ──────────────────────────────────────────────────────────────────────
+
+/// `util.format(fmt, ...args)` — substitute %s/%d/%i/%f/%j/%o/%O/%% in `fmt`; leftover args are
+/// appended space-separated. `arg_start` skips a leading options object (formatWithOptions).
+fn format(self: *Interpreter, all_args: []const Value, arg_start: usize) EvalError!Completion {
+    const arena = self.arena;
+    const args = if (all_args.len > arg_start) all_args[arg_start..] else all_args[all_args.len..];
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+
+    if (args.len == 0) return .{ .normal = .{ .string = "" } };
+
+    var arg_i: usize = 1; // args[0] is the format target.
+    const fmt0 = args[0];
+
+    if (fmt0 == .string) {
+        const f = fmt0.string;
+        var i: usize = 0;
+        while (i < f.len) {
+            const c = f[i];
+            if (c == '%' and i + 1 < f.len) {
+                const spec = f[i + 1];
+                switch (spec) {
+                    '%' => {
+                        out.append(arena, '%') catch return error.OutOfMemory;
+                        i += 2;
+                        continue;
+                    },
+                    's', 'd', 'i', 'f', 'j', 'o', 'O', 'c' => {
+                        if (arg_i < args.len) {
+                            const a = args[arg_i];
+                            arg_i += 1;
+                            const piece = try formatOne(self, spec, a);
+                            out.appendSlice(arena, piece) catch return error.OutOfMemory;
+                        } else {
+                            // No matching arg → emit the directive literally.
+                            out.append(arena, '%') catch return error.OutOfMemory;
+                            out.append(arena, spec) catch return error.OutOfMemory;
+                        }
+                        i += 2;
+                        continue;
+                    },
+                    else => {},
+                }
+            }
+            out.append(arena, c) catch return error.OutOfMemory;
+            i += 1;
+        }
+    } else {
+        // Non-string first arg → inspect it.
+        const s = try inspectValue(self, fmt0, 0, false);
+        out.appendSlice(arena, s) catch return error.OutOfMemory;
+    }
+
+    // Append leftover args, space-separated.
+    while (arg_i < args.len) : (arg_i += 1) {
+        out.append(arena, ' ') catch return error.OutOfMemory;
+        const a = args[arg_i];
+        const piece = if (a == .string) a.string else try inspectValue(self, a, 0, false);
+        out.appendSlice(arena, piece) catch return error.OutOfMemory;
+    }
+
+    return .{ .normal = .{ .string = out.items } };
+}
+
+/// Render one format directive's argument.
+fn formatOne(self: *Interpreter, spec: u8, a: Value) EvalError![]const u8 {
+    const arena = self.arena;
+    switch (spec) {
+        's' => {
+            // %s: strings as-is; objects via inspect; other primitives via String().
+            if (a == .string) return a.string;
+            if (a == .object) return inspectValue(self, a, 0, false);
+            const sc = try self.toStringValuePub(a);
+            if (sc.isAbrupt()) return "";
+            return sc.normal.string;
+        },
+        'd', 'i' => {
+            const n = try toNumber(self, a);
+            if (std.math.isNan(n)) return "NaN";
+            const t = std.math.trunc(n);
+            return numToString(arena, t);
+        },
+        'f' => {
+            const n = try toNumber(self, a);
+            return numToString(arena, n);
+        },
+        'j' => return jsonStringify(self, a),
+        'o', 'O' => return inspectValue(self, a, 0, false),
+        'c' => return "", // CSS directive — consumed, renders nothing.
+        else => return "",
+    }
+}
+
+fn numToString(arena: std.mem.Allocator, n: f64) ![]const u8 {
+    if (std.math.isNan(n)) return "NaN";
+    if (std.math.isInf(n)) return if (n > 0) "Infinity" else "-Infinity";
+    if (n == std.math.trunc(n) and @abs(n) < 1e21) {
+        return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))}) catch error.OutOfMemory;
+    }
+    return std.fmt.allocPrint(arena, "{d}", .{n}) catch error.OutOfMemory;
+}
+
+fn toNumber(self: *Interpreter, v: Value) EvalError!f64 {
+    _ = self;
+    return switch (v) {
+        .number => v.number,
+        .boolean => if (v.boolean) 1 else 0,
+        .null => 0,
+        .undefined => std.math.nan(f64),
+        .string => std.fmt.parseFloat(f64, std.mem.trim(u8, v.string, " \t\r\n")) catch std.math.nan(f64),
+        else => std.math.nan(f64),
+    };
+}
+
+fn jsonStringify(self: *Interpreter, v: Value) EvalError![]const u8 {
+    const g = self.globals orelse return "undefined";
+    const json_b = g.lookup("JSON") orelse return "undefined";
+    if (json_b.value != .object) return "undefined";
+    const sv = json_b.value.object.get("stringify") orelse return "undefined";
+    if (sv != .object) return "undefined";
+    const c = try self.callFunction(sv.object, &.{v}, json_b.value);
+    if (c.isAbrupt()) return "undefined";
+    if (c.normal == .string) return c.normal.string;
+    return "undefined";
+}
+
+// ── inspect ─────────────────────────────────────────────────────────────────────
+
+/// `util.inspect(value)` — a readable rendering. `depth` is the current nesting depth (~2 max);
+/// `quoted` requests string quoting (true for strings nested inside a container).
+fn inspectValue(self: *Interpreter, v: Value, depth: usize, quoted: bool) EvalError![]const u8 {
+    const arena = self.arena;
+    switch (v) {
+        .undefined => return "undefined",
+        .null => return "null",
+        .boolean => return if (v.boolean) "true" else "false",
+        .number => return numToString(arena, v.number),
+        .string => {
+            if (!quoted) return v.string;
+            return std.fmt.allocPrint(arena, "'{s}'", .{v.string}) catch error.OutOfMemory;
+        },
+        .symbol => {
+            const desc = v.symbol.description orelse "";
+            return std.fmt.allocPrint(arena, "Symbol({s})", .{desc}) catch error.OutOfMemory;
+        },
+        .object => return inspectObject(self, v.object, depth),
+        else => {
+            const sc = try self.toStringValuePub(v);
+            if (sc.isAbrupt()) return "";
+            return sc.normal.string;
+        },
+    }
+}
+
+fn inspectObject(self: *Interpreter, obj: *Object, depth: usize) EvalError![]const u8 {
+    const arena = self.arena;
+
+    // Functions → [Function: name] / [Function (anonymous)].
+    if (obj.kind == .function) {
+        const nm = funcName(obj);
+        if (nm.len == 0) return "[Function (anonymous)]";
+        return std.fmt.allocPrint(arena, "[Function: {s}]", .{nm}) catch error.OutOfMemory;
+    }
+    // RegExp → /source/flags.
+    if (obj.regexp != null) {
+        const sc = try self.getProperty(.{ .object = obj }, "source");
+        const fc = try self.getProperty(.{ .object = obj }, "flags");
+        const src = if (!sc.isAbrupt() and sc.normal == .string) sc.normal.string else "";
+        const flg = if (!fc.isAbrupt() and fc.normal == .string) fc.normal.string else "";
+        return std.fmt.allocPrint(arena, "/{s}/{s}", .{ src, flg }) catch error.OutOfMemory;
+    }
+    // Date → ISO string.
+    if (obj.date_value != null) {
+        const c = try self.getProperty(.{ .object = obj }, "toISOString");
+        if (!c.isAbrupt() and c.normal == .object) {
+            const r = try self.callFunction(c.normal.object, &.{}, .{ .object = obj });
+            if (!r.isAbrupt() and r.normal == .string) return r.normal.string;
+        }
+        return "[Date]";
+    }
+    // Error → its toString (e.g. "Error: boom").
+    if (obj.error_data) {
+        const sc = try self.toStringValuePub(.{ .object = obj });
+        if (!sc.isAbrupt() and sc.normal == .string) return sc.normal.string;
+        return "[Error]";
+    }
+
+    // Depth limit: beyond ~2 levels, summarize.
+    if (depth > 2) {
+        if (obj.kind == .array) return "[Array]";
+        return "[Object]";
+    }
+
+    // Arrays → [ a, b, c ].
+    if (obj.kind == .array) {
+        const len = obj.arrayLen();
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        out.appendSlice(arena, "[") catch return error.OutOfMemory;
+        var i: usize = 0;
+        var first = true;
+        while (i < len) : (i += 1) {
+            if (!first) out.appendSlice(arena, ",") catch return error.OutOfMemory;
+            out.append(arena, ' ') catch return error.OutOfMemory;
+            first = false;
+            const ev = obj.arrayGet(i);
+            const s = try inspectValue(self, ev, depth + 1, true);
+            out.appendSlice(arena, s) catch return error.OutOfMemory;
+        }
+        if (!first) out.append(arena, ' ') catch return error.OutOfMemory;
+        out.appendSlice(arena, "]") catch return error.OutOfMemory;
+        return out.items;
+    }
+
+    // Plain object → { k: v, … } over own enumerable string-keyed props.
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(arena, "{") catch return error.OutOfMemory;
+    var first = true;
+    var it = obj.properties.iterator();
+    while (it.next()) |entry| {
+        const pv = entry.value_ptr.*;
+        if (!pv.enumerable) continue;
+        const key = entry.key_ptr.*;
+        if (key.len > 0 and key[0] == '%') continue; // skip hidden host state
+        if (!first) out.appendSlice(arena, ",") catch return error.OutOfMemory;
+        out.append(arena, ' ') catch return error.OutOfMemory;
+        first = false;
+        if (isIdentifier(key)) {
+            out.appendSlice(arena, key) catch return error.OutOfMemory;
+        } else {
+            const qk = std.fmt.allocPrint(arena, "'{s}'", .{key}) catch return error.OutOfMemory;
+            out.appendSlice(arena, qk) catch return error.OutOfMemory;
+        }
+        out.appendSlice(arena, ": ") catch return error.OutOfMemory;
+        const sv = switch (pv.payload) {
+            .data => try inspectValue(self, pv.payload.data, depth + 1, true),
+            .accessor => "[Getter/Setter]",
+        };
+        out.appendSlice(arena, sv) catch return error.OutOfMemory;
+    }
+    if (!first) out.append(arena, ' ') catch return error.OutOfMemory;
+    out.appendSlice(arena, "}") catch return error.OutOfMemory;
+    return out.items;
+}
+
+fn funcName(obj: *Object) []const u8 {
+    if (obj.get("name")) |nv| if (nv == .string) return nv.string;
+    if (obj.native_name.len > 0) return obj.native_name;
+    return "";
+}
+
+fn isIdentifier(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s, 0..) |c, i| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$' or
+            (i > 0 and c >= '0' and c <= '9');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// ── promisify ───────────────────────────────────────────────────────────────────
+
+/// `util.promisify(fn)` → a function that, when called, returns a Promise and invokes
+/// `fn(...args, callback)` where `callback(err, value)` settles the promise.
+fn promisify(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const arena = self.arena;
+    const fn_v: Value = if (args.len > 0) args[0] else .undefined;
+    if (fn_v != .object or fn_v.object.kind != .function) {
+        return self.throwError("TypeError", "The \"original\" argument must be of type function");
+    }
+    const wrapper = try Object.createNative(arena, .util_method, "");
+    wrapper.prototype = self.functionProto();
+    _ = wrapper.properties.orderedRemove("prototype");
+    // Hidden own state: the wrapped function (its presence flags this native as the wrapper).
+    try wrapper.defineData("%promisify_fn%", fn_v, false, false, true);
+    try wrapper.defineData("name", .{ .string = "" }, false, false, true);
+    return .{ .normal = .{ .object = wrapper } };
+}
+
+/// The promisify wrapper's behavior: make a Promise, build a settling callback carrying it, call the
+/// original `fn(...args, callback)`. A synchronous throw of `fn` rejects the promise.
+fn promisifyWrapper(self: *Interpreter, func: *Object, args: []const Value) EvalError!Completion {
+    const arena = self.arena;
+    const fn_v = func.get("%promisify_fn%") orelse return self.throwError("TypeError", "promisify: missing original");
+    if (fn_v != .object) return self.throwError("TypeError", "promisify: original not callable");
+
+    const promise = try async_mod.newPromise(self);
+
+    // Build the (err, value) callback native carrying the promise.
+    const cb = try Object.createNative(arena, .util_method, "");
+    cb.prototype = self.functionProto();
+    _ = cb.properties.orderedRemove("prototype");
+    try cb.defineData("%promisify_promise%", .{ .object = promise }, false, false, true);
+
+    // call_args = [...args, cb].
+    var call_args: std.ArrayListUnmanaged(Value) = .empty;
+    call_args.appendSlice(arena, args) catch return error.OutOfMemory;
+    call_args.append(arena, .{ .object = cb }) catch return error.OutOfMemory;
+
+    const c = try self.callFunction(fn_v.object, call_args.items, .undefined);
+    if (c == .throw) {
+        // A synchronous throw rejects the promise (Node wraps it).
+        try async_mod.rejectPromise(self, promise, c.throw);
+    }
+    return .{ .normal = .{ .object = promise } };
+}
+
+/// The settling callback: `(err, value)` → reject on a truthy `err`, else resolve with `value`.
+fn promisifyCallback(self: *Interpreter, func: *Object, args: []const Value) EvalError!Completion {
+    const pv = func.get("%promisify_promise%") orelse return .{ .normal = .undefined };
+    if (pv != .object) return .{ .normal = .undefined };
+    const promise = pv.object;
+    const err: Value = if (args.len > 0) args[0] else .undefined;
+    if (truthy(err)) {
+        try async_mod.rejectPromise(self, promise, err);
+    } else {
+        const res: Value = if (args.len > 1) args[1] else .undefined;
+        try async_mod.resolvePromise(self, promise, res);
+    }
+    return .{ .normal = .undefined };
+}
+
+fn truthy(v: Value) bool {
+    return switch (v) {
+        .undefined, .null => false,
+        .boolean => v.boolean,
+        .number => v.number != 0 and !std.math.isNan(v.number),
+        .string => v.string.len > 0,
+        else => true,
+    };
+}
+
+// ── callbackify ─────────────────────────────────────────────────────────────────
+
+/// `util.callbackify(fn)` (minimal): validate + return the original. Full callbackify (await the
+/// returned thenable, invoke a trailing node-style callback) is deferred — sufficient for the smoke
+/// path and never on the conformance surface.
+fn callbackify(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const fn_v: Value = if (args.len > 0) args[0] else .undefined;
+    if (fn_v != .object or fn_v.object.kind != .function)
+        return self.throwError("TypeError", "The \"original\" argument must be of type function");
+    return .{ .normal = fn_v };
+}
+
+// ── inherits ────────────────────────────────────────────────────────────────────
+
+/// `util.inherits(ctor, superCtor)` — set `ctor.super_ = superCtor` and
+/// `ctor.prototype = Object.create(superCtor.prototype)` with a `constructor` back-reference.
+fn inherits(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const arena = self.arena;
+    const ctor_v: Value = if (args.len > 0) args[0] else .undefined;
+    const super_v: Value = if (args.len > 1) args[1] else .undefined;
+    if (ctor_v != .object or ctor_v.object.kind != .function)
+        return self.throwError("TypeError", "The \"ctor\" argument must be of type function");
+    if (super_v != .object or super_v.object.kind != .function)
+        return self.throwError("TypeError", "The \"superCtor\" argument must be of type function");
+
+    const ctor = ctor_v.object;
+    const super = super_v.object;
+
+    // ctor.super_ = superCtor.
+    try ctor.defineData("super_", super_v, true, false, true);
+
+    // ctor.prototype = Object.create(superCtor.prototype) with a non-enumerable `constructor`.
+    const super_proto_v = super.get("prototype");
+    const super_proto: ?*Object = if (super_proto_v) |spv| (if (spv == .object) spv.object else null) else null;
+    const new_proto = try Object.create(arena, super_proto);
+    try new_proto.defineData("constructor", ctor_v, true, false, true);
+    try ctor.defineData("prototype", .{ .object = new_proto }, false, false, false);
+
+    return .{ .normal = .undefined };
+}
+
+// ── deprecate ───────────────────────────────────────────────────────────────────
+
+/// `util.deprecate(fn, msg)` → a wrapper that (best-effort) warns once then forwards to the original.
+fn deprecate(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const arena = self.arena;
+    const fn_v: Value = if (args.len > 0) args[0] else .undefined;
+    if (fn_v != .object or fn_v.object.kind != .function) {
+        // Node returns the value unchanged for a non-function.
+        return .{ .normal = fn_v };
+    }
+    const msg_v: Value = if (args.len > 1) args[1] else .{ .string = "" };
+    const wrapper = try Object.createNative(arena, .util_method, "");
+    wrapper.prototype = self.functionProto();
+    _ = wrapper.properties.orderedRemove("prototype");
+    try wrapper.defineData("%deprecated_fn%", fn_v, false, false, true);
+    try wrapper.defineData("%deprecated_msg%", msg_v, false, false, true);
+    try wrapper.defineData("%deprecated_warned%", .{ .boolean = false }, true, false, true);
+    return .{ .normal = .{ .object = wrapper } };
+}
+
+fn deprecateWrapper(self: *Interpreter, func: *Object, args: []const Value) EvalError!Completion {
+    const fn_v = func.get("%deprecated_fn%") orelse return .{ .normal = .undefined };
+    if (fn_v != .object) return .{ .normal = .undefined };
+    // Warn once (best-effort; flip the flag — no host stderr dependency).
+    const warned = func.get("%deprecated_warned%");
+    if (warned == null or warned.? != .boolean or !warned.?.boolean) {
+        try func.defineData("%deprecated_warned%", .{ .boolean = true }, true, false, true);
+    }
+    return self.callFunction(fn_v.object, args, .undefined);
+}
+
+// ── types predicates ────────────────────────────────────────────────────────────
+
+fn typesPredicate(name: []const u8, args: []const Value) EvalError!Completion {
+    const v: Value = if (args.len > 0) args[0] else .undefined;
+    const obj: ?*Object = if (v == .object) v.object else null;
+    const r: bool = blk: {
+        const o = obj orelse break :blk false;
+        if (eql(u8, name, "isDate")) break :blk o.date_value != null;
+        if (eql(u8, name, "isRegExp")) break :blk o.regexp != null;
+        if (eql(u8, name, "isNativeError")) break :blk o.error_data;
+        if (eql(u8, name, "isPromise")) break :blk o.promise != null;
+        if (eql(u8, name, "isArrayBuffer")) break :blk o.kind == .array_buffer;
+        if (eql(u8, name, "isTypedArray")) break :blk o.typed_array != null;
+        if (eql(u8, name, "isMap")) break :blk o.collection != null and o.collection.?.kind == .map;
+        if (eql(u8, name, "isSet")) break :blk o.collection != null and o.collection.?.kind == .set;
+        if (eql(u8, name, "isAsyncFunction")) break :blk o.kind == .function and o.call != null and o.call.?.is_async;
+        break :blk false;
+    };
+    return .{ .normal = .{ .boolean = r } };
+}
+
+// ── isDeepStrictEqual ────────────────────────────────────────────────────────────
+
+/// A pragmatic structural deep-equality (SameValue on primitives, recursive on own enumerable
+/// string keys / array elements). Sufficient for the common smoke path; not a full SameValueZero +
+/// Map/Set/typed-array walk.
+fn deepEqual(self: *Interpreter, a: Value, b: Value) EvalError!bool {
+    if (a == .object and b == .object) {
+        const oa = a.object;
+        const ob = b.object;
+        if (oa == ob) return true;
+        if (oa.kind == .array and ob.kind == .array) {
+            const la = oa.arrayLen();
+            if (la != ob.arrayLen()) return false;
+            var i: usize = 0;
+            while (i < la) : (i += 1) {
+                if (!try deepEqual(self, oa.arrayGet(i), ob.arrayGet(i))) return false;
+            }
+            return true;
+        }
+        // Plain objects: same set of own enumerable string keys + equal values.
+        if (!try sameKeys(self, oa, ob)) return false;
+        if (!try sameKeys(self, ob, oa)) return false;
+        return true;
+    }
+    return sameValue(a, b);
+}
+
+fn sameKeys(self: *Interpreter, oa: *Object, ob: *Object) EvalError!bool {
+    var it = oa.properties.iterator();
+    while (it.next()) |entry| {
+        const pv = entry.value_ptr.*;
+        if (!pv.enumerable or pv.payload != .data) continue;
+        const key = entry.key_ptr.*;
+        if (key.len > 0 and key[0] == '%') continue;
+        const bv = ob.get(key) orelse return false;
+        if (!try deepEqual(self, pv.payload.data, bv)) return false;
+    }
+    return true;
+}
+
+fn sameValue(a: Value, b: Value) bool {
+    return switch (a) {
+        .undefined => b == .undefined,
+        .null => b == .null,
+        .boolean => b == .boolean and a.boolean == b.boolean,
+        .number => b == .number and (a.number == b.number or (std.math.isNan(a.number) and std.math.isNan(b.number))),
+        .string => b == .string and std.mem.eql(u8, a.string, b.string),
+        .object => b == .object and a.object == b.object,
+        else => std.meta.eql(a, b),
+    };
+}
