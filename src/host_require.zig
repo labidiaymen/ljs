@@ -296,7 +296,7 @@ pub fn installEntryRequire(self: *Interpreter, script_path: []const u8, script_d
 //  core module registry: path / fs / os
 // ════════════════════════════════════════════════════════════════════════════
 
-const core_modules = [_][]const u8{ "path", "fs", "os" };
+const core_modules = [_][]const u8{ "path", "fs", "os", "events" };
 
 /// Strip a `node:` prefix (Node accepts `node:path` etc.).
 fn coreName(spec: []const u8) []const u8 {
@@ -321,6 +321,8 @@ fn loadCoreModule(self: *Interpreter, name: []const u8) EvalError!Completion {
 /// Build a core module object: a plain object of `.core_module_fn` natives + a few data properties,
 /// each native flagged with its module via a hidden own `"%mod%"` property.
 fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
+    // The `events` module's exports IS the `EventEmitter` class itself (spec 103, host_events.zig).
+    if (std.mem.eql(u8, name, "events")) return @import("host_events.zig").build(self);
     const arena = self.arena;
     const obj = try Object.create(arena, self.objectProto());
     if (std.mem.eql(u8, name, "path")) {

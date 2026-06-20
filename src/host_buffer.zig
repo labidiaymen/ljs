@@ -11,6 +11,7 @@ const Completion = @import("completion.zig").Completion;
 const interpreter = @import("interpreter.zig");
 const Interpreter = interpreter.Interpreter;
 const EvalError = interpreter.EvalError;
+const rw = @import("host_buffer_rw.zig");
 
 // ── install ──────────────────────────────────────────────────────────────────
 
@@ -32,14 +33,19 @@ pub fn installBuffer(self: *Interpreter, function_proto: ?*Object) EvalError!voi
     try proto.defineData("constructor", .{ .object = ctor }, true, false, true);
 
     // Statics.
-    for ([_][]const u8{ "alloc", "allocUnsafe", "allocUnsafeSlow", "from", "isBuffer", "byteLength", "concat" }) |name|
+    for ([_][]const u8{ "alloc", "allocUnsafe", "allocUnsafeSlow", "from", "isBuffer", "byteLength", "concat", "compare" }) |name|
         try defineMethod(self, ctor, name, function_proto);
     // Prototype methods.
     for ([_][]const u8{
-        "toString",      "write",         "slice",        "subarray",     "equals",
-        "toJSON",        "readUInt8",     "writeUInt8",   "readUInt16LE", "readUInt16BE",
-        "writeUInt16LE", "writeUInt16BE", "readUInt32LE", "readUInt32BE", "writeUInt32LE",
-        "writeUInt32BE",
+        "toString",      "write",         "slice",         "subarray",      "equals",        "toJSON",
+        "indexOf",       "lastIndexOf",   "includes",      "fill",          "copy",          "compare",
+        "swap16",        "swap32",
+        // Numeric read/write matrix (dispatched via host_buffer_rw.zig).
+               "readInt8",      "readUInt8",     "writeInt8",     "writeUInt8",
+        "readInt16LE",   "readInt16BE",   "readUInt16LE",  "readUInt16BE",  "writeInt16LE",  "writeInt16BE",
+        "writeUInt16LE", "writeUInt16BE", "readInt32LE",   "readInt32BE",   "readUInt32LE",  "readUInt32BE",
+        "writeInt32LE",  "writeInt32BE",  "writeUInt32LE", "writeUInt32BE", "readFloatLE",   "readFloatBE",
+        "writeFloatLE",  "writeFloatBE",  "readDoubleLE",  "readDoubleBE",  "writeDoubleLE", "writeDoubleBE",
     }) |name|
         try defineMethod(self, proto, name, function_proto);
 
@@ -207,6 +213,10 @@ pub fn bufferFn(self: *Interpreter, name: []const u8, this_val: Value, args: []c
     if (eq(u8, name, "isBuffer")) return .{ .normal = .{ .boolean = isBuffer(self, if (args.len > 0) args[0] else .undefined) } };
     if (eq(u8, name, "byteLength")) return bByteLength(self, args);
     if (eq(u8, name, "concat")) return bConcat(self, args);
+    // `Buffer.compare(a, b)` static vs `buf.compare(other)` prototype: the static form has a non-Buffer
+    // `this_val` (the `Buffer` ctor) and reads both operands from args.
+    if (eq(u8, name, "compare") and !(this_val == .object and bytesOf(this_val.object) != null))
+        return bCompareStatic(self, args);
     // Prototype methods (receiver = this_val).
     const recv = this_val;
     if (recv != .object) return self.throwError("TypeError", "Buffer method called on non-object");
@@ -217,7 +227,15 @@ pub fn bufferFn(self: *Interpreter, name: []const u8, this_val: Value, args: []c
     if (eq(u8, name, "slice") or eq(u8, name, "subarray")) return bSlice(self, buf, bytes.len, args);
     if (eq(u8, name, "equals")) return bEquals(self, bytes, args);
     if (eq(u8, name, "toJSON")) return bToJSON(self, bytes);
-    return readWrite(self, bytes, name, args);
+    if (eq(u8, name, "indexOf")) return bIndexOf(self, bytes, args, .first);
+    if (eq(u8, name, "lastIndexOf")) return bIndexOf(self, bytes, args, .last);
+    if (eq(u8, name, "includes")) return bIndexOf(self, bytes, args, .includes);
+    if (eq(u8, name, "fill")) return bFill(self, buf, bytes, args);
+    if (eq(u8, name, "copy")) return bCopy(self, bytes, args);
+    if (eq(u8, name, "compare")) return bCompare(self, bytes, args);
+    if (eq(u8, name, "swap16") or eq(u8, name, "swap32")) return bSwap(self, buf, bytes, eq(u8, name, "swap16"));
+    if (try rw.readWrite(self, bytes, name, args)) |c| return c;
+    return .{ .normal = .undefined };
 }
 
 fn isBuffer(self: *Interpreter, v: Value) bool {
@@ -437,65 +455,171 @@ fn bToJSON(self: *Interpreter, bytes: []u8) EvalError!Completion {
     return .{ .normal = .{ .object = obj } };
 }
 
-/// The small read/write numeric matrix (UInt8 / UInt16LE/BE / UInt32LE/BE).
-fn readWrite(self: *Interpreter, bytes: []u8, name: []const u8, args: []const Value) EvalError!Completion {
-    const eq = std.mem.eql;
-    const off = try toIndex(self, if (args.len > 0 and !std.mem.startsWith(u8, name, "write")) args[0] else (if (args.len > 1) args[1] else .undefined), 0, bytes.len);
-    if (std.mem.startsWith(u8, name, "read")) {
-        const ro = try toIndex(self, if (args.len > 0) args[0] else .undefined, 0, bytes.len);
-        if (eq(u8, name, "readUInt8")) {
-            if (ro >= bytes.len) return self.throwError("RangeError", "out of range");
-            return .{ .normal = .{ .number = @floatFromInt(bytes[ro]) } };
+// ── search / fill / copy / compare / swap ────────────────────────────────────
+
+/// Resolve a search "needle" argument to a byte sequence: a number → a single byte; a string →
+/// encoded bytes; a Buffer/Uint8Array → its bytes. Returns null for an unsupported value.
+fn needleBytes(self: *Interpreter, v: Value, enc: Enc) EvalError!?[]const u8 {
+    switch (v) {
+        .number => |n| {
+            const b: u8 = @truncate(@as(u64, @intFromFloat(@mod(@max(@trunc(n), 0), 256))));
+            const out = self.arena.alloc(u8, 1) catch return error.OutOfMemory;
+            out[0] = b;
+            return out;
+        },
+        .string => |s| return try encode(self.arena, s, enc),
+        .object => |o| return bytesOf(o),
+        else => return null,
+    }
+}
+
+const SearchKind = enum { first, last, includes };
+
+fn bIndexOf(self: *Interpreter, bytes: []u8, args: []const Value, kind: SearchKind) EvalError!Completion {
+    const val: Value = if (args.len > 0) args[0] else .undefined;
+    // Trailing encoding arg: indexOf(value[, byteOffset[, encoding]]).
+    const enc: Enc = if (args.len > 2) try argEnc(self, args[2]) else (if (args.len > 1 and args[1] == .string) try argEnc(self, args[1]) else Enc.utf8);
+    const needle = (try needleBytes(self, val, enc)) orelse return notFound(kind, bytes.len);
+
+    // byteOffset (only when args[1] is not the encoding string).
+    const has_off = args.len > 1 and args[1] != .string;
+    var start: i64 = if (kind == .last) @as(i64, @intCast(bytes.len)) else 0;
+    if (has_off) {
+        const nd = try self.toNumberV(args[1]);
+        if (nd.isAbrupt()) return nd;
+        var n = nd.normal.number;
+        if (std.math.isNan(n)) n = if (kind == .last) @floatFromInt(bytes.len) else 0;
+        n = @trunc(n);
+        if (n < 0) n += @floatFromInt(bytes.len);
+        start = @intFromFloat(n);
+    }
+
+    if (needle.len == 0) {
+        // Empty needle: Node returns clamped offset (or length).
+        var s = start;
+        if (s < 0) s = 0;
+        if (s > @as(i64, @intCast(bytes.len))) s = @intCast(bytes.len);
+        return found(kind, @intCast(s), bytes.len);
+    }
+
+    if (kind == .last) {
+        // Search backwards; start is the highest index the match may BEGIN at.
+        if (start < 0) return notFound(kind, bytes.len);
+        var i: i64 = @min(start, @as(i64, @intCast(bytes.len)) - @as(i64, @intCast(needle.len)));
+        while (i >= 0) : (i -= 1) {
+            const u: usize = @intCast(i);
+            if (std.mem.eql(u8, bytes[u .. u + needle.len], needle)) return found(kind, u, bytes.len);
         }
-        if (eq(u8, name, "readUInt16LE") or eq(u8, name, "readUInt16BE")) {
-            if (ro + 2 > bytes.len) return self.throwError("RangeError", "out of range");
-            const le = eq(u8, name, "readUInt16LE");
-            const v: u16 = if (le) @as(u16, bytes[ro]) | (@as(u16, bytes[ro + 1]) << 8) else (@as(u16, bytes[ro]) << 8) | @as(u16, bytes[ro + 1]);
-            return .{ .normal = .{ .number = @floatFromInt(v) } };
-        }
-        if (eq(u8, name, "readUInt32LE") or eq(u8, name, "readUInt32BE")) {
-            if (ro + 4 > bytes.len) return self.throwError("RangeError", "out of range");
-            const le = eq(u8, name, "readUInt32LE");
-            var v: u32 = 0;
-            if (le) {
-                inline for (0..4) |k| v |= @as(u32, bytes[ro + k]) << (8 * k);
+        return notFound(kind, bytes.len);
+    }
+    // first / includes: forward.
+    var s = start;
+    if (s < 0) s = 0;
+    var i: usize = @intCast(s);
+    while (i + needle.len <= bytes.len) : (i += 1) {
+        if (std.mem.eql(u8, bytes[i .. i + needle.len], needle)) return found(kind, i, bytes.len);
+    }
+    return notFound(kind, bytes.len);
+}
+
+fn found(kind: SearchKind, idx: usize, len: usize) Completion {
+    _ = len;
+    if (kind == .includes) return .{ .normal = .{ .boolean = true } };
+    return .{ .normal = .{ .number = @floatFromInt(idx) } };
+}
+
+fn notFound(kind: SearchKind, len: usize) Completion {
+    _ = len;
+    if (kind == .includes) return .{ .normal = .{ .boolean = false } };
+    return .{ .normal = .{ .number = -1 } };
+}
+
+/// fill(value[, start[, end]][, encoding]). Mutates and returns the buffer.
+fn bFill(self: *Interpreter, buf: *Object, bytes: []u8, args: []const Value) EvalError!Completion {
+    const val: Value = if (args.len > 0) args[0] else .undefined;
+    // Optional trailing encoding string (in slot 1, 2, or 3).
+    var enc: Enc = .utf8;
+    var n_numeric: usize = args.len; // count of args excluding a trailing encoding string
+    if (args.len > 1 and args[args.len - 1] == .string and val != .string) {
+        // Only treat the last arg as encoding if value is non-string (string value + 1 arg is ambiguous;
+        // Node treats fill(str) start/end numeric). Conservative: trailing string = encoding.
+        enc = try argEnc(self, args[args.len - 1]);
+        n_numeric = args.len - 1;
+    } else if (val == .string and args.len >= 2 and args[args.len - 1] == .string) {
+        enc = try argEnc(self, args[args.len - 1]);
+        n_numeric = args.len - 1;
+    }
+    const start = try toIndex(self, if (n_numeric > 1) args[1] else .undefined, 0, bytes.len);
+    const end = try toIndex(self, if (n_numeric > 2) args[2] else .undefined, bytes.len, bytes.len);
+    if (end <= start) return .{ .normal = .{ .object = buf } };
+    const region = bytes[start..end];
+    switch (val) {
+        .string => {
+            const filler = try encode(self.arena, val.string, enc);
+            if (filler.len == 0) {
+                @memset(region, 0);
             } else {
-                inline for (0..4) |k| v = (v << 8) | @as(u32, bytes[ro + k]);
+                var i: usize = 0;
+                while (i < region.len) : (i += 1) region[i] = filler[i % filler.len];
             }
-            return .{ .normal = .{ .number = @floatFromInt(v) } };
-        }
-        return .{ .normal = .undefined };
+        },
+        else => {
+            const nd = try self.toNumberV(val);
+            if (nd.isAbrupt()) return nd;
+            const b: u8 = @truncate(@as(u64, @intFromFloat(@mod(@max(@trunc(nd.normal.number), 0), 256))));
+            @memset(region, b);
+        },
     }
-    // write*: value is arg[0], offset arg[1].
-    const nd = try self.toNumberV(if (args.len > 0) args[0] else .undefined);
-    if (nd.isAbrupt()) return nd;
-    const val: u64 = @intFromFloat(@mod(@max(nd.normal.number, 0), 4294967296.0));
-    if (eq(u8, name, "writeUInt8")) {
-        if (off >= bytes.len) return self.throwError("RangeError", "out of range");
-        bytes[off] = @truncate(val);
-        return .{ .normal = .{ .number = @floatFromInt(off + 1) } };
-    }
-    if (eq(u8, name, "writeUInt16LE") or eq(u8, name, "writeUInt16BE")) {
-        if (off + 2 > bytes.len) return self.throwError("RangeError", "out of range");
-        const v: u16 = @truncate(val);
-        if (eq(u8, name, "writeUInt16LE")) {
-            bytes[off] = @truncate(v);
-            bytes[off + 1] = @truncate(v >> 8);
-        } else {
-            bytes[off] = @truncate(v >> 8);
-            bytes[off + 1] = @truncate(v);
-        }
-        return .{ .normal = .{ .number = @floatFromInt(off + 2) } };
-    }
-    if (eq(u8, name, "writeUInt32LE") or eq(u8, name, "writeUInt32BE")) {
-        if (off + 4 > bytes.len) return self.throwError("RangeError", "out of range");
-        const v: u32 = @truncate(val);
-        if (eq(u8, name, "writeUInt32LE")) {
-            inline for (0..4) |k| bytes[off + k] = @truncate(v >> (8 * k));
-        } else {
-            inline for (0..4) |k| bytes[off + k] = @truncate(v >> (8 * (3 - k)));
-        }
-        return .{ .normal = .{ .number = @floatFromInt(off + 4) } };
-    }
-    return .{ .normal = .undefined };
+    return .{ .normal = .{ .object = buf } };
+}
+
+/// copy(target[, targetStart[, sourceStart[, sourceEnd]]]). Returns the number of bytes copied.
+fn bCopy(self: *Interpreter, bytes: []u8, args: []const Value) EvalError!Completion {
+    const target: Value = if (args.len > 0) args[0] else .undefined;
+    if (target != .object) return self.throwError("TypeError", "argument must be a Buffer or Uint8Array");
+    const dst = bytesOf(target.object) orelse return self.throwError("TypeError", "argument must be a Buffer or Uint8Array");
+    const t_start = try toIndex(self, if (args.len > 1) args[1] else .undefined, 0, dst.len);
+    const s_start = try toIndex(self, if (args.len > 2) args[2] else .undefined, 0, bytes.len);
+    const s_end = try toIndex(self, if (args.len > 3) args[3] else .undefined, bytes.len, bytes.len);
+    if (s_end <= s_start or t_start >= dst.len) return .{ .normal = .{ .number = 0 } };
+    const n = @min(s_end - s_start, dst.len - t_start);
+    // Source and target may overlap (same backing ArrayBuffer); use a forward/backward safe move.
+    std.mem.copyForwards(u8, dst[t_start .. t_start + n], bytes[s_start .. s_start + n]);
+    return .{ .normal = .{ .number = @floatFromInt(n) } };
+}
+
+/// Lexicographic byte comparison → -1 / 0 / 1.
+fn cmpBytes(a: []const u8, b: []const u8) f64 {
+    return switch (std.mem.order(u8, a, b)) {
+        .lt => -1,
+        .eq => 0,
+        .gt => 1,
+    };
+}
+
+fn bCompare(self: *Interpreter, bytes: []u8, args: []const Value) EvalError!Completion {
+    const other: Value = if (args.len > 0) args[0] else .undefined;
+    if (other != .object) return self.throwError("TypeError", "argument must be a Buffer or Uint8Array");
+    const ob = bytesOf(other.object) orelse return self.throwError("TypeError", "argument must be a Buffer or Uint8Array");
+    return .{ .normal = .{ .number = cmpBytes(bytes, ob) } };
+}
+
+/// Static `Buffer.compare(a, b)`.
+fn bCompareStatic(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const a: Value = if (args.len > 0) args[0] else .undefined;
+    const b: Value = if (args.len > 1) args[1] else .undefined;
+    if (a != .object or b != .object) return self.throwError("TypeError", "arguments must be Buffers or Uint8Arrays");
+    const ab = bytesOf(a.object) orelse return self.throwError("TypeError", "arguments must be Buffers or Uint8Arrays");
+    const bb = bytesOf(b.object) orelse return self.throwError("TypeError", "arguments must be Buffers or Uint8Arrays");
+    return .{ .normal = .{ .number = cmpBytes(ab, bb) } };
+}
+
+/// swap16 / swap32: reverse bytes within each 2- or 4-byte group in place. Returns the buffer.
+fn bSwap(self: *Interpreter, buf: *Object, bytes: []u8, is16: bool) EvalError!Completion {
+    const group: usize = if (is16) 2 else 4;
+    if (bytes.len % group != 0)
+        return self.throwError("RangeError", "Buffer size must be a multiple of the swap width");
+    var i: usize = 0;
+    while (i < bytes.len) : (i += group) std.mem.reverse(u8, bytes[i .. i + group]);
+    return .{ .normal = .{ .object = buf } };
 }

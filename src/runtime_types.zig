@@ -663,6 +663,11 @@ pub const NativeId = enum {
     /// HOST (Node axis, NOT ECMA-262): `Buffer` constructor + statics + prototype methods —
     /// `native_name` selects which (spec 101).
     buffer_fn,
+    /// HOST (Node axis, spec 103 — NOT ECMA-262): the `events` core module — the `EventEmitter`
+    /// constructor + its prototype methods (`on`/`once`/`emit`/…). `native_name` selects which.
+    /// Per-instance listener state lives on a hidden own prop of the instance. Inert on the Test262
+    /// path (host core modules are not requireable there).
+    events_method,
     /// HOST (Node axis, spec 100 — NOT ECMA-262): a `process` method — `native_name` selects
     /// `cwd`/`exit`/`nextTick`/`stdoutWrite`/`stderrWrite`. Built + installed by `host_setup`; inert on
     /// the Test262 path (host globals are not installed there).

@@ -774,6 +774,9 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
     if (ctor.call == null and ctor.native != .none) {
         const constructible = switch (ctor.native) {
             .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor, .string_ctor, .object_ctor, .array_ctor, .function_ctor, .number_ctor, .boolean_ctor, .promise_ctor, .map_ctor, .set_ctor, .weakmap_ctor, .weakset_ctor, .iterator_ctor, .proxy_ctor, .regexp_ctor, .array_buffer_ctor, .typed_array_ctor, .data_view_ctor, .date_ctor, .disposable_stack_ctor, .async_disposable_stack_ctor, .weakref_ctor, .finalization_registry_ctor => true,
+            // HOST (spec 103): the `events` EventEmitter constructor is `new`-able; its prototype
+            // methods (same NativeId, different `native_name`) are not.
+            .events_method => std.mem.eql(u8, ctor.native_name, "EventEmitter"),
             else => false,
         };
         if (!constructible) return self.throwError("TypeError", "value is not a constructor");
