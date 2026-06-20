@@ -141,6 +141,9 @@ pub fn installHostGlobals(self: *Interpreter, ctx: HostCtx) EvalError!void {
 
     try env.declare("process", .{ .object = process }, true, true);
 
+    // ── Buffer (spec 101) ───────────────────────────────────────────────────────────────────────────
+    try @import("host_buffer.zig").installBuffer(self, function_proto);
+
     // process is also an own property of the global object (so `globalThis.process` works).
     if (env.lookup("%GlobalThis%")) |gb| if (gb.value == .object) {
         try gb.value.object.defineData("process", .{ .object = process }, true, false, true);

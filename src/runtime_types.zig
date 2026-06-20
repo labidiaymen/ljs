@@ -660,6 +660,9 @@ pub const NativeId = enum {
     /// HOST (Node axis, NOT ECMA-262): `console.log` — write the space-joined ToString of its args
     /// plus a newline to stdout (spec 098, so timer output is observable).
     console_log,
+    /// HOST (Node axis, NOT ECMA-262): `Buffer` constructor + statics + prototype methods —
+    /// `native_name` selects which (spec 101).
+    buffer_fn,
     /// HOST (Node axis, spec 100 — NOT ECMA-262): a `process` method — `native_name` selects
     /// `cwd`/`exit`/`nextTick`/`stdoutWrite`/`stderrWrite`. Built + installed by `host_setup`; inert on
     /// the Test262 path (host globals are not installed there).
