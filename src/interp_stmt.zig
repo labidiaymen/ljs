@@ -124,7 +124,9 @@ pub fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError
                     if (bc.isAbrupt()) return bc;
                 }
             }
-            return .{ .normal = .undefined };
+            // §14.3.1.2/§14.3.2.4/§14.3.3 Evaluation: a declaration's completion value is ~empty~
+            // (§6.2.4) — `eval('1; let x;')` is 1, not undefined (UpdateEmpty keeps the prior value).
+            return .empty;
         },
         .block => |stmts| {
             // §14.2 Block. Allocate a child scope only when the block actually has lexical
@@ -156,11 +158,11 @@ pub fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError
                         b.mutable = true;
                         b.initialized = true;
                     }
-                    return .{ .normal = .undefined };
+                    return .empty; // §15.2.6 a FunctionDeclaration's Evaluation is ~empty~ (§6.2.4)
                 }
                 try env.declare(name, .{ .object = obj }, true, true);
             }
-            return .{ .normal = .undefined };
+            return .empty; // §15.2.6 a FunctionDeclaration's Evaluation is ~empty~ (§6.2.4)
         },
         .class_decl => |c| {
             // §15.7.14 ClassDefinitionEvaluation — build the constructor, then bind the class
@@ -168,7 +170,8 @@ pub fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError
             const cc = try interp_expr.evalClass(self, c, env);
             if (cc.isAbrupt()) return cc;
             if (c.name) |name| try env.declare(name, cc.normal, true, true);
-            return .{ .normal = .undefined };
+            // §15.7.16 a ClassDeclaration's Evaluation is ~empty~ (§6.2.4) — `eval('1; class C{}')` is 1.
+            return .empty;
         },
         .ret => |maybe_expr| {
             // §14.10 ReturnStatement.
@@ -180,45 +183,19 @@ pub fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError
             return .{ .ret = .undefined };
         },
         .if_stmt => |s| {
-            // §14.6 IfStatement.
+            // §14.6.7 IfStatement Evaluation: a taken branch's completion is `UpdateEmpty(C, undefined)`
+            // — so an empty-valued branch (`if(true);`, `if(true){break;}`) yields a NON-empty undefined
+            // (not ~empty~), which an enclosing StatementList will NOT replace with its prior value
+            // (`do { 7; if(true){break;} } while(false)` is undefined, not 7). A false branch with no
+            // `else` returns NormalCompletion(undefined) (§14.6.7 step 4.a).
             const cc = try self.evalExpr(s.cond, env);
             if (cc.isAbrupt()) return cc;
-            if (toBoolean(cc.normal)) return self.evalStmt(s.then.*, env);
-            if (s.otherwise) |els| return self.evalStmt(els.*, env);
+            if (toBoolean(cc.normal)) return (try self.evalStmt(s.then.*, env)).updateEmpty(.undefined);
+            if (s.otherwise) |els| return (try self.evalStmt(els.*, env)).updateEmpty(.undefined);
             return .{ .normal = .undefined };
         },
-        .while_stmt => |s| {
-            // §14.7.3 WhileStatement.
-            while (true) {
-                const cc = try self.evalExpr(s.cond, env);
-                if (cc.isAbrupt()) return cc;
-                if (!toBoolean(cc.normal)) break;
-                const bc = try self.evalStmt(s.body.*, env);
-                switch (bc) {
-                    .normal => {},
-                    .cont => |l| if (!loopHandles(l, my_labels)) return bc, // labelled `continue` for an outer loop
-                    .brk => |l| if (loopHandles(l, my_labels)) break else return bc,
-                    .ret, .throw => return bc,
-                }
-            }
-            return .{ .normal = .undefined };
-        },
-        .do_while_stmt => |s| {
-            // §14.7.2 DoWhileStatement — body runs first, then the condition gates repetition.
-            while (true) {
-                const bc = try self.evalStmt(s.body.*, env);
-                switch (bc) {
-                    .normal => {},
-                    .cont => |l| if (!loopHandles(l, my_labels)) return bc,
-                    .brk => |l| if (loopHandles(l, my_labels)) break else return bc,
-                    .ret, .throw => return bc,
-                }
-                const cc = try self.evalExpr(s.cond, env);
-                if (cc.isAbrupt()) return cc;
-                if (!toBoolean(cc.normal)) break;
-            }
-            return .{ .normal = .undefined };
-        },
+        .while_stmt => |s| return evalWhile(self, s, env, my_labels),
+        .do_while_stmt => |s| return evalDoWhile(self, s, env, my_labels),
         .for_stmt => |s| {
             // §14.7.4 ForStatement: only a LEXICAL head (`let`/`const`/`using`) needs a fresh
             // per-iteration scope (CreatePerIterationEnvironment). A `var` head hoists out to the
@@ -271,13 +248,19 @@ pub fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError
                 if (bound) result = try runScope(self, s.catch_block.?, catch_env);
             }
             if (s.finally_block) |fb| {
+                // §14.15.3 (Finally): if the finally completes normally (including ~empty~), the
+                // try/catch result `result` wins; otherwise the finally's abrupt completion wins.
                 const fc = try runScope(self, fb, try Environment.create(self.arena, env));
-                if (fc.isAbrupt()) return fc;
+                if (fc.isAbrupt()) return fc.updateEmpty(.undefined);
             }
-            return result;
+            // §14.15.3 Return UpdateEmpty(result, undefined): an empty try/catch value becomes a
+            // NON-empty undefined (a break out of `try{}finally{break}` is undefined, not the prior V).
+            return result.updateEmpty(.undefined);
         },
-        .break_stmt => |label| return .{ .brk = label },
-        .continue_stmt => |label| return .{ .cont = label },
+        // §14.9.2/§14.8.2: a break/continue is an abrupt completion with an ~empty~ [[Value]]
+        // (value=null); §6.2.4.6 UpdateEmpty fills it with the enclosing StatementList's accumulated V.
+        .break_stmt => |label| return .{ .brk = .{ .label = label } },
+        .continue_stmt => |label| return .{ .cont = .{ .label = label } },
         .labeled_stmt => |s| {
             // §14.13 LabelledStatement. The labels applying to THIS statement (`my_labels`, captured
             // and cleared at the top) plus this label are republished as `pending_labels` for the
@@ -290,45 +273,15 @@ pub fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError
             const bc = try self.evalStmt(s.body.*, env);
             self.pending_labels.clearRetainingCapacity(); // consumed (or unused by a non-loop body)
             switch (bc) {
-                .brk => |l| if (l != null and std.mem.eql(u8, l.?, s.label)) return .{ .normal = .undefined },
+                // §14.13.4 step 4: a break targeting THIS label → NormalCompletion(stmtResult.[[Value]])
+                // (the LabelledItem's accumulated value, e.g. `L: { 5; break L; }` is 5).
+                .brk => |a| if (a.label != null and std.mem.eql(u8, a.label.?, s.label))
+                    return .{ .normal = a.value orelse .undefined },
                 else => {},
             }
             return bc;
         },
-        .switch_stmt => |s| {
-            // §14.12 SwitchStatement — match by ===, fall through, `break` exits. A switch is a
-            // `break` target (label-less, or labelled when wrapped in `L:`), never a `continue` one.
-            const dc = try self.evalExpr(s.discriminant, env);
-            if (dc.isAbrupt()) return dc;
-            const sw_env = try Environment.create(self.arena, env);
-            var matched = false;
-            // First pass: case clauses in order. Second pass (if no match): from default.
-            var pass: u8 = 0;
-            while (pass < 2) : (pass += 1) {
-                for (s.cases) |case| {
-                    if (!matched) {
-                        if (pass == 0) {
-                            if (case.test_expr) |te| {
-                                const tc = try self.evalExpr(te, sw_env);
-                                if (tc.isAbrupt()) return tc;
-                                if (!strictEquals(dc.normal, tc.normal)) continue;
-                            } else continue; // skip default on pass 0
-                        } else {
-                            if (case.test_expr != null) continue; // pass 1: only start at default
-                        }
-                        matched = true;
-                    }
-                    const bc = try runBlock(self, case.body, sw_env);
-                    switch (bc) {
-                        .normal => {},
-                        .brk => |l| if (loopHandles(l, my_labels)) return .{ .normal = .undefined } else return bc,
-                        .ret, .throw, .cont => return bc,
-                    }
-                }
-                if (matched) break;
-            }
-            return .{ .normal = .undefined };
-        },
+        .switch_stmt => |s| return evalSwitch(self, s, env, my_labels),
         .with_stmt => |s| {
             // §14.11.7 — ToObject the operand, run the body in an object Environment Record whose
             // binding object is it. null/undefined → TypeError (§7.1.18). `with_depth` gates
@@ -344,7 +297,9 @@ pub fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError
             with_env.with_object = obj;
             self.with_depth += 1;
             defer self.with_depth -= 1;
-            return self.evalStmt(s.body.*, with_env);
+            // §14.11.7 step 7: Return UpdateEmpty(C, undefined) — an empty-valued body yields a
+            // NON-empty undefined (`do{6;with({}){break;}}while(0)` is undefined, not 6).
+            return (try self.evalStmt(s.body.*, with_env)).updateEmpty(.undefined);
         },
     }
 }
@@ -708,13 +663,28 @@ pub fn envHasWith(env: *Environment) bool {
     return false;
 }
 
+/// §13.2.13 / §14.2.2 StatementList Evaluation with §6.2.4.6 UpdateEmpty: thread the last non-empty
+/// statement value `v` forward; an empty-valued statement keeps the prior `v`. On an abrupt
+/// completion (break/continue/return/throw) return `UpdateEmpty(result, v)` so a `break`/`continue`
+/// carries the accumulated value (`{ 3; break; }` → break carrying 3). The final normal completion is
+/// `v` (the running accumulator), never the trailing statement's own empty value.
 pub fn runBlock(self: *Interpreter, stmts: []const ast.Stmt, env: *Environment) EvalError!Completion {
-    var last: Completion = .{ .normal = .undefined };
+    // `v == null` means the accumulated [[Value]] is still ~empty~ (no statement yet produced a
+    // non-empty value) — so a block of only declarations (`{ let x; }`) is itself ~empty~ (§14.2.2),
+    // and an enclosing list keeps its prior value (`eval('1; { let x; }')` is 1).
+    var v: ?Value = null;
     for (stmts) |s| {
-        last = try self.evalStmt(s, env);
-        if (last.isAbrupt()) return last;
+        const c = try self.evalStmt(s, env);
+        switch (c) {
+            .normal => |nv| v = nv, // §6.2.4.6: non-empty value replaces V
+            .empty => {}, // empty value keeps the prior V
+            // Abrupt — carry THIS list's accumulated V. When V is still empty (`{ break; }`), leave
+            // the completion's [[Value]] empty so an ENCLOSING list/switch fills it (`switch{case a:7;
+            // case b: break;}` → break carries 7, accumulated by the switch, not this case body).
+            else => return if (v) |nv| c.updateEmpty(nv) else c,
+        }
     }
-    return last;
+    return if (v) |nv| .{ .normal = nv } else .empty;
 }
 
 /// Run a StatementList that forms its OWN lexical scope (a Block, or a try / catch / finally
@@ -737,6 +707,98 @@ pub fn runScope(self: *Interpreter, stmts: []const ast.Stmt, env: *Environment) 
     return self.disposeFrom(marker, c);
 }
 
+/// §14.7.3.2 WhileStatement Evaluation: V starts undefined; each body completion UpdateEmpty-
+/// accumulates into V; break/continue/return/throw carry V (§6.2.4.6). Split out of `evalStmt` so its
+/// locals don't enlarge the hot recursive `evalStmt` frame (a tree-walker recurses on the native
+/// stack — see `max_depth`).
+pub fn evalWhile(self: *Interpreter, s: anytype, env: *Environment, my_labels: []const []const u8) EvalError!Completion {
+    var v: Value = .undefined;
+    while (true) {
+        const cc = try self.evalExpr(s.cond, env);
+        if (cc.isAbrupt()) return cc;
+        if (!toBoolean(cc.normal)) break;
+        const bc = try self.evalStmt(s.body.*, env);
+        switch (bc) {
+            .normal => |bv| v = bv,
+            .empty => {}, // §14.7.3.2 step 2.d: empty body value keeps the prior V
+            .cont => |a| if (loopHandles(a.label, my_labels)) {
+                if (a.value) |cv| v = cv; // §LoopContinues true: accumulate, keep looping
+            } else return bc.updateEmpty(v),
+            .brk => |a| if (loopHandles(a.label, my_labels)) {
+                return .{ .normal = a.value orelse v }; // break exits carrying V
+            } else return bc.updateEmpty(v),
+            .ret, .throw => return bc,
+        }
+    }
+    return .{ .normal = v };
+}
+
+/// §14.7.2.2 DoWhileStatement Evaluation — body runs first, then the condition gates repetition.
+/// V accumulates as for WhileStatement.
+pub fn evalDoWhile(self: *Interpreter, s: anytype, env: *Environment, my_labels: []const []const u8) EvalError!Completion {
+    var v: Value = .undefined;
+    while (true) {
+        const bc = try self.evalStmt(s.body.*, env);
+        switch (bc) {
+            .normal => |bv| v = bv,
+            .empty => {},
+            .cont => |a| if (loopHandles(a.label, my_labels)) {
+                if (a.value) |cv| v = cv;
+            } else return bc.updateEmpty(v),
+            .brk => |a| if (loopHandles(a.label, my_labels)) {
+                return .{ .normal = a.value orelse v };
+            } else return bc.updateEmpty(v),
+            .ret, .throw => return bc,
+        }
+        const cc = try self.evalExpr(s.cond, env);
+        if (cc.isAbrupt()) return cc;
+        if (!toBoolean(cc.normal)) break;
+    }
+    return .{ .normal = v };
+}
+
+/// §14.12.4 SwitchStatement / CaseBlockEvaluation — match by ===, fall through, `break` exits.
+/// V starts undefined; each evaluated clause's StatementList result UpdateEmpty-accumulates into V;
+/// a break exits carrying V (§6.2.4.6). Split out of `evalStmt` to keep its frame small.
+pub fn evalSwitch(self: *Interpreter, s: anytype, env: *Environment, my_labels: []const []const u8) EvalError!Completion {
+    const dc = try self.evalExpr(s.discriminant, env);
+    if (dc.isAbrupt()) return dc;
+    const sw_env = try Environment.create(self.arena, env);
+    var matched = false;
+    var v: Value = .undefined;
+    // First pass: case clauses in order. Second pass (if no match): from default.
+    var pass: u8 = 0;
+    while (pass < 2) : (pass += 1) {
+        for (s.cases) |case| {
+            if (!matched) {
+                if (pass == 0) {
+                    if (case.test_expr) |te| {
+                        const tc = try self.evalExpr(te, sw_env);
+                        if (tc.isAbrupt()) return tc;
+                        if (!strictEquals(dc.normal, tc.normal)) continue;
+                    } else continue; // skip default on pass 0
+                } else {
+                    if (case.test_expr != null) continue; // pass 1: only start at default
+                }
+                matched = true;
+            }
+            const bc = try runBlock(self, case.body, sw_env);
+            switch (bc) {
+                .normal => |bv| v = bv, // §14.12.4: non-empty clause value replaces V
+                .empty => {}, // empty clause value keeps the prior V
+                // A break for this switch exits carrying the accumulated V (UpdateEmpty);
+                // other abrupt completions propagate carrying V (`{ 3; break; }` → 3).
+                .brk => |a| if (loopHandles(a.label, my_labels)) {
+                    return .{ .normal = a.value orelse v };
+                } else return bc.updateEmpty(v),
+                .ret, .throw, .cont => return bc.updateEmpty(v),
+            }
+        }
+        if (matched) break;
+    }
+    return .{ .normal = v };
+}
+
 /// §14.7.4 ForStatement body — the init/cond/body/update loop (the `using`-head dispose epilogue,
 /// when present, is applied by the caller around this). Returns the loop's completion; a `break`
 /// targeting this loop is consumed (→ normal), other abrupt completions propagate.
@@ -745,6 +807,8 @@ pub fn runForBody(self: *Interpreter, s: anytype, loop_env: *Environment, my_lab
         const ic = try self.evalStmt(i.*, loop_env);
         if (ic.isAbrupt()) return ic;
     }
+    // §14.7.4.2 ForBodyEvaluation: V starts undefined; each body completion UpdateEmpty-accumulates.
+    var v: Value = .undefined;
     while (true) {
         if (s.cond) |t| {
             const tc = try self.evalExpr(t, loop_env);
@@ -753,9 +817,14 @@ pub fn runForBody(self: *Interpreter, s: anytype, loop_env: *Environment, my_lab
         }
         const bc = try self.evalStmt(s.body.*, loop_env);
         switch (bc) {
-            .normal => {}, // fall through to the update
-            .cont => |l| if (!loopHandles(l, my_labels)) return bc, // for our loop: fall through to update
-            .brk => |l| if (loopHandles(l, my_labels)) break else return bc,
+            .normal => |bv| v = bv, // fall through to the update
+            .empty => {},
+            .cont => |a| if (loopHandles(a.label, my_labels)) {
+                if (a.value) |cv| v = cv; // for our loop: fall through to update
+            } else return bc.updateEmpty(v),
+            .brk => |a| if (loopHandles(a.label, my_labels)) {
+                return .{ .normal = a.value orelse v };
+            } else return bc.updateEmpty(v),
             .ret, .throw => return bc,
         }
         if (s.update) |u| {
@@ -763,7 +832,7 @@ pub fn runForBody(self: *Interpreter, s: anytype, loop_env: *Environment, my_lab
             if (uc.isAbrupt()) return uc;
         }
     }
-    return .{ .normal = .undefined };
+    return .{ .normal = v };
 }
 
 /// §14.7.5 `for (HEAD in EXPR)` — ForIn/OfHeadEvaluation (enumerate) + ForIn/OfBodyEvaluation.
@@ -777,18 +846,25 @@ pub fn evalForIn(self: *Interpreter, s: anytype, env: *Environment, my_labels: [
     var keys: std.ArrayListUnmanaged(Value) = .empty;
     const ek = try enumerateKeys(self, rc.normal, &keys);
     if (ek.isAbrupt()) return ek; // a Proxy ownKeys/getOwnPropertyDescriptor trap may throw
+    // §14.7.5.6 ForIn/OfBodyEvaluation: V starts undefined; each body completion UpdateEmpty-accumulates.
+    var v: Value = .undefined;
     for (keys.items) |k| {
         const hb = try bindForHead(self, s.head, k, env);
         if (hb.completion.isAbrupt()) return hb.completion;
         const bc = try self.evalStmt(s.body.*, hb.env);
         switch (bc) {
-            .normal => {},
-            .cont => |l| if (!loopHandles(l, my_labels)) return bc,
-            .brk => |l| if (loopHandles(l, my_labels)) break else return bc,
+            .normal => |bv| v = bv,
+            .empty => {},
+            .cont => |a| if (loopHandles(a.label, my_labels)) {
+                if (a.value) |cv| v = cv;
+            } else return bc.updateEmpty(v),
+            .brk => |a| if (loopHandles(a.label, my_labels)) {
+                return .{ .normal = a.value orelse v };
+            } else return bc.updateEmpty(v),
             .ret, .throw => return bc,
         }
     }
-    return .{ .normal = .undefined };
+    return .{ .normal = v };
 }
 
 /// §14.7.5 `for (HEAD of EXPR)` — ForIn/OfHeadEvaluation (§7.4.2 GetIterator) + ForIn/OfBodyEvaluation,
@@ -806,16 +882,18 @@ pub fn evalForOf(self: *Interpreter, s: anytype, env: *Environment, my_labels: [
     };
     // §ER: a `for (using x of …)` head disposes the iterated resource at the END OF EACH ITERATION.
     const head_uses = s.head == .decl and (s.head.decl.kind == .using_decl or s.head.decl.kind == .await_using_decl);
+    // §14.7.5.6 ForIn/OfBodyEvaluation: V starts undefined; each body completion UpdateEmpty-accumulates.
+    var accum: Value = .undefined;
     while (true) {
         try self.tick(); // §reliability: an infinite iterable terminates via the step watchdog, never hangs
         const step = try self.iteratorStep(iterator);
-        const v = switch (step) {
+        const item = switch (step) {
             .abrupt => |c| return c, // a throwing next() — already an abrupt completion
             .done => break,
             .value => |val| val,
         };
         const marker = self.disposables.items.len;
-        const hb = try bindForHead(self, s.head, v, env);
+        const hb = try bindForHead(self, s.head, item, env);
         if (hb.completion.isAbrupt()) {
             const after = try self.disposeFrom(marker, hb.completion); // dispose any pushed before the throw
             try self.iteratorClose(iterator); // §7.4.11 abrupt binding → close the iterator
@@ -825,23 +903,28 @@ pub fn evalForOf(self: *Interpreter, s: anytype, env: *Environment, my_labels: [
         // §ER DisposeResources at end of iteration (normal OR abrupt), before the iterator-close logic.
         if (head_uses) bc = try self.disposeFrom(marker, bc);
         switch (bc) {
-            .normal => {},
-            .cont => |l| {
+            .normal => |bv| accum = bv,
+            .empty => {},
+            .cont => |a| {
                 // A `continue` for our loop steps to the next value; a labelled one for an outer
                 // loop is an abrupt exit of THIS loop — a NORMAL completion close (§7.4.11): a
                 // throwing `return()` propagates.
-                if (!loopHandles(l, my_labels)) {
+                if (loopHandles(a.label, my_labels)) {
+                    if (a.value) |cv| accum = cv;
+                } else {
                     const cc = try self.iteratorCloseChecked(iterator);
                     if (cc.isAbrupt()) return cc;
-                    return bc;
+                    return bc.updateEmpty(accum);
                 }
             },
-            .brk => |l| {
+            .brk => |a| {
                 // §14.7.5.7 step 11.b.iii: break closes the iterator on a NORMAL completion — a
                 // throwing `return()` (or non-object result) propagates (§7.4.11 steps 5–6).
                 const cc = try self.iteratorCloseChecked(iterator);
                 if (cc.isAbrupt()) return cc;
-                if (loopHandles(l, my_labels)) break else return bc; // outer-targeted break still propagates
+                if (loopHandles(a.label, my_labels)) {
+                    return .{ .normal = a.value orelse accum };
+                } else return bc.updateEmpty(accum); // outer-targeted break still propagates
             },
             .ret => {
                 // §7.4.11: a `return` completion is NOT a throw → propagate a throwing `return()`.
@@ -857,7 +940,7 @@ pub fn evalForOf(self: *Interpreter, s: anytype, env: *Environment, my_labels: [
             },
         }
     }
-    return .{ .normal = .undefined };
+    return .{ .normal = accum };
 }
 
 /// §14.7.5.6 ForIn/OfBodyEvaluation with the `async` iteration hint — `for await (HEAD of EXPR) BODY`.
@@ -874,6 +957,7 @@ pub fn evalForAwaitOf(self: *Interpreter, s: anytype, env: *Environment, my_labe
         .abrupt => |c| return c,
         .iterator => |it| it,
     };
+    var accum: Value = .undefined; // §14.7.5.6 ForIn/OfBodyEvaluation V accumulator
     while (true) {
         try self.tick(); // §reliability: an infinite async iterable terminates via the step watchdog, never hangs
         // §14.7.5.6 step 3.b: result ← Await( IteratorNext(iterator) ). An async iterator's `next`
@@ -888,24 +972,28 @@ pub fn evalForAwaitOf(self: *Interpreter, s: anytype, env: *Environment, my_labe
             .result => |r| r,
         };
         if (step.done) break; // §14.7.5.6: done → finish the loop
-        const v = step.value;
-        const hb = try bindForHead(self, s.head, v, env);
+        const hb = try bindForHead(self, s.head, step.value, env);
         if (hb.completion.isAbrupt()) {
             try asyncIteratorClose(self, iterator);
             return hb.completion;
         }
         const bc = try self.evalStmt(s.body.*, hb.env);
         switch (bc) {
-            .normal => {},
-            .cont => |l| {
-                if (!loopHandles(l, my_labels)) {
+            .normal => |bv| accum = bv,
+            .empty => {},
+            .cont => |a| {
+                if (loopHandles(a.label, my_labels)) {
+                    if (a.value) |cv| accum = cv;
+                } else {
                     try asyncIteratorClose(self, iterator);
-                    return bc;
+                    return bc.updateEmpty(accum);
                 }
             },
-            .brk => |l| {
+            .brk => |a| {
                 try asyncIteratorClose(self, iterator);
-                if (loopHandles(l, my_labels)) break else return bc;
+                if (loopHandles(a.label, my_labels)) {
+                    return .{ .normal = a.value orelse accum };
+                } else return bc.updateEmpty(accum);
             },
             .ret, .throw => {
                 try asyncIteratorClose(self, iterator);
@@ -913,7 +1001,7 @@ pub fn evalForAwaitOf(self: *Interpreter, s: anytype, env: *Environment, my_labe
             },
         }
     }
-    return .{ .normal = .undefined };
+    return .{ .normal = accum };
 }
 
 /// §7.4.11 AsyncIteratorClose — best-effort: call `iterator.return()`, AWAIT its (promise) result,

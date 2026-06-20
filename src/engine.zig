@@ -235,6 +235,7 @@ pub fn evaluateModule(
     };
     return switch (completion) {
         .normal => |v| .{ .normal = v },
+        .empty => .{ .normal = .undefined }, // §6.2.4 empty script value surfaces as undefined
         .throw => |v| .{ .thrown = v },
         .ret => |v| .{ .normal = v },
         .brk, .cont => .{ .normal = .undefined },
@@ -386,6 +387,7 @@ pub fn evaluateWithLimitL(arena: std.mem.Allocator, source: []const u8, mode: Ru
     interp.cleanupGenerators(); // join/abandon any parked generator/async threads (no lingering OS thread)
     return switch (completion) {
         .normal => |v| .{ .normal = v },
+        .empty => .{ .normal = .undefined }, // §6.2.4 empty script value surfaces as undefined
         .throw => |v| .{ .thrown = v },
         .ret => |v| .{ .normal = v }, // stray top-level return → its value
         // TODO(Cycle B/D): top-level return/break/continue should be parse-phase SyntaxErrors.

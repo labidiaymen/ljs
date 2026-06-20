@@ -113,7 +113,7 @@ fn asyncModuleBodyThread(parent: *Interpreter, root: *module_mod.ModuleRecord, g
         break :blk tc;
     };
     switch (comp) {
-        .normal, .ret => {
+        .normal, .empty, .ret => {
             // Refresh the namespace snapshot with the final export values (a populate engine error
             // becomes a throw transfer so it surfaces rather than being silently dropped).
             if (root.namespace) |ns| {

@@ -1645,7 +1645,7 @@ pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this
         for (fd.body) |stmt| {
             const c = try self.evalStmt(stmt, call_env);
             switch (c) {
-                .normal => {},
+                .normal, .empty => {},
                 .ret, .throw => {
                     body_c = c;
                     break;
@@ -1663,7 +1663,7 @@ pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this
     for (fd.body) |stmt| {
         const c = try self.evalStmt(stmt, call_env);
         switch (c) {
-            .normal => {},
+            .normal, .empty => {},
             .ret => |v| return finishCtorReturn(self, fd, v),
             .throw => return c,
             .brk, .cont => {}, // not produced inside a function body (loops/labels consume them)

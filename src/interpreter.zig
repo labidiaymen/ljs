@@ -57,7 +57,7 @@ pub const Interpreter = struct {
     // expressions/calls would overflow it and SIGSEGV. We throw RangeError first (as V8 does:
     // "Maximum call stack size exceeded"). Conservative for the larger M1 frames; raise once
     // eval runs on a dedicated large-stack thread.
-    max_depth: u32 = 400,
+    max_depth: u32 = 300,
     /// The current `this` binding (§9.4.5 GetThisEnvironment, M1 subset): set by method calls,
     /// undefined otherwise. Saved/restored around each [[Call]].
     this_val: Value = .undefined,
@@ -229,12 +229,19 @@ pub const Interpreter = struct {
         // initialized closures BEFORE any statement runs, so a forward reference resolves. Run after
         // the var step so a function binding clobbers a same-named `var`-hoisted `undefined`.
         try interp_stmt.hoistFunctionDeclarations(self, program.statements, env.varScope());
-        var last: Completion = .{ .normal = .undefined };
+        // §16.1.7 ScriptEvaluation / §19.2.1.1 PerformEval: the body is a StatementList — thread the
+        // §6.2.4.6 UpdateEmpty accumulator so the completion value is the last NON-empty statement
+        // value (`eval('1; var x;')` is 1; `eval('var x;')` is ~empty~ → surfaced as undefined).
+        var v: Value = .undefined;
         for (program.statements) |stmt| {
-            last = try self.evalStmt(stmt, env);
-            if (last.isAbrupt()) return last; // ReturnIfAbrupt (§5.2.3.4)
+            const c = try self.evalStmt(stmt, env);
+            switch (c) {
+                .normal => |nv| v = nv,
+                .empty => {},
+                else => return c.updateEmpty(v), // ReturnIfAbrupt (§5.2.3.4), carrying V
+            }
         }
-        return last;
+        return .{ .normal = v };
     }
 
     pub fn tick(self: *Interpreter) EvalError!void {

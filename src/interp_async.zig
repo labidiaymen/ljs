@@ -175,6 +175,10 @@ pub fn generatorBodyThread(parent: *Interpreter, gen: *object_mod.Generator) voi
             gen.transfer_value = v;
             gen.transfer_kind = .ret;
         },
+        .empty => { // §6.2.4 a body completing ~empty~ returns undefined
+            gen.transfer_value = .undefined;
+            gen.transfer_kind = .ret;
+        },
         .ret => |v| {
             gen.transfer_value = v;
             gen.transfer_kind = .ret;
@@ -295,7 +299,7 @@ pub fn runGeneratorBody(self: *Interpreter, gen: *object_mod.Generator) EvalErro
         for (mr.statements) |stmt| {
             last = try self.evalStmt(stmt, mr.env);
             switch (last) {
-                .normal => {},
+                .normal, .empty => {}, // §6.2.4 a normal/empty statement completion continues the body
                 else => return last,
             }
         }
@@ -329,7 +333,7 @@ pub fn runGeneratorBody(self: *Interpreter, gen: *object_mod.Generator) EvalErro
         for (fd.body) |stmt| {
             const c = try self.evalStmt(stmt, call_env);
             switch (c) {
-                .normal => {},
+                .normal, .empty => {},
                 .ret, .throw => {
                     body_c = c;
                     break;
@@ -347,7 +351,7 @@ pub fn runGeneratorBody(self: *Interpreter, gen: *object_mod.Generator) EvalErro
     for (fd.body) |stmt| {
         const c = try self.evalStmt(stmt, call_env);
         switch (c) {
-            .normal => {},
+            .normal, .empty => {},
             .ret => |v| return .{ .normal = v },
             .throw => return c,
             .brk, .cont => {},
@@ -1018,6 +1022,10 @@ pub fn asyncBodyThread(parent: *Interpreter, gen: *object_mod.Generator) void {
             gen.transfer_value = v;
             gen.transfer_kind = .ret;
         },
+        .empty => { // §6.2.4 a body completing ~empty~ returns undefined
+            gen.transfer_value = .undefined;
+            gen.transfer_kind = .ret;
+        },
         .ret => |v| {
             gen.transfer_value = v;
             gen.transfer_kind = .ret;
@@ -1154,7 +1162,7 @@ pub fn doAsyncYieldDelegate(self: *Interpreter, source: Value) EvalError!Complet
                 if (self.current_gen) |g| if (g.abandon) return .{ .ret = .undefined };
                 received = .{ .kind = .ret, .value = v, .abandon = false };
             },
-            .brk, .cont => return .{ .ret = .undefined },
+            .empty, .brk, .cont => return .{ .ret = .undefined }, // not producible by a yield handoff
         }
     }
 }
