@@ -296,7 +296,7 @@ pub fn installEntryRequire(self: *Interpreter, script_path: []const u8, script_d
 //  core module registry: path / fs / os
 // ════════════════════════════════════════════════════════════════════════════
 
-const core_modules = [_][]const u8{ "path", "fs", "os", "events", "util", "url", "assert", "assert/strict" };
+const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "url", "assert", "assert/strict" };
 
 /// Strip a `node:` prefix (Node accepts `node:path` etc.).
 fn coreName(spec: []const u8) []const u8 {
@@ -328,13 +328,20 @@ fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
     if (std.mem.eql(u8, name, "assert/strict")) return @import("host_assert.zig").buildStrict(self);
     const arena = self.arena;
     if (std.mem.eql(u8, name, "util")) return @import("host_util.zig").build(self); // HOST util (spec 103)
+    // HOST path (spec 105): require('path') → an in-engine port of Node's lib/path.js carrying
+    // `.posix`/`.win32` full namespaces. `path/posix` / `path/win32` select a sub-namespace.
+    if (std.mem.eql(u8, name, "path")) return @import("host_path.zig").build(self);
+    if (std.mem.eql(u8, name, "path/posix") or std.mem.eql(u8, name, "path/win32")) {
+        // Reuse the cached `path` module so `require('path/posix') === require('path').posix`.
+        const root_c = try loadCoreModule(self, "path");
+        const root = root_c.normal.object;
+        const sub = if (std.mem.eql(u8, name, "path/posix")) "posix" else "win32";
+        const v = root.get(sub) orelse return error.OutOfMemory;
+        if (v != .object) return error.OutOfMemory;
+        return v.object;
+    }
     const obj = try Object.create(arena, self.objectProto());
-    if (std.mem.eql(u8, name, "path")) {
-        for ([_][]const u8{ "join", "resolve", "dirname", "basename", "extname", "normalize", "isAbsolute", "relative", "parse" }) |m|
-            try defineCoreMethod(self, obj, name, m);
-        try obj.defineData("sep", .{ .string = if (is_windows) "\\" else "/" }, true, true, true);
-        try obj.defineData("delimiter", .{ .string = if (is_windows) ";" else ":" }, true, true, true);
-    } else if (std.mem.eql(u8, name, "fs")) {
+    if (std.mem.eql(u8, name, "fs")) {
         for ([_][]const u8{ "readFileSync", "existsSync", "writeFileSync", "statSync", "readdirSync", "mkdirSync" }) |m|
             try defineCoreMethod(self, obj, name, m);
     } else if (std.mem.eql(u8, name, "os")) {
@@ -363,7 +370,6 @@ fn defineCoreMethod(self: *Interpreter, target: *Object, mod: []const u8, method
 pub fn coreModuleFn(self: *Interpreter, func: *Object, this_val: Value, args: []const Value) EvalError!Completion {
     const mod = if (func.get("%mod%")) |v| (if (v == .string) v.string else "") else "";
     const method = func.native_name;
-    if (std.mem.eql(u8, mod, "path")) return pathMethod(self, method, args);
     if (std.mem.eql(u8, mod, "fs")) return fsMethod(self, method, args);
     if (std.mem.eql(u8, mod, "os")) return osMethod(self, method, args);
     if (std.mem.eql(u8, mod, "fs_stats")) {
@@ -376,173 +382,11 @@ pub fn coreModuleFn(self: *Interpreter, func: *Object, this_val: Value, args: []
     return .{ .normal = .undefined };
 }
 
-// ── path methods ──────────────────────────────────────────────────────────────
+// ── shared helper ───────────────────────────────────────────────────────────────
 
-/// ToString an argument via the engine (so a non-string path arg coerces like Node's, e.g. a number).
+/// ToString an argument via the engine (so a non-string arg coerces like Node's, e.g. a number).
 fn argString(self: *Interpreter, v: Value) EvalError!Completion {
     return self.toStringValuePub(v);
-}
-
-fn pathMethod(self: *Interpreter, method: []const u8, args: []const Value) EvalError!Completion {
-    const arena = self.arena;
-    const eq = std.mem.eql;
-
-    if (eq(u8, method, "join")) {
-        // Concatenate the string args with the platform sep, then normalize. `path.join()` → ".".
-        var parts: std.ArrayListUnmanaged([]const u8) = .empty;
-        for (args) |a| {
-            const sc = try argString(self, a);
-            if (sc.isAbrupt()) return sc;
-            if (sc.normal.string.len > 0) parts.append(arena, sc.normal.string) catch return error.OutOfMemory;
-        }
-        if (parts.items.len == 0) return .{ .normal = .{ .string = "." } };
-        const joined = joinRaw(arena, parts.items) catch return error.OutOfMemory;
-        return .{ .normal = .{ .string = normalizeStr(arena, joined) catch return error.OutOfMemory } };
-    }
-    if (eq(u8, method, "resolve")) {
-        var parts: std.ArrayListUnmanaged([]const u8) = .empty;
-        for (args) |a| {
-            const sc = try argString(self, a);
-            if (sc.isAbrupt()) return sc;
-            parts.append(arena, sc.normal.string) catch return error.OutOfMemory;
-        }
-        // path.resolve with no/empty args resolves against the cwd (like Node).
-        if (parts.items.len == 0) {
-            const cwd = if (self.host_cwd.len > 0) self.host_cwd else (std.process.currentPathAlloc(self.io, arena) catch ".");
-            return .{ .normal = .{ .string = cwd } };
-        }
-        // Prepend the cwd so a fully-relative arg set resolves to an absolute path (Node semantics).
-        var full: std.ArrayListUnmanaged([]const u8) = .empty;
-        if (self.host_cwd.len > 0) full.append(arena, self.host_cwd) catch return error.OutOfMemory;
-        full.appendSlice(arena, parts.items) catch return error.OutOfMemory;
-        const r = path.resolve(arena, full.items) catch return error.OutOfMemory;
-        return .{ .normal = .{ .string = r } };
-    }
-    if (eq(u8, method, "dirname")) {
-        const sc = try argString(self, if (args.len > 0) args[0] else .undefined);
-        if (sc.isAbrupt()) return sc;
-        const d = path.dirname(sc.normal.string) orelse ".";
-        return .{ .normal = .{ .string = if (d.len == 0) "." else d } };
-    }
-    if (eq(u8, method, "basename")) {
-        const sc = try argString(self, if (args.len > 0) args[0] else .undefined);
-        if (sc.isAbrupt()) return sc;
-        var base = path.basename(sc.normal.string);
-        // Optional ext suffix to strip (path.basename(p, ext)).
-        if (args.len > 1 and args[1] != .undefined) {
-            const ec = try argString(self, args[1]);
-            if (ec.isAbrupt()) return ec;
-            if (ec.normal.string.len > 0 and ec.normal.string.len < base.len and std.mem.endsWith(u8, base, ec.normal.string))
-                base = base[0 .. base.len - ec.normal.string.len];
-        }
-        return .{ .normal = .{ .string = base } };
-    }
-    if (eq(u8, method, "extname")) {
-        const sc = try argString(self, if (args.len > 0) args[0] else .undefined);
-        if (sc.isAbrupt()) return sc;
-        return .{ .normal = .{ .string = extnameStr(sc.normal.string) } };
-    }
-    if (eq(u8, method, "normalize")) {
-        const sc = try argString(self, if (args.len > 0) args[0] else .undefined);
-        if (sc.isAbrupt()) return sc;
-        return .{ .normal = .{ .string = normalizeStr(arena, sc.normal.string) catch return error.OutOfMemory } };
-    }
-    if (eq(u8, method, "isAbsolute")) {
-        const sc = try argString(self, if (args.len > 0) args[0] else .undefined);
-        if (sc.isAbrupt()) return sc;
-        return .{ .normal = .{ .boolean = path.isAbsolute(sc.normal.string) } };
-    }
-    if (eq(u8, method, "relative")) {
-        const fc = try argString(self, if (args.len > 0) args[0] else .undefined);
-        if (fc.isAbrupt()) return fc;
-        const tc = try argString(self, if (args.len > 1) args[1] else .undefined);
-        if (tc.isAbrupt()) return tc;
-        const cwd = if (self.host_cwd.len > 0) self.host_cwd else ".";
-        const r = path.relative(arena, cwd, null, fc.normal.string, tc.normal.string) catch return error.OutOfMemory;
-        return .{ .normal = .{ .string = r } };
-    }
-    if (eq(u8, method, "parse")) {
-        const sc = try argString(self, if (args.len > 0) args[0] else .undefined);
-        if (sc.isAbrupt()) return sc;
-        const p = sc.normal.string;
-        const obj = try Object.create(arena, self.objectProto());
-        const dir = path.dirname(p) orelse "";
-        const base = path.basename(p);
-        const ext = extnameStr(p);
-        const root_len: usize = if (path.isAbsolute(p)) (if (is_windows) @min(p.len, 3) else 1) else 0;
-        const name_part = if (ext.len > 0 and ext.len < base.len) base[0 .. base.len - ext.len] else base;
-        try obj.defineData("root", .{ .string = p[0..root_len] }, true, true, true);
-        try obj.defineData("dir", .{ .string = dir }, true, true, true);
-        try obj.defineData("base", .{ .string = base }, true, true, true);
-        try obj.defineData("ext", .{ .string = ext }, true, true, true);
-        try obj.defineData("name", .{ .string = name_part }, true, true, true);
-        return .{ .normal = .{ .object = obj } };
-    }
-    return .{ .normal = .undefined };
-}
-
-/// Concatenate path parts with the platform separator (no normalization).
-fn joinRaw(arena: std.mem.Allocator, parts: []const []const u8) ![]const u8 {
-    const sep: u8 = if (is_windows) '\\' else '/';
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    for (parts, 0..) |part, i| {
-        if (i > 0) try out.append(arena, sep);
-        try out.appendSlice(arena, part);
-    }
-    return out.items;
-}
-
-/// `path.extname` — the last `.`-extension of the basename (Node: a leading dot is not an extension,
-/// and a trailing dot yields ".").
-fn extnameStr(p: []const u8) []const u8 {
-    const base = path.basename(p);
-    var i: usize = base.len;
-    var saw_non_dot = false;
-    while (i > 0) {
-        i -= 1;
-        if (base[i] == '.') {
-            if (i == 0) return ""; // ".foo" → no ext
-            if (!saw_non_dot) continue; // trailing dots
-            return base[i..];
-        }
-        saw_non_dot = true;
-    }
-    return "";
-}
-
-/// `path.normalize` — collapse `.`/`..` segments and duplicate separators, preserving the platform
-/// separator and a leading absolute marker. Built on `path.resolve`-style semantics but pure-string
-/// (does not consult the cwd).
-fn normalizeStr(arena: std.mem.Allocator, p: []const u8) ![]const u8 {
-    if (p.len == 0) return ".";
-    const sep: u8 = if (is_windows) '\\' else '/';
-    const is_abs = path.isAbsolute(p);
-    const had_trailing = p.len > 0 and (p[p.len - 1] == '/' or p[p.len - 1] == '\\');
-
-    var segs: std.ArrayListUnmanaged([]const u8) = .empty;
-    var it = std.mem.tokenizeAny(u8, p, "/\\");
-    while (it.next()) |seg| {
-        if (std.mem.eql(u8, seg, ".")) continue;
-        if (std.mem.eql(u8, seg, "..")) {
-            if (segs.items.len > 0 and !std.mem.eql(u8, segs.items[segs.items.len - 1], "..")) {
-                _ = segs.pop();
-            } else if (!is_abs) {
-                try segs.append(arena, "..");
-            }
-            continue;
-        }
-        try segs.append(arena, seg);
-    }
-
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    if (is_abs and !is_windows) try out.append(arena, sep);
-    for (segs.items, 0..) |seg, i| {
-        if (i > 0) try out.append(arena, sep);
-        try out.appendSlice(arena, seg);
-    }
-    if (out.items.len == 0) return if (is_abs) (if (is_windows) "\\" else "/") else ".";
-    if (had_trailing) try out.append(arena, sep);
-    return out.items;
 }
 
 // ── fs methods (sync subset) ────────────────────────────────────────────────────

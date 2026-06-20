@@ -82,6 +82,13 @@ pub fn main(init: std.process.Init) !void {
                 (std.fs.path.resolve(arena, &.{ cwd, arg }) catch arg)
             else
                 arg;
+            // On Windows, Node reports `__filename`/`__dirname` with the platform separator (`\`).
+            // The CLI arg may carry `/`; normalize so `path.dirname(__filename)` matches Node.
+            if (@import("builtin").os.tag == .windows and script_path.len > 0) {
+                const buf = try arena.alloc(u8, script_path.len);
+                for (script_path, 0..) |ch, i| buf[i] = if (ch == '/') '\\' else ch;
+                script_path = buf;
+            }
             script_dir = std.fs.path.dirname(script_path) orelse cwd;
         }
         break :blk ljs.HostCtx{ .argv = argv.items, .env_pairs = env_pairs.items, .cwd = cwd, .pid = hostPid(), .script_path = script_path, .script_dir = script_dir };
