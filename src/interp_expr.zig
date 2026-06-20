@@ -1184,7 +1184,10 @@ pub fn finalizeFunctionPrototype(self: *Interpreter, obj: *Object) std.mem.Alloc
         pv.object.prototype = if (fd.is_async) interp_async.asyncGeneratorProto(self) else interp_async.generatorProto(self);
         try obj.defineData("prototype", pv, true, false, false);
     } else {
-        // §10.2.4: an ordinary constructor's `.prototype` is non-enumerable + configurable.
+        // §10.2.4 MakeConstructor / §20.2.3: an ordinary constructor's `.prototype` is an ordinary
+        // object whose [[Prototype]] is %Object.prototype% (`createFunction` left it null), and the
+        // own `prototype` descriptor is { writable:true, enumerable:false, configurable:true }.
+        pv.object.prototype = self.objectProto();
         try obj.defineData("prototype", pv, true, false, true);
     }
 }

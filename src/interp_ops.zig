@@ -20,7 +20,6 @@ const toNumber = ops.toNumber;
 const relational = ops.relational;
 const strictEquals = ops.strictEquals;
 const looseEquals = ops.looseEquals;
-const instanceOf = ops.instanceOf;
 const parseIndex = ops.parseIndex;
 const numToInt32 = ops.numberToInt32;
 const numToUint32 = ops.numberToUint32;
@@ -339,7 +338,7 @@ pub inline fn evalBinary(self: *Interpreter, op: ast.BinaryOp, ln: *const ast.No
         .gt => return relationalV(self, l, r, .gt),
         .le => return relationalV(self, l, r, .le),
         .ge => return relationalV(self, l, r, .ge),
-        .instanceof_ => return .{ .normal = .{ .boolean = instanceOf(l, r) } },
+        .instanceof_ => return instanceofOperator(self, l, r),
         .eq => {
             const c = try looseEqualsV(self, l, r);
             if (c.isAbrupt()) return c;
@@ -353,6 +352,42 @@ pub inline fn evalBinary(self: *Interpreter, op: ast.BinaryOp, ln: *const ast.No
         .seq => return .{ .normal = .{ .boolean = strictEquals(l, r) } },
         .sne => return .{ .normal = .{ .boolean = !strictEquals(l, r) } },
     }
+}
+
+/// §13.10 / §7.3.22 InstanceofOperator ( V, target ). `V instanceof target`:
+///  1. If target is not an Object, throw a TypeError.
+///  2. instOfHandler = GetMethod(target, @@hasInstance).
+///  3. If instOfHandler is not undefined, return ToBoolean(Call(instOfHandler, target, «V»)).
+///  4. If IsCallable(target) is false, throw a TypeError.
+///  5. Return OrdinaryHasInstance(target, V).
+/// Note ordinary Function objects carry Function.prototype[@@hasInstance], so the @@hasInstance
+/// branch normally handles them; the OrdinaryHasInstance fallback covers a realm without that
+/// method installed. `ordinaryHasInstance` already performs the §7.3.21 `Get(C,"prototype")`
+/// (firing getters) and the non-object-prototype TypeError.
+pub fn instanceofOperator(self: *Interpreter, v: Value, target: Value) EvalError!Completion {
+    // §7.3.22 step 1: target must be an Object.
+    if (target != .object) return self.throwError("TypeError", "Right-hand side of 'instanceof' is not an object");
+    // §7.3.22 step 2: instOfHandler = GetMethod(target, @@hasInstance). The getter may throw.
+    if (self.wellKnownSymbol("hasInstance")) |sym| {
+        const hc = try self.getSymbolProperty(target, sym);
+        if (hc.isAbrupt()) return hc;
+        const handler = hc.normal;
+        // §7.3.22 step 3: a non-undefined/non-null handler is invoked; GetMethod requires it be
+        // callable, else TypeError (a present-but-non-callable @@hasInstance is an error).
+        if (handler != .undefined and handler != .null) {
+            if (handler != .object or !isCallable(handler.object)) {
+                return self.throwError("TypeError", "Symbol.hasInstance method is not callable");
+            }
+            // §7.3.22 step 3: Return ToBoolean(? Call(instOfHandler, target, «V»)).
+            const rc = try self.callFunction(handler.object, &.{v}, target);
+            if (rc.isAbrupt()) return rc;
+            return .{ .normal = .{ .boolean = ops.toBoolean(rc.normal) } };
+        }
+    }
+    // §7.3.22 step 4: with no @@hasInstance, target must be callable.
+    if (!isCallable(target.object)) return self.throwError("TypeError", "Right-hand side of 'instanceof' is not callable");
+    // §7.3.22 step 5: Return OrdinaryHasInstance(target, V).
+    return self.ordinaryHasInstance(target, v);
 }
 
 /// §13.15.3 ApplyStringOrNumericBinaryOperator for the value-level operators shared by binary

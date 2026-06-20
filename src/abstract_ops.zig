@@ -423,21 +423,6 @@ fn bigintLooseEqual(l: Value, r: Value) bool {
     }
 }
 
-/// §13.10.2 InstanceofOperator (M1: ordinary prototype-chain check; lenient on non-callable RHS).
-pub fn instanceOf(l: Value, r: Value) bool {
-    if (r != .object or r.object.kind != .function) return false;
-    const pv = r.object.get("prototype") orelse return false;
-    if (pv != .object) return false;
-    const target = pv.object;
-    if (l != .object) return false;
-    var p = l.object.prototype;
-    while (p) |proto| {
-        if (proto == target) return true;
-        p = proto.prototype;
-    }
-    return false;
-}
-
 /// Canonical array-index string ("0".."N") → usize, else null.
 pub fn parseIndex(key: []const u8) ?usize {
     if (key.len == 0) return null;
