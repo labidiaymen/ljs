@@ -191,6 +191,16 @@ pub const Interpreter = struct {
     /// Set by `host_setup.installHostGlobals` from the `HostCtx` `main` built at startup. Empty off
     /// the host path (never read there — `process` isn't installed on the Test262/eval-less surface).
     host_cwd: []const u8 = "",
+    /// HOST (Node axis, spec 102): the per-run CommonJS `require` module cache, keyed by resolved
+    /// ABSOLUTE file path → that module's `module.exports` Value. Populated by `host_require.loadModule`
+    /// (entered BEFORE running a module body so a circular require sees the partial exports). The `path`/
+    /// `fs`/`os` core modules are cached separately in `core_module_cache`. Empty + never consulted on the
+    /// Test262 path (require is host-only, installed only by `host_setup`).
+    require_cache: std.StringHashMapUnmanaged(Value) = .empty,
+    /// HOST (Node axis, spec 102): the core-module exports cache, keyed by module name (`"path"`/`"fs"`/
+    /// `"os"`) → its (built-once) exports object. Distinct from `require_cache` (file modules) so a core
+    /// module is never re-built. Empty off the host path.
+    core_module_cache: std.StringHashMapUnmanaged(Value) = .empty,
     /// §13.3.10 / §16.2.1.6 dynamic `import()` host hooks (the minimal Test262 harness loader). When
     /// set, `evalImportCall` resolves the specifier via `module_loader` relative to `host_referrer_key`,
     /// loads + links + evaluates the target module graph (shared `module_cache`, keyed by resolved key

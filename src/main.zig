@@ -71,7 +71,20 @@ pub fn main(init: std.process.Init) !void {
         while (it.next()) |entry| try env_pairs.append(arena, .{ entry.key_ptr.*, entry.value_ptr.* });
 
         const cwd = std.process.currentPathAlloc(io, arena) catch "";
-        break :blk ljs.HostCtx{ .argv = argv.items, .env_pairs = env_pairs.items, .cwd = cwd, .pid = hostPid() };
+        // HOST (spec 102): the entry script's absolute path + directory (for `require`/`__filename`/
+        // `__dirname`). Only meaningful for `run` (a real file); `eval` has no script file.
+        var script_path: []const u8 = "";
+        var script_dir: []const u8 = "";
+        if (is_run) {
+            script_path = if (std.fs.path.isAbsolute(arg))
+                arg
+            else if (cwd.len > 0)
+                (std.fs.path.resolve(arena, &.{ cwd, arg }) catch arg)
+            else
+                arg;
+            script_dir = std.fs.path.dirname(script_path) orelse cwd;
+        }
+        break :blk ljs.HostCtx{ .argv = argv.items, .env_pairs = env_pairs.items, .cwd = cwd, .pid = hostPid(), .script_path = script_path, .script_dir = script_dir };
     };
 
     const result = if (is_run)

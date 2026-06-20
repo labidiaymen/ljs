@@ -77,7 +77,7 @@ fn makeBuffer(self: *Interpreter, n: usize) EvalError!*Object {
     return Object.createTypedArray(self.arena, proto, ab, 0, n, .u8) catch return error.OutOfMemory;
 }
 
-fn makeBufferFromBytes(self: *Interpreter, src: []const u8) EvalError!*Object {
+pub fn makeBufferFromBytes(self: *Interpreter, src: []const u8) EvalError!*Object {
     const buf = try makeBuffer(self, src.len);
     if (bytesOf(buf)) |dst| @memcpy(dst, src);
     return buf;

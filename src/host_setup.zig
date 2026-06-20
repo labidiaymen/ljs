@@ -26,6 +26,11 @@ pub const HostCtx = struct {
     env_pairs: []const [2][]const u8,
     cwd: []const u8,
     pid: i64 = 0,
+    /// HOST (spec 102): the entry script's ABSOLUTE path + directory, so `require`/`__filename`/
+    /// `__dirname` can be injected for the top-level script (`ljs run <file>`). Empty for `ljs eval`
+    /// (no script file) → no `require` is injected (a `require` call would then be a ReferenceError).
+    script_path: []const u8 = "",
+    script_dir: []const u8 = "",
 };
 
 /// `@import("builtin").os.tag` → the Node `process.platform` string (best-effort coverage of the
@@ -143,6 +148,11 @@ pub fn installHostGlobals(self: *Interpreter, ctx: HostCtx) EvalError!void {
 
     // ── Buffer (spec 101) ───────────────────────────────────────────────────────────────────────────
     try @import("host_buffer.zig").installBuffer(self, function_proto);
+
+    // ── CommonJS require / module / exports / __filename / __dirname (spec 102) ──────────────────────
+    // Only for `ljs run <file>` (a known script path); `ljs eval` leaves these absent.
+    if (ctx.script_path.len > 0)
+        try @import("host_require.zig").installEntryRequire(self, ctx.script_path, ctx.script_dir);
 
     // process is also an own property of the global object (so `globalThis.process` works).
     if (env.lookup("%GlobalThis%")) |gb| if (gb.value == .object) {

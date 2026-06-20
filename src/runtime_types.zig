@@ -667,6 +667,15 @@ pub const NativeId = enum {
     /// `cwd`/`exit`/`nextTick`/`stdoutWrite`/`stderrWrite`. Built + installed by `host_setup`; inert on
     /// the Test262 path (host globals are not installed there).
     process_method,
+    /// HOST (Node axis, spec 102 — NOT ECMA-262): the per-module `require(specifier)` function. Each
+    /// module's `require` is a fresh object carrying its directory as a hidden own `"%dir%"` property
+    /// (`callNative` receives `func`, so the dir is read off the receiver). Resolves a specifier to a
+    /// core module / file path and returns its cached exports. Inert on the Test262 path.
+    require_fn,
+    /// HOST (Node axis, spec 102 — NOT ECMA-262): a core-module method (`path`/`fs`/`os`) — the owning
+    /// module is selected by a hidden own `"%mod%"` property and the method by `native_name`. Built once
+    /// per run by `host_require`; inert on the Test262 path.
+    core_module_fn,
     /// §10.4.4.6 %ThrowTypeError% — the unique per-realm function that unconditionally throws a
     /// TypeError. Used as the poison `get`/`set` for `callee` (and historically `caller`) on a
     /// strict / unmapped arguments object. Never returns normally.
