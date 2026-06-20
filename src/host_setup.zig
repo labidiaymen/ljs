@@ -95,7 +95,25 @@ pub fn installHostGlobals(self: *Interpreter, ctx: HostCtx) EvalError!void {
     }
 
     // ── process ───────────────────────────────────────────────────────────────────────────────────
-    const process = try Object.create(arena, object_proto);
+    // `process` is an EventEmitter (spec 105): its prototype chain runs
+    //   process → process.constructor.prototype → %EventEmitter.prototype% → %Object.prototype%
+    // so `process.on/once/emit/…` resolve via the EventEmitter mix-in, and `process instanceof
+    // process.constructor` / `Object.getPrototypeOf(process) instanceof EventEmitter` hold.
+    const event_emitter = try @import("host_events.zig").build(self); // the EventEmitter class
+    self.core_module_cache.put(arena, "events", .{ .object = event_emitter }) catch return error.OutOfMemory;
+    const ee_proto: ?*Object = if (event_emitter.get("prototype")) |pv| (if (pv == .object) pv.object else object_proto) else object_proto;
+
+    // The `process.constructor` — a native callable whose `.prototype` is the process prototype.
+    const process_ctor = try Object.createNative(arena, .process_method, "process_ctor");
+    process_ctor.prototype = function_proto;
+    try process_ctor.defineData("name", .{ .string = "process" }, false, false, true);
+    // The process prototype: [[Prototype]] = %EventEmitter.prototype%, with a `constructor` backref.
+    const process_proto = try Object.create(arena, ee_proto);
+    try process_proto.defineData("constructor", .{ .object = process_ctor }, true, false, true);
+    try process_ctor.defineData("prototype", .{ .object = process_proto }, false, false, false);
+
+    const process = try Object.create(arena, process_proto);
+    self.process_obj = process;
 
     // process.argv — [execPath, scriptPath, ...extra].
     {
@@ -144,7 +162,24 @@ pub fn installHostGlobals(self: *Interpreter, ctx: HostCtx) EvalError!void {
         try process.defineData("stderr", .{ .object = stderr }, true, true, true);
     }
 
+    // process._eventsCount — a number (the suite asserts it is not NaN). Initialized to 0.
+    try process.defineData("_eventsCount", .{ .number = 0 }, true, false, true);
+
+    // ── spec-105 expanded process surface (hrtime/uptime/cpuUsage/memoryUsage/emitWarning/kill/umask/
+    //    features/release/config/allowedNodeEnvironmentFlags/exitCode/title) ──────────────────────────
+    try @import("host_process.zig").install(self, process, function_proto);
+
     try env.declare("process", .{ .object = process }, true, true);
+
+    // ── Error.captureStackTrace / Error.stackTraceLimit (V8 host extension, spec 105) ────────────────
+    // Node tests (and much Node code) rely on the V8-only `Error.captureStackTrace(target[, ctor])`.
+    // It is NOT ECMA-262, so it lives on the host path only (never touched by the Test262 surface).
+    if (env.lookup("Error")) |eb| if (eb.value == .object) {
+        const error_ctor = eb.value.object;
+        try defineHostMethod(self, error_ctor, "captureStackTrace", "captureStackTrace", function_proto);
+        if (error_ctor.get("stackTraceLimit") == null)
+            try error_ctor.defineData("stackTraceLimit", .{ .number = 10 }, true, false, true);
+    };
 
     // ── Buffer (spec 101) ───────────────────────────────────────────────────────────────────────────
     try @import("host_buffer.zig").installBuffer(self, function_proto);
@@ -181,15 +216,19 @@ fn defineHostMethod(self: *Interpreter, target: *Object, key: []const u8, impl: 
     try target.defineData(key, .{ .object = fn_obj }, true, false, true);
 }
 
-/// Dispatch a `process_method` native by `name`. Called from `interp_native.callNative`.
-pub fn processMethod(self: *Interpreter, name: []const u8, args: []const Value) EvalError!Completion {
+/// Dispatch a `process_method` native. Called from `interp_native.callNative`. The spec-100 core
+/// methods (cwd/exit/nextTick/std{out,err}Write) live here; the spec-105 surface forwards to
+/// `host_process.method`.
+pub fn processMethod(self: *Interpreter, func: *Object, this_val: Value, args: []const Value) EvalError!Completion {
+    const name = func.native_name;
+    if (std.mem.eql(u8, name, "process_ctor")) return .{ .normal = .undefined }; // `new process.constructor()` no-op
     if (std.mem.eql(u8, name, "cwd")) {
         return .{ .normal = .{ .string = self.host_cwd } };
     }
     if (std.mem.eql(u8, name, "exit")) {
         // §process.exit([code]): ToInt32-ish — Node coerces to an integer, NaN/undefined → 0. Flush the
         // host writers (so buffered console output reaches the terminal) before terminating the process.
-        var code: u8 = 0;
+        var code: u8 = self.host_exit_code; // default to the pending exitCode
         if (args.len > 0 and args[0] != .undefined) {
             const nd = try self.toNumberV(args[0]);
             if (nd.isAbrupt()) return nd;
@@ -202,6 +241,9 @@ pub fn processMethod(self: *Interpreter, name: []const u8, args: []const Value) 
                 code = @intCast(@mod(wrapped, 256));
             }
         }
+        // §process: fire the `'exit'` event ONCE (re-entrant `process.exit()` from an exit handler is a
+        // no-op for the event but still terminates) before flushing + terminating.
+        try emitExit(self, code);
         // Best-effort flush before terminating; a broken pipe must not block exit.
         if (self.host_out) |w| w.flush() catch |e| std.log.debug("process.exit: stdout flush failed: {s}", .{@errorName(e)});
         if (self.host_err) |w| w.flush() catch |e| std.log.debug("process.exit: stderr flush failed: {s}", .{@errorName(e)});
@@ -210,14 +252,45 @@ pub fn processMethod(self: *Interpreter, name: []const u8, args: []const Value) 
     if (std.mem.eql(u8, name, "nextTick")) {
         const cb = if (args.len > 0) args[0] else .undefined;
         if (cb != .object or cb.object.kind != .function)
-            return self.throwError("TypeError", "process.nextTick requires a callback function");
+            return @import("host_process.zig").throwCodedPub(self, "TypeError", "ERR_INVALID_ARG_TYPE", "The \"callback\" argument must be of type function.");
         const extra: []const Value = if (args.len > 1) try self.arena.dupe(Value, args[1..]) else &.{};
         self.next_tick_queue.append(self.arena, .{ .callback = cb.object, .args = extra }) catch return error.OutOfMemory;
         return .{ .normal = .undefined };
     }
     if (std.mem.eql(u8, name, "stdoutWrite")) return writeStream(self, self.host_out, args);
     if (std.mem.eql(u8, name, "stderrWrite")) return writeStream(self, self.host_err, args);
-    return .{ .normal = .undefined };
+    // Everything else is the spec-105 expanded surface.
+    return @import("host_process.zig").method(self, name, this_val, args);
+}
+
+/// Whether the `'exit'` event has already fired (so a re-entrant `process.exit()` from inside an exit
+/// handler does not refire it). Lives as a hidden own prop on `process`.
+const EXIT_FIRED_KEY = "%exitFired%";
+
+/// Read `process.exitCode` (if a small integer) into `host_exit_code`, then fire the `'exit'` event
+/// with the resolved code — at most once per process. Called by `process.exit` and by `engine.runHost`
+/// at the natural end of the run.
+pub fn emitExit(self: *Interpreter, code: u8) EvalError!void {
+    const process = self.process_obj orelse return;
+    if (process.get(EXIT_FIRED_KEY)) |v| if (v == .boolean and v.boolean) return; // already fired
+    try process.defineData(EXIT_FIRED_KEY, .{ .boolean = true }, true, false, false);
+    self.host_exit_code = code;
+    const c = try @import("host_process.zig").emitEvent(self, .{ .object = process }, "exit", &[_]Value{.{ .number = @floatFromInt(code) }});
+    if (c == .throw) @import("host_timers.zig").hostReportError(self, c.throw);
+}
+
+/// Resolve the run's final exit code from `process.exitCode` (an own data prop a script may have set).
+/// Non-integer / out-of-range / undefined → 0. Used by `engine.runHost` to drive the end-of-run
+/// `'exit'` event.
+pub fn resolveExitCode(self: *Interpreter) u8 {
+    const process = self.process_obj orelse return 0;
+    const v = process.get("exitCode") orelse return 0;
+    if (v != .number) return 0;
+    const n = v.number;
+    if (std.math.isNan(n)) return 0;
+    const t = std.math.trunc(n);
+    if (t < 0 or t > 255) return @intCast(@mod(@as(i64, @intFromFloat(@max(@min(t, 2_000_000_000), -2_000_000_000))), 256));
+    return @intFromFloat(t);
 }
 
 /// `process.stdout.write(s)` / `process.stderr.write(s)`: ToString(arg[0]) → the writer, return `true`.

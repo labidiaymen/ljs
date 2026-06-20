@@ -53,7 +53,7 @@ pub fn fromI64(arena: std.mem.Allocator, v: i64) Error!*const Const {
     return snapshot(arena, m);
 }
 
-/// `from u64` — exact (used for unsigned 64-bit Buffer reads, where the value may exceed i64).
+/// `from u64` — exact (unsigned 64-bit Buffer reads / `process.hrtime.bigint()` counts that exceed i64).
 pub fn fromU64(arena: std.mem.Allocator, v: u64) Error!*const Const {
     var m = try Managed.initSet(arena, v);
     defer m.deinit();

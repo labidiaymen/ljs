@@ -191,6 +191,15 @@ pub const Interpreter = struct {
     /// Set by `host_setup.installHostGlobals` from the `HostCtx` `main` built at startup. Empty off
     /// the host path (never read there — `process` isn't installed on the Test262/eval-less surface).
     host_cwd: []const u8 = "",
+    /// HOST (Node axis, spec 105): the `process` object (set by `installHostGlobals`) — kept so the
+    /// engine can `process.emit('exit', code)` at the end of `runHost`. Null off the host path.
+    process_obj: ?*object_mod.Object = null,
+    /// HOST (Node axis, spec 105): monotonic ms at process launch — the base for `process.uptime()`
+    /// and `process.hrtime()`. 0 off the host path.
+    host_start_ms: f64 = 0,
+    /// HOST (Node axis, spec 105): the pending `process.exitCode` (the value the run exits with unless
+    /// a `process.exit(code)` overrides it). 0 off the host path.
+    host_exit_code: u8 = 0,
     /// HOST (Node axis, spec 102): the per-run CommonJS `require` module cache, keyed by resolved
     /// ABSOLUTE file path → that module's `module.exports` Value. Populated by `host_require.loadModule`
     /// (entered BEFORE running a module body so a circular require sees the partial exports). The `path`/

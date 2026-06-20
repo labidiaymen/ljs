@@ -529,7 +529,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .global_fn => return globalFn(self, func.native_name, args), // §19.2 global function intrinsics
         .timer_fn => return host_timers.timerFn(self, func.native_name, args), // HOST timers (spec 098)
         .console_log => return host_timers.consoleLog(self, args), // HOST console.log (spec 098)
-        .process_method => return host_setup.processMethod(self, func.native_name, args), // HOST process (spec 100)
+        .process_method => return host_setup.processMethod(self, func, this_val, args), // HOST process (spec 100/105)
         .buffer_fn => return @import("host_buffer.zig").bufferFn(self, func.native_name, this_val, args), // HOST Buffer (spec 101)
         .events_method => return @import("host_events.zig").method(self, func, this_val, args), // HOST events/EventEmitter (spec 103)
         .require_fn => return @import("host_require.zig").requireFn(self, func, args), // HOST require (spec 102)

@@ -454,6 +454,16 @@ pub fn runHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, ctx:
             error.StepLimitExceeded => .step_limit,
         };
     };
+    // §process: fire the `'exit'` event with the resolved exit code (from `process.exitCode`,
+    // default 0) at the natural end of the run. A `process.exit()` earlier already fired + terminated;
+    // this only runs on the fall-off-the-end path. The handler runs synchronously.
+    host_setup.emitExit(&interp, host_setup.resolveExitCode(&interp)) catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
     interp.cleanupGenerators();
     return switch (completion) {
         .normal => |v| .{ .normal = v },
