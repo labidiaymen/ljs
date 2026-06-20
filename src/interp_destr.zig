@@ -380,8 +380,14 @@ pub fn destrCloseChecked(self: *Interpreter, rec: ArrayDestr) EvalError!Completi
 
 /// GetIterator(value) once for array destructuring, choosing the unobservable fast path for a plain
 /// Array (default iterator) and the §7.4 protocol otherwise. A non-iterable → abrupt TypeError.
+///
+/// §8.5.2 the fast path (read indices directly) is observably equivalent to the iterator protocol
+/// ONLY when the value's `@@iterator` is still the pristine intrinsic (`%Array.prototype.values%` /
+/// the String iterator). A program that reassigns `Array.prototype[Symbol.iterator]` (or gives the
+/// array an own `@@iterator`) MUST have its custom iterator driven, so when the iterator is not
+/// pristine we fall through to the real §7.4 GetIterator path.
 pub fn destrOpen(self: *Interpreter, value: Value) EvalError!Interpreter.DriverOrAbrupt {
-    if (value == .object and value.object.kind == .array) {
+    if (value == .object and value.object.kind == .array and try iterMethodIsNative(self, value, .array_values)) {
         const arr = value.object;
         const len = arr.arrayLen();
         if (len == arr.elements.items.len) {
@@ -393,7 +399,7 @@ pub fn destrOpen(self: *Interpreter, value: Value) EvalError!Interpreter.DriverO
         while (i < len) : (i += 1) try items.append(self.arena, arr.arrayGet(i));
         return .{ .driver = .{ .fast = .{ .items = items.items } } };
     }
-    if (value == .string) {
+    if (value == .string and try iterMethodIsNative(self, value, .string_iterator)) {
         // A String iterates code units; materialize once (finite) and drive the fast path over them.
         const s = value.string;
         var units: std.ArrayListUnmanaged(Value) = .empty;
@@ -405,4 +411,17 @@ pub fn destrOpen(self: *Interpreter, value: Value) EvalError!Interpreter.DriverO
         .abrupt => |c| .{ .abrupt = c },
         .iterator => |iterator| .{ .driver = .{ .iter = .{ .iterator = iterator } } },
     };
+}
+
+/// True iff `value`'s `@@iterator` method resolves (through the prototype chain) to the native with
+/// id `want` — i.e. the iterator is the pristine intrinsic, so the index-reading fast path is
+/// observably equivalent to running it. Any reassignment / own-property override yields a different
+/// (or non-native) method → false, sending the caller to the real GetIterator path. A throwing
+/// accessor `@@iterator` also returns false (the slow path re-reads it and propagates the throw).
+fn iterMethodIsNative(self: *Interpreter, value: Value, want: object_mod.NativeId) EvalError!bool {
+    const sym = self.wellKnownIterator() orelse return false;
+    const mc = try self.getSymbolProperty(value, sym);
+    if (mc.isAbrupt()) return false;
+    const m = mc.normal;
+    return m == .object and m.object.kind == .function and m.object.native == want;
 }
