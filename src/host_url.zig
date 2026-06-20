@@ -47,12 +47,42 @@ pub fn install(self: *Interpreter) EvalError!void {
     }
 }
 
-/// `require('url')` → an object exposing `URL` + `URLSearchParams` (the requireable core module).
+/// `require('url')` → an object exposing the WHATWG `URL`/`URLSearchParams` PLUS the legacy `url`
+/// module surface (`parse`/`format`/`resolve`/`Url`/`domainToASCII`/`domainToUnicode`/
+/// `pathToFileURL`/`fileURLToPath`/`urlToHttpOptions`). The WHATWG ctors here are FRESH ones (so the
+/// module's `URL` is the requireable copy); they share the same `.url_method` dispatch.
 pub fn buildUrlModule(self: *Interpreter) EvalError!*Object {
     const obj = try Object.create(self.arena, self.objectProto());
-    try obj.defineData("URL", .{ .object = try makeUrlCtor(self) }, true, true, true);
+    const url_ctor = try makeUrlCtor(self);
+    try obj.defineData("URL", .{ .object = url_ctor }, true, true, true);
     try obj.defineData("URLSearchParams", .{ .object = try makeUrlSearchParamsCtor(self) }, true, true, true);
+
+    // Legacy `url` module free functions (each a `.url_method` flagged "url_legacy").
+    const legacy = [_][]const u8{
+        "parse",            "format",          "resolve",       "resolveObject",
+        "domainToASCII",    "domainToUnicode", "pathToFileURL", "fileURLToPath",
+        "urlToHttpOptions",
+    };
+    for (legacy) |m| {
+        const fn_obj = try makeMethod(self, "url_legacy", m);
+        try obj.defineData(m, .{ .object = fn_obj }, true, true, true);
+    }
+    // The legacy `url.Url` constructor (an empty-instance ctor — Node's `new url.Url()`).
+    const url_legacy_ctor = try makeMethod(self, "url_legacy_ctor", "Url");
+    try url_legacy_ctor.defineData("prototype", .{ .object = try Object.create(self.arena, self.objectProto()) }, false, false, false);
+    try obj.defineData("Url", .{ .object = url_legacy_ctor }, true, true, true);
     return obj;
+}
+
+/// Install the WHATWG `URL` statics (`URL.canParse`/`URL.parse`/`URL.createObjectURL`/
+/// `URL.revokeObjectURL`) as own properties of the `URL` constructor. Shared by the global ctor and
+/// the `require('url')` copy.
+fn installUrlStatics(self: *Interpreter, ctor: *Object) EvalError!void {
+    const statics = [_][]const u8{ "canParse", "parse", "createObjectURL", "revokeObjectURL" };
+    for (statics) |s| {
+        const fn_obj = try makeMethod(self, "url_static", s);
+        try ctor.defineData(s, .{ .object = fn_obj }, true, false, true);
+    }
 }
 
 // ── constructor / prototype builders ─────────────────────────────────────────
@@ -95,7 +125,9 @@ fn makeCtor(self: *Interpreter, ctor_kind: []const u8, proto_kind: []const u8, c
 }
 
 fn makeUrlCtor(self: *Interpreter) EvalError!*Object {
-    return makeCtor(self, "url_ctor", "url", "URL", &.{ "toString", "toJSON" }, &.{});
+    const ctor = try makeCtor(self, "url_ctor", "url", "URL", &.{ "toString", "toJSON" }, &.{});
+    try installUrlStatics(self, ctor);
+    return ctor;
 }
 
 fn makeUrlSearchParamsCtor(self: *Interpreter) EvalError!*Object {
@@ -135,6 +167,9 @@ pub fn method(self: *Interpreter, func: *Object, this_val: Value, args: []const 
     const name = func.native_name;
     const eq = std.mem.eql;
     if (eq(u8, kind, "url_ctor")) return urlConstruct(self, this_val, args);
+    if (eq(u8, kind, "url_static")) return urlStatic(self, name, args);
+    if (eq(u8, kind, "url_legacy")) return legacyMethod(self, name, this_val, args);
+    if (eq(u8, kind, "url_legacy_ctor")) return .{ .normal = this_val }; // `new url.Url()` → empty instance
     if (eq(u8, kind, "usp_ctor")) return uspConstruct(self, this_val, args);
     if (eq(u8, kind, "te_ctor") or eq(u8, kind, "td_ctor")) return codecConstruct(self, this_val);
     if (eq(u8, kind, "url")) return urlMethod(self, name, this_val);
@@ -387,6 +422,376 @@ fn urlMethod(self: *Interpreter, name: []const u8, this_val: Value) EvalError!Co
         return .{ .normal = this_val.object.get("href") orelse Value{ .string = "" } };
     }
     return .{ .normal = .undefined };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  URL statics: canParse / parse / createObjectURL / revokeObjectURL
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Build a Node-style error with a `code` own property (so `assert.throws({ code })` matches).
+fn throwCode(self: *Interpreter, kind: []const u8, code: []const u8, msg: []const u8) EvalError!Completion {
+    const arena = self.arena;
+    const err = try Object.create(arena, self.errorProto(kind));
+    err.error_data = true;
+    try err.set("name", .{ .string = kind });
+    try err.set("message", .{ .string = msg });
+    try err.defineData("code", .{ .string = code }, true, false, true);
+    return .{ .throw = .{ .object = err } };
+}
+
+/// Can `input` (resolved against an optional `base`) be parsed as an absolute URL? (first-cut: the
+/// minimal absolute-scheme test; relative-with-valid-base also counts).
+fn canParseInput(arena: std.mem.Allocator, input: []const u8, base: ?[]const u8) bool {
+    if ((parseAbsolute(arena, input) catch return false) != null) return true;
+    if (base) |b| return (parseAbsolute(arena, b) catch return false) != null;
+    return false;
+}
+
+/// Dispatch a `URL.*` static. `name` is canParse/parse/createObjectURL/revokeObjectURL.
+fn urlStatic(self: *Interpreter, name: []const u8, args: []const Value) EvalError!Completion {
+    const arena = self.arena;
+    const eq = std.mem.eql;
+
+    if (eq(u8, name, "createObjectURL")) {
+        // Minimal: a blob: URL with an opaque id (no real Blob store; identity not relied upon).
+        if (args.len == 0) return throwCode(self, "TypeError", "ERR_MISSING_ARGS", "The \"obj\" argument must be specified");
+        const tag: usize = if (args[0] == .object) @intFromPtr(args[0].object) else 0;
+        const id = std.fmt.allocPrint(arena, "blob:nodedata:{x}", .{tag}) catch return error.OutOfMemory;
+        return .{ .normal = .{ .string = id } };
+    }
+    if (eq(u8, name, "revokeObjectURL")) {
+        // Node requires the `url` argument; a missing arg is ERR_MISSING_ARGS.
+        if (args.len == 0) return throwCode(self, "TypeError", "ERR_MISSING_ARGS", "The \"url\" argument must be specified");
+        return .{ .normal = .undefined };
+    }
+
+    // canParse / parse share input + base coercion.
+    const inc = try self.toStringValuePub(if (args.len > 0) args[0] else .undefined);
+    if (inc.isAbrupt()) return inc;
+    const input = inc.normal.string;
+    var base: ?[]const u8 = null;
+    if (args.len > 1 and args[1] != .undefined and args[1] != .null) {
+        const bc = try self.toStringValuePub(args[1]);
+        if (bc.isAbrupt()) return bc;
+        base = bc.normal.string;
+    }
+
+    if (eq(u8, name, "canParse")) {
+        return .{ .normal = .{ .boolean = canParseInput(arena, input, base) } };
+    }
+    if (eq(u8, name, "parse")) {
+        // URL.parse(input[,base]) → a URL instance, or null if it cannot be parsed (never throws).
+        if (!canParseInput(arena, input, base)) return .{ .normal = .null };
+        const proto = self.globalProto("URL") orelse self.objectProto();
+        const inst = try Object.create(arena, proto);
+        const c = try urlConstruct(self, .{ .object = inst }, args);
+        if (c == .throw) return .{ .normal = .null };
+        return c;
+    }
+    return .{ .normal = .undefined };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  legacy `url` module: parse / format / resolve / domainTo* / *fileURL* / urlToHttpOptions
+// ════════════════════════════════════════════════════════════════════════════
+
+fn legacyMethod(self: *Interpreter, name: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
+    _ = this_val;
+    const eq = std.mem.eql;
+    if (eq(u8, name, "urlToHttpOptions")) return urlToHttpOptions(self, args);
+    if (eq(u8, name, "domainToASCII")) return domainToAsciiOrUnicode(self, args, true);
+    if (eq(u8, name, "domainToUnicode")) return domainToAsciiOrUnicode(self, args, false);
+    if (eq(u8, name, "pathToFileURL")) return pathToFileURL(self, args);
+    if (eq(u8, name, "fileURLToPath")) return fileURLToPath(self, args);
+    if (eq(u8, name, "format")) return legacyFormat(self, args);
+    if (eq(u8, name, "parse")) return legacyParse(self, args);
+    if (eq(u8, name, "resolve") or eq(u8, name, "resolveObject")) return legacyResolve(self, args);
+    return .{ .normal = .undefined };
+}
+
+/// `urlToHttpOptions(urlObject)` — project a WHATWG URL instance to the http(s) `request` options
+/// shape: `{ protocol, hostname, hash, search, pathname, path, href, port?, auth? }`. Reads the URL's
+/// own data properties (a non-URL object yields `undefined`/`NaN` fields, per Node).
+fn urlToHttpOptions(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const arena = self.arena;
+    const url_v: Value = if (args.len > 0) args[0] else .undefined;
+    const opts = try Object.create(arena, self.objectProto());
+    if (url_v != .object) return .{ .normal = .{ .object = opts } };
+    const uo = url_v.object;
+
+    const get = struct {
+        fn s(o: *Object, k: []const u8) ?[]const u8 {
+            const v = o.get(k) orelse return null;
+            return if (v == .string) v.string else null;
+        }
+    };
+
+    // protocol/hash/search/pathname/href pass through (undefined when absent on the source).
+    for ([_][]const u8{ "protocol", "hash", "search", "pathname", "href" }) |k| {
+        if (get.s(uo, k)) |val| {
+            try opts.defineData(k, .{ .string = val }, true, true, true);
+        } else {
+            try opts.defineData(k, .undefined, true, true, true);
+        }
+    }
+    // hostname: Node's urlToHttpOptions strips the IPv6 brackets (`[::1]` → `::1`).
+    if (get.s(uo, "hostname")) |hn| {
+        const stripped = if (hn.len >= 2 and hn[0] == '[' and hn[hn.len - 1] == ']') hn[1 .. hn.len - 1] else hn;
+        try opts.defineData("hostname", .{ .string = stripped }, true, true, true);
+    } else {
+        try opts.defineData("hostname", .undefined, true, true, true);
+    }
+
+    // port → number (NaN when absent/empty).
+    const port_num: f64 = blk: {
+        const ps = get.s(uo, "port") orelse break :blk std.math.nan(f64);
+        if (ps.len == 0) break :blk std.math.nan(f64);
+        const n = std.fmt.parseInt(u32, ps, 10) catch break :blk std.math.nan(f64);
+        break :blk @floatFromInt(n);
+    };
+    try opts.defineData("port", .{ .number = port_num }, true, true, true);
+
+    // auth → "user[:pass]" when a username is present (else undefined).
+    const user = get.s(uo, "username") orelse "";
+    if (user.len > 0) {
+        const pass = get.s(uo, "password") orelse "";
+        const auth = if (pass.len > 0)
+            std.fmt.allocPrint(arena, "{s}:{s}", .{ user, pass }) catch return error.OutOfMemory
+        else
+            user;
+        try opts.defineData("auth", .{ .string = auth }, true, true, true);
+    } else {
+        try opts.defineData("auth", .undefined, true, true, true);
+    }
+
+    // path = pathname + search (search "" when absent → "").
+    const pathname = get.s(uo, "pathname") orelse "";
+    const search = get.s(uo, "search") orelse "";
+    const path = std.fmt.allocPrint(arena, "{s}{s}", .{ pathname, search }) catch return error.OutOfMemory;
+    try opts.defineData("path", .{ .string = path }, true, true, true);
+
+    return .{ .normal = .{ .object = opts } };
+}
+
+/// `domainToASCII` / `domainToUnicode` — without ICU we cannot do real IDNA/punycode. Return the
+/// input domain UNCHANGED for an already-ASCII domain (so the ASCII round-trip used by tests works);
+/// a non-ASCII domain has no available transform → "" (Node returns "" for an unparseable domain).
+fn domainToAsciiOrUnicode(self: *Interpreter, args: []const Value, to_ascii: bool) EvalError!Completion {
+    _ = to_ascii;
+    const sc = try self.toStringValuePub(if (args.len > 0) args[0] else .{ .string = "" });
+    if (sc.isAbrupt()) return sc;
+    const s = sc.normal.string;
+    var ascii_only = true;
+    for (s) |c| if (c >= 0x80) {
+        ascii_only = false;
+        break;
+    };
+    return .{ .normal = .{ .string = if (ascii_only) s else "" } };
+}
+
+/// `pathToFileURL(path)` → a `file:` URL instance. Percent-encodes the path's special bytes and
+/// normalizes backslashes; a minimal POSIX-leaning implementation.
+fn pathToFileURL(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const arena = self.arena;
+    const sc = try self.toStringValuePub(if (args.len > 0) args[0] else .{ .string = "" });
+    if (sc.isAbrupt()) return sc;
+    const path = sc.normal.string;
+
+    var enc: std.ArrayListUnmanaged(u8) = .empty;
+    const hex = "0123456789ABCDEF";
+    for (path) |c| {
+        // Encode the bytes Node escapes in a file URL path (%, control, space, ?, #) and leave the
+        // path separators; a backslash is preserved as %5C on POSIX.
+        if (c == '%' or c == '?' or c == '#' or c < 0x20 or c == ' ' or c == '\\') {
+            enc.append(arena, '%') catch return error.OutOfMemory;
+            enc.append(arena, hex[c >> 4]) catch return error.OutOfMemory;
+            enc.append(arena, hex[c & 0x0f]) catch return error.OutOfMemory;
+        } else {
+            enc.append(arena, c) catch return error.OutOfMemory;
+        }
+    }
+    const lead = if (enc.items.len > 0 and enc.items[0] == '/') "" else "/";
+    const href = std.fmt.allocPrint(arena, "file://{s}{s}", .{ lead, enc.items }) catch return error.OutOfMemory;
+
+    const proto = self.globalProto("URL") orelse self.objectProto();
+    const inst = try Object.create(arena, proto);
+    const parts = (parseAbsolute(arena, href) catch return error.OutOfMemory) orelse return throwCode(self, "TypeError", "ERR_INVALID_URL", "Invalid URL");
+    try storeUrl(self, inst, parts);
+    return .{ .normal = .{ .object = inst } };
+}
+
+/// `fileURLToPath(url)` — the inverse: a `file:` URL (string or URL instance) → a filesystem path.
+/// Throws Node's typed errors for a non-string/URL arg, a non-`file:` scheme, etc.
+fn fileURLToPath(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const arena = self.arena;
+    const url_v: Value = if (args.len > 0) args[0] else .undefined;
+
+    var href: []const u8 = "";
+    if (url_v == .string) {
+        href = url_v.string;
+    } else if (url_v == .object and url_v.object.get("href") != null) {
+        const h = url_v.object.get("href").?;
+        if (h == .string) href = h.string;
+    } else {
+        return throwCode(self, "TypeError", "ERR_INVALID_ARG_TYPE", "The \"path\" argument must be of type string or an instance of URL.");
+    }
+
+    const parts = (parseAbsolute(arena, href) catch return error.OutOfMemory) orelse
+        return throwCode(self, "TypeError", "ERR_INVALID_URL", "Invalid URL");
+    if (!std.mem.eql(u8, parts.protocol, "file:"))
+        return throwCode(self, "TypeError", "ERR_INVALID_URL_SCHEME", "The URL must be of scheme file");
+    if (parts.hostname.len > 0)
+        return throwCode(self, "TypeError", "ERR_INVALID_FILE_URL_HOST", "File URL host must be \"localhost\" or empty");
+
+    // Percent-decode the pathname.
+    const decoded = percentDecodePath(arena, parts.pathname) catch return error.OutOfMemory;
+    return .{ .normal = .{ .string = decoded } };
+}
+
+/// Percent-decode a URL path (NO '+'→' ' mapping — that's form-encoding, not path-encoding).
+fn percentDecodePath(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == '%' and i + 2 < s.len) {
+            const hi = hexVal(s[i + 1]);
+            const lo = hexVal(s[i + 2]);
+            if (hi != null and lo != null) {
+                try out.append(arena, hi.? * 16 + lo.?);
+                i += 2;
+                continue;
+            }
+        }
+        try out.append(arena, c);
+    }
+    return out.items;
+}
+
+/// Legacy `url.format(urlObject)` — accept a WHATWG URL instance (→ its href) or a legacy-shaped
+/// object (`{ protocol, host/hostname, pathname, search, hash, ... }`). A string passthrough too.
+fn legacyFormat(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const arena = self.arena;
+    const v: Value = if (args.len > 0) args[0] else .undefined;
+    if (v == .string) return .{ .normal = v };
+    if (v != .object) {
+        const sc = try self.toStringValuePub(v);
+        return sc;
+    }
+    const o = v.object;
+    // A WHATWG URL instance → its href.
+    if (o.get("href")) |h| if (h == .string) return .{ .normal = h };
+
+    const get = struct {
+        fn s(io: *Object, k: []const u8) []const u8 {
+            const x = io.get(k) orelse return "";
+            return if (x == .string) x.string else "";
+        }
+    };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    const protocol = get.s(o, "protocol");
+    if (protocol.len > 0) {
+        out.appendSlice(arena, protocol) catch return error.OutOfMemory;
+        if (!std.mem.endsWith(u8, protocol, ":")) out.append(arena, ':') catch return error.OutOfMemory;
+    }
+    const host = if (get.s(o, "host").len > 0) get.s(o, "host") else get.s(o, "hostname");
+    if (host.len > 0) {
+        out.appendSlice(arena, "//") catch return error.OutOfMemory;
+        out.appendSlice(arena, host) catch return error.OutOfMemory;
+    }
+    out.appendSlice(arena, get.s(o, "pathname")) catch return error.OutOfMemory;
+    out.appendSlice(arena, get.s(o, "search")) catch return error.OutOfMemory;
+    out.appendSlice(arena, get.s(o, "hash")) catch return error.OutOfMemory;
+    return .{ .normal = .{ .string = out.items } };
+}
+
+/// Legacy `url.parse(urlString)` — a minimal parse returning an object with the legacy field names
+/// (`protocol/host/hostname/port/pathname/search/hash/path/href`). Throws ERR_INVALID_ARG_TYPE for a
+/// non-string input (matching Node's first check).
+fn legacyParse(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const arena = self.arena;
+    const v: Value = if (args.len > 0) args[0] else .undefined;
+    if (v != .string) {
+        return throwCode(self, "TypeError", "ERR_INVALID_ARG_TYPE", "The \"url\" argument must be of type string.");
+    }
+    const input = v.string;
+    const obj = try Object.create(arena, self.objectProto());
+
+    const parts = (parseAbsolute(arena, input) catch return error.OutOfMemory) orelse {
+        // No scheme → a path-only legacy URL.
+        var pq = input;
+        var hash: []const u8 = "";
+        var search: []const u8 = "";
+        if (std.mem.indexOfScalar(u8, pq, '#')) |h| {
+            hash = pq[h..];
+            pq = pq[0..h];
+        }
+        if (std.mem.indexOfScalar(u8, pq, '?')) |q| {
+            search = pq[q..];
+            pq = pq[0..q];
+        }
+        const path = std.fmt.allocPrint(arena, "{s}{s}", .{ pq, search }) catch return error.OutOfMemory;
+        try obj.defineData("protocol", .null, true, true, true);
+        try obj.defineData("host", .null, true, true, true);
+        try obj.defineData("hostname", .null, true, true, true);
+        try obj.defineData("port", .null, true, true, true);
+        try obj.defineData("pathname", .{ .string = pq }, true, true, true);
+        try obj.defineData("search", if (search.len > 0) Value{ .string = search } else .null, true, true, true);
+        try obj.defineData("hash", if (hash.len > 0) Value{ .string = hash } else .null, true, true, true);
+        try obj.defineData("path", .{ .string = path }, true, true, true);
+        try obj.defineData("href", .{ .string = input }, true, true, true);
+        return .{ .normal = .{ .object = obj } };
+    };
+
+    const host = if (parts.port.len > 0)
+        std.fmt.allocPrint(arena, "{s}:{s}", .{ parts.hostname, parts.port }) catch return error.OutOfMemory
+    else
+        parts.hostname;
+    const path = std.fmt.allocPrint(arena, "{s}{s}", .{ parts.pathname, parts.search }) catch return error.OutOfMemory;
+    try obj.defineData("protocol", .{ .string = parts.protocol }, true, true, true);
+    try obj.defineData("host", if (host.len > 0) Value{ .string = host } else .null, true, true, true);
+    try obj.defineData("hostname", if (parts.hostname.len > 0) Value{ .string = parts.hostname } else .null, true, true, true);
+    try obj.defineData("port", if (parts.port.len > 0) Value{ .string = parts.port } else .null, true, true, true);
+    try obj.defineData("pathname", .{ .string = parts.pathname }, true, true, true);
+    try obj.defineData("search", if (parts.search.len > 0) Value{ .string = parts.search } else .null, true, true, true);
+    try obj.defineData("hash", if (parts.hash.len > 0) Value{ .string = parts.hash } else .null, true, true, true);
+    try obj.defineData("path", .{ .string = path }, true, true, true);
+    try obj.defineData("href", .{ .string = input }, true, true, true);
+    return .{ .normal = .{ .object = obj } };
+}
+
+/// Legacy `url.resolve(from, to)` — resolve `to` against `from` via the WHATWG `new URL(to, from)`
+/// path when `from` is absolute; else a simple path merge. First-cut: covers the common cases.
+fn legacyResolve(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const arena = self.arena;
+    const fc = try self.toStringValuePub(if (args.len > 0) args[0] else .{ .string = "" });
+    if (fc.isAbrupt()) return fc;
+    const tc = try self.toStringValuePub(if (args.len > 1) args[1] else .{ .string = "" });
+    if (tc.isAbrupt()) return tc;
+    const from = fc.normal.string;
+    const to = tc.normal.string;
+
+    // `to` absolute → it wins.
+    if ((parseAbsolute(arena, to) catch null) != null) return .{ .normal = .{ .string = to } };
+
+    // `from` absolute → resolve relative against it and re-serialize.
+    if ((parseAbsolute(arena, from) catch null)) |base| {
+        const rc = resolveRelative(arena, base, to) catch return error.OutOfMemory;
+        var merged = base;
+        merged.pathname = rc.pathname;
+        merged.search = rc.search;
+        merged.hash = rc.hash;
+        const proto = self.globalProto("URL") orelse self.objectProto();
+        const inst = try Object.create(arena, proto);
+        try storeUrl(self, inst, merged);
+        const href = inst.get("href") orelse Value{ .string = to };
+        return .{ .normal = href };
+    }
+
+    // Both relative → a path merge.
+    const rc = resolveRelative(arena, .{ .pathname = from }, to) catch return error.OutOfMemory;
+    const out = std.fmt.allocPrint(arena, "{s}{s}{s}", .{ rc.pathname, rc.search, rc.hash }) catch return error.OutOfMemory;
+    return .{ .normal = .{ .string = out } };
 }
 
 // ════════════════════════════════════════════════════════════════════════════

@@ -296,7 +296,7 @@ pub fn installEntryRequire(self: *Interpreter, script_path: []const u8, script_d
 //  core module registry: path / fs / os
 // ════════════════════════════════════════════════════════════════════════════
 
-const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring" };
+const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test" };
 
 /// Strip a `node:` prefix (Node accepts `node:path` etc.).
 fn coreName(spec: []const u8) []const u8 {
@@ -318,6 +318,12 @@ fn loadCoreModule(self: *Interpreter, name: []const u8) EvalError!Completion {
     return .{ .normal = .{ .object = obj } };
 }
 
+/// Public wrapper around `loadCoreModule` so other host modules can require a core module's exports
+/// (e.g. `node:test`'s `t.assert` aliasing the `assert` module).
+pub fn loadCoreModulePub(self: *Interpreter, name: []const u8) EvalError!Completion {
+    return loadCoreModule(self, name);
+}
+
 /// Build a core module object: a plain object of `.core_module_fn` natives + a few data properties,
 /// each native flagged with its module via a hidden own `"%mod%"` property.
 fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
@@ -326,6 +332,8 @@ fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
     // HOST assert (spec 104): `require('assert')` (callable + methods) / `require('assert/strict')`.
     if (std.mem.eql(u8, name, "assert")) return @import("host_assert.zig").build(self);
     if (std.mem.eql(u8, name, "assert/strict")) return @import("host_assert.zig").buildStrict(self);
+    // HOST node:test (spec 106 Unit A): require('node:test') / require('test') → the test runner.
+    if (std.mem.eql(u8, name, "test")) return @import("host_nodetest.zig").build(self);
     const arena = self.arena;
     if (std.mem.eql(u8, name, "util")) return @import("host_util.zig").build(self); // HOST util (spec 103)
     // HOST path (spec 105): require('path') → an in-engine port of Node's lib/path.js carrying

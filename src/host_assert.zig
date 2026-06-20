@@ -527,12 +527,21 @@ fn errorMatches(self: *Interpreter, err: Value, expected: Value) EvalError!Compl
         return regexpTest(self, eo, msg);
     }
 
-    // A function: either a constructor (instanceof) or a validation predicate.
+    // A function: either a constructor (instanceof) or a validation predicate. Only try the
+    // `instanceof` branch when `expected` has an OBJECT `prototype` (i.e. could be a constructor);
+    // an arrow/method/bound predicate has a non-object (or absent) prototype, for which
+    // `ordinaryHasInstance` throws "non-object prototype" — those are always pure predicates.
     if (eo.kind == .function) {
-        const inst = try self.ordinaryHasInstance(expected, err);
-        if (inst.isAbrupt()) return inst;
-        if (inst.normal == .boolean and inst.normal.boolean) return .{ .normal = .{ .boolean = true } };
-        // Not an instance → treat as a predicate: expected(err) truthy ⇒ pass.
+        const has_ctor_proto = blk: {
+            const p = eo.get("prototype") orelse break :blk false;
+            break :blk p == .object;
+        };
+        if (has_ctor_proto) {
+            const inst = try self.ordinaryHasInstance(expected, err);
+            if (inst.isAbrupt()) return inst;
+            if (inst.normal == .boolean and inst.normal.boolean) return .{ .normal = .{ .boolean = true } };
+        }
+        // Not an instance (or not a constructor) → treat as a predicate: expected(err) truthy ⇒ pass.
         const r = try self.callFunction(eo, &.{err}, .undefined);
         if (r.isAbrupt()) return r;
         return .{ .normal = .{ .boolean = ops.toBoolean(r.normal) } };
@@ -630,9 +639,15 @@ fn settleRejects(self: *Interpreter, result: *Object, rejected: bool, reason: Va
             try async_mod.rejectPromise(self, result, try failValue(self, msg_v, "Missing expected rejection.", "rejects"));
         }
     } else {
-        // doesNotReject: a rejection is unwanted.
+        // doesNotReject: a rejection is unwanted. Node's generated message appends the actual
+        // rejection's message: `Got unwanted rejection.\nActual message: "<msg>"`.
         if (rejected) {
-            try async_mod.rejectPromise(self, result, try failValue(self, msg_v, "Got unwanted rejection.", "doesNotReject"));
+            const default_msg = blk: {
+                const rmsg = try errorMessageString(self, reason);
+                break :blk std.fmt.allocPrint(self.arena, "Got unwanted rejection.\nActual message: \"{s}\"", .{rmsg}) catch
+                    return error.OutOfMemory;
+            };
+            try async_mod.rejectPromise(self, result, try failValue(self, msg_v, default_msg, "doesNotReject"));
         } else {
             try async_mod.resolvePromise(self, result, .undefined);
         }
