@@ -44,6 +44,14 @@ pub const AsyncTestResult = union(enum) {
 /// them). Deterministic — no real timers; the drain is step-bounded so a never-settling promise or a
 /// runaway microtask loop terminates rather than hangs.
 pub fn evaluateAsyncTest(arena: std.mem.Allocator, source: []const u8, mode: RunMode, step_limit: u64) error{OutOfMemory}!AsyncTestResult {
+    return evaluateAsyncTestL(arena, source, mode, step_limit, null, "");
+}
+
+/// §13.3.10 like `evaluateAsyncTest`, but with the optional minimal harness module loader (+ the
+/// test's referrer key) threaded in so a `flags:[async]` test that does `await import('./fixture.js')`
+/// can resolve + load the fixture. The dynamic-import bucket is overwhelmingly async tests, so this is
+/// the primary entry for it. `loader == null` reproduces the loader-less async-test behavior.
+pub fn evaluateAsyncTestL(arena: std.mem.Allocator, source: []const u8, mode: RunMode, step_limit: u64, loader: ?ModuleLoader, referrer_key: []const u8) error{OutOfMemory}!AsyncTestResult {
     const interp_mod = @import("interpreter.zig");
     const obj_mod = @import("object.zig");
     const program = Parser.parseMode(arena, source, mode == .strict) catch |e| switch (e) {
@@ -74,7 +82,13 @@ pub fn evaluateAsyncTest(arena: std.mem.Allocator, source: []const u8, mode: Run
     };
     var gen_registry: std.ArrayListUnmanaged(*obj_mod.Generator) = .empty;
     var job_queue: std.ArrayListUnmanaged(obj_mod.Job) = .empty;
+    var mcache: std.StringHashMapUnmanaged(*module_mod.ModuleRecord) = .empty;
     var interp = Interpreter{ .arena = arena, .step_limit = step_limit, .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue, .async_done = done_sink };
+    if (loader) |l| {
+        interp.module_loader = l;
+        interp.module_cache = &mcache;
+        interp.host_referrer_key = referrer_key;
+    }
     // §9.4.2 GetThisBinding: the global environment's `this` is the global object (in both strict and
     // sloppy mode), so the top-level Script body runs with `this` = globalThis.
     interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
@@ -110,17 +124,11 @@ pub fn evaluate(arena: std.mem.Allocator, source: []const u8, mode: RunMode) err
 
 const module_mod = @import("module.zig");
 
-/// §16.2.1.6 HostResolveImportedModule — the minimal harness loader interface. Given a referencing
-/// module's resolved key and a specifier, the host (the Test262 runner) returns the dependency's
-/// resolved key + source text by reading the sibling file from disk, or null if it can't be found.
-/// This is a TEST HARNESS hook, not a general Node host module system.
-pub const ModuleLoader = struct {
-    ctx: *anyopaque,
-    /// Resolve `specifier` relative to `referrer_key`; return the resolved key + source or null.
-    resolve: *const fn (ctx: *anyopaque, referrer_key: []const u8, specifier: []const u8) ?ResolvedSource,
-};
-
-pub const ResolvedSource = struct { key: []const u8, source: []const u8 };
+/// §16.2.1.6 HostResolveImportedModule loader interface — defined in `module.zig` (a leaf module)
+/// so the interpreter can also hold a loader without an engine↔interpreter import cycle; re-exported
+/// here for the runner + CLI that constructed these via `ljs.ModuleLoader`.
+pub const ModuleLoader = module_mod.ModuleLoader;
+pub const ResolvedSource = module_mod.ResolvedSource;
 
 /// Parse + recursively load a module graph rooted at `root_key`/`root_source`, caching each module
 /// by resolved key (so a diamond / self-import is shared and a cycle terminates). Returns the root
@@ -326,6 +334,14 @@ pub fn evaluateAsyncModule(
 /// Like `evaluate`, but with an explicit interpreter step cap (the watchdog, research D8).
 /// The Test262 harness uses this to bound runaway tests deterministically.
 pub fn evaluateWithLimit(arena: std.mem.Allocator, source: []const u8, mode: RunMode, step_limit: u64) error{OutOfMemory}!EvaluationResult {
+    return evaluateWithLimitL(arena, source, mode, step_limit, null, "");
+}
+
+/// §13.3.10 like `evaluateWithLimit`, but with the optional minimal harness module loader (+ the
+/// script's referrer key) threaded in so a script-context dynamic `import()` can resolve + load a
+/// fixture module. `loader == null` is the plain `evaluate` behavior (import() rejects with a
+/// TypeError). The per-run module cache lives on `arena` for the realm's lifetime.
+pub fn evaluateWithLimitL(arena: std.mem.Allocator, source: []const u8, mode: RunMode, step_limit: u64, loader: ?ModuleLoader, referrer_key: []const u8) error{OutOfMemory}!EvaluationResult {
     // §11.2.2: in strict RunMode the whole Script starts in strict context (the Test262 runner runs
     // each test in both modes and expects the engine to honor this). An explicit `"use strict"`
     // directive prologue is detected independently inside the parser.
@@ -341,7 +357,13 @@ pub fn evaluateWithLimit(arena: std.mem.Allocator, source: []const u8, mode: Run
     // §9.5 the realm Job (microtask) queue — drained once the synchronous script completes (Promise
     // reactions / async-function continuations run here). Empty for a script with no promises (no-op).
     var job_queue: std.ArrayListUnmanaged(@import("object.zig").Job) = .empty;
+    var mcache: std.StringHashMapUnmanaged(*module_mod.ModuleRecord) = .empty;
     var interp = Interpreter{ .arena = arena, .step_limit = step_limit, .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
+    if (loader) |l| {
+        interp.module_loader = l;
+        interp.module_cache = &mcache;
+        interp.host_referrer_key = referrer_key;
+    }
     // §9.4.2 GetThisBinding: the global environment's `this` is the global object (both modes).
     interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
     const completion = interp.run(program, global) catch |e| {

@@ -151,8 +151,14 @@ pub fn generatorBodyThread(parent: *Interpreter, gen: *object_mod.Generator) voi
         .step_limit = parent.step_limit,
         .globals = parent.globals,
         .gen_registry = parent.gen_registry,
+        .job_queue = parent.job_queue,
         .io = parent.io,
         .current_gen = gen,
+        // §13.3.10 a generator/async-generator body may `yield import(...)` / `await import(...)`.
+        .module_loader = parent.module_loader,
+        .module_cache = parent.module_cache,
+        .host_referrer_key = parent.host_referrer_key,
+        .async_done = parent.async_done,
     };
     const comp = body.runGeneratorBody(gen) catch |e| blk: {
         // §27.5.3.3: an engine error (step-limit / OOM) on the body thread completes the generator
@@ -982,6 +988,11 @@ pub fn asyncBodyThread(parent: *Interpreter, gen: *object_mod.Generator) void {
         .job_queue = parent.job_queue,
         .io = parent.io,
         .current_gen = gen,
+        // §13.3.10 a `await import(...)` inside the async body resolves via the parent's loader.
+        .module_loader = parent.module_loader,
+        .module_cache = parent.module_cache,
+        .host_referrer_key = parent.host_referrer_key,
+        .async_done = parent.async_done,
     };
     const comp = body.runGeneratorBody(gen) catch |e| blk: {
         const kind: []const u8 = if (e == error.StepLimitExceeded) "RangeError" else "Error";

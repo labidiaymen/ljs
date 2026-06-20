@@ -13,6 +13,7 @@ const Environment = @import("environment.zig").Environment;
 const object_mod = @import("object.zig");
 const Object = object_mod.Object;
 const module_mod = @import("module.zig");
+const Parser = @import("parser.zig").Parser;
 
 /// §16.2.1.6.3 ResolveExport result — the resolved binding's owning module + LOCAL name. For a
 /// local export this is `(m, local)`; an indirect/star re-export hops to the defining module.
@@ -100,6 +101,10 @@ fn asyncModuleBodyThread(parent: *Interpreter, root: *module_mod.ModuleRecord, g
         // Top-level-await module code may call the Test262 `$DONE` sink directly (the `[async]`
         // module contract); the body thread needs the shared sink so that call is recorded.
         .async_done = parent.async_done,
+        // §13.3.10 a top-level-await module body may contain a dynamic `import()`.
+        .module_loader = parent.module_loader,
+        .module_cache = parent.module_cache,
+        .host_referrer_key = parent.host_referrer_key,
     };
     const comp = body.runGeneratorBody(gen) catch |e| blk: {
         const kind: []const u8 = if (e == error.StepLimitExceeded) "RangeError" else "Error";
@@ -252,10 +257,13 @@ pub fn evaluateModule(self: *Interpreter, m: *module_mod.ModuleRecord) EvalError
     const env = m.env.?;
     const saved_this = self.this_val;
     const saved_strict = self.strict;
+    const saved_ref = self.host_referrer_key;
     self.this_val = .undefined;
     self.strict = true;
+    self.host_referrer_key = m.key; // a nested dynamic import() resolves relative to THIS module
     defer self.this_val = saved_this;
     defer self.strict = saved_strict;
+    defer self.host_referrer_key = saved_ref;
     var last: Completion = .{ .normal = .undefined };
     for (m.program.statements) |stmt| {
         last = try self.evalStmt(stmt, env);
@@ -307,4 +315,52 @@ fn lookupModuleExport(m: *const module_mod.ModuleRecord, local: []const u8) Valu
     const b = Environment.resolveAlias(raw) orelse return .undefined;
     if (!b.initialized) return .undefined;
     return b.value;
+}
+
+// ── §13.3.10 / §16.2.1.6 dynamic import() module graph loading ───────────────
+
+/// §16.2.1.6 ContinueDynamicImport — parse + recursively resolve a module graph for a dynamic
+/// `import()`, caching every module by resolved key in the interpreter's shared `module_cache` (so a
+/// re-import of the same specifier — or a cycle / diamond — reuses the record and evaluates once).
+/// Returns the root record, or null when any module fails to parse or a specifier fails to resolve
+/// (the caller rejects the import() promise with a SyntaxError). Requires `module_loader` +
+/// `module_cache` to be set; returns null if not (a loader-less realm cannot load).
+pub fn loadDynamicGraph(self: *Interpreter, key: []const u8, source: []const u8) EvalError!?*module_mod.ModuleRecord {
+    const cache = self.module_cache orelse return null;
+    if (cache.get(key)) |m| return m;
+    const program = Parser.parseModule(self.arena, source) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null, // parse error in the imported module → reject with SyntaxError
+    };
+    const rec = self.arena.create(module_mod.ModuleRecord) catch return error.OutOfMemory;
+    rec.* = .{ .key = key, .program = program };
+    cache.put(self.arena, key, rec) catch return error.OutOfMemory; // cache BEFORE recursing (cycles)
+    const loader = self.module_loader orelse return null;
+    var deps: std.ArrayListUnmanaged(*module_mod.ModuleRecord) = .empty;
+    for (program.requested_modules) |spec| {
+        const resolved = loader.resolve(loader.ctx, key, spec) orelse return null;
+        const dep = (try loadDynamicGraph(self, resolved.key, resolved.source)) orelse return null;
+        deps.append(self.arena, dep) catch return error.OutOfMemory;
+    }
+    rec.deps = deps.items;
+    return rec;
+}
+
+/// §13.3.10 ImportCall completion: load + Link + Evaluate the module graph at (`key`,`source`) and
+/// return its namespace object as a `.normal` completion, or an abrupt `.throw` (a SyntaxError for a
+/// parse/resolve failure, an unresolvable-import SyntaxError from linking, or the module body's own
+/// thrown error). The caller (`evalImportCall`) maps a `.normal` to FulfillPromise(namespace) and a
+/// `.throw` to RejectPromise(reason). The module graph evaluates synchronously (the harness loader is
+/// synchronous; the import() promise's reactions still run as Jobs during the drain).
+pub fn dynamicImport(self: *Interpreter, key: []const u8, source: []const u8) EvalError!Completion {
+    const root = (try loadDynamicGraph(self, key, source)) orelse
+        return self.throwError("SyntaxError", "could not load the dynamically imported module");
+    const global = self.globals orelse return self.throwError("TypeError", "no realm for dynamic import");
+    try linkModule(self, root, global);
+    const ic = try instantiateModule(self, root);
+    if (ic.isAbrupt()) return ic;
+    const ec = try evaluateModule(self, root); // saves/restores this_val/strict/host_referrer_key
+    if (ec.isAbrupt()) return ec;
+    const ns = try moduleNamespace(self, root);
+    return .{ .normal = .{ .object = ns } };
 }

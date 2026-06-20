@@ -9,6 +9,19 @@ const ast = @import("ast.zig");
 const Environment = @import("environment.zig").Environment;
 const Object = @import("object.zig").Object;
 
+/// §16.2.1.6 HostResolveImportedModule — the minimal Test262 harness loader interface. Given a
+/// referencing module/script's resolved key and a specifier, the host (the conformance runner)
+/// returns the dependency's resolved key + source text by reading the sibling file from disk, or
+/// null if it can't be found. A TEST HARNESS hook, NOT a general Node host module system. Defined
+/// in this leaf module so both `engine.zig` and the interpreter can hold a loader without an import
+/// cycle (engine imports interpreter, so the type cannot live there).
+pub const ResolvedSource = struct { key: []const u8, source: []const u8 };
+pub const ModuleLoader = struct {
+    ctx: *anyopaque,
+    /// Resolve `specifier` relative to `referrer_key`; return the resolved key + source or null.
+    resolve: *const fn (ctx: *anyopaque, referrer_key: []const u8, specifier: []const u8) ?ResolvedSource,
+};
+
 pub const Status = enum { unlinked, linking, linked, evaluating, evaluated };
 
 pub const ModuleRecord = struct {

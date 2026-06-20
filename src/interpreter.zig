@@ -132,6 +132,20 @@ pub const Interpreter = struct {
     /// main + async-body interpreters so a `$DONE` from inside a `.then` job is observed. Null for
     /// ordinary evaluation (no `$DONE` installed → never written).
     async_done: ?*AsyncDone = null,
+    /// §13.3.10 / §16.2.1.6 dynamic `import()` host hooks (the minimal Test262 harness loader). When
+    /// set, `evalImportCall` resolves the specifier via `module_loader` relative to `host_referrer_key`,
+    /// loads + links + evaluates the target module graph (shared `module_cache`, keyed by resolved key
+    /// so a re-import returns the same namespace and evaluates the body once), and FULFILLS the import()
+    /// promise with the module namespace. Null in a loader-less eval → ImportCall rejects with a
+    /// TypeError (the unchanged legacy "module loading is not supported" behavior). Shared (pointers)
+    /// across the main + async-body interpreters so an `import()` inside a `.then` job resolves too.
+    module_loader: ?module_mod.ModuleLoader = null,
+    module_cache: ?*std.StringHashMapUnmanaged(*module_mod.ModuleRecord) = null,
+    /// The resolved key of the currently-executing script/module — the referrer for relative dynamic
+    /// import specifiers. Script/async-test entry points set it to the test path; module-body
+    /// evaluation sets it (save/restore) to the active module's key so a nested `import()` resolves
+    /// relative to that module.
+    host_referrer_key: []const u8 = "",
     /// The process-global threaded Io — supplies the raw-OS-futex backing `std.Io.Semaphore.wait/post`
     /// for the generator ping-pong handoff. `global_single_threaded` spins up no thread pool (futex ops
     /// are pool-independent), so this is free for ordinary (non-generator) execution.

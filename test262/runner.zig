@@ -129,8 +129,8 @@ fn runOne(io: std.Io, dir: std.Io.Dir, arena: Allocator, opts: Options, prelude:
         run_sloppy = run_sloppy and m == .sloppy;
     }
 
-    if (run_strict) try execOne(io, arena, opts, prelude, meta, source, path, .strict, report);
-    if (run_sloppy) try execOne(io, arena, opts, prelude, meta, source, path, .sloppy, report);
+    if (run_strict) try execOne(io, dir, arena, opts, prelude, meta, source, path, .strict, report);
+    if (run_sloppy) try execOne(io, dir, arena, opts, prelude, meta, source, path, .sloppy, report);
 }
 
 /// §16.2 run one `[module]` test. Modules run in strict mode only (module code is always strict).
@@ -180,17 +180,24 @@ fn runModuleTest(io: std.Io, dir: std.Io.Dir, arena: Allocator, opts: Options, p
     try report.add(classify(meta, result, .strict, path));
 }
 
-fn execOne(io: std.Io, arena: Allocator, opts: Options, prelude: []const u8, meta: md.Metadata, source: []const u8, path: []const u8, mode: Mode, report: *rep.Report) RunError!void {
+fn execOne(io: std.Io, dir: std.Io.Dir, arena: Allocator, opts: Options, prelude: []const u8, meta: md.Metadata, source: []const u8, path: []const u8, mode: Mode, report: *rep.Report) RunError!void {
     const full = try buildSource(io, arena, opts, prelude, meta, source, mode);
     const engine_mode: ljs.RunMode = if (mode == .strict) .strict else .sloppy;
+    // §13.3.10 a script may contain a dynamic `import()` (the `dynamic-import` corpus). Provide the
+    // minimal harness loader + this test's path as the referrer so a relative specifier resolves to a
+    // sibling fixture. The assembled `full` source prepends the harness prelude (no own lines added),
+    // so specifiers stay relative to the test file. The loader ctx lives on the per-test scratch arena.
+    const ctx = arena.create(ModuleLoaderCtx) catch return RunError.OutOfMemory;
+    ctx.* = .{ .io = io, .dir = dir, .arena = arena };
+    const loader = ljs.ModuleLoader{ .ctx = ctx, .resolve = ModuleLoaderCtx.resolve };
     // §[async]: drive the test through the $DONE / microtask-drain path; a parse-negative async test
     // still classifies on the parse error (handled in classifyAsync).
     if (meta.flags.is_async) {
-        const ar = try ljs.evaluateAsyncTest(arena, full, engine_mode, opts.step_limit);
+        const ar = try ljs.evaluateAsyncTestL(arena, full, engine_mode, opts.step_limit, loader, path);
         try report.add(classifyAsync(meta, ar, mode, path));
         return;
     }
-    const result = try ljs.evaluateWithLimit(arena, full, engine_mode, opts.step_limit);
+    const result = try ljs.evaluateWithLimitL(arena, full, engine_mode, opts.step_limit, loader, path);
     try report.add(classify(meta, result, mode, path));
 }
 

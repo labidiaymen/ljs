@@ -29,6 +29,7 @@ const interp_destr = @import("interp_destr.zig");
 const interp_ops = @import("interp_ops.zig");
 const interp_async = @import("interp_async.zig");
 const interp_native = @import("interp_native.zig");
+const interp_module = @import("interp_module.zig");
 const interp_collection = @import("interp_collection.zig");
 
 const toNumber = ops.toNumber;
@@ -1628,8 +1629,26 @@ pub fn evalImportCall(self: *Interpreter, ic: anytype, env: *Environment) EvalEr
     // Step 6–7: specifierString = ToString(specifier); IfAbruptRejectPromise.
     switch (try interp_ops.toStringCoerceV(self, sc.normal)) {
         .abrupt => |a| try interp_async.rejectPromise(self, promise, a.throw),
-        .string => {
-            // Step 8: HostLoadImportedModule — no loader in scope, so reject with a TypeError.
+        .string => |spec| {
+            // Step 8: HostLoadImportedModule. With the minimal Test262 harness loader in scope,
+            // resolve the specifier relative to the referrer, load + link + evaluate the target
+            // module graph, and settle the promise with its namespace (fulfill) or the failure
+            // (reject). With no loader (a bare `ljs eval`), reject with a TypeError as before.
+            if (self.module_loader) |loader| if (self.module_cache != null) {
+                if (loader.resolve(loader.ctx, self.host_referrer_key, spec)) |rs| {
+                    const c = try interp_module.dynamicImport(self, rs.key, rs.source);
+                    switch (c) {
+                        .normal => |v| try interp_async.resolvePromise(self, promise, v),
+                        .throw => |t| try interp_async.rejectPromise(self, promise, t),
+                        else => try interp_async.rejectPromise(self, promise, .undefined),
+                    }
+                } else {
+                    // §16.2.1.6 the specifier did not resolve to a module → reject with a TypeError.
+                    const tc = try self.throwError("TypeError", "Cannot resolve module specifier");
+                    try interp_async.rejectPromise(self, promise, tc.throw);
+                }
+                return .{ .normal = .{ .object = promise } };
+            };
             const tc = try self.throwError("TypeError", "module loading is not supported");
             try interp_async.rejectPromise(self, promise, tc.throw);
         },
