@@ -60,7 +60,11 @@ pub fn parseAssignment(self: *Parser) ParseError!*const ast.Node {
     //   • `async [no LT] function …` — an async function expression.
     // `async` is the modifier ONLY with no LineTerminator before the following token (else ASI /
     // `async` is an identifier). Distinguished from a CALL `async(x)` by the trailing `=>`.
-    if (self.atAsyncArrowOrFunction()) |kind| {
+    // §15.8 the `.function_expr` case (`async [no LT] function …`) is a PrimaryExpression, not an
+    // assignment-level production — it is recognized in `parsePrimary` so trailing Member/Call
+    // suffixes (`(async function*(){}())`) and the binary/conditional climb attach to it. Only the
+    // two ARROW cover-grammars are handled here (arrows are assignment-level productions).
+    if (self.atAsyncArrowOrFunction()) |kind| if (kind != .function_expr) {
         // §12.7.1 Early Error: the `async` of an async arrow / async function expression is a
         // terminal symbol and must not contain a Unicode escape (`async function …`).
         if (self.peek().had_escape) return ParseError.UnexpectedToken;
@@ -90,13 +94,9 @@ pub fn parseAssignment(self: *Parser) ParseError!*const ast.Node {
                 if (paramsHaveAwait(pl)) return ParseError.UnexpectedToken;
                 return self.finishArrowAsync(pl, true);
             },
-            .function_expr => {
-                _ = self.advance(); // `async`
-                _ = self.advance(); // `function`
-                return self.alloc(.{ .function = try self.parseFunction(true) });
-            },
+            .function_expr => unreachable, // handled in parsePrimary (see comment above)
         }
-    }
+    };
     // §15.3 ArrowFunction (cover grammar, checked before the precedence climb):
     //   • `Identifier =>` — a single un-parenthesized parameter.
     //   • `( … ) =>` — a parenthesized formal list (lookahead to the matching `)`).
@@ -974,6 +974,18 @@ pub fn parseBigIntLiteral(self: *Parser, lexeme: []const u8) ParseError!*const s
 
 pub fn parsePrimary(self: *Parser) ParseError!*const ast.Node {
     const t = self.peek();
+    // §15.8 AsyncFunctionExpression / AsyncGeneratorExpression (`async [no LT] function …`) is a
+    // PrimaryExpression. Recognized here (rather than at the assignment level) so the trailing
+    // Member/Call suffixes parsed by `continuePostfix` attach to it — e.g. the IIFE
+    // `(async function*(){ yield x }())`. The two async ARROW cover-grammars stay at the assignment
+    // level (`parseAssignment`); only this `.function_expr` shape reaches here.
+    if (self.atAsyncArrowOrFunction()) |kind| if (kind == .function_expr) {
+        // §12.7.1 Early Error: the `async` modifier is a terminal symbol — no Unicode escape.
+        if (t.had_escape) return ParseError.UnexpectedToken;
+        _ = self.advance(); // `async`
+        _ = self.advance(); // `function`
+        return self.alloc(.{ .function = try self.parseFunction(true) });
+    };
     switch (t.kind) {
         .number => {
             _ = self.advance();

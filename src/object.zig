@@ -643,7 +643,11 @@ pub const Object = struct {
             }),
             .regexp_string_iterator_next => 0, // §22.2.9.2.1
             .regexp_static => 1, // §22.2.5.2 RegExp.escape ( S )
-            else => null, // internal natives (resolving functions, combinator elements, test hooks)
+            // §27.2.1.3 CreateResolvingFunctions: the resolve and reject functions each have a
+            // "length" of 1 (and an empty "name"). Observable when a yielded/awaited thenable's `then`
+            // receives them — `yield-thenable-create-resolving-functions-{resolve,reject}`.
+            .promise_resolve_fn, .promise_reject_fn => 1,
+            else => null, // internal natives (combinator elements, test hooks)
         };
     }
 

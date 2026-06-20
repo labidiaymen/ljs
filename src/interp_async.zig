@@ -1039,18 +1039,39 @@ pub fn doAwait(self: *Interpreter, value: Value) EvalError!Completion {
 /// until the next request resumes us. A `.next(v)` makes the yield evaluate to `v`; an injected
 /// `.throw`/`.return` re-throws / returns at the yield point (running finally blocks).
 pub fn doAsyncYield(self: *Interpreter, value: Value) EvalError!Completion {
-    // §27.6.3.8 step 5: Await the operand first.
-    const ac = try doAwait(self, value);
-    if (ac.isAbrupt()) return ac; // a rejected await of the yield operand throws into the body
-    const awaited = ac.normal;
+    return doAsyncYieldRaw(self, value, true);
+}
+
+/// §27.6.3.8 AsyncGeneratorYield, parameterized by whether the operand is awaited first.
+/// `await_first = true` is the plain `yield value` path (§27.6.3.8 step 5 awaits the operand).
+/// `await_first = false` is the `yield*` re-yield (§14.4.14 step 7.a/b/c uses a plain GeneratorYield
+/// of the ALREADY-decoded inner result — the inner `next` result was awaited once, and its `value`
+/// must NOT be awaited again; otherwise a manually-implemented async iterator that yields a Promise
+/// would have it unwrapped, violating `yield-star-promise-not-unwrapped`).
+pub fn doAsyncYieldRaw(self: *Interpreter, value: Value, await_first: bool) EvalError!Completion {
+    const yielded = if (await_first) blk: {
+        // §27.6.3.8 step 5: Await the operand first.
+        const ac = try doAwait(self, value);
+        if (ac.isAbrupt()) return ac; // a rejected await of the yield operand throws into the body
+        break :blk ac.normal;
+    } else value;
     // Now suspend producing the yielded value (a non-await handoff → the servicer settles the request).
     self.current_gen.?.transfer_await = false;
-    const r = doYieldRaw(self, awaited);
+    const r = doYieldRaw(self, yielded);
     if (r.abandon) return .{ .ret = .undefined };
     return switch (r.kind) {
         .next => .{ .normal = r.value }, // the value sent to the next .next(v)
         .throw => .{ .throw = r.value }, // §27.6.3.8: an injected .throw re-throws at the yield
-        .ret => .{ .ret = r.value }, // an injected .return returns (runs finally blocks)
+        // §27.6.3.8 step 8.b: a `.return(v)` resumption of a PLAIN async yield Awaits `v` (so a
+        // thenable resumption value is adopted — `yield-return-then-getter-ticks`). The `yield*`
+        // re-yield path (`await_first = false`) does NOT await here: the resumption is forwarded to
+        // the inner iterator's `return` by the delegate loop (§14.4.14 step 7.c), which awaits the
+        // inner result instead.
+        .ret => if (await_first) blk: {
+            const av = try doAwait(self, r.value);
+            if (av.isAbrupt()) break :blk av; // a rejected await throws into the body
+            break :blk Completion{ .ret = av.normal };
+        } else Completion{ .ret = r.value },
     };
 }
 
@@ -1077,7 +1098,13 @@ pub fn doAsyncYieldDelegate(self: *Interpreter, source: Value) EvalError!Complet
             const mc = try self.getProperty(.{ .object = iterator }, method);
             if (mc.isAbrupt()) return mc;
             if (mc.normal != .object or mc.normal.object.kind != .function) {
-                if (received.kind == .ret) return .{ .ret = received.value };
+                // §27.6.3.8 step 7.c.iii: inner `return` is undefined → for an async generator,
+                // Await(received.[[Value]]) first, then Return Completion(received).
+                if (received.kind == .ret) {
+                    const av = try doAwait(self, received.value);
+                    if (av.isAbrupt()) return av;
+                    return .{ .ret = av.normal };
+                }
                 try interp_stmt.asyncIteratorClose(self, iterator);
                 return self.throwError("TypeError", "The async iterator does not provide a throw method");
             }
@@ -1097,13 +1124,23 @@ pub fn doAsyncYieldDelegate(self: *Interpreter, source: Value) EvalError!Complet
             if (received.kind == .ret) return .{ .ret = step.value };
             return .{ .normal = step.value };
         }
-        // Re-yield the inner value to the outer consumer (AsyncGeneratorYield), capturing the next
-        // resumption (which we forward to the inner iterator).
-        const yc = try doAsyncYield(self, step.value);
+        // §14.4.14 step 7.a.v / 7.b.iii / 7.c.ix: re-yield the inner result's value via a plain
+        // GeneratorYield (NO second await — the inner result was already awaited at line above), so a
+        // Promise produced by a manual async iterator passes through unwrapped.
+        const yc = try doAsyncYieldRaw(self, step.value, false);
         switch (yc) {
             .normal => |v| received = .{ .kind = .next, .value = v, .abandon = false },
             .throw => |e| received = .{ .kind = .throw, .value = e, .abandon = false },
-            .ret => |v| return .{ .ret = v }, // an injected .return unwinds the body
+            // §27.6.3.8 step 7.c: a `.return` resumption at the re-yield is FORWARDED to the inner
+            // iterator's `return` (next loop turn), NOT an immediate unwind — the inner `return` may
+            // yield a not-done result that re-yields and continues the delegation. The body unwinds
+            // only when the inner `return` reports done (step 7.c.viii) or has no `return` method.
+            // EXCEPTION: realm teardown also surfaces as a `.ret` (via `doAsyncYield`'s abandon path);
+            // never loop back to call the inner iterator in that case — unwind immediately.
+            .ret => |v| {
+                if (self.current_gen) |g| if (g.abandon) return .{ .ret = .undefined };
+                received = .{ .kind = .ret, .value = v, .abandon = false };
+            },
             .brk, .cont => return .{ .ret = .undefined },
         }
     }
