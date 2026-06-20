@@ -782,6 +782,9 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
             // HOST (spec 106): `new vm.Script(...)` is `new`-able; the module fns / prototype methods
             // share the NativeId but a different `native_name`, so they are not.
             .vm_method => std.mem.eql(u8, ctor.native_name, "Script"),
+            // HOST (spec 107): `new net.Socket()` / `new net.Server()` are `new`-able; the shared
+            // `.net_method` statics / prototype methods (different `native_name`) are not.
+            .net_method => std.mem.eql(u8, ctor.native_name, "Socket") or std.mem.eql(u8, ctor.native_name, "Server"),
             // HOST (spec 105): `new Buffer(...)` (the deprecated constructor) is `new`-able; the
             // shared `.buffer_fn` prototype/static methods are not.
             .buffer_fn => std.mem.eql(u8, ctor.native_name, "Buffer"),

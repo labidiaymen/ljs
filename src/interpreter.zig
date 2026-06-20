@@ -176,6 +176,19 @@ pub const Interpreter = struct {
     /// (before timers). Inert on the Test262 path. `next_immediate_id` hands out ids.
     immediates: std.ArrayListUnmanaged(object_mod.ImmediateEntry) = .empty,
     next_immediate_id: u64 = 1,
+    /// HOST (Node axis, spec 107): the libxev I/O loop + its accounting. `io_loop` is the lazily
+    /// created `*host_io.IoLoop` (opaque here so interpreter.zig need not import xev); created the
+    /// first time a socket/server is opened, so non-I/O scripts never touch libxev. `io_pending` is a
+    /// ref-count of in-flight libxev operations maintained by `host_net` (bumped at arm time, dropped
+    /// on the `.disarm` completion) — `runEventLoop` keeps running / blocks on I/O while it is > 0.
+    /// `io_handles` maps a small per-handle id (stored as a hidden `"%io%"` prop on the JS Socket/
+    /// Server) → its `*anyopaque` host state, so a JS method call recovers the native state from
+    /// `this`. All inert on the Test262 path (io_pending stays 0 → the event loop never enters the
+    /// I/O branch).
+    io_loop: ?*anyopaque = null,
+    io_pending: usize = 0,
+    io_handles: std.AutoHashMapUnmanaged(u64, *anyopaque) = .empty,
+    next_io_id: u64 = 1,
     /// HOST (Node axis, spec 100): the `process.nextTick` queue — drained FULLY (including ticks
     /// enqueued by running ticks) at the TOP of each event-loop turn, BEFORE the microtask `job_queue`,
     /// so a nextTick callback runs ahead of any Promise reaction scheduled the same turn. Empty + never

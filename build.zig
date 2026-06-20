@@ -28,6 +28,12 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
+    // libxev (host I/O event loop — io_uring/kqueue/IOCP). The FIRST external dependency, adopted
+    // when the Node host-runtime axis opened the I/O slice (spec 107). HOST-only: reachable solely
+    // from the CLI host path (`runHost` → the event loop); the Test262 engine surface never creates a
+    // loop, so it's inert in the conformance harness. Pinned in build.zig.zon against Zig 0.16.0.
+    const xev = b.dependency("xev", .{ .target = target, .optimize = optimize });
+
     const mod = b.addModule("ljs", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -39,6 +45,8 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        // `@import("xev")` is available throughout the engine (used by the host I/O layer only).
+        .imports = &.{.{ .name = "xev", .module = xev.module("xev") }},
     });
 
     // Here we define an executable. An executable needs to have a root module

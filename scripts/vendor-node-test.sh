@@ -4,7 +4,7 @@
 # (spec 104, Unit B) — the host-runtime analogue of vendor-test262.sh.
 #
 # We sparse-checkout a single pinned LTS tag of nodejs/node and keep only:
-#   • test/parallel/test-{buffer,events,util,path,url,querystring,assert,timers,process}-*.js
+#   • test/parallel/test-{buffer,events,util,path,url,querystring,assert,timers,process,net,stream,http}-*.js
 #   • test/common/      (the shared harness Node tests `require('../common')`)
 #   • test/fixtures/    (data files some of those tests read)
 #
@@ -26,7 +26,7 @@ fi
 DEST="vendor/node-test"
 
 # The test-<mod>-*.js families we keep under test/parallel (everything else is pruned).
-MODULES="buffer events util path url querystring assert timers process"
+MODULES="buffer events util path url querystring assert timers process net stream http"
 
 rm -rf "$DEST"
 mkdir -p "$(dirname "$DEST")"

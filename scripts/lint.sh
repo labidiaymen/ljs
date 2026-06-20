@@ -8,10 +8,12 @@ echo "==> zig fmt --check"
 zig fmt --check src build.zig
 
 if command -v zlint >/dev/null 2>&1; then
-  echo "==> zlint --deny-warnings"
-  # No path arg: zlint walks the project from the repo root (honours .gitignore),
-  # picking up src/*.zig and build.zig. --deny-warnings makes warnings fail the gate.
-  zlint --deny-warnings
+  echo "==> zlint --deny-warnings (src/*.zig via stdin)"
+  # Feed zlint the explicit src .zig file list via stdin. zlint does NOT honour .gitignore for .zig
+  # files, so a no-path walk from the repo root would also lint fetched dependency sources (e.g.
+  # zig-pkg/libxev, spec 107) and fail on THEIR style; a bare dir arg (`zlint src`) lints 0 files.
+  # `build.zig` is covered by the `zig fmt --check` above. --deny-warnings makes warnings fail.
+  find src -name '*.zig' | zlint -S --deny-warnings
 else
   echo "==> zlint not installed — skipping (optional). Install: https://github.com/DonIsaac/zlint"
   echo "    (zig fmt formatting was still enforced above.)"

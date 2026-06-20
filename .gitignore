@@ -1,6 +1,8 @@
 # Zig build artifacts
 .zig-cache/
 zig-out/
+# Fetched package dependencies (libxev, spec 107) — pinned by hash in build.zig.zon, not vendored
+zig-pkg/
 
 # Spec Kit / agent (may contain credentials)
 .claude/

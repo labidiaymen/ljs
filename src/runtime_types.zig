@@ -704,6 +704,10 @@ pub const NativeId = enum {
     nodetest_method,
     /// HOST (Node axis, spec 106): `vm` module fns + `vm.Script` (Script ctor is constructible).
     vm_method,
+    /// HOST (Node axis, spec 107): `net` module — statics (`isIP`/`createServer`/`connect`/`Socket`/
+    /// `Server`) and Socket/Server instance methods (native_name prefixed `s.`/`v.` to disambiguate).
+    /// Backed by libxev TCP; dispatched in `host_net.zig`.
+    net_method,
     /// §10.4.4.6 %ThrowTypeError% — the unique per-realm function that unconditionally throws a
     /// TypeError. Used as the poison `get`/`set` for `callee` (and historically `caller`) on a
     /// strict / unmapped arguments object. Never returns normally.

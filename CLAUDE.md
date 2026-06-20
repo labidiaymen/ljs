@@ -5,7 +5,9 @@ shell commands, and other important information, read the current plan:
 (`001-test262-harness`), M1 core language (`002-core-language`), M2 arrays+strings (`003-builtin-library`;
 Object/Math deferred per the parse_error diagnostic). Real conformance: 23.3% of `language/expressions`.
 
-Active stack: Zig 0.16.0 (pinned), pure std, tree-walk interpreter, in-process Test262 runner.
+Active stack: Zig 0.16.0 (pinned), pure std **+ libxev (host I/O only, spec 107 — the first external
+dependency; pinned by hash in `build.zig.zon`, fetched to gitignored `zig-pkg/`)**, tree-walk
+interpreter, in-process Test262 runner.
 Constitution: `.specify/memory/constitution.md` — correctness/conformance before performance.
 <!-- SPECKIT END -->
 

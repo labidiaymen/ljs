@@ -11,6 +11,7 @@ const Interpreter = interpreter.Interpreter;
 const EvalError = interpreter.EvalError;
 const host_time = @import("host_time.zig");
 const host_setup = @import("host_setup.zig");
+const host_io = @import("host_io.zig");
 
 /// Dispatch the host scheduling globals (native `timer_fn`) by name. Inert unless the event loop runs.
 pub fn timerFn(self: *Interpreter, name: []const u8, args: []const Value) EvalError!Completion {
@@ -124,30 +125,53 @@ pub fn runEventLoop(self: *Interpreter) EvalError!void {
             if (c == .throw) hostReportError(self, c.throw);
             continue;
         }
-        // 3. Timer phase.
+        // 3. Timer + I/O phase.
         compactCancelled(self);
-        if (self.timers.items.len == 0) break; // microtasks + immediates already empty here → done
-        var min_idx: usize = 0;
-        for (self.timers.items, 0..) |t, i| {
-            if (t.deadline_ms < self.timers.items[min_idx].deadline_ms) min_idx = i;
+        // Liveness: keep running while a timer is pending OR libxev I/O is in flight. (Immediates were
+        // handled above; microtasks/nextTicks drained at the top.) Off the host I/O path `io_pending`
+        // is always 0, so this is exactly the historical `if (timers.len == 0) break`.
+        if (self.timers.items.len == 0 and host_io.pendingIo(self) == 0) break;
+        // When libxev operations are in flight, route the wait through the I/O-aware tick (which also
+        // fires a due timer). This branch is never taken off the host I/O path (no loop → 0 pending).
+        if (host_io.pendingIo(self) > 0) {
+            try host_io.tick(self);
+            continue;
         }
-        const due = self.timers.items[min_idx].deadline_ms;
+        // Pure-timer path (no I/O in flight) — `timers.len > 0` is guaranteed by the break above.
+        const idx = earliestDueIndex(self).?;
+        const due = self.timers.items[idx].deadline_ms;
         const now = host_time.monotonicMs();
         if (due > now) {
             host_time.sleepMs(due - now); // nothing else runnable; wait for the next timer
             continue;
         }
-        // Snapshot the entry, then reschedule (interval) / remove (one-shot) BEFORE invoking — so a
-        // `clearInterval(self)` inside the callback observes the still-present entry and cancels it.
-        const entry = self.timers.items[min_idx];
-        if (entry.interval_ms) |iv| {
-            self.timers.items[min_idx].deadline_ms = host_time.monotonicMs() + @max(iv, 1);
-        } else {
-            _ = self.timers.orderedRemove(min_idx);
-        }
-        const c = try self.callFunction(entry.callback, entry.args, .undefined);
-        if (c == .throw) hostReportError(self, c.throw);
+        try fireTimer(self, idx);
     }
+}
+
+/// Index of the timer with the earliest deadline, or null if the queue is empty. (Shared by the
+/// pure-timer path here and the I/O-aware `host_io.tick`.)
+pub fn earliestDueIndex(self: *Interpreter) ?usize {
+    if (self.timers.items.len == 0) return null;
+    var min_idx: usize = 0;
+    for (self.timers.items, 0..) |t, i| {
+        if (t.deadline_ms < self.timers.items[min_idx].deadline_ms) min_idx = i;
+    }
+    return min_idx;
+}
+
+/// Fire the timer at `idx`: reschedule (interval) / remove (one-shot) BEFORE invoking — so a
+/// `clearInterval(self)` inside the callback observes the still-present entry and cancels it — then
+/// call the callback, reporting an uncaught throw to stderr (the loop continues).
+pub fn fireTimer(self: *Interpreter, idx: usize) EvalError!void {
+    const entry = self.timers.items[idx];
+    if (entry.interval_ms) |iv| {
+        self.timers.items[idx].deadline_ms = host_time.monotonicMs() + @max(iv, 1);
+    } else {
+        _ = self.timers.orderedRemove(idx);
+    }
+    const c = try self.callFunction(entry.callback, entry.args, .undefined);
+    if (c == .throw) hostReportError(self, c.throw);
 }
 
 /// Pop the first non-cancelled immediate (FIFO), discarding cancelled ones; null if none remain.
