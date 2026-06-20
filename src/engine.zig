@@ -394,3 +394,53 @@ pub fn evaluateWithLimitL(arena: std.mem.Allocator, source: []const u8, mode: Ru
         .brk, .cont => .{ .normal = .undefined },
     };
 }
+
+const host_timers = @import("host_timers.zig");
+
+/// HOST run (Node axis, spec 098): like `evaluate`, but after the top-level script + initial microtask
+/// drain it runs the **event loop** (`runEventLoop`) — firing `setTimeout`/`setInterval` callbacks with
+/// microtasks drained between them — until the timer queue empties. Used by the `ljs run` CLI so timers
+/// + `console.log` work. NOT used by Test262 (that path stays microtask-only and never sleeps).
+pub fn runHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, out: *std.Io.Writer, err: *std.Io.Writer) error{OutOfMemory}!EvaluationResult {
+    const program = Parser.parseMode(arena, source, mode == .strict) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .syntax_error = @errorName(e) },
+    };
+    const global = Environment.create(arena, null) catch return error.OutOfMemory;
+    builtins.setup(arena, global) catch return error.OutOfMemory;
+    var gen_registry: std.ArrayListUnmanaged(*@import("object.zig").Generator) = .empty;
+    var job_queue: std.ArrayListUnmanaged(@import("object.zig").Job) = .empty;
+    var interp = Interpreter{ .arena = arena, .step_limit = default_step_limit, .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
+    interp.host_out = out;
+    interp.host_err = err;
+    interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
+    const completion = interp.run(program, global) catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
+    // A synchronous throw aborts the host run before the loop (like Node printing an uncaught error and
+    // exiting) — surface it; don't run timers scheduled before the throw.
+    if (completion == .throw) {
+        interp.cleanupGenerators();
+        return .{ .thrown = completion.throw };
+    }
+    // Drive the macrotask/microtask event loop to completion (timers fire here).
+    host_timers.runEventLoop(&interp) catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
+    interp.cleanupGenerators();
+    return switch (completion) {
+        .normal => |v| .{ .normal = v },
+        .empty => .{ .normal = .undefined },
+        .ret => |v| .{ .normal = v },
+        .throw => |v| .{ .thrown = v },
+        .brk, .cont => .{ .normal = .undefined },
+    };
+}

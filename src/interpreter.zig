@@ -166,6 +166,18 @@ pub const Interpreter = struct {
     /// main + async-body interpreters so a `$DONE` from inside a `.then` job is observed. Null for
     /// ordinary evaluation (no `$DONE` installed → never written).
     async_done: ?*AsyncDone = null,
+    /// HOST (Node axis, spec 098 — NOT ECMA-262): the macrotask TIMER queue (`setTimeout`/
+    /// `setInterval`). Populated by the timer globals, fired by the host event loop (`runEventLoop`)
+    /// which sits ABOVE the microtask `job_queue`. Empty + never consulted on the Test262 path (no
+    /// host loop runs there), so conformance is unaffected. `next_timer_id` hands out timer ids.
+    timers: std.ArrayListUnmanaged(object_mod.TimerEntry) = .empty,
+    next_timer_id: u64 = 1,
+    /// HOST (Node axis, spec 098): the shared stdout / stderr writers for `console.log` + uncaught
+    /// timer errors, threaded in by `runHost`. ONE writer per stream for the whole run (creating a
+    /// fresh `File.Writer` per call would positioned-write from offset 0 and clobber a redirected
+    /// file). Null off the host path → `console.log` falls back to a one-shot writer.
+    host_out: ?*std.Io.Writer = null,
+    host_err: ?*std.Io.Writer = null,
     /// §13.3.10 / §16.2.1.6 dynamic `import()` host hooks (the minimal Test262 harness loader). When
     /// set, `evalImportCall` resolves the specifier via `module_loader` relative to `host_referrer_key`,
     /// loads + links + evaluates the target module graph (shared `module_cache`, keyed by resolved key

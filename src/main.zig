@@ -41,11 +41,21 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
 
-    const result = try ljs.evaluate(arena, source, .sloppy);
+    // `ljs run <file>` uses the HOST event loop (timers + console.log fire); `ljs eval "<src>"` is a
+    // plain one-shot evaluation (no event loop) — matches a REPL-style expression evaluation.
+    const is_run = std.mem.eql(u8, cmd, "run");
+    const result = if (is_run)
+        try ljs.runHost(arena, source, .sloppy, out, err)
+    else
+        try ljs.evaluate(arena, source, .sloppy);
     switch (result) {
         .normal => |v| {
-            try v.writeDisplay(out);
-            try out.writeAll("\n");
+            // `run` is for side effects (console.log) — don't echo the script's completion value;
+            // `eval` echoes it (REPL-style).
+            if (!is_run) {
+                try v.writeDisplay(out);
+                try out.writeAll("\n");
+            }
             try out.flush();
         },
         .thrown => |v| {

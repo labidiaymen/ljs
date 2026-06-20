@@ -297,6 +297,19 @@ pub const Job = union(enum) {
     },
 };
 
+/// HOST (Node axis, spec 098 — NOT ECMA-262): one scheduled timer (`setTimeout`/`setInterval`). The
+/// host event loop fires `callback(args...)` when the MONOTONIC clock reaches `deadline_ms`; an
+/// `interval_ms != null` reschedules (`deadline_ms += interval_ms`), a one-shot is removed.
+/// `cancelled` is set by `clearTimeout`/`clearInterval` (the loop skips + compacts it).
+pub const TimerEntry = struct {
+    id: u64,
+    callback: *Object,
+    args: []const Value,
+    deadline_ms: f64,
+    interval_ms: ?f64 = null,
+    cancelled: bool = false,
+};
+
 /// §27.5 Generator object internal state ([[GeneratorState]]). A generator created by calling a
 /// `function*` starts `suspended_start`; `.next` spawns the body thread and runs it to the first
 /// `yield`/return (→ `suspended_yield` / `completed`); each subsequent `.next` resumes from a parked
@@ -620,6 +633,13 @@ pub const NativeId = enum {
     /// `encodeURI`/`encodeURIComponent`/`decodeURI`/`decodeURIComponent` (§19.2.6). Installed on the
     /// global env (and thus mirrored onto globalThis as non-enumerable own properties).
     global_fn,
+    /// HOST (Node axis, NOT ECMA-262): the timer globals — `native_name` selects
+    /// `setTimeout`/`setInterval`/`clearTimeout`/`clearInterval` (spec 098). Register a callback on the
+    /// interpreter's timer queue, fired by the host event loop. Inert on the Test262 path (no loop runs).
+    timer_fn,
+    /// HOST (Node axis, NOT ECMA-262): `console.log` — write the space-joined ToString of its args
+    /// plus a newline to stdout (spec 098, so timer output is observable).
+    console_log,
     /// §10.4.4.6 %ThrowTypeError% — the unique per-realm function that unconditionally throws a
     /// TypeError. Used as the poison `get`/`set` for `callee` (and historically `caller`) on a
     /// strict / unmapped arguments object. Never returns normally.

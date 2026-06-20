@@ -9,6 +9,7 @@ const engine = @import("engine.zig");
 pub const RunMode = engine.RunMode;
 pub const EvaluationResult = engine.EvaluationResult;
 pub const evaluate = engine.evaluate;
+pub const runHost = engine.runHost;
 pub const evaluateWithLimit = engine.evaluateWithLimit;
 pub const evaluateWithLimitL = engine.evaluateWithLimitL;
 pub const evaluateAsyncTest = engine.evaluateAsyncTest;

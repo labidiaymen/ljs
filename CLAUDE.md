@@ -9,18 +9,43 @@ Active stack: Zig 0.16.0 (pinned), pure std, tree-walk interpreter, in-process T
 Constitution: `.specify/memory/constitution.md` — correctness/conformance before performance.
 <!-- SPECKIT END -->
 
-## Scope — 100% ECMAScript, NO Node host APIs
-- **Goal:** 100% **ECMAScript** conformance — the JS *language* plus the standard built-in
-  *library*, i.e. exactly what Test262 covers under `test/language/` and `test/built-ins/`.
-  Conformance is tracked over the full `language/` tree (no longer just `language/expressions`).
-- **Explicitly out of scope — Node host APIs.** ljs does **NOT** implement any Node/host
-  runtime surface: CommonJS `require` / module loading, ESM host module loading, `fs` / `http` /
-  `net` / `process` / `Buffer`, and host timers (`setTimeout` / `setInterval`). These are host
-  embeddings, not ECMA-262.
+## Scope — ECMAScript conformance + (now) a Node host-runtime axis
+- **Goal (axis 1, primary):** 100% **ECMAScript** conformance — the JS *language* plus the standard
+  built-in *library*, i.e. exactly what Test262 covers under `test/language/` and `test/built-ins/`.
+  Conformance is tracked over the full `language/` tree. **Reached language 95.1% on 2026-06-20.**
 - **In scope (it's ECMAScript):** Promises and the microtask / Job queue (`Promise`, `await`,
-  Job scheduling) — these are defined by ECMA-262, not the host. Host *timers* are not.
-- **Stop rule:** when the only remaining work to advance conformance would be implementing a
-  Node host API, **stop** — that is by definition out of scope.
+  Job scheduling) — these are defined by ECMA-262, not the host.
+- The former hard "NO Node host APIs / stop-rule" is **superseded** by the Node axis below for the
+  host surface; ECMAScript conformance via Test262 remains the primary, separately-tracked axis and
+  must never regress when host work lands (the host runtime is a CLI-only layer above the engine).
+
+### Scope expansion (2026-06-20, user-authorized) — Node host-runtime axis OPENED
+- **Authorized:** with language at 95.1% (the documented gate), the **Node.js-like host runtime** is
+  now an active SECOND axis. It is a host embedding ABOVE the ECMA-262 engine, not part of Test262
+  conformance (Node conformance = Node's own suite + web-platform-tests, a separate measure).
+- **Sequencing:** (1) **event loop + timers** (`specs/098-event-loop-timers/`, slice 1 — in progress);
+  then (2) I/O host APIs (`fs`/`net`/`http`) on **libxev** (the first external dependency — amend the
+  "pure std" note when that slice lands; pin libxev against Zig 0.16.0); then `process`/`Buffer`,
+  module loading (`require`/ESM host), etc. The microtask queue (ECMA-262) sits ABOVE the macrotask
+  layer: **drain all microtasks after every macrotask callback.**
+- **Isolation rule (critical):** host APIs are a CLI/host-only layer. The Test262 engine surface
+  (`evaluateWithLimit`/`evaluateAsyncTest`) stays microtask-only and never sleeps, so the host event
+  loop NEVER runs on the conformance path. Every host cycle still gates on 0 Test262 regressions.
+
+### Scope expansion (2026-06-17, user-authorized — to break past the ~92-93% ceiling)
+- **UTF-16 string semantics — IN SCOPE (always was; a documented deviation being corrected).**
+  ECMA-262 strings are sequences of UTF-16 code units. ljs stores `[]const u8` and currently
+  reports `length`/`charCodeAt`/indexing over BYTES (`"é".length === 2`). The fix is a phased epic
+  (`specs/068-utf16-strings/`): treat the storage as WTF-8 (lone surrogates representable) with an
+  ASCII fast path, and compute code-unit `length`/indexing/methods/escapes/iteration/regex on
+  demand. No charter conflict — pure language conformance.
+- **Module LANGUAGE part — IN SCOPE (ECMA-262 §16.2).** The ESM grammar (`import`/`export`
+  declarations, early errors), module linking/evaluation semantics, and the `import()` dynamic
+  ImportCall expression ARE ECMAScript. A **minimal test-harness module loader** (resolve a
+  specifier to source by reading the referenced file relative to the test) is permitted to drive
+  the Test262 module corpus — it is a test harness, NOT a general Node host API. General Node host
+  APIs (`require`, `fs`/`http`/`net`/`process`/`Buffer`) — see the Node axis above.
+  Sequencing: tackle UTF-16 first (no loader nuance, biggest scattered payoff), modules second.
 
 ### Scope expansion (2026-06-17, user-authorized — to break past the ~92-93% ceiling)
 - **UTF-16 string semantics — IN SCOPE (always was; a documented deviation being corrected).**
