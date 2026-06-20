@@ -295,6 +295,18 @@ pub const Job = union(enum) {
         /// Its `then` method (already extracted, §27.2.1.3.2).
         then_fn: *Object,
     },
+    /// HOST (spec 099): a `queueMicrotask(cb)` job — call `cb()` (no args). Same queue as Promise
+    /// reactions, so it interleaves FIFO with `.then`. Only ever enqueued by the host global.
+    microtask: *Object,
+};
+
+/// HOST (Node axis, spec 099 — NOT ECMA-262): one `setImmediate` registration, fired in the event
+/// loop's "check" phase (before timers). `cancelled` is set by `clearImmediate`.
+pub const ImmediateEntry = struct {
+    id: u64,
+    callback: *Object,
+    args: []const Value,
+    cancelled: bool = false,
 };
 
 /// HOST (Node axis, spec 098 — NOT ECMA-262): one scheduled timer (`setTimeout`/`setInterval`). The

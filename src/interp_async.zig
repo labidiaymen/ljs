@@ -889,6 +889,15 @@ pub fn drainJobs(self: *Interpreter) EvalError!void {
                     if (e == error.StepLimitExceeded) return e;
                 };
             },
+            .microtask => |cb| {
+                // HOST (spec 099) queueMicrotask: call cb(); a throw is reported (HostReportErrors)
+                // to stderr and the drain continues — the watchdog still propagates.
+                const c = self.callFunction(cb, &.{}, .undefined) catch |e| {
+                    if (e == error.StepLimitExceeded) return e;
+                    continue;
+                };
+                if (c == .throw) @import("host_timers.zig").hostReportError(self, c.throw);
+            },
         }
         // Periodically compact the consumed prefix so a long-running drain doesn't grow unbounded.
         if (head >= 256 and head * 2 >= q.items.len) {

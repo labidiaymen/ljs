@@ -45,6 +45,7 @@ pub const CombinatorState = rt.CombinatorState;
 pub const PromiseCapability = rt.PromiseCapability;
 pub const Job = rt.Job;
 pub const TimerEntry = rt.TimerEntry;
+pub const ImmediateEntry = rt.ImmediateEntry;
 pub const GeneratorState = rt.GeneratorState;
 pub const ResumeKind = rt.ResumeKind;
 pub const TransferKind = rt.TransferKind;

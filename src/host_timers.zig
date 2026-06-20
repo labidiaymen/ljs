@@ -4,18 +4,60 @@
 //! only — the Test262 engine surface never calls `runEventLoop`, so conformance is unaffected.
 const std = @import("std");
 const Value = @import("value.zig").Value;
+const object_mod = @import("object.zig");
 const Completion = @import("completion.zig").Completion;
 const interpreter = @import("interpreter.zig");
 const Interpreter = interpreter.Interpreter;
 const EvalError = interpreter.EvalError;
 const host_time = @import("host_time.zig");
 
-/// Dispatch the four timer globals (native `timer_fn`) by name. Inert unless the host event loop runs.
+/// Dispatch the host scheduling globals (native `timer_fn`) by name. Inert unless the event loop runs.
 pub fn timerFn(self: *Interpreter, name: []const u8, args: []const Value) EvalError!Completion {
     if (std.mem.eql(u8, name, "setTimeout")) return schedule(self, args, false);
     if (std.mem.eql(u8, name, "setInterval")) return schedule(self, args, true);
     if (std.mem.eql(u8, name, "clearTimeout")) return cancel(self, args);
     if (std.mem.eql(u8, name, "clearInterval")) return cancel(self, args);
+    if (std.mem.eql(u8, name, "queueMicrotask")) return queueMicrotask(self, args);
+    if (std.mem.eql(u8, name, "setImmediate")) return setImmediate(self, args);
+    if (std.mem.eql(u8, name, "clearImmediate")) return clearImmediate(self, args);
+    return .{ .normal = .undefined };
+}
+
+/// `queueMicrotask(callback)` (WHATWG/Node): enqueue a microtask calling `callback()` on the SAME Job
+/// queue as Promise reactions (FIFO interleave). A non-callable argument is a TypeError.
+fn queueMicrotask(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const cb = if (args.len > 0) args[0] else .undefined;
+    if (cb != .object or cb.object.kind != .function)
+        return self.throwError("TypeError", "queueMicrotask requires a callback function");
+    if (self.job_queue) |q| q.append(self.arena, .{ .microtask = cb.object }) catch return error.OutOfMemory;
+    return .{ .normal = .undefined };
+}
+
+/// `setImmediate(callback, ...args)` (Node): queue a check-phase task; returns its numeric id.
+fn setImmediate(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const cb = if (args.len > 0) args[0] else .undefined;
+    if (cb != .object or cb.object.kind != .function)
+        return self.throwError("TypeError", "callback is not a function");
+    const extra: []const Value = if (args.len > 1) try self.arena.dupe(Value, args[1..]) else &.{};
+    const id = self.next_immediate_id;
+    self.next_immediate_id += 1;
+    self.immediates.append(self.arena, .{ .id = id, .callback = cb.object, .args = extra }) catch return error.OutOfMemory;
+    return .{ .normal = .{ .number = @floatFromInt(id) } };
+}
+
+/// `clearImmediate(id)` (Node): cancel a pending immediate (no-op if unknown/undefined).
+fn clearImmediate(self: *Interpreter, args: []const Value) EvalError!Completion {
+    if (args.len == 0) return .{ .normal = .undefined };
+    const nd = try self.toNumberV(args[0]);
+    if (nd.isAbrupt()) return nd;
+    if (std.math.isNan(nd.normal.number)) return .{ .normal = .undefined };
+    const id: u64 = @intFromFloat(@max(nd.normal.number, 0));
+    for (self.immediates.items) |*im| {
+        if (im.id == id) {
+            im.cancelled = true;
+            break;
+        }
+    }
     return .{ .normal = .undefined };
 }
 
@@ -68,17 +110,28 @@ fn cancel(self: *Interpreter, args: []const Value) EvalError!Completion {
 /// throws prints an uncaught-exception line to stderr and the loop continues (slice 1; refine later).
 pub fn runEventLoop(self: *Interpreter) EvalError!void {
     while (true) {
+        // 1. Microtasks always drain to empty first (Promise reactions + queueMicrotask).
         try self.drainJobs();
+        // 2. Check phase: run ONE pending immediate (then loop → re-drain microtasks). An immediate
+        //    queued during a callback runs on a later turn, not re-entrantly.
+        if (popImmediate(self)) |imm| {
+            const c = try self.callFunction(imm.callback, imm.args, .undefined);
+            if (c == .throw) hostReportError(self, c.throw);
+            continue;
+        }
+        // 3. Timer phase.
         compactCancelled(self);
-        if (self.timers.items.len == 0) break;
-        // Earliest-deadline timer.
+        if (self.timers.items.len == 0) break; // microtasks + immediates already empty here → done
         var min_idx: usize = 0;
         for (self.timers.items, 0..) |t, i| {
             if (t.deadline_ms < self.timers.items[min_idx].deadline_ms) min_idx = i;
         }
         const due = self.timers.items[min_idx].deadline_ms;
         const now = host_time.monotonicMs();
-        if (due > now) host_time.sleepMs(due - now);
+        if (due > now) {
+            host_time.sleepMs(due - now); // nothing else runnable; wait for the next timer
+            continue;
+        }
         // Snapshot the entry, then reschedule (interval) / remove (one-shot) BEFORE invoking — so a
         // `clearInterval(self)` inside the callback observes the still-present entry and cancels it.
         const entry = self.timers.items[min_idx];
@@ -88,8 +141,17 @@ pub fn runEventLoop(self: *Interpreter) EvalError!void {
             _ = self.timers.orderedRemove(min_idx);
         }
         const c = try self.callFunction(entry.callback, entry.args, .undefined);
-        if (c == .throw) printUncaught(self, c.throw);
+        if (c == .throw) hostReportError(self, c.throw);
     }
+}
+
+/// Pop the first non-cancelled immediate (FIFO), discarding cancelled ones; null if none remain.
+fn popImmediate(self: *Interpreter) ?object_mod.ImmediateEntry {
+    while (self.immediates.items.len > 0) {
+        const im = self.immediates.orderedRemove(0);
+        if (!im.cancelled) return im;
+    }
+    return null;
 }
 
 /// Drop cancelled timers from the queue (compaction; preserves relative order of the survivors).
@@ -122,10 +184,12 @@ pub fn consoleLog(self: *Interpreter, args: []const Value) EvalError!Completion 
     return .{ .normal = .undefined };
 }
 
-/// Print an uncaught timer-callback exception to stderr (best-effort; the loop continues).
-fn printUncaught(self: *Interpreter, v: Value) void {
+/// HOST HostReportErrors: print an uncaught host-callback exception (timer / queueMicrotask) to
+/// stderr, best-effort; the event loop / microtask drain continues. Shared by `runEventLoop` and
+/// `drainJobs` (the queueMicrotask path).
+pub fn hostReportError(self: *Interpreter, v: Value) void {
     const w = self.host_err orelse return;
-    w.writeAll("Uncaught (in timer) ") catch return;
+    w.writeAll("Uncaught ") catch return;
     v.writeDisplay(w) catch return;
     w.writeAll("\n") catch return;
     w.flush() catch return;

@@ -172,6 +172,10 @@ pub const Interpreter = struct {
     /// host loop runs there), so conformance is unaffected. `next_timer_id` hands out timer ids.
     timers: std.ArrayListUnmanaged(object_mod.TimerEntry) = .empty,
     next_timer_id: u64 = 1,
+    /// HOST (Node axis, spec 099): the `setImmediate` queue — fired in the event loop's "check" phase
+    /// (before timers). Inert on the Test262 path. `next_immediate_id` hands out ids.
+    immediates: std.ArrayListUnmanaged(object_mod.ImmediateEntry) = .empty,
+    next_immediate_id: u64 = 1,
     /// HOST (Node axis, spec 098): the shared stdout / stderr writers for `console.log` + uncaught
     /// timer errors, threaded in by `runHost`. ONE writer per stream for the whole run (creating a
     /// fresh `File.Writer` per call would positioned-write from offset 0 and clobber a redirected

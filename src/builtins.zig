@@ -1091,7 +1091,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     // HOST runtime (Node axis, spec 098 — NOT ECMA-262): timer globals (native `timer_fn`, dispatched
     // by name) + a minimal `console.log`. Inert on the Test262 path (the host event loop never runs
     // there); present so `ljs run` can schedule + observe callbacks.
-    const timer_fns = [_][]const u8{ "setTimeout", "setInterval", "clearTimeout", "clearInterval" };
+    const timer_fns = [_][]const u8{ "setTimeout", "setInterval", "clearTimeout", "clearInterval", "queueMicrotask", "setImmediate", "clearImmediate" };
     for (timer_fns) |tf| {
         const fn_obj = try Object.createNative(arena, .timer_fn, tf);
         fn_obj.prototype = function_proto;
