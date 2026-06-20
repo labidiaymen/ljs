@@ -4,8 +4,8 @@ A JavaScript engine written from scratch in [Zig](https://ziglang.org) — **spe
 for correctness and Test262 conformance, with a measured (not deferred) performance story.
 
 > **Status (Test262, harness metric):**
-> `language/` **91.4%** (40,631 / 44,475) · `built-ins/` **66.0%** (30,997 / 46,981) ·
-> **combined 78.3%** (71,628 / 91,456). The standard built-in library is where the remaining work
+> `language/` **95.1%** (42,308 / 44,475) · `built-ins/` **66.9%** (31,420 / 46,981) ·
+> **combined 80.5%** (73,728 / 91,456). The standard built-in library is where the remaining work
 > is. A learning-grade, in-progress engine — not a drop-in Node replacement.
 
 Built with **Spec-Driven Development** ([Spec Kit](https://github.com/github/spec-kit)): every
@@ -68,9 +68,10 @@ Numbers are the standard Test262 harness metric (with `--harness-dir`). Only the
 tests, the `baseline/*.json` passing-set snapshots, and the `specs/` SDD docs are in git; the
 corpus is reproducible from `test262.pin`.
 
-**Current (verified):** `language/` **91.4%** (40,631 / 44,475) · `built-ins/` **66.0%**
-(30,997 / 46,981). The remaining `language/` ~9% is mostly runtime edge cases and a few
-module-evaluation / early-error details. `ArrayBuffer`/`TypedArray`/`DataView` are now implemented;
+**Current (verified):** `language/` **95.1%** (42,308 / 44,475) · `built-ins/` **66.9%**
+(31,420 / 46,981). The remaining `language/` ~5% is runtime edge cases (class private + direct-eval
+super tails, async-generator tick ordering, top-level-await ordering), the global declarative-env ↔
+global-object var-mirroring epic, proper tail calls, and out-of-scope proposals. `ArrayBuffer`/`TypedArray`/`DataView` are now implemented;
 the largest remaining `built-ins/` gaps are big *separate* engines — `Temporal`, `Intl`, `Atomics`,
 `Date` — alongside method-family gaps in the core prototypes (`Object`/`Array`/`String`/`Iterator`).
 
