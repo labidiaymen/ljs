@@ -192,7 +192,9 @@ pub const Lexer = struct {
         var saw_newline = false;
         while (self.pos < self.src.len) {
             const c = self.src[self.pos];
-            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            // §12.2 WhiteSpace: SP, TAB, plus VT (U+000B) and FF (U+000C) — the latter two are
+            // white space, NOT line terminators (they do not arm ASI). §12.3 LineTerminator: LF / CR.
+            if (c == ' ' or c == '\t' or c == 0x0B or c == 0x0C or c == '\r' or c == '\n') {
                 if (c == '\n' or c == '\r') saw_newline = true;
                 self.pos += 1;
                 continue;
