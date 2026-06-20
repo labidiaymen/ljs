@@ -13,5 +13,4 @@
       ctx (argv / `init.environ_map.iterator()` / `std.process.currentPathAlloc` / per-platform pid).
 - [x] T8. Verified: `true win32 string`; nextTick→promise ordering (`sync,nt,p`); `process.env.PATH`
       non-empty; `global===globalThis`; `process.stdout.write`; `process.exit(3)` → exit 3, no "after".
-- [x] T9. build/test/lint/bench GREEN; language baseline conformance: ok (42,308/95.1%, 0 regressions); built-ins 31,505/ok. Committed + pushed.
-      31,505/ok); present at gate.
+- [x] T9. build/test/lint/bench GREEN; language baseline conformance: ok (42,308/95.1%, 0 regressions); built-ins 31,505/ok. Committed + pushed (07e62a2).
