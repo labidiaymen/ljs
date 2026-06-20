@@ -779,6 +779,9 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
             .events_method => std.mem.eql(u8, ctor.native_name, "EventEmitter"),
             // HOST (spec 103): the WHATWG URL/URLSearchParams + TextEncoder/TextDecoder constructors.
             .url_method => true,
+            // HOST (spec 105): `new Buffer(...)` (the deprecated constructor) is `new`-able; the
+            // shared `.buffer_fn` prototype/static methods are not.
+            .buffer_fn => std.mem.eql(u8, ctor.native_name, "Buffer"),
             else => false,
         };
         if (!constructible) return self.throwError("TypeError", "value is not a constructor");
@@ -851,6 +854,9 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
         },
         .weakref_ctor => return builtin_weakref.constructWeakRef(self, new_obj, args), // §26.1.1 (new WeakRef)
         .finalization_registry_ctor => return builtin_weakref.constructFinalizationRegistry(self, new_obj, args), // §26.2.1 (new FinalizationRegistry)
+        // HOST (spec 105): `new Buffer(...)` delegates to the Buffer constructor logic (which itself
+        // allocates a fresh byte-backed instance), ignoring `new_obj`.
+        .buffer_fn => return @import("host_buffer.zig").bufferFn(self, "Buffer", .undefined, args),
         else => {},
     }
 

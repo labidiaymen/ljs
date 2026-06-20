@@ -53,6 +53,13 @@ pub fn fromI64(arena: std.mem.Allocator, v: i64) Error!*const Const {
     return snapshot(arena, m);
 }
 
+/// `from u64` — exact (used for unsigned 64-bit Buffer reads, where the value may exceed i64).
+pub fn fromU64(arena: std.mem.Allocator, v: u64) Error!*const Const {
+    var m = try Managed.initSet(arena, v);
+    defer m.deinit();
+    return snapshot(arena, m);
+}
+
 /// §12.9.3.2 the numeric value of a digit string in `base` (2/8/10/16). The string must already be
 /// stripped of any prefix / separators (digits only); an empty string is `0`. `negative` applies a
 /// sign. Invalid digits → `InvalidString`.

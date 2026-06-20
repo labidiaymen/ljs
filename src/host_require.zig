@@ -296,7 +296,7 @@ pub fn installEntryRequire(self: *Interpreter, script_path: []const u8, script_d
 //  core module registry: path / fs / os
 // ════════════════════════════════════════════════════════════════════════════
 
-const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "url", "assert", "assert/strict" };
+const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "url", "assert", "assert/strict", "buffer" };
 
 /// Strip a `node:` prefix (Node accepts `node:path` etc.).
 fn coreName(spec: []const u8) []const u8 {
@@ -351,7 +351,45 @@ fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
     } else if (std.mem.eql(u8, name, "url")) {
         // HOST (spec 103): require('url') → { URL, URLSearchParams }.
         return @import("host_url.zig").buildUrlModule(self);
+    } else if (std.mem.eql(u8, name, "buffer")) {
+        // HOST (spec 105): require('buffer') → { Buffer, kMaxLength, constants, SlowBuffer, ... }.
+        return buildBufferModule(self, obj);
     }
+    return obj;
+}
+
+/// Build the `buffer` core module's exports. `Buffer` is the global ctor (installed by host_buffer);
+/// `SlowBuffer` aliases it. Exposes `kMaxLength` and `constants.{MAX_LENGTH,MAX_STRING_LENGTH}`.
+fn buildBufferModule(self: *Interpreter, obj: *Object) EvalError!*Object {
+    const arena = self.arena;
+    // Look up the global `Buffer` constructor (installed as a global by host_buffer).
+    const buffer_ctor: Value = blk: {
+        const g = self.globals orelse break :blk .undefined;
+        if (g.lookup("Buffer")) |b| break :blk b.value;
+        break :blk .undefined;
+    };
+    const host_buffer = @import("host_buffer.zig");
+    if (buffer_ctor == .object) {
+        try obj.defineData("Buffer", buffer_ctor, true, false, true);
+    }
+    // SlowBuffer(size) — historically a non-pooled Buffer; a distinct native requiring a number size.
+    const slow = try host_buffer.makeNative(self, "SlowBuffer");
+    try obj.defineData("SlowBuffer", .{ .object = slow }, true, false, true);
+    // isAscii / isUtf8 (module-level helpers over a Buffer/TypedArray/ArrayBuffer view).
+    for ([_][]const u8{ "isAscii", "isUtf8" }) |m| {
+        const fn_obj = try host_buffer.makeNative(self, m);
+        try obj.defineData(m, .{ .object = fn_obj }, true, false, true);
+    }
+    try obj.defineData("kMaxLength", .{ .number = @floatFromInt(host_buffer.kMaxLength) }, true, false, true);
+    try obj.defineData("kStringMaxLength", .{ .number = 536870888 }, true, false, true);
+    try obj.defineData("INSPECT_MAX_BYTES", .{ .number = 50 }, true, true, true);
+
+    const constants = try Object.create(arena, self.objectProto());
+    try constants.defineData("MAX_LENGTH", .{ .number = @floatFromInt(host_buffer.kMaxLength) }, false, false, true);
+    try constants.defineData("MAX_STRING_LENGTH", .{ .number = 536870888 }, false, false, true);
+    try obj.defineData("constants", .{ .object = constants }, true, false, true);
+
+    // Buffer.isEncoding-backed standalone helper not exposed; the tests use Buffer.* directly.
     return obj;
 }
 

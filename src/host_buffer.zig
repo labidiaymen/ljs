@@ -33,25 +33,41 @@ pub fn installBuffer(self: *Interpreter, function_proto: ?*Object) EvalError!voi
     try proto.defineData("constructor", .{ .object = ctor }, true, false, true);
 
     // Statics.
-    for ([_][]const u8{ "alloc", "allocUnsafe", "allocUnsafeSlow", "from", "isBuffer", "byteLength", "concat", "compare" }) |name|
+    for ([_][]const u8{ "alloc", "allocUnsafe", "allocUnsafeSlow", "from", "isBuffer", "byteLength", "concat", "compare", "isEncoding", "of" }) |name|
         try defineMethod(self, ctor, name, function_proto);
     // Prototype methods.
     for ([_][]const u8{
-        "toString",      "write",         "slice",         "subarray",      "equals",        "toJSON",
-        "indexOf",       "lastIndexOf",   "includes",      "fill",          "copy",          "compare",
-        "swap16",        "swap32",
+        "toString",        "write",           "slice",            "subarray",         "equals",          "toJSON",
+        "indexOf",         "lastIndexOf",     "includes",         "fill",             "copy",            "compare",
+        "swap16",          "swap32",
         // Numeric read/write matrix (dispatched via host_buffer_rw.zig).
-               "readInt8",      "readUInt8",     "writeInt8",     "writeUInt8",
-        "readInt16LE",   "readInt16BE",   "readUInt16LE",  "readUInt16BE",  "writeInt16LE",  "writeInt16BE",
-        "writeUInt16LE", "writeUInt16BE", "readInt32LE",   "readInt32BE",   "readUInt32LE",  "readUInt32BE",
-        "writeInt32LE",  "writeInt32BE",  "writeUInt32LE", "writeUInt32BE", "readFloatLE",   "readFloatBE",
-        "writeFloatLE",  "writeFloatBE",  "readDoubleLE",  "readDoubleBE",  "writeDoubleLE", "writeDoubleBE",
+                 "readInt8",         "readUInt8",        "writeInt8",       "writeUInt8",
+        "readInt16LE",     "readInt16BE",     "readUInt16LE",     "readUInt16BE",     "writeInt16LE",    "writeInt16BE",
+        "writeUInt16LE",   "writeUInt16BE",   "readInt32LE",      "readInt32BE",      "readUInt32LE",    "readUInt32BE",
+        "writeInt32LE",    "writeInt32BE",    "writeUInt32LE",    "writeUInt32BE",    "readFloatLE",     "readFloatBE",
+        "writeFloatLE",    "writeFloatBE",    "readDoubleLE",     "readDoubleBE",     "writeDoubleLE",   "writeDoubleBE",
+        // Variable-width (byteLength 1–6) integer accessors.
+        "readIntLE",       "readIntBE",       "readUIntLE",       "readUIntBE",       "writeIntLE",      "writeIntBE",
+        "writeUIntLE",     "writeUIntBE",
+        // BigInt 64-bit accessors.
+            "readBigInt64LE",   "readBigInt64BE",   "readBigUInt64LE", "readBigUInt64BE",
+        "writeBigInt64LE", "writeBigInt64BE", "writeBigUInt64LE", "writeBigUInt64BE", "swap64",
     }) |name|
         try defineMethod(self, proto, name, function_proto);
 
     try env.declare("Buffer", .{ .object = ctor }, true, true);
     if (env.lookup("%GlobalThis%")) |gb| if (gb.value == .object)
         try gb.value.object.defineData("Buffer", .{ .object = ctor }, true, false, true);
+}
+
+/// Create a standalone `buffer_fn` native function named `name` (for the `buffer` module's
+/// `SlowBuffer` export). Dispatched through `bufferFn` by `name`.
+pub fn makeNative(self: *Interpreter, name: []const u8) EvalError!*Object {
+    const fn_obj = try Object.createNative(self.arena, .buffer_fn, name);
+    fn_obj.prototype = self.functionProto();
+    _ = fn_obj.properties.orderedRemove("prototype");
+    try fn_obj.defineData("name", .{ .string = name }, false, false, true);
+    return fn_obj;
 }
 
 fn defineMethod(self: *Interpreter, target: *Object, name: []const u8, function_proto: ?*Object) EvalError!void {
@@ -94,13 +110,31 @@ pub fn makeBufferFromBytes(self: *Interpreter, src: []const u8) EvalError!*Objec
 const Enc = enum { utf8, hex, base64, latin1, ascii, utf16le };
 
 fn parseEnc(name: []const u8) Enc {
+    return parseEncOpt(name) orelse .utf8;
+}
+
+/// Like `parseEnc` but returns null for an unrecognized encoding name (so callers can throw
+/// `ERR_UNKNOWN_ENCODING` where Node does).
+fn parseEncOpt(name: []const u8) ?Enc {
     const eq = std.ascii.eqlIgnoreCase;
+    if (eq(name, "utf8") or eq(name, "utf-8")) return .utf8;
     if (eq(name, "hex")) return .hex;
     if (eq(name, "base64") or eq(name, "base64url")) return .base64;
     if (eq(name, "latin1") or eq(name, "binary")) return .latin1;
     if (eq(name, "ascii")) return .ascii;
     if (eq(name, "utf16le") or eq(name, "ucs2") or eq(name, "ucs-2") or eq(name, "utf-16le")) return .utf16le;
-    return .utf8; // "utf8"/"utf-8"/unknown
+    return null;
+}
+
+/// Resolve an encoding argument, THROWING `ERR_UNKNOWN_ENCODING` (TypeError) for an unrecognized
+/// name (Node's `toString`/`write` behavior). `undefined` → utf8. Returns the Enc or a throw.
+fn argEncChecked(self: *Interpreter, v: Value) EvalError!union(enum) { enc: Enc, throw: Completion } {
+    if (v == .undefined) return .{ .enc = .utf8 };
+    const sc = try self.toStringValuePub(v);
+    if (sc.isAbrupt()) return .{ .throw = sc };
+    if (parseEncOpt(sc.normal.string)) |e| return .{ .enc = e };
+    const msg = std.fmt.allocPrint(self.arena, "Unknown encoding: {s}", .{sc.normal.string}) catch return error.OutOfMemory;
+    return .{ .throw = try throwCode(self, "TypeError", "ERR_UNKNOWN_ENCODING", msg) };
 }
 
 fn hexDigit(c: u8) ?u8 {
@@ -210,18 +244,30 @@ pub fn bufferFn(self: *Interpreter, name: []const u8, this_val: Value, args: []c
     if (eq(u8, name, "from")) return bFrom(self, args, false);
     if (eq(u8, name, "alloc")) return bAlloc(self, args, true);
     if (eq(u8, name, "allocUnsafe") or eq(u8, name, "allocUnsafeSlow")) return bAlloc(self, args, false);
+    if (eq(u8, name, "SlowBuffer")) {
+        // SlowBuffer(size) requires a number-typed size (TypeError otherwise), then allocs zeroed.
+        const a0: Value = if (args.len > 0) args[0] else .undefined;
+        if (a0 != .number)
+            return throwCode(self, "TypeError", "ERR_INVALID_ARG_TYPE", "The \"size\" argument must be of type number.");
+        return bAlloc(self, args, true);
+    }
     if (eq(u8, name, "isBuffer")) return .{ .normal = .{ .boolean = isBuffer(self, if (args.len > 0) args[0] else .undefined) } };
     if (eq(u8, name, "byteLength")) return bByteLength(self, args);
     if (eq(u8, name, "concat")) return bConcat(self, args);
+    if (eq(u8, name, "isEncoding")) return .{ .normal = .{ .boolean = isEncoding(self, if (args.len > 0) args[0] else .undefined) } };
+    if (eq(u8, name, "of")) return bOf(self, args);
+    if (eq(u8, name, "isAscii") or eq(u8, name, "isUtf8")) return bIsAsciiUtf8(self, eq(u8, name, "isAscii"), args);
     // `Buffer.compare(a, b)` static vs `buf.compare(other)` prototype: the static form has a non-Buffer
     // `this_val` (the `Buffer` ctor) and reads both operands from args.
     if (eq(u8, name, "compare") and !(this_val == .object and bytesOf(this_val.object) != null))
         return bCompareStatic(self, args);
-    // Prototype methods (receiver = this_val).
+    // Prototype methods (receiver = this_val). A non-Buffer receiver is an ERR_INVALID_ARG_TYPE
+    // (Node validates `this`/`source` as a Buffer or Uint8Array).
     const recv = this_val;
-    if (recv != .object) return self.throwError("TypeError", "Buffer method called on non-object");
+    const src_exp = "an instance of Buffer or Uint8Array";
+    if (recv != .object) return throwArgType(self, "source", src_exp, recv);
     const buf = recv.object;
-    const bytes = bytesOf(buf) orelse return self.throwError("TypeError", "not a Buffer");
+    const bytes = bytesOf(buf) orelse return throwArgType(self, "source", src_exp, recv);
     if (eq(u8, name, "toString")) return bToString(self, bytes, args);
     if (eq(u8, name, "write")) return bWrite(self, bytes, args);
     if (eq(u8, name, "slice") or eq(u8, name, "subarray")) return bSlice(self, buf, bytes.len, args);
@@ -233,7 +279,9 @@ pub fn bufferFn(self: *Interpreter, name: []const u8, this_val: Value, args: []c
     if (eq(u8, name, "fill")) return bFill(self, buf, bytes, args);
     if (eq(u8, name, "copy")) return bCopy(self, bytes, args);
     if (eq(u8, name, "compare")) return bCompare(self, bytes, args);
-    if (eq(u8, name, "swap16") or eq(u8, name, "swap32")) return bSwap(self, buf, bytes, eq(u8, name, "swap16"));
+    if (eq(u8, name, "swap16")) return bSwap(self, buf, bytes, 2);
+    if (eq(u8, name, "swap32")) return bSwap(self, buf, bytes, 4);
+    if (eq(u8, name, "swap64")) return bSwap(self, buf, bytes, 8);
     if (try rw.readWrite(self, bytes, name, args)) |c| return c;
     return .{ .normal = .undefined };
 }
@@ -265,8 +313,80 @@ fn argEnc(self: *Interpreter, v: Value) EvalError!Enc {
     return parseEnc(sc.normal.string);
 }
 
+/// Clamp a finite/Infinity/NaN f64 to the i64 range so `@intFromFloat` can never panic. NaN → 0.
+fn clampToI64(n: f64) i64 {
+    if (std.math.isNan(n)) return 0;
+    if (n >= @as(f64, @floatFromInt(std.math.maxInt(i64)))) return std.math.maxInt(i64);
+    if (n <= @as(f64, @floatFromInt(std.math.minInt(i64)))) return std.math.minInt(i64);
+    return @intFromFloat(n);
+}
+
+/// Throw a Node-style error (RangeError/TypeError) carrying a `code` property (e.g.
+/// "ERR_OUT_OF_RANGE"), which the Node tests' `assert.throws({ code })` validators check.
+fn throwCode(self: *Interpreter, kind: []const u8, code: []const u8, msg: []const u8) EvalError!Completion {
+    const arena = self.arena;
+    const err = try Object.create(arena, self.errorProto(kind));
+    err.error_data = true;
+    try err.set("name", .{ .string = kind });
+    try err.set("message", .{ .string = msg });
+    try err.defineData("code", .{ .string = code }, true, false, true);
+    return .{ .throw = .{ .object = err } };
+}
+
+/// Node's `Received <detail>` suffix for an ERR_INVALID_ARG_TYPE message, describing the actual
+/// value's type (e.g. `type string ('abc')`, `type number (5)`, `an instance of Foo`, `null`).
+fn receivedDetail(self: *Interpreter, v: Value) EvalError![]const u8 {
+    const arena = self.arena;
+    const ao = @import("abstract_ops.zig");
+    return switch (v) {
+        .undefined => "undefined",
+        .null => "null",
+        .boolean => |b| std.fmt.allocPrint(arena, "type boolean ({s})", .{if (b) "true" else "false"}) catch return error.OutOfMemory,
+        .number => |n| blk: {
+            const s = ao.numberToString(arena, n) catch return error.OutOfMemory;
+            break :blk std.fmt.allocPrint(arena, "type number ({s})", .{s}) catch return error.OutOfMemory;
+        },
+        .string => |s| std.fmt.allocPrint(arena, "type string ('{s}')", .{s}) catch return error.OutOfMemory,
+        .bigint => "type bigint",
+        .symbol => "type symbol",
+        .object => |o| if (o.kind == .function) "function" else "an instance of Object",
+    };
+}
+
+/// Throw ERR_INVALID_ARG_TYPE (TypeError) with Node's full "must be ... Received ..." message.
+fn throwArgType(self: *Interpreter, arg_name: []const u8, expected: []const u8, v: Value) EvalError!Completion {
+    const detail = try receivedDetail(self, v);
+    const msg = std.fmt.allocPrint(self.arena, "The \"{s}\" argument must be {s}. Received {s}", .{ arg_name, expected, detail }) catch return error.OutOfMemory;
+    return throwCode(self, "TypeError", "ERR_INVALID_ARG_TYPE", msg);
+}
+
+/// Validate an allocation/length size argument: must be a non-negative integer ≤ kMaxLength.
+/// Returns the size, or throws (ERR_OUT_OF_RANGE / ERR_INVALID_ARG_TYPE) like Node.
+fn validateSize(self: *Interpreter, v: Value) EvalError!union(enum) { size: usize, throw: Completion } {
+    const nd = try self.toNumberV(v);
+    if (nd.isAbrupt()) return .{ .throw = nd };
+    const n = nd.normal.number;
+    if (std.math.isNan(n) or n != @trunc(n))
+        return .{ .throw = try throwCode(self, "RangeError", "ERR_OUT_OF_RANGE", "The value of \"size\" is out of range. It must be an integer.") };
+    if (n < 0 or n > @as(f64, @floatFromInt(kMaxLength)))
+        return .{ .throw = try throwCode(self, "RangeError", "ERR_OUT_OF_RANGE", "The value of \"size\" is out of range.") };
+    return .{ .size = @intFromFloat(n) };
+}
+
+/// Node's `buffer.kMaxLength` (max bytes in a Buffer). We cap allocation at a sane ceiling well below
+/// this so a huge-but-valid size throws rather than OOMs.
+pub const kMaxLength: u64 = 4294967295;
+/// Practical allocation ceiling: a request above this throws ERR_OUT_OF_RANGE instead of OOMing.
+const ALLOC_CAP: u64 = 1 << 30;
+
 fn bAlloc(self: *Interpreter, args: []const Value, do_fill: bool) EvalError!Completion {
-    const size = try toIndex(self, if (args.len > 0) args[0] else .undefined, 0, 1 << 30);
+    const vs = try validateSize(self, if (args.len > 0) args[0] else .{ .number = 0 });
+    const size = switch (vs) {
+        .throw => |c| return c,
+        .size => |s| s,
+    };
+    if (size > ALLOC_CAP)
+        return throwCode(self, "RangeError", "ERR_OUT_OF_RANGE", "The value of \"size\" is out of range.");
     const buf = try makeBuffer(self, size);
     if (do_fill and args.len > 1 and args[1] != .undefined) {
         const bytes = bytesOf(buf).?;
@@ -296,12 +416,20 @@ fn bFrom(self: *Interpreter, args: []const Value, ctor_number_allocs: bool) Eval
             const bytes = try encode(self.arena, s, enc);
             return .{ .normal = .{ .object = try makeBufferFromBytes(self, bytes) } };
         },
-        .number => |n| {
+        .number => {
             // `new Buffer(n)` (deprecated) allocates n zeroed bytes; `Buffer.from(number)` is a TypeError.
-            if (!ctor_number_allocs) return self.throwError("TypeError", "The \"value\" argument must not be of type number");
-            const size: usize = if (std.math.isNan(n) or n < 0) 0 else @intFromFloat(@min(n, 1 << 30));
+            if (!ctor_number_allocs)
+                return throwCode(self, "TypeError", "ERR_INVALID_ARG_TYPE", "The \"value\" argument must not be of type number");
+            const vs = try validateSize(self, a0);
+            const size = switch (vs) {
+                .throw => |c| return c,
+                .size => |s| s,
+            };
+            if (size > ALLOC_CAP)
+                return throwCode(self, "RangeError", "ERR_OUT_OF_RANGE", "The value of \"size\" is out of range.");
             return .{ .normal = .{ .object = try makeBuffer(self, size) } };
         },
+        .undefined, .null, .boolean => return throwCode(self, "TypeError", "ERR_INVALID_ARG_TYPE", "The first argument must be of type string or an instance of Buffer, ArrayBuffer, Array, or Array-like Object."),
         .object => |o| {
             // A typed array / Buffer → copy its bytes. An ArrayBuffer → a VIEW sharing it. Else an
             // array-like of byte values.
@@ -329,7 +457,7 @@ fn bFrom(self: *Interpreter, args: []const Value, ctor_number_allocs: bool) Eval
             }
             return .{ .normal = .{ .object = buf } };
         },
-        else => return self.throwError("TypeError", "The first argument must be of type string, Buffer, ArrayBuffer, Array, or Array-like"),
+        else => return throwCode(self, "TypeError", "ERR_INVALID_ARG_TYPE", "The first argument must be of type string or an instance of Buffer, ArrayBuffer, Array, or Array-like Object."),
     }
 }
 
@@ -377,12 +505,31 @@ fn bConcat(self: *Interpreter, args: []const Value) EvalError!Completion {
 }
 
 fn bToString(self: *Interpreter, bytes: []u8, args: []const Value) EvalError!Completion {
-    const enc = if (args.len > 0) try argEnc(self, args[0]) else Enc.utf8;
+    const enc = switch (try argEncChecked(self, if (args.len > 0) args[0] else .undefined)) {
+        .enc => |e| e,
+        .throw => |c| return c,
+    };
     const start = try toIndex(self, if (args.len > 1) args[1] else .undefined, 0, bytes.len);
     const end = try toIndex(self, if (args.len > 2) args[2] else .undefined, bytes.len, bytes.len);
     const slice = if (end > start) bytes[start..end] else bytes[0..0];
     const s = try decode(self.arena, slice, enc);
     return .{ .normal = .{ .string = s } };
+}
+
+/// Validate `buf.write`'s offset: an integer in [0, len]; else ERR_OUT_OF_RANGE with Node's `&&`
+/// bounds message. `undefined` → 0.
+fn writeOffset(self: *Interpreter, v: Value, len: usize) EvalError!union(enum) { v: usize, throw: Completion } {
+    if (v == .undefined) return .{ .v = 0 };
+    const nd = try self.toNumberV(v);
+    if (nd.isAbrupt()) return .{ .throw = nd };
+    const n = nd.normal.number;
+    if (std.math.isNan(n) or n != @trunc(n) or n < 0 or n > @as(f64, @floatFromInt(len))) {
+        const ao = @import("abstract_ops.zig");
+        const recv = ao.numberToString(self.arena, n) catch return error.OutOfMemory;
+        const msg = std.fmt.allocPrint(self.arena, "The value of \"offset\" is out of range. It must be >= 0 && <= {d}. Received {s}", .{ len, recv }) catch return error.OutOfMemory;
+        return .{ .throw = try throwCode(self, "RangeError", "ERR_OUT_OF_RANGE", msg) };
+    }
+    return .{ .v = @intFromFloat(n) };
 }
 
 fn bWrite(self: *Interpreter, bytes: []u8, args: []const Value) EvalError!Completion {
@@ -395,14 +542,31 @@ fn bWrite(self: *Interpreter, bytes: []u8, args: []const Value) EvalError!Comple
     var enc: Enc = .utf8;
     if (args.len > 1) {
         if (args[1] == .string) {
-            enc = parseEnc(args[1].string);
+            enc = switch (try argEncChecked(self, args[1])) {
+                .enc => |e| e,
+                .throw => |c| return c,
+            };
         } else {
-            offset = try toIndex(self, args[1], 0, bytes.len);
+            // offset must be an integer in [0, len] (Node throws ERR_OUT_OF_RANGE with `&&` bounds).
+            offset = switch (try writeOffset(self, args[1], bytes.len)) {
+                .v => |o| o,
+                .throw => |c| return c,
+            };
             max_len = bytes.len - offset;
             if (args.len > 2) {
-                if (args[2] == .string) enc = parseEnc(args[2].string) else {
+                if (args[2] == .string) {
+                    enc = switch (try argEncChecked(self, args[2])) {
+                        .enc => |e| e,
+                        .throw => |c| return c,
+                    };
+                } else {
                     max_len = @min(max_len, try toIndex(self, args[2], max_len, bytes.len));
-                    if (args.len > 3) enc = try argEnc(self, args[3]);
+                    if (args.len > 3) {
+                        enc = switch (try argEncChecked(self, args[3])) {
+                            .enc => |e| e,
+                            .throw => |c| return c,
+                        };
+                    }
                 }
             }
         }
@@ -441,8 +605,9 @@ fn relIndex(self: *Interpreter, v: Value, default: usize, len: usize) EvalError!
 
 fn bEquals(self: *Interpreter, bytes: []u8, args: []const Value) EvalError!Completion {
     const other: Value = if (args.len > 0) args[0] else .undefined;
-    if (other != .object) return self.throwError("TypeError", "argument must be a Buffer or Uint8Array");
-    const ob = bytesOf(other.object) orelse return self.throwError("TypeError", "argument must be a Buffer or Uint8Array");
+    const exp = "an instance of Buffer or Uint8Array";
+    if (other != .object) return throwArgType(self, "otherBuffer", exp, other);
+    const ob = bytesOf(other.object) orelse return throwArgType(self, "otherBuffer", exp, other);
     return .{ .normal = .{ .boolean = std.mem.eql(u8, bytes, ob) } };
 }
 
@@ -491,7 +656,7 @@ fn bIndexOf(self: *Interpreter, bytes: []u8, args: []const Value, kind: SearchKi
         if (std.math.isNan(n)) n = if (kind == .last) @floatFromInt(bytes.len) else 0;
         n = @trunc(n);
         if (n < 0) n += @floatFromInt(bytes.len);
-        start = @intFromFloat(n);
+        start = clampToI64(n);
     }
 
     if (needle.len == 0) {
@@ -573,14 +738,51 @@ fn bFill(self: *Interpreter, buf: *Object, bytes: []u8, args: []const Value) Eva
     return .{ .normal = .{ .object = buf } };
 }
 
+/// Resolve a `copy` index arg: ToInteger, must be `>= 0` (ERR_OUT_OF_RANGE `It must be >= 0`).
+/// When `cap_throws`, a value `> max` also throws `>= 0 && <= {max}`; otherwise it is returned as-is
+/// (the caller clamps). `undefined` → `default`. A non-integer coerces (Node coerces copy offsets).
+fn copyIndex(self: *Interpreter, v: Value, default: usize, max: usize, cap_throws: bool, name: []const u8) EvalError!union(enum) { v: usize, throw: Completion } {
+    if (v == .undefined) return .{ .v = default };
+    const nd = try self.toNumberV(v);
+    if (nd.isAbrupt()) return .{ .throw = nd };
+    var n = nd.normal.number;
+    if (std.math.isNan(n)) n = 0;
+    n = @trunc(n);
+    const ao = @import("abstract_ops.zig");
+    if (n < 0) {
+        const recv = ao.numberToString(self.arena, nd.normal.number) catch return error.OutOfMemory;
+        const msg = std.fmt.allocPrint(self.arena, "The value of \"{s}\" is out of range. It must be >= 0. Received {s}", .{ name, recv }) catch return error.OutOfMemory;
+        return .{ .throw = try throwCode(self, "RangeError", "ERR_OUT_OF_RANGE", msg) };
+    }
+    if (cap_throws and n > @as(f64, @floatFromInt(max))) {
+        const recv = ao.numberToString(self.arena, nd.normal.number) catch return error.OutOfMemory;
+        const msg = std.fmt.allocPrint(self.arena, "The value of \"{s}\" is out of range. It must be >= 0 && <= {d}. Received {s}", .{ name, max, recv }) catch return error.OutOfMemory;
+        return .{ .throw = try throwCode(self, "RangeError", "ERR_OUT_OF_RANGE", msg) };
+    }
+    return .{ .v = @intFromFloat(n) };
+}
+
 /// copy(target[, targetStart[, sourceStart[, sourceEnd]]]). Returns the number of bytes copied.
 fn bCopy(self: *Interpreter, bytes: []u8, args: []const Value) EvalError!Completion {
     const target: Value = if (args.len > 0) args[0] else .undefined;
-    if (target != .object) return self.throwError("TypeError", "argument must be a Buffer or Uint8Array");
-    const dst = bytesOf(target.object) orelse return self.throwError("TypeError", "argument must be a Buffer or Uint8Array");
-    const t_start = try toIndex(self, if (args.len > 1) args[1] else .undefined, 0, dst.len);
-    const s_start = try toIndex(self, if (args.len > 2) args[2] else .undefined, 0, bytes.len);
-    const s_end = try toIndex(self, if (args.len > 3) args[3] else .undefined, bytes.len, bytes.len);
+    const exp = "an instance of Buffer or Uint8Array";
+    if (target != .object) return throwArgType(self, "target", exp, target);
+    const dst = bytesOf(target.object) orelse return throwArgType(self, "target", exp, target);
+    // targetStart/sourceStart/sourceEnd are coerced ToInteger then range-checked (>= 0, and source
+    // offsets <= source length); Node throws ERR_OUT_OF_RANGE on a negative / too-large value.
+    const t_start = switch (try copyIndex(self, if (args.len > 1) args[1] else .undefined, 0, dst.len, false, "targetStart")) {
+        .v => |x| x,
+        .throw => |c| return c,
+    };
+    const s_start = switch (try copyIndex(self, if (args.len > 2) args[2] else .undefined, 0, bytes.len, true, "sourceStart")) {
+        .v => |x| x,
+        .throw => |c| return c,
+    };
+    var s_end = switch (try copyIndex(self, if (args.len > 3) args[3] else .undefined, bytes.len, bytes.len, false, "sourceEnd")) {
+        .v => |x| x,
+        .throw => |c| return c,
+    };
+    if (s_end > bytes.len) s_end = bytes.len;
     if (s_end <= s_start or t_start >= dst.len) return .{ .normal = .{ .number = 0 } };
     const n = @min(s_end - s_start, dst.len - t_start);
     // Source and target may overlap (same backing ArrayBuffer); use a forward/backward safe move.
@@ -597,29 +799,117 @@ fn cmpBytes(a: []const u8, b: []const u8) f64 {
     };
 }
 
+/// `buf.compare(target[, targetStart[, targetEnd[, sourceStart[, sourceEnd]]]])`. The optional
+/// range args slice both operands before the lexicographic comparison; each must be an integer in
+/// the valid range (ERR_INVALID_ARG_TYPE / ERR_OUT_OF_RANGE otherwise).
 fn bCompare(self: *Interpreter, bytes: []u8, args: []const Value) EvalError!Completion {
     const other: Value = if (args.len > 0) args[0] else .undefined;
-    if (other != .object) return self.throwError("TypeError", "argument must be a Buffer or Uint8Array");
-    const ob = bytesOf(other.object) orelse return self.throwError("TypeError", "argument must be a Buffer or Uint8Array");
-    return .{ .normal = .{ .number = cmpBytes(bytes, ob) } };
+    const exp = "an instance of Buffer or Uint8Array";
+    if (other != .object) return throwArgType(self, "target", exp, other);
+    const ob = bytesOf(other.object) orelse return throwArgType(self, "target", exp, other);
+    // *Start args validate against kMaxLength (clamped later); *End args against the buffer length.
+    const t_start = switch (try cmpRange(self, if (args.len > 1) args[1] else .undefined, 0, kMaxLength, "targetStart")) {
+        .v => |x| x,
+        .throw => |c| return c,
+    };
+    const t_end = switch (try cmpRange(self, if (args.len > 2) args[2] else .undefined, ob.len, ob.len, "targetEnd")) {
+        .v => |x| x,
+        .throw => |c| return c,
+    };
+    const s_start = switch (try cmpRange(self, if (args.len > 3) args[3] else .undefined, 0, kMaxLength, "sourceStart")) {
+        .v => |x| x,
+        .throw => |c| return c,
+    };
+    const s_end = switch (try cmpRange(self, if (args.len > 4) args[4] else .undefined, bytes.len, bytes.len, "sourceEnd")) {
+        .v => |x| x,
+        .throw => |c| return c,
+    };
+    // Clamp slice indices to the actual byte lengths (the validated offsets may exceed them).
+    const ss = @min(s_start, bytes.len);
+    const se = @min(s_end, bytes.len);
+    const ts = @min(t_start, ob.len);
+    const te = @min(t_end, ob.len);
+    const src = if (se > ss) bytes[ss..se] else bytes[0..0];
+    const tgt = if (te > ts) ob[ts..te] else ob[0..0];
+    return .{ .normal = .{ .number = cmpBytes(src, tgt) } };
+}
+
+/// Resolve one of `compare`'s optional range args: a number-typed integer in [0, kMaxLength], with
+/// `undefined` → `default`. Non-number → ERR_INVALID_ARG_TYPE; out-of-range → ERR_OUT_OF_RANGE.
+/// (The value is range-validated here but clamped to the actual buffer length by the caller.)
+fn cmpRange(self: *Interpreter, v: Value, default: usize, max: u64, name: []const u8) EvalError!union(enum) { v: usize, throw: Completion } {
+    if (v == .undefined) return .{ .v = default };
+    if (v != .number) {
+        const msg = std.fmt.allocPrint(self.arena, "The \"{s}\" argument must be of type number.", .{name}) catch return error.OutOfMemory;
+        return .{ .throw = try throwCode(self, "TypeError", "ERR_INVALID_ARG_TYPE", msg) };
+    }
+    const n = v.number;
+    if (std.math.isNan(n) or n != @trunc(n) or n < 0 or n > @as(f64, @floatFromInt(max))) {
+        const ao = @import("abstract_ops.zig");
+        const recv = ao.numberToString(self.arena, n) catch return error.OutOfMemory;
+        const msg = std.fmt.allocPrint(self.arena, "The value of \"{s}\" is out of range. It must be >= 0 && <= {d}. Received {s}", .{ name, max, recv }) catch return error.OutOfMemory;
+        return .{ .throw = try throwCode(self, "RangeError", "ERR_OUT_OF_RANGE", msg) };
+    }
+    return .{ .v = @intFromFloat(n) };
 }
 
 /// Static `Buffer.compare(a, b)`.
 fn bCompareStatic(self: *Interpreter, args: []const Value) EvalError!Completion {
     const a: Value = if (args.len > 0) args[0] else .undefined;
     const b: Value = if (args.len > 1) args[1] else .undefined;
-    if (a != .object or b != .object) return self.throwError("TypeError", "arguments must be Buffers or Uint8Arrays");
-    const ab = bytesOf(a.object) orelse return self.throwError("TypeError", "arguments must be Buffers or Uint8Arrays");
-    const bb = bytesOf(b.object) orelse return self.throwError("TypeError", "arguments must be Buffers or Uint8Arrays");
+    const exp = "an instance of Buffer or Uint8Array";
+    const ab = (if (a == .object) bytesOf(a.object) else null) orelse return throwArgType(self, "buf1", exp, a);
+    const bb = (if (b == .object) bytesOf(b.object) else null) orelse return throwArgType(self, "buf2", exp, b);
     return .{ .normal = .{ .number = cmpBytes(ab, bb) } };
 }
 
-/// swap16 / swap32: reverse bytes within each 2- or 4-byte group in place. Returns the buffer.
-fn bSwap(self: *Interpreter, buf: *Object, bytes: []u8, is16: bool) EvalError!Completion {
-    const group: usize = if (is16) 2 else 4;
-    if (bytes.len % group != 0)
-        return self.throwError("RangeError", "Buffer size must be a multiple of the swap width");
+/// swap16 / swap32 / swap64: reverse bytes within each `group`-byte chunk in place. Returns the buffer.
+fn bSwap(self: *Interpreter, buf: *Object, bytes: []u8, group: usize) EvalError!Completion {
+    if (bytes.len % group != 0) {
+        const msg = switch (group) {
+            2 => "Buffer size must be a multiple of 16-bits",
+            4 => "Buffer size must be a multiple of 32-bits",
+            else => "Buffer size must be a multiple of 64-bits",
+        };
+        return throwCode(self, "RangeError", "ERR_INVALID_BUFFER_SIZE", msg);
+    }
     var i: usize = 0;
     while (i < bytes.len) : (i += group) std.mem.reverse(u8, bytes[i .. i + group]);
+    return .{ .normal = .{ .object = buf } };
+}
+
+/// `Buffer.isEncoding(enc)` — true if `enc` is a recognized encoding name.
+fn isEncoding(self: *Interpreter, v: Value) bool {
+    _ = self;
+    if (v != .string) return false;
+    const s = v.string;
+    const eq = std.ascii.eqlIgnoreCase;
+    for ([_][]const u8{ "utf8", "utf-8", "hex", "base64", "base64url", "latin1", "binary", "ascii", "utf16le", "ucs2", "ucs-2", "utf-16le" }) |name|
+        if (eq(s, name)) return true;
+    return false;
+}
+
+/// `buffer.isAscii(view)` / `buffer.isUtf8(view)` — true if the view's bytes are all-ASCII / valid
+/// UTF-8. The argument must be a TypedArray/Buffer or ArrayBuffer (ERR_INVALID_ARG_TYPE otherwise).
+fn bIsAsciiUtf8(self: *Interpreter, ascii: bool, args: []const Value) EvalError!Completion {
+    const a0: Value = if (args.len > 0) args[0] else .undefined;
+    if (a0 != .object) return throwCode(self, "TypeError", "ERR_INVALID_ARG_TYPE", "The \"input\" argument must be an instance of Buffer, TypedArray, or ArrayBuffer.");
+    const bytes: []const u8 = bytesOf(a0.object) orelse (if (a0.object.array_buffer) |ab| ab.bytes else return throwCode(self, "TypeError", "ERR_INVALID_ARG_TYPE", "The \"input\" argument must be an instance of Buffer, TypedArray, or ArrayBuffer."));
+    if (ascii) {
+        for (bytes) |b| if (b > 0x7f) return .{ .normal = .{ .boolean = false } };
+        return .{ .normal = .{ .boolean = true } };
+    }
+    return .{ .normal = .{ .boolean = std.unicode.utf8ValidateSlice(bytes) } };
+}
+
+/// `Buffer.of(...bytes)` — a Buffer from the argument list (each ToNumber → a byte).
+fn bOf(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const buf = try makeBuffer(self, args.len);
+    const bytes = bytesOf(buf).?;
+    for (args, 0..) |a, i| {
+        const nd = try self.toNumberV(a);
+        if (nd.isAbrupt()) return nd;
+        bytes[i] = @truncate(@as(u64, @intFromFloat(@mod(@max(@trunc(nd.normal.number), 0), 256))));
+    }
     return .{ .normal = .{ .object = buf } };
 }

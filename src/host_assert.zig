@@ -549,6 +549,16 @@ fn errorMatches(self: *Interpreter, err: Value, expected: Value) EvalError!Compl
         const want = pv.payload.data;
         const got_c = try self.getProperty(err, key);
         if (got_c.isAbrupt()) return got_c;
+        // A RegExp-valued property (e.g. `{ message: /.../ }`) is tested against the actual value's
+        // string form (Node's assert.throws semantics), not deep-equaled.
+        if (want == .object and want.object.regexp != null) {
+            const sc = try self.toStringValuePub(got_c.normal);
+            if (sc.isAbrupt()) return sc;
+            const tc = try regexpTest(self, want.object, sc.normal.string);
+            if (tc.isAbrupt()) return tc;
+            if (!(tc.normal == .boolean and tc.normal.boolean)) return .{ .normal = .{ .boolean = false } };
+            continue;
+        }
         if (!try deepEqual(self, got_c.normal, want, true)) return .{ .normal = .{ .boolean = false } };
     }
     return .{ .normal = .{ .boolean = true } };
