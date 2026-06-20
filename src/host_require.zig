@@ -296,7 +296,7 @@ pub fn installEntryRequire(self: *Interpreter, script_path: []const u8, script_d
 //  core module registry: path / fs / os
 // ════════════════════════════════════════════════════════════════════════════
 
-const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test" };
+const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test", "timers", "timers/promises" };
 
 /// Strip a `node:` prefix (Node accepts `node:path` etc.).
 fn coreName(spec: []const u8) []const u8 {
@@ -358,6 +358,16 @@ fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
     }
     // HOST (spec 105): `require('querystring')` → parse/decode/stringify/encode/escape/unescape.
     if (std.mem.eql(u8, name, "querystring")) return @import("host_querystring.zig").build(self);
+    // HOST (spec 106): `require('timers')` → the timer globals as a module, plus a `.promises`
+    // sub-namespace; `require('timers/promises')` IS that same `.promises` object (identity holds).
+    if (std.mem.eql(u8, name, "timers")) return @import("host_timers_mod.zig").buildTimers(self);
+    if (std.mem.eql(u8, name, "timers/promises")) {
+        const timers_c = try loadCoreModule(self, "timers");
+        if (timers_c.normal == .object) {
+            if (timers_c.normal.object.get("promises")) |pv| if (pv == .object) return pv.object;
+        }
+        return Object.create(self.arena, self.objectProto());
+    }
     const obj = try Object.create(arena, self.objectProto());
     if (std.mem.eql(u8, name, "fs")) {
         for ([_][]const u8{ "readFileSync", "existsSync", "writeFileSync", "statSync", "readdirSync", "mkdirSync" }) |m|

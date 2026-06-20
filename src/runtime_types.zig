@@ -687,6 +687,11 @@ pub const NativeId = enum {
     /// HOST (Node axis, spec 105 — NOT ECMA-262): a `querystring` core-module method (parse/decode/
     /// stringify/encode/escape/unescape) — selected by `native_name`. Inert on the Test262 path.
     qs_method,
+    /// HOST (Node axis, spec 106 — NOT ECMA-262): a `timers` / `timers/promises` core-module method
+    /// (`setTimeout`/`setImmediate`/`setInterval` promisified, `scheduler.wait`/`yield`, the legacy
+    /// `enroll`/`unenroll`/`active` stubs, and the internal promise-settling timer callback) — selected
+    /// by `native_name` + hidden own state. Inert on the Test262 path.
+    timers_method,
     /// HOST (Node axis, spec 104 — NOT ECMA-262): an `assert` core-module method (ok/equal/
     /// strictEqual/deepStrictEqual/throws/rejects/match/... + the `AssertionError` constructor and
     /// the rejects/doesNotReject promise-reaction natives) — selected by `native_name` / hidden
