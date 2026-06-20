@@ -396,12 +396,17 @@ pub fn evaluateWithLimitL(arena: std.mem.Allocator, source: []const u8, mode: Ru
 }
 
 const host_timers = @import("host_timers.zig");
+const host_setup = @import("host_setup.zig");
 
-/// HOST run (Node axis, spec 098): like `evaluate`, but after the top-level script + initial microtask
-/// drain it runs the **event loop** (`runEventLoop`) — firing `setTimeout`/`setInterval` callbacks with
-/// microtasks drained between them — until the timer queue empties. Used by the `ljs run` CLI so timers
-/// + `console.log` work. NOT used by Test262 (that path stays microtask-only and never sleeps).
-pub fn runHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, out: *std.Io.Writer, err: *std.Io.Writer) error{OutOfMemory}!EvaluationResult {
+/// HOST (Node axis, spec 100): re-exported so the CLI (`main`) builds the argv/env/cwd context.
+pub const HostCtx = host_setup.HostCtx;
+
+/// HOST run (Node axis, spec 098/100): like `evaluate`, but installs the host globals (`process`,
+/// `global`, timers, `console`) from `ctx`, then — after the top-level script + initial nextTick +
+/// microtask drain — runs the **event loop** (`runEventLoop`) until the timer queue empties. Used by
+/// the `ljs run` CLI so timers + `console.log` + `process` work. NOT used by Test262 (that path stays
+/// microtask-only, never installs host globals, and never sleeps).
+pub fn runHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, ctx: HostCtx, out: *std.Io.Writer, err: *std.Io.Writer) error{OutOfMemory}!EvaluationResult {
     const program = Parser.parseMode(arena, source, mode == .strict) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .syntax_error = @errorName(e) },
@@ -414,6 +419,10 @@ pub fn runHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, out:
     interp.host_out = out;
     interp.host_err = err;
     interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
+    host_setup.installHostGlobals(&interp, ctx) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StepLimitExceeded => return .step_limit,
+    };
     const completion = interp.run(program, global) catch |e| {
         interp.cleanupGenerators();
         return switch (e) {
@@ -427,8 +436,64 @@ pub fn runHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, out:
         interp.cleanupGenerators();
         return .{ .thrown = completion.throw };
     }
+    // §process.nextTick: drain ticks scheduled by the top-level script BEFORE the first microtask
+    // checkpoint, so a `process.nextTick` runs ahead of a same-turn `Promise.then` (Node ordering). The
+    // event loop re-drains at the top of each turn; this seeds the pre-loop checkpoint.
+    host_setup.drainNextTicks(&interp) catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
     // Drive the macrotask/microtask event loop to completion (timers fire here).
     host_timers.runEventLoop(&interp) catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
+    interp.cleanupGenerators();
+    return switch (completion) {
+        .normal => |v| .{ .normal = v },
+        .empty => .{ .normal = .undefined },
+        .ret => |v| .{ .normal = v },
+        .throw => |v| .{ .thrown = v },
+        .brk, .cont => .{ .normal = .undefined },
+    };
+}
+
+/// HOST `ljs eval` (Node axis, spec 100): like `evaluate`, but installs the host globals (so
+/// `console.log` / `process` work) and threads the run's stdout/stderr writers — WITHOUT running the
+/// event loop (a one-shot REPL-style evaluation; a `setTimeout`/`process.nextTick` scheduled here
+/// simply never fires, which is acceptable). The microtask Job queue is still drained (Promise
+/// reactions run). Returns the script's completion value (the CLI echoes it REPL-style).
+pub fn evalHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, ctx: HostCtx, out: *std.Io.Writer, err: *std.Io.Writer) error{OutOfMemory}!EvaluationResult {
+    const program = Parser.parseMode(arena, source, mode == .strict) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .syntax_error = @errorName(e) },
+    };
+    const global = Environment.create(arena, null) catch return error.OutOfMemory;
+    builtins.setup(arena, global) catch return error.OutOfMemory;
+    var gen_registry: std.ArrayListUnmanaged(*@import("object.zig").Generator) = .empty;
+    var job_queue: std.ArrayListUnmanaged(@import("object.zig").Job) = .empty;
+    var interp = Interpreter{ .arena = arena, .step_limit = default_step_limit, .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
+    interp.host_out = out;
+    interp.host_err = err;
+    interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
+    host_setup.installHostGlobals(&interp, ctx) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StepLimitExceeded => return .step_limit,
+    };
+    const completion = interp.run(program, global) catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
+    interp.drainJobs() catch |e| {
         interp.cleanupGenerators();
         return switch (e) {
             error.OutOfMemory => error.OutOfMemory,

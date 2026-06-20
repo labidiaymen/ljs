@@ -1088,27 +1088,10 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
         try env.declare(gf, .{ .object = fn_obj }, true, true);
     }
 
-    // HOST runtime (Node axis, spec 098 — NOT ECMA-262): timer globals (native `timer_fn`, dispatched
-    // by name) + a minimal `console.log`. Inert on the Test262 path (the host event loop never runs
-    // there); present so `ljs run` can schedule + observe callbacks.
-    const timer_fns = [_][]const u8{ "setTimeout", "setInterval", "clearTimeout", "clearInterval", "queueMicrotask", "setImmediate", "clearImmediate" };
-    for (timer_fns) |tf| {
-        const fn_obj = try Object.createNative(arena, .timer_fn, tf);
-        fn_obj.prototype = function_proto;
-        try fn_obj.defineData("name", .{ .string = tf }, false, false, true);
-        try env.declare(tf, .{ .object = fn_obj }, true, true);
-    }
-    {
-        const console_obj = try Object.create(arena, object_proto);
-        const log_fn = try Object.createNative(arena, .console_log, "log");
-        log_fn.prototype = function_proto;
-        try log_fn.defineData("name", .{ .string = "log" }, false, false, true);
-        try console_obj.defineData("log", .{ .object = log_fn }, true, false, true);
-        // `console.info`/`.debug`/`.warn`/`.error` alias `.log` for slice 1.
-        for ([_][]const u8{ "info", "debug", "warn", "error" }) |alias|
-            try console_obj.defineData(alias, .{ .object = log_fn }, true, false, true);
-        try env.declare("console", .{ .object = console_obj }, true, true);
-    }
+    // HOST runtime (Node axis): the timer globals (`setTimeout`/…/`queueMicrotask`/`setImmediate`) and
+    // `console` are NOT installed here — they moved to `host_setup.installHostGlobals` (spec 100), which
+    // the CLI (`ljs run`/`eval`) calls after this `setup`. The Test262 engine surface never installs
+    // host globals, so a conformance realm is now pure ECMAScript (no inert host bindings).
 
     // §21.3 Math — a namespace object (not a constructor): non-enumerable function-valued methods
     // (proto = %Object.prototype%) + the §21.3.1 value properties. `Math.pow(2,32)` backs

@@ -10,6 +10,7 @@ const interpreter = @import("interpreter.zig");
 const Interpreter = interpreter.Interpreter;
 const EvalError = interpreter.EvalError;
 const host_time = @import("host_time.zig");
+const host_setup = @import("host_setup.zig");
 
 /// Dispatch the host scheduling globals (native `timer_fn`) by name. Inert unless the event loop runs.
 pub fn timerFn(self: *Interpreter, name: []const u8, args: []const Value) EvalError!Completion {
@@ -110,6 +111,10 @@ fn cancel(self: *Interpreter, args: []const Value) EvalError!Completion {
 /// throws prints an uncaught-exception line to stderr and the loop continues (slice 1; refine later).
 pub fn runEventLoop(self: *Interpreter) EvalError!void {
     while (true) {
+        // 0. nextTick queue drains FULLY first (Node: ticks run before each microtask checkpoint, so a
+        //    nextTick callback precedes any Promise reaction scheduled the same turn). Ticks may enqueue
+        //    more ticks AND microtasks; this drains to empty before the microtask drain below.
+        try host_setup.drainNextTicks(self);
         // 1. Microtasks always drain to empty first (Promise reactions + queueMicrotask).
         try self.drainJobs();
         // 2. Check phase: run ONE pending immediate (then loop → re-drain microtasks). An immediate

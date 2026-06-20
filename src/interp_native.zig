@@ -36,6 +36,7 @@ const interp_expr = @import("interp_expr.zig");
 const interp_async = @import("interp_async.zig");
 const interp_eval = @import("interp_eval.zig");
 const host_timers = @import("host_timers.zig");
+const host_setup = @import("host_setup.zig");
 const interp_collection = @import("interp_collection.zig");
 
 const toBoolean = ops.toBoolean;
@@ -528,6 +529,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .global_fn => return globalFn(self, func.native_name, args), // §19.2 global function intrinsics
         .timer_fn => return host_timers.timerFn(self, func.native_name, args), // HOST timers (spec 098)
         .console_log => return host_timers.consoleLog(self, args), // HOST console.log (spec 098)
+        .process_method => return host_setup.processMethod(self, func.native_name, args), // HOST process (spec 100)
         .eval_fn => {
             // §19.2.1: reaching `callNative` means INDIRECT eval (`(0,eval)(s)`, `var e=eval; e(s)`,
             // `globalThis.eval(s)`) — the direct case is intercepted in `evalCall` before dispatch.
@@ -852,7 +854,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .bigint_method => return builtin_bigint.bigintMethod(self, func.native_name, this_val, args), // §21.2.3 toString/valueOf
         .symbol_ctor => return builtin_symbol.constructor(self, args), // §20.4.1.1 Symbol([description])
         .promise_ctor => return interp_async.promiseConstructor(self, this_val, args), // §27.2.3.1 Promise(executor)
-        .timer_fn, .console_log => unreachable, // HOST (spec 098) — handled in the first switch
+        .timer_fn, .console_log, .process_method => unreachable, // HOST (spec 098/100) — handled in the first switch
         .array_ctor, .array_method, .array_static, .string_method, .string_static, .math_method, .reflect_method => unreachable, // handled in the first switch
         .species_getter, .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
         .symbol_static, .symbol_description => unreachable, // handled in the first switch

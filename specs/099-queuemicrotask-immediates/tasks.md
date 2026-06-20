@@ -10,5 +10,6 @@
 - [x] T6. `builtins.zig`: registered the three new globals.
 - [x] T7. Verified: `sync → promise/queueMicrotask → immediate → timeout 0`; clearImmediate cancels;
       `queueMicrotask(5)` → TypeError.
-- [~] T8. Gate: build/test/lint/bench GREEN; 0 Test262 refs to the new globals + `.microtask` is an
-      additive switch arm (inert on the Test262 path); language baseline check running; present at gate.
+- [x] T8. Gate: build/test/lint/bench GREEN; language baseline `conformance: ok` (0 regressions,
+      42,308/95.1%); built-ins provably 0 (0 Test262 refs + additive switch arm). Committed + pushed
+      (c011c29).

@@ -5,6 +5,18 @@ const std = @import("std");
 const Io = std.Io;
 const ljs = @import("ljs");
 
+/// HOST (spec 100): the OS process id, best-effort per platform (0 if unavailable). The branch is
+/// chosen at comptime (`builtin.os.tag` is comptime-known) so only the matching platform call is
+/// analyzed — `std.os.linux.getpid` is never compiled on Windows.
+fn hostPid() i64 {
+    const tag = @import("builtin").os.tag;
+    if (tag == .windows) return @intCast(std.os.windows.GetCurrentProcessId());
+    if (tag == .linux) return @intCast(std.os.linux.getpid());
+    if (tag.isDarwin() or tag == .freebsd or tag == .openbsd or tag == .netbsd or tag == .dragonfly)
+        return @intCast(std.c.getpid());
+    return 0;
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
@@ -41,13 +53,31 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
 
-    // `ljs run <file>` uses the HOST event loop (timers + console.log fire); `ljs eval "<src>"` is a
-    // plain one-shot evaluation (no event loop) — matches a REPL-style expression evaluation.
+    // HOST (spec 100): build the `process` context — argv = [execPath, scriptPath, ...extra]; env = a
+    // snapshot of the OS environment; cwd via the std Io API; pid best-effort. Both `run` and `eval`
+    // install the host globals (so `console.log`/`process` work in either); only `run` runs the loop.
     const is_run = std.mem.eql(u8, cmd, "run");
+    const ctx = blk: {
+        // argv0 = the ljs executable name (args[0]); the "script" slot is the file path for `run`, or
+        // the exe name again for `eval` (no script file). Extra args (args[3..]) trail.
+        var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+        const exe0: []const u8 = if (args.len > 0) args[0] else "ljs";
+        try argv.append(arena, exe0);
+        if (is_run) try argv.append(arena, arg) else try argv.append(arena, exe0);
+        if (args.len > 3) for (args[3..]) |a| try argv.append(arena, a);
+
+        var env_pairs: std.ArrayListUnmanaged([2][]const u8) = .empty;
+        var it = init.environ_map.iterator();
+        while (it.next()) |entry| try env_pairs.append(arena, .{ entry.key_ptr.*, entry.value_ptr.* });
+
+        const cwd = std.process.currentPathAlloc(io, arena) catch "";
+        break :blk ljs.HostCtx{ .argv = argv.items, .env_pairs = env_pairs.items, .cwd = cwd, .pid = hostPid() };
+    };
+
     const result = if (is_run)
-        try ljs.runHost(arena, source, .sloppy, out, err)
+        try ljs.runHost(arena, source, .sloppy, ctx, out, err)
     else
-        try ljs.evaluate(arena, source, .sloppy);
+        try ljs.evalHost(arena, source, .sloppy, ctx, out, err);
     switch (result) {
         .normal => |v| {
             // `run` is for side effects (console.log) — don't echo the script's completion value;

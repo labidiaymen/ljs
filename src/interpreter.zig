@@ -176,12 +176,21 @@ pub const Interpreter = struct {
     /// (before timers). Inert on the Test262 path. `next_immediate_id` hands out ids.
     immediates: std.ArrayListUnmanaged(object_mod.ImmediateEntry) = .empty,
     next_immediate_id: u64 = 1,
+    /// HOST (Node axis, spec 100): the `process.nextTick` queue — drained FULLY (including ticks
+    /// enqueued by running ticks) at the TOP of each event-loop turn, BEFORE the microtask `job_queue`,
+    /// so a nextTick callback runs ahead of any Promise reaction scheduled the same turn. Empty + never
+    /// consulted on the Test262 path (host globals are not installed there).
+    next_tick_queue: std.ArrayListUnmanaged(object_mod.NextTickEntry) = .empty,
     /// HOST (Node axis, spec 098): the shared stdout / stderr writers for `console.log` + uncaught
     /// timer errors, threaded in by `runHost`. ONE writer per stream for the whole run (creating a
     /// fresh `File.Writer` per call would positioned-write from offset 0 and clobber a redirected
     /// file). Null off the host path → `console.log` falls back to a one-shot writer.
     host_out: ?*std.Io.Writer = null,
     host_err: ?*std.Io.Writer = null,
+    /// HOST (Node axis, spec 100): the current working directory string returned by `process.cwd()`.
+    /// Set by `host_setup.installHostGlobals` from the `HostCtx` `main` built at startup. Empty off
+    /// the host path (never read there — `process` isn't installed on the Test262/eval-less surface).
+    host_cwd: []const u8 = "",
     /// §13.3.10 / §16.2.1.6 dynamic `import()` host hooks (the minimal Test262 harness loader). When
     /// set, `evalImportCall` resolves the specifier via `module_loader` relative to `host_referrer_key`,
     /// loads + links + evaluates the target module graph (shared `module_cache`, keyed by resolved key

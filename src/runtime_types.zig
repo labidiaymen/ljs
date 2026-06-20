@@ -309,6 +309,14 @@ pub const ImmediateEntry = struct {
     cancelled: bool = false,
 };
 
+/// HOST (Node axis, spec 100 — NOT ECMA-262): one `process.nextTick(cb, ...args)` registration. The
+/// nextTick queue is drained FULLY (including ticks enqueued by running ticks) BEFORE each microtask
+/// checkpoint in the event loop, so a tick runs ahead of any Promise reaction scheduled the same turn.
+pub const NextTickEntry = struct {
+    callback: *Object,
+    args: []const Value,
+};
+
 /// HOST (Node axis, spec 098 — NOT ECMA-262): one scheduled timer (`setTimeout`/`setInterval`). The
 /// host event loop fires `callback(args...)` when the MONOTONIC clock reaches `deadline_ms`; an
 /// `interval_ms != null` reschedules (`deadline_ms += interval_ms`), a one-shot is removed.
@@ -652,6 +660,10 @@ pub const NativeId = enum {
     /// HOST (Node axis, NOT ECMA-262): `console.log` — write the space-joined ToString of its args
     /// plus a newline to stdout (spec 098, so timer output is observable).
     console_log,
+    /// HOST (Node axis, spec 100 — NOT ECMA-262): a `process` method — `native_name` selects
+    /// `cwd`/`exit`/`nextTick`/`stdoutWrite`/`stderrWrite`. Built + installed by `host_setup`; inert on
+    /// the Test262 path (host globals are not installed there).
+    process_method,
     /// §10.4.4.6 %ThrowTypeError% — the unique per-realm function that unconditionally throws a
     /// TypeError. Used as the poison `get`/`set` for `callee` (and historically `caller`) on a
     /// strict / unmapped arguments object. Never returns normally.
