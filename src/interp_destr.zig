@@ -154,29 +154,55 @@ pub fn assignPattern(self: *Interpreter, target: *const ast.Node, value: Value, 
             };
             for (elems) |el| {
                 if (el.* == .spread) {
-                    // §13.15.5.3 AssignmentRestElement — drain the remainder, then assign it (the rest
-                    // target — identifier / member / index / nested pattern). No close (iterator drained).
-                    const rest = try destrRest(self, &rec);
-                    const rest_arr = switch (rest) {
-                        .abrupt => |c| return c,
-                        .array => |a| a,
+                    // §13.15.5.4 AssignmentRestElement: when the target is not a nested pattern, its
+                    // lref is evaluated FIRST (step 1.a — may throw, e.g. `[...{}[thrower()]]`, closing
+                    // the not-done iterator), THEN the remainder is drained, THEN PutValue. A nested
+                    // pattern (`[...[a]]`) has no lref step — drain, then destructure.
+                    const ref = evalElementRef(self, el.spread, env) catch |e| {
+                        try destrClose(self, rec);
+                        return e;
                     };
-                    const rc = try assignTargetNode(self, el.spread, .{ .object = rest_arr }, env);
-                    if (rc.isAbrupt()) return rc;
-                    return .{ .normal = .undefined }; // rest is always last — done
+                    switch (ref) {
+                        .abrupt => |c| return destrCloseAbrupt(self, rec, c), // §13.15.5.4 1.b: lref abrupt → close not-done iterator
+                        .ok => |r| {
+                            const rest = try destrRest(self, &rec);
+                            const rest_arr = switch (rest) {
+                                .abrupt => |c| return c,
+                                .array => |a| a,
+                            };
+                            const rc = try putElementRef(self, r, .{ .object = rest_arr }, null, env);
+                            if (rc.isAbrupt()) return rc;
+                            return .{ .normal = .undefined }; // rest is always last — iterator drained
+                        },
+                    }
                 }
-                // §13.15.5.3: every element (incl. an elision) advances the iterator exactly once.
-                const sc = try destrStep(self, &rec);
-                if (sc.isAbrupt()) return sc; // IteratorStep threw → already done, no close needed
-                if (el.* == .elision) continue; // hole — value consumed, assigned nowhere
-                const tc = assignElement(self, el, sc.normal, env) catch |e| {
+                if (el.* == .elision) {
+                    // §13.15.5.4: an elision advances the iterator exactly once, assigning nowhere.
+                    const sc = try destrStep(self, &rec);
+                    if (sc.isAbrupt()) return sc;
+                    continue;
+                }
+                // §13.15.5.5 step 1: AssignmentElement's lref (DestructuringAssignmentTarget) is
+                // evaluated BEFORE the iterator is stepped — a throw here (e.g. `[ {}[thrower()] ]`)
+                // closes the not-done iterator without ever calling `next()` (nextCount === 0).
+                const ref = evalElementRef(self, el, env) catch |e| {
                     try destrClose(self, rec);
                     return e;
                 };
-                if (tc.isAbrupt()) {
-                    try destrClose(self, rec); // §13.15.5.3: a throwing target/default closes the iterator
-                    return tc;
-                }
+                const r = switch (ref) {
+                    .abrupt => |c| return destrCloseAbrupt(self, rec, c), // §13.15.5.5 1.b: lref abrupt → close not-done iterator
+                    .ok => |r| r,
+                };
+                // §13.15.5.5 steps 2-3: step the iterator (done → value is undefined), then PutValue
+                // (applying the `= default` when undefined). A throw from the default or the write
+                // closes the not-done iterator.
+                const sc = try destrStep(self, &rec);
+                if (sc.isAbrupt()) return sc; // IteratorStep threw → already done, no close needed
+                const tc = putElementRef(self, r, sc.normal, elementDefault(el), env) catch |e| {
+                    try destrClose(self, rec);
+                    return e;
+                };
+                if (tc.isAbrupt()) return destrCloseAbrupt(self, rec, tc); // §13.15.5.5: abrupt default/write closes the iterator
             }
             // §13.15.5.3: pattern satisfied with no rest → close the iterator if not done. A
             // NORMAL completion close (§7.4.11): a throwing `return()` / non-object propagates.
@@ -281,6 +307,112 @@ pub fn assignElement(self: *Interpreter, el: *const ast.Node, value: Value, env:
     }
 }
 
+/// The `= default` initializer node of an array-pattern element, or null when it has none. The
+/// literal parser folds `[a = d]` / `[a.b = d]` / `[a[k] = d]` / `[a.#x = d]` into an
+/// `assign`/`assign_*`/`private_assign` node, and `[ [p] = d ]` / `[ {p} = d ]` (a nested pattern
+/// with a default) into an `assign_pattern` node.
+fn elementDefault(el: *const ast.Node) ?*const ast.Node {
+    return switch (el.*) {
+        .assign => |a| a.value,
+        .assign_member => |m| m.value,
+        .assign_index => |ix| ix.value,
+        .private_assign => |pa| pa.value,
+        .assign_pattern => |ap| ap.value,
+        else => null,
+    };
+}
+
+/// §13.15.5.5 step 1 / §13.15.5.4 (AssignmentRestElement step 1): evaluate one array-element
+/// DestructuringAssignmentTarget's REFERENCE — its side-effecting base object / computed key — BEFORE
+/// the iterator is stepped, returning an `AssignRef` to PutValue into later. A nested array/object
+/// pattern has no reference to evaluate (step 1's "is neither an ObjectLiteral nor an ArrayLiteral"
+/// guard) and is returned as `.pattern` for `putElementRef` to recurse. An abrupt completion from the
+/// base/key (e.g. `{}[thrower()]`) is surfaced so the caller can IteratorClose the not-done iterator.
+pub fn evalElementRef(self: *Interpreter, el: *const ast.Node, env: *Environment) EvalError!Interpreter.AssignRefOrAbrupt {
+    switch (el.*) {
+        // §13.15.5.5: a single-identifier target — defer the binding resolution to PutValue (no
+        // observable side effect), matching `assignToTarget`'s identifier path.
+        .assign => |a| return .{ .ok = .{ .ident = a.name } },
+        .identifier => |n| return .{ .ok = .{ .ident = n } },
+        // `a.b [= d]` — evaluate the base object now (source order); the property name is static.
+        .assign_member => |m| {
+            const oc = try self.evalExpr(m.object, env);
+            if (oc.isAbrupt()) return .{ .abrupt = oc };
+            return .{ .ok = .{ .member = .{ .object = oc.normal, .name = m.name } } };
+        },
+        .member => |m| {
+            const oc = try self.evalExpr(m.object, env);
+            if (oc.isAbrupt()) return .{ .abrupt = oc };
+            return .{ .ok = .{ .member = .{ .object = oc.normal, .name = m.name } } };
+        },
+        // `a[k] [= d]` — evaluate the base object THEN the computed key, in source order.
+        .assign_index => |ix| {
+            const oc = try self.evalExpr(ix.object, env);
+            if (oc.isAbrupt()) return .{ .abrupt = oc };
+            const kc = try self.evalExpr(ix.key, env);
+            if (kc.isAbrupt()) return .{ .abrupt = kc };
+            return .{ .ok = .{ .index = .{ .object = oc.normal, .key = kc.normal } } };
+        },
+        .index => |ix| {
+            const oc = try self.evalExpr(ix.object, env);
+            if (oc.isAbrupt()) return .{ .abrupt = oc };
+            const kc = try self.evalExpr(ix.key, env);
+            if (kc.isAbrupt()) return .{ .abrupt = kc };
+            return .{ .ok = .{ .index = .{ .object = oc.normal, .key = kc.normal } } };
+        },
+        // `a.#x [= d]` — evaluate the base object now; the private name is static.
+        .private_assign => |pa| {
+            const oc = try self.evalExpr(pa.object, env);
+            if (oc.isAbrupt()) return .{ .abrupt = oc };
+            return .{ .ok = .{ .private = .{ .object = oc.normal, .name = pa.name } } };
+        },
+        .private_member => |pm| {
+            const oc = try self.evalExpr(pm.object, env);
+            if (oc.isAbrupt()) return .{ .abrupt = oc };
+            return .{ .ok = .{ .private = .{ .object = oc.normal, .name = pm.name } } };
+        },
+        // A nested pattern `[ [p] ]` / `[ {p} ]` (optionally with a default `[ {p} = d ]`, which the
+        // literal parser wrapped as `assign_pattern`) — no lref step; recurse at PutValue time.
+        .array_literal, .object_literal => return .{ .ok = .{ .pattern = el } },
+        .assign_pattern => |ap| return .{ .ok = .{ .pattern = ap.target } },
+        else => return .{ .abrupt = try self.throwError("ReferenceError", "invalid assignment target") },
+    }
+}
+
+/// §13.15.5.5 steps 4-6: complete an AssignmentElement given the iterator-stepped `value` and the
+/// pre-resolved reference `ref`. Applies the `= default` when `value` is `undefined`, then PutValue
+/// (or, for a nested pattern, runs DestructuringAssignment over the value). `default` is null when the
+/// element has no initializer.
+pub fn putElementRef(self: *Interpreter, ref: Interpreter.AssignRef, value: Value, default: ?*const ast.Node, env: *Environment) EvalError!Completion {
+    // A nested pattern recurses on the (defaulted) value — DestructuringAssignmentEvaluation.
+    if (ref == .pattern) {
+        const v = if (default) |dn| blk: {
+            const dc = try applyDefault(self, value, dn, env);
+            if (dc.isAbrupt()) return dc;
+            break :blk dc.normal;
+        } else value;
+        return assignPattern(self, ref.pattern, v, env);
+    }
+    var v: Value = value;
+    if (default) |dn| {
+        const dc = try applyDefault(self, value, dn, env);
+        if (dc.isAbrupt()) return dc;
+        v = dc.normal;
+    }
+    switch (ref) {
+        .ident => |name| {
+            // §13.15.5.2 step 5.d: an anonymous fn/class default on a single-identifier target takes
+            // that name (only when the default was actually used — source value was undefined).
+            if (value == .undefined) if (default) |dn| try self.maybeSetAnonName(dn, v, name);
+            return interp_stmt.putWithAwareIdentifier(self, name, v, env);
+        },
+        .member => |m| return self.setProperty(m.object, m.name, v),
+        .index => |ix| return self.setPropertyV(ix.object, ix.key, v),
+        .private => |p| return self.setPrivate(p.object, p.name, v),
+        .pattern => unreachable, // handled above
+    }
+}
+
 /// §13.15.5.5: when the destructured source `value` is `undefined`, evaluate and use `default`;
 /// otherwise keep `value`. Returns a Completion so a throwing default initializer propagates.
 pub fn applyDefault(self: *Interpreter, value: Value, default: *const ast.Node, env: *Environment) EvalError!Completion {
@@ -365,6 +497,30 @@ pub fn destrClose(self: *Interpreter, rec: ArrayDestr) EvalError!void {
         .fast => {},
         .iter => |it| if (!it.done) try self.iteratorClose(it.iterator),
     }
+}
+
+/// §7.4.11 IteratorClose with the ORIGINAL abrupt completion's precedence. The completion that
+/// reaches here is abrupt for one of two reasons, and §7.4.11 resolves the conflict differently:
+///   • a `throw` (step 6: the original throw wins — a throwing/non-object `return()` is SWALLOWED), or
+///   • a `return` / loop-exiting `break`/`continue` (steps 7-8: a throwing `return()` — or a
+///     non-Object result — PROPAGATES, masking the original return). The latter is exactly what
+///     `[ {}[yield] ] = it` then `iter.return()` exercises: the element-ref yield produces a `return`
+///     completion, and a `return()` that throws / yields null surfaces that error.
+/// Returns the completion to propagate (the original, or the close error when it must win).
+pub fn destrCloseAbrupt(self: *Interpreter, rec: ArrayDestr, completion: Completion) EvalError!Completion {
+    const it = switch (rec) {
+        .fast => return completion, // fast Array path has no iterator object — nothing to close
+        .iter => |it| it,
+    };
+    if (it.done) return completion;
+    if (completion == .throw) {
+        try self.iteratorClose(it.iterator); // step 6: swallow a throwing/non-object `return()`
+        return completion;
+    }
+    // step 7-8: a `return`/`break`/`continue` completion — a throwing `return()` (or non-Object
+    // result) replaces the original completion; otherwise the original propagates.
+    const cc = try self.iteratorCloseChecked(it.iterator);
+    return if (cc.isAbrupt()) cc else completion;
 }
 
 /// §7.4.11 IteratorClose after a destructuring pattern that completed NORMALLY (no rest, iterator

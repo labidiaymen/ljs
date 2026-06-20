@@ -292,6 +292,10 @@ pub fn validateAssignmentTarget(self: *Parser, node: *const ast.Node) ParseError
         .assign_member, .assign_index, .private_assign => {},
         // Nested pattern `[{a}, [b]] = …` — the element is itself a literal to refine.
         .array_literal, .object_literal => try self.validateAssignmentPattern(node),
+        // §13.15.5.5 a nested pattern carrying a default `[ {} = d ]` / `[ [a] = d ]`: the inner
+        // `{} = d` was refined to an `assign_pattern` by the cover grammar (a nested literal target
+        // followed by `=`). The TARGET side is the pattern to refine; the DEFAULT is any expression.
+        .assign_pattern => |ap| try self.validateAssignmentPattern(ap.target),
         else => return ParseError.UnexpectedToken, // §13.15.1 invalid assignment target
     }
 }

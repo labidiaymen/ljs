@@ -706,6 +706,28 @@ pub const Interpreter = struct {
         }
     };
 
+    /// §13.15.5.5 a RESOLVED DestructuringAssignmentTarget reference for one array-pattern element,
+    /// captured BEFORE the iterator is stepped (§13.15.5.4 step 5.b.i: lref is evaluated first, then
+    /// the iterator advanced — so `[ {}[thrower()] ] = it` throws before any `next()` call). A
+    /// nested array/object pattern has no PutValue reference; it carries the pattern node to recurse.
+    pub const AssignRef = union(enum) {
+        /// An IdentifierReference target (`[a] = …`) — resolved lazily at PutValue (the binding lookup
+        /// has no observable side effect, so deferring it is spec-equivalent).
+        ident: []const u8,
+        /// `a.b = …` — the base object is evaluated now; the property name is static.
+        member: struct { object: Value, name: []const u8 },
+        /// `a[k] = …` — both base and computed key are evaluated now (source order: object then key).
+        index: struct { object: Value, key: Value },
+        /// `a.#x = …` — the base object is evaluated now; the private name is static.
+        private: struct { object: Value, name: []const u8 },
+        /// A nested pattern `[ [a] ] = …` / `[ {a} ] = …` — recurse via DestructuringAssignment.
+        pattern: *const ast.Node,
+    };
+
+    /// Result of resolving an array-element AssignmentTarget reference: the resolved `AssignRef`, or
+    /// an abrupt completion from evaluating a side-effecting base/computed key (§13.15.5.5 step 1.b).
+    pub const AssignRefOrAbrupt = union(enum) { ok: AssignRef, abrupt: Completion };
+
     // ── §27.5 Generators (thread-per-generator, strict ping-pong handoff) ────────
     //
     // A tree-walker recurses on the native stack and cannot suspend mid-evaluation, so a generator
