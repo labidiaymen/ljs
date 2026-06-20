@@ -30,13 +30,23 @@ const BoolOrAbrupt = Interpreter.BoolOrAbrupt;
 const PVOrAbrupt = Interpreter.PVOrAbrupt;
 const protoProxy = interpreter.Interpreter.protoProxy;
 
-/// §15.7 PrivateGet — read PrivateName `key` on `base`. A private member access by `key` whose brand
-/// name on a non-object, or on an object lacking the brand, is a TypeError (§15.7 — the brand
-/// check). A private accessor invokes its getter with `this` = `base`; a getter-less accessor
-/// (set-only) is a TypeError on read.
-pub fn getPrivate(self: *Interpreter, base: Value, key: []const u8) EvalError!Completion {
+/// §8.2.x ResolvePrivateIdentifier — map a source private spelling (`#x`) to the unique slot key of
+/// the innermost in-scope Private Name. A reference outside any PrivateEnvironment (e.g. a `#x` that
+/// escaped the parser's `in_class_body` gate, or a realm-less unit test) falls back to the spelling
+/// itself, so the brand check still fails as "not declared". Cheap: a short innermost-out chain walk.
+pub fn resolvePrivateKey(self: *Interpreter, spelling: []const u8) []const u8 {
+    if (self.private_env) |pe| if (pe.resolve(spelling)) |pn| return pn.key;
+    return spelling;
+}
+
+/// §15.7 PrivateGet — read PrivateName `spelling` (`#x`) on `base`. The spelling is resolved through
+/// the running [[PrivateEnvironment]] (§8.2.x) to a unique slot key; a non-object base, or an object
+/// lacking THAT Private Name's brand, is a §13.15 TypeError. A private accessor invokes its getter
+/// with `this` = `base`; a getter-less accessor (set-only) is a TypeError on read.
+pub fn getPrivate(self: *Interpreter, base: Value, spelling: []const u8) EvalError!Completion {
     if (base != .object) return self.throwError("TypeError", "Cannot read private member from an object whose class did not declare it");
     const o = base.object;
+    const key = resolvePrivateKey(self, spelling);
     const pv = o.getPrivate(key) orelse
         return self.throwError("TypeError", "Cannot read private member from an object whose class did not declare it");
     switch (pv.payload) {
@@ -51,9 +61,10 @@ pub fn getPrivate(self: *Interpreter, base: Value, key: []const u8) EvalError!Co
 /// §15.7 PrivateSet — write PrivateName `key` on `base`'s own private slot. The brand must exist
 /// (TypeError otherwise). A private field is writable; a private method is read-only (TypeError on
 /// assignment); a private accessor invokes its setter with `this` = `base` (set-less → TypeError).
-pub fn setPrivate(self: *Interpreter, base: Value, key: []const u8, value: Value) EvalError!Completion {
+pub fn setPrivate(self: *Interpreter, base: Value, spelling: []const u8, value: Value) EvalError!Completion {
     if (base != .object) return self.throwError("TypeError", "Cannot write private member to an object whose class did not declare it");
     const o = base.object;
+    const key = resolvePrivateKey(self, spelling);
     const pv = o.getPrivate(key) orelse
         return self.throwError("TypeError", "Cannot write private member to an object whose class did not declare it");
     switch (pv.payload) {

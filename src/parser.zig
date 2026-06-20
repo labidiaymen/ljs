@@ -188,6 +188,45 @@ pub const Parser = struct {
         return p.parseProgram();
     }
 
+    /// §19.2.1.1 PerformEval context for a DIRECT eval: the eval code is a CONTINUATION of the
+    /// caller's running context, so its body may legally use `super.x`/`super(...)` (when the caller is
+    /// inside a method / derived constructor), `new.target` (inside any function), private references
+    /// (inside a class body — `private_names` lists the visible spellings), and `await`/`yield` per the
+    /// caller's goal. Seeded from the interpreter's current execution context; all false/empty for an
+    /// indirect eval (which runs as fresh global code). `super(...)` is additionally gated on the eval
+    /// not crossing a function boundary, matching §13.3.7.1 — captured here as `in_derived_ctor`.
+    pub const EvalContext = struct {
+        in_function: bool = false,
+        in_method: bool = false,
+        in_derived_ctor: bool = false,
+        in_class_body: bool = false,
+        in_generator: bool = false,
+        in_async: bool = false,
+        private_names: []const []const u8 = &.{},
+    };
+
+    /// §19.2.1.1 parse direct-eval source, seeding the §13.x lexical-context Early-Error flags from the
+    /// caller's running execution context so `super`/`new.target`/private references that are legal in
+    /// the surrounding method/class body are accepted in the eval code too.
+    pub fn parseEvalMode(arena: std.mem.Allocator, src: []const u8, strict: bool, ctx: EvalContext) ParseError!ast.Program {
+        var lexer = lex.Lexer.init(arena, src);
+        var toks: std.ArrayList(lex.Token) = .empty;
+        while (true) {
+            const t = try lexer.next();
+            try toks.append(arena, t);
+            if (t.kind == .eof) break;
+        }
+        var p = Parser{ .tokens = toks.items, .arena = arena, .strict = strict };
+        p.in_function = ctx.in_function;
+        p.in_method = ctx.in_method;
+        p.in_derived_ctor = ctx.in_derived_ctor;
+        p.in_class_body = ctx.in_class_body;
+        p.in_generator = ctx.in_generator;
+        p.in_async = ctx.in_async;
+        for (ctx.private_names) |pn| try p.private_names.append(arena, pn);
+        return p.parseProgram();
+    }
+
     /// §16.2 parse the source text as a Module (the module goal). Module code is always strict
     /// (§11.2.2), `import`/`export` declarations are permitted at the top level, and the top-level
     /// `this` is undefined / `new.target` & `super` are restricted at runtime. Returns a `Program`

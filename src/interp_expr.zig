@@ -10,7 +10,6 @@ const object_mod = @import("object.zig");
 const Object = object_mod.Object;
 const ops = @import("abstract_ops.zig");
 const bigint = @import("bigint.zig");
-const Parser = @import("parser.zig").Parser;
 const builtin_proxy = @import("builtin_proxy.zig");
 const builtin_regexp = @import("builtin_regexp.zig");
 const builtin_arraybuffer = @import("builtin_arraybuffer.zig");
@@ -31,6 +30,7 @@ const interp_async = @import("interp_async.zig");
 const interp_native = @import("interp_native.zig");
 const interp_module = @import("interp_module.zig");
 const interp_template = @import("interp_template.zig");
+const interp_eval = @import("interp_eval.zig");
 const interp_collection = @import("interp_collection.zig");
 
 const toNumber = ops.toNumber;
@@ -404,7 +404,9 @@ pub fn evalExpr(self: *Interpreter, node: *const ast.Node, env: *Environment) Ev
             // or an object lacking the brand; true iff `obj` carries the private name.
             const oc = try self.evalExpr(pi.object, env);
             if (oc.isAbrupt()) return oc;
-            const has = oc.normal == .object and oc.normal.object.hasPrivate(pi.name);
+            // §8.2.x: resolve `#x` through the running [[PrivateEnvironment]] to its unique slot key.
+            const pkey = interp_property.resolvePrivateKey(self, pi.name);
+            const has = oc.normal == .object and oc.normal.object.hasPrivate(pkey);
             return .{ .normal = .{ .boolean = has } };
         },
         .spread => return self.throwError("SyntaxError", "Unexpected token '...'"), // only valid in array/call/new lists
@@ -460,12 +462,26 @@ pub fn evalSuperCall(self: *Interpreter, arg_nodes: []const *const ast.Node, env
     const alc = try evalSpreadList(self, arg_nodes, env, &args);
     if (alc.isAbrupt()) return alc;
     if (self.this_val != .object) return self.throwError("ReferenceError", "'super' called with no 'this'");
-    const instance = self.this_val.object;
-    // §15.7.14: run the parent constructor (its own fields-before-body for a base parent), then
-    // this derived class's own instance fields — both on the existing `this`.
+    var instance = self.this_val.object;
+    // §15.7.14 / §10.2.2 [[Construct]]: run the parent constructor. A constructor may RETURN a
+    // different object (e.g. `class Base { constructor(o){ return o; } }`); per §13.3.7.1
+    // SuperCall step 7–11, that returned object becomes the bound `this` (BindThisValue), so this
+    // derived class's own fields/private brands install on IT, not on the originally-created object.
     if (cur_fd.super_ctor) |sup| {
         const pc = try runParentCtor(self, sup, args.items, instance);
         if (pc.isAbrupt()) return pc;
+        // §13.3.7.1 SuperCall step 7–11: the parent [[Construct]] result becomes the bound `this`.
+        // ljs models a NATIVE parent (Object/Function/RegExp/Error/Map/…) as initializing the
+        // pre-created `instance` IN PLACE (it already carries the derived class's prototype via the
+        // new.target chain), and such a native may hand back a *separate* receiver that is NOT proto-
+        // linked to the subclass — rebinding to it would break `new (class extends Object{})() instanceof`
+        // the subclass. So only honor an explicit return-override from a USER (AST) parent constructor
+        // (`class Base { constructor(o){ return o } }`); for a native parent keep the proto-correct
+        // `instance`.
+        if (pc.normal == .object and sup.native == .none) {
+            instance = pc.normal.object;
+            self.this_val = pc.normal;
+        }
     }
     // §13.3.7.1: `this` is now bound (BindThisValue) — leave the TDZ before field initializers run
     // (a field initializer may reference `this`).
@@ -835,11 +851,22 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
                 const saved_nt = self.new_target;
                 self.new_target = .{ .object = ctor };
                 defer self.new_target = saved_nt;
-                // Run the parent constructor (base or derived) on the new instance.
+                // Run the parent constructor (base or derived) on the new instance. A USER (AST)
+                // parent that RETURNS a different object becomes the bound `this` (§13.3.7.1) — this
+                // class's own fields/private brands then install on it. A NATIVE parent
+                // (Object/Function/RegExp/…) initializes the proto-correct `new_obj` in place and may
+                // hand back a separate non-proto-linked receiver, so it is NOT rebound (keeps
+                // `new (class extends Object{})() instanceof` the subclass). Mirrors evalSuperCall.
                 const pc = try runParentCtor(self, sup, args, new_obj);
                 if (pc.isAbrupt()) return pc;
+                if (pc.normal == .object and sup.native == .none) {
+                    const bound = pc.normal.object;
+                    const fc = try initInstanceFields(self, fd, bound);
+                    if (fc.isAbrupt()) return fc;
+                    return .{ .normal = .{ .object = bound } };
+                }
             }
-            // Then this class's own fields.
+            // Then this class's own fields (parent returned undefined/primitive → keep `new_obj`).
             const fc = try initInstanceFields(self, fd, new_obj);
             if (fc.isAbrupt()) return fc;
             return .{ .normal = .{ .object = new_obj } };
@@ -1202,6 +1229,8 @@ pub fn evalFunctionExpr(self: *Interpreter, f: *const ast.Function, env: *Enviro
         .captured_this = if (f.is_arrow) self.this_val else .undefined,
         .captured_this_init_cell = if (f.is_arrow) self.this_init_cell else null, // §13.3.7 lexical TDZ
         .captured_home_object = if (f.is_arrow) self.home_object else null, // §13.3.5 lexical [[HomeObject]]
+        .captured_private_env = if (f.is_arrow) self.private_env else null, // §9.2 lexical [[PrivateEnvironment]]
+        .private_env = if (f.is_arrow) null else self.private_env, // §9.2 a method/fn inside a class body
         .strict = f.strict,
     });
     obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
@@ -1317,7 +1346,7 @@ pub fn evalCall(self: *Interpreter, c: anytype, env: *Environment) EvalError!Com
         const eval_env = try Environment.create(self.arena, env);
         // §19.2.1.1: a DIRECT eval inherits the caller's strictness. (Whether the eval scope is a
         // VariableEnvironment depends on the eval body's OWN strictness — set in `performEval`.)
-        return performEval(self, arg.string, eval_env, self.strict, true);
+        return interp_eval.performEval(self, arg.string, eval_env, self.strict, true);
     }
 
     if (callee != .object or callee.object.kind != .function) {
@@ -1481,6 +1510,12 @@ pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this
     // installs its own (null for a non-method, masking outer `super`).
     self.home_object = if (fd.is_arrow) fd.captured_home_object else fd.home_object;
     defer self.home_object = saved_home;
+    // §9.2: install this function's [[PrivateEnvironment]] for private-name resolution. An arrow keeps
+    // the one it captured LEXICALLY (like `this`/`super`); an ordinary function installs its own (null
+    // for a non-class function, so a stray `#x` finds nothing).
+    const saved_private_env = self.private_env;
+    self.private_env = if (fd.is_arrow) fd.captured_private_env else fd.private_env;
+    defer self.private_env = saved_private_env;
     // §13.3.12: install [[NewTarget]] for this body. An ordinary [[Call]] gets `undefined`; a
     // [[Construct]] (`construct` set `pending_new_target` to the constructor right before this call)
     // gets that constructor. An arrow has no own [[NewTarget]] — it keeps the enclosing one lexically
@@ -1498,6 +1533,13 @@ pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this
     const saved_in_param_init = self.in_param_init;
     self.in_param_init = !fd.is_arrow or interp_async.paramsBindName(fd, "arguments");
     defer self.in_param_init = saved_in_param_init;
+    // §13.3.12: an ordinary (non-arrow) function body makes `new.target` legal for a direct `eval`
+    // nested inside it (arrows inherit it lexically, so they don't bump — an arrow at Script top level
+    // keeps depth 0). Used only to seed the eval parse context; the hot path pays one increment.
+    if (!fd.is_arrow) self.func_depth += 1;
+    defer if (!fd.is_arrow) {
+        self.func_depth -= 1;
+    };
     for (fd.params, 0..) |param, i| {
         var v: Value = if (i < args.len) args[i] else .undefined; // missing args → undefined
         var defaulted = false;
@@ -1814,89 +1856,6 @@ pub fn evalDelete(self: *Interpreter, operand: *const ast.Node, env: *Environmen
             return .{ .normal = .{ .boolean = true } };
         },
     }
-}
-
-/// §20.5: throw a real Error object carrying `name`/`message`, proto-linked to the realm's
-/// matching Error constructor (so `e instanceof TypeError` and name-based classification work).
-/// §19.2.1.1 PerformEval — parse `source` as a Script and run it in `target_env` on THIS
-/// interpreter (so the live step/depth counters carry through; runaway eval code still terminates
-/// and recursion through eval stays bounded). A parse error → a real `SyntaxError` (§19.2.1 step
-/// 7). The script's completion VALUE is the result (the engine's `run` already returns the last
-/// statement's value). `target_env` is a fresh child of the caller's env for DIRECT eval (reads/
-/// writes of surrounding bindings work; `let`/`const`/`class` are eval-local) or the GLOBAL env for
-/// INDIRECT eval. `this_val`/`home_object` are left at the interpreter's current values (inherited
-/// for direct; the caller resets them for indirect). Non-string `source` is handled by the caller.
-/// §20.2.1.1 / §20.2.1.1.1 CreateDynamicFunction — `Function(p1, …, pN, body)`: the last argument is
-/// the function body, the rest are parameter texts (joined with `,`). Builds the source
-/// `(function anonymous(<params>\n) {\n<body>\n})` and evaluates it in the GLOBAL scope (the dynamic
-/// function closes over global bindings, not the caller's), returning the resulting function. A
-/// malformed parameter/body → a catchable SyntaxError (via performEval). The `\n` after the params
-/// and around the body match the spec text (prevent `//`-comment / `)` injection from hiding the
-/// closing delimiters). The function's name is `anonymous`; its strictness comes from its own body.
-pub fn functionConstructor(self: *Interpreter, args: []const Value) EvalError!Completion {
-    const genv = self.globals orelse return self.throwError("EvalError", "Function: no realm");
-    var params: std.ArrayListUnmanaged(u8) = .empty;
-    var body: []const u8 = "";
-    if (args.len > 0) {
-        for (args[0 .. args.len - 1], 0..) |p, i| {
-            const sc = try self.toStringValuePub(p);
-            if (sc.isAbrupt()) return sc;
-            if (i > 0) try params.appendSlice(self.arena, ",");
-            try params.appendSlice(self.arena, sc.normal.string);
-        }
-        const bc = try self.toStringValuePub(args[args.len - 1]);
-        if (bc.isAbrupt()) return bc;
-        body = bc.normal.string;
-    }
-    const source = try std.fmt.allocPrint(self.arena, "(function anonymous({s}\n) {{\n{s}\n}})", .{ params.items, body });
-    // Evaluate in the global context with the global `this` (the dynamic function is created there).
-    const saved_this = self.this_val;
-    const saved_home = self.home_object;
-    defer {
-        self.this_val = saved_this;
-        self.home_object = saved_home;
-    }
-    self.this_val = if (genv.lookup("%GlobalThis%")) |b| b.value else .undefined;
-    self.home_object = null;
-    return performEval(self, source, genv, false, false);
-}
-
-pub fn performEval(self: *Interpreter, source: []const u8, target_env: *Environment, inherit_strict: bool, is_direct: bool) EvalError!Completion {
-    // §19.2.1.1: the eval code is strict iff it carries its own `"use strict"` prologue OR (DIRECT
-    // eval only) the calling context is strict (`inherit_strict`). Parsing with the inherited flag
-    // folds both into `program.strict`, which `run` installs as the eval body's runtime strictness.
-    const program = Parser.parseMode(self.arena, source, inherit_strict) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        // §19.2.1 step 7: a parse failure throws a SyntaxError (a real, catchable error object).
-        else => return self.throwError("SyntaxError", "eval: invalid source"),
-    };
-    // §19.2.1.3 step 3.d: a SLOPPY direct eval evaluated inside a function's formal-parameter list
-    // (`f(p = eval("var arguments"))`) hoists its `var`/function declarations into the caller's var
-    // scope, but the parameter env's `arguments` binding (§10.2.11 step 22) sits between the eval's
-    // lexical env and that var scope. A var- or function-declaration of `arguments` therefore collides
-    // with it and is a SyntaxError. A STRICT eval gets its own var scope (declarations stay eval-local,
-    // no collision), and an indirect eval runs in global scope — neither triggers this.
-    if (is_direct and self.in_param_init and !program.strict and
-        interp_stmt.declaresVarOrFuncName(program.statements, "arguments"))
-    {
-        return self.throwError("SyntaxError", "eval cannot declare 'arguments' in a parameter-scope direct eval");
-    }
-    // §19.2.1.3: a STRICT eval gets its OWN VariableEnvironment (its `var`s are eval-local); a
-    // SLOPPY direct eval's `var`s hoist to the caller's var scope (its fresh eval env is left a
-    // non-var-scope so `varScope()` climbs past it). An indirect eval / Function-body eval already
-    // targets the global var scope, which this preserves (`or`-ing keeps an existing var scope).
-    target_env.is_var_scope = target_env.is_var_scope or program.strict;
-    // §19.2.1.3 step 9.d.ii.2 / 12.b.ii.2: a (sloppy) direct eval whose `var`/function declarations
-    // hoist into a NON-GLOBAL function VariableEnvironment creates them DELETABLE, so a later
-    // `delete x` removes them (`var-env-*-local-new-delete`). A strict eval (own var scope), an
-    // indirect eval, or a global-scoped eval do not get this flag (the global path keeps ljs's
-    // existing global-binding semantics). The flag is read by the var/function hoist in `run`.
-    const saved_eval_deletable = self.eval_var_deletable;
-    self.eval_var_deletable = is_direct and !program.strict and target_env.varScope() != self.globals;
-    defer self.eval_var_deletable = saved_eval_deletable;
-    // Reuse `run` (ReturnIfAbrupt over the statement list); the completion value is the last
-    // statement's value. Counters are the interpreter's own — not reset, so limits still apply.
-    return self.run(program, target_env);
 }
 
 /// §20.2.3.1/.2/.3 — `Function.prototype.call`/`apply`/`bind`. `this_val` is the target function

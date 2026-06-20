@@ -69,6 +69,15 @@ pub fn initInstanceFields(self: *Interpreter, fd: object_mod.FunctionData, insta
     const saved_home = self.home_object;
     self.home_object = fd.home_object;
     defer self.home_object = saved_home;
+    // §9.2: a field initializer resolves `this.#x` against the class's [[PrivateEnvironment]].
+    const saved_penv = self.private_env;
+    self.private_env = fd.private_env;
+    defer self.private_env = saved_penv;
+    // §15.7.10: a field initializer is evaluated as a function (§13.3.12 `new.target` is legal in it,
+    // evaluating to undefined) — count it as a function context so a nested direct `eval` can parse
+    // `new.target`. A BASE class runs fields outside the ctor body's callFunction frame, so bump here.
+    self.func_depth += 1;
+    defer self.func_depth -= 1;
     for (fd.fields) |field| {
         var v: Value = .undefined;
         if (field.init) |ie| {
@@ -80,7 +89,20 @@ pub fn initInstanceFields(self: *Interpreter, fd: object_mod.FunctionData, insta
             const fname = if (field.key_symbol) |sym| try self.symbolPropName(sym) else field.key;
             try self.maybeSetAnonName(ie, v, fname);
         }
-        if (field.key_symbol) |sym| try instance.setSymbol(sym, v) else try instance.set(field.key, v);
+        // §15.7.14 DefineField: a private field adds its brand to the instance's private slots AT
+        // this point in declaration order (so a forward `this.#x` earlier in the list threw above);
+        // a public field defines an ordinary own property.
+        if (field.is_private) {
+            // §7.3.28 PrivateFieldAdd step 2: adding a Private Name already present on the object is a
+            // TypeError (a derived class re-running its initializer on an object already branded — e.g.
+            // `class Base{constructor(o){return o}}` returning the same object to two `new C(o)` calls).
+            if (instance.hasPrivate(field.key)) return self.throwError("TypeError", "Cannot initialize private field twice on the same object");
+            try instance.setPrivate(field.key, v);
+        } else if (field.key_symbol) |sym| {
+            try instance.setSymbol(sym, v);
+        } else {
+            try instance.set(field.key, v);
+        }
     }
     return .{ .normal = .undefined };
 }
@@ -96,8 +118,20 @@ pub fn installPrivateElements(self: *Interpreter, fd: object_mod.FunctionData, i
     const saved_home = self.home_object;
     self.this_val = .{ .object = instance };
     self.home_object = fd.home_object; // the class `.prototype` (so `super.x` resolves)
+    // §9.2: a private field initializer resolves `this.#x` against the class's [[PrivateEnvironment]].
+    const saved_penv = self.private_env;
+    self.private_env = fd.private_env;
     defer self.this_val = saved_this;
     defer self.home_object = saved_home;
+    defer self.private_env = saved_penv;
+    // §7.3.29 PrivateMethodOrAccessorAdd step 3: adding a private method/accessor whose Private Name is
+    // already on the object is a TypeError. This fires when a derived class re-runs its private-element
+    // install on an object a previous construction already branded (a base ctor returning the same
+    // object to two `new C(o)` calls). Check up front — a get+set pair shares one key and is added in a
+    // single pass below (the per-element merge must NOT trip this), so test BEFORE adding any.
+    for (fd.private_elements) |pe| {
+        if (instance.hasPrivate(pe.key)) return self.throwError("TypeError", "Cannot initialize private method twice on the same object");
+    }
     for (fd.private_elements) |pe| {
         switch (pe.kind) {
             .method => try instance.setPrivate(pe.key, .{ .object = pe.func.? }),
@@ -208,6 +242,39 @@ pub fn evalClass(self: *Interpreter, c: *const ast.Class, env: *Environment) Eva
     }
     var fields: std.ArrayListUnmanaged(object_mod.FieldInit) = .empty;
 
+    // §8.2.x / §15.7.14 ClassDefinitionEvaluation: mint a FRESH Private Name per declared private
+    // element of THIS class evaluation, and push a PrivateEnvironment frame (parent = the enclosing
+    // one). Two evaluations of the same class source get distinct Private Names (so a `#x` minted by
+    // one is never found on an instance branded by the other → the §13.15 brand-check TypeError); a
+    // nested class's `#x` shadows an outer one (innermost-out resolution). The frame is installed as
+    // the running [[PrivateEnvironment]] for the whole body (methods/initializers capture/resolve it)
+    // and restored on exit. A `key`-map is built so each element's install uses its unique slot key.
+    var pname_map: std.StringHashMapUnmanaged(*object_mod.PrivateName) = .empty;
+    var pnames: std.ArrayListUnmanaged(*object_mod.PrivateName) = .empty;
+    for (c.elements) |el| {
+        if (!el.is_private) continue;
+        if (pname_map.contains(el.key)) continue; // a get/set pair shares ONE Private Name
+        const pn = try self.arena.create(object_mod.PrivateName);
+        const key = try std.fmt.allocPrint(self.arena, "{s}\x00{d}", .{ el.key, self.private_name_counter });
+        self.private_name_counter += 1;
+        pn.* = .{ .spelling = el.key, .key = key };
+        try pname_map.put(self.arena, el.key, pn);
+        try pnames.append(self.arena, pn);
+    }
+    const saved_penv = self.private_env;
+    defer self.private_env = saved_penv;
+    if (pnames.items.len > 0) {
+        const pe = try self.arena.create(object_mod.PrivateEnv);
+        pe.* = .{ .parent = saved_penv, .names = pnames.items };
+        self.private_env = pe;
+    }
+    // Resolve a private element's source spelling (`#x`) to its unique slot key for this class.
+    const privKey = struct {
+        fn f(map: *std.StringHashMapUnmanaged(*object_mod.PrivateName), spelling: []const u8) []const u8 {
+            return if (map.get(spelling)) |pn| pn.key else spelling;
+        }
+    }.f;
+
     // §15.7.14: build the constructor function object. Default constructor: a base class gets an
     // empty body; a derived class's default constructor forwards its args to `super(...)` (handled
     // by `is_derived_ctor` + an implicit super-call in evalNew when there's no explicit ctor body).
@@ -232,6 +299,10 @@ pub fn evalClass(self: *Interpreter, c: *const ast.Class, env: *Environment) Eva
     // constructor resolves against `Super.prototype`); the ctor reads its own `super_ctor` for
     // `super(...)` via `proto.constructor`.
     if (ctor.call) |*fd| fd.home_object = proto;
+    // §9.2: the constructor (explicit or synthesized default) runs with this class's
+    // [[PrivateEnvironment]], so `this.#x` inside the constructor body resolves to this class's
+    // Private Names. `self.private_env` is the frame pushed above (or the outer one if no privates).
+    if (ctor.call) |*fd| fd.private_env = self.private_env;
     // §15.7.14 step 13 / §10.2.4 MakeConstructor: a class constructor's `prototype` own property is
     // { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false } (an ordinary function
     // gets a writable one; `createFunction` defaulted to writable). Lock it here so a later
@@ -283,7 +354,9 @@ pub fn evalClass(self: *Interpreter, c: *const ast.Class, env: *Environment) Eva
                 const saved_home = self.home_object;
                 self.this_val = .{ .object = ctor };
                 self.home_object = ctor;
+                self.func_depth += 1; // §13.3.12: `new.target` is legal inside a static block (→ a nested direct eval may use it)
                 const bc = self.runBlockBody(el.value.block, block_env);
+                self.func_depth -= 1;
                 self.this_val = saved_this;
                 self.home_object = saved_home;
                 const r = try bc;
@@ -302,10 +375,11 @@ pub fn evalClass(self: *Interpreter, c: *const ast.Class, env: *Environment) Eva
                     if (f.call) |*mfd| mfd.is_private_method = true;
                     // §15.7.14: a private method's name is `#m` (its key includes the `#`).
                     try self.setFunctionName(f, el.key, "");
+                    const pkey = privKey(&pname_map, el.key);
                     if (el.is_static) {
-                        try ctor.setPrivate(el.key, fc.normal);
+                        try ctor.setPrivate(pkey, fc.normal);
                     } else {
-                        try private_elements.append(self.arena, .{ .key = el.key, .kind = .method, .func = f });
+                        try private_elements.append(self.arena, .{ .key = pkey, .spelling = el.key, .kind = .method, .func = f });
                     }
                 } else {
                     const key = try classElementKey(self, el, class_env);
@@ -336,15 +410,17 @@ pub fn evalClass(self: *Interpreter, c: *const ast.Class, env: *Environment) Eva
                     // instance → record (merged per-instance at construction).
                     // §15.7.14: a private accessor's name is "get #x" / "set #x".
                     try self.setFunctionName(f, el.key, if (el.kind == .get) "get" else "set");
+                    const pkey = privKey(&pname_map, el.key);
                     if (el.is_static) {
                         if (el.kind == .get) {
-                            try ctor.definePrivateAccessor(el.key, f, null);
+                            try ctor.definePrivateAccessor(pkey, f, null);
                         } else {
-                            try ctor.definePrivateAccessor(el.key, null, f);
+                            try ctor.definePrivateAccessor(pkey, null, f);
                         }
                     } else {
                         try private_elements.append(self.arena, .{
-                            .key = el.key,
+                            .key = pkey,
+                            .spelling = el.key,
                             .kind = if (el.kind == .get) .get else .set,
                             .func = f,
                         });
@@ -374,15 +450,19 @@ pub fn evalClass(self: *Interpreter, c: *const ast.Class, env: *Environment) Eva
                         if (el.value.field_init) |ie| {
                             const saved_this = self.this_val;
                             self.this_val = .{ .object = ctor };
+                            self.func_depth += 1; // §15.7.10: a field initializer is a function context (`new.target` legal)
                             const ic = try self.evalExpr(ie, class_env);
+                            self.func_depth -= 1;
                             self.this_val = saved_this;
                             if (ic.isAbrupt()) return ic;
                             v = ic.normal;
                         }
-                        try ctor.setPrivate(el.key, v);
+                        try ctor.setPrivate(privKey(&pname_map, el.key), v);
                     } else {
-                        // §15.7.14: an instance private field — recorded; initializer runs per `new`.
-                        try private_elements.append(self.arena, .{ .key = el.key, .kind = .field, .init = el.value.field_init });
+                        // §15.7.14: an instance private field joins the SINGLE ordered [[Fields]] list
+                        // (interleaved with public fields, declaration order) — its brand is added when
+                        // its initializer runs (DefineField), so an earlier forward `this.#x` throws.
+                        try fields.append(self.arena, .{ .key = privKey(&pname_map, el.key), .init = el.value.field_init, .is_private = true });
                     }
                     continue;
                 }
@@ -399,7 +479,9 @@ pub fn evalClass(self: *Interpreter, c: *const ast.Class, env: *Environment) Eva
                     if (el.value.field_init) |ie| {
                         const saved_this = self.this_val;
                         self.this_val = .{ .object = ctor };
+                        self.func_depth += 1; // §15.7.10: a field initializer is a function context (`new.target` legal)
                         const ic = try self.evalExpr(ie, class_env);
+                        self.func_depth -= 1;
                         self.this_val = saved_this;
                         if (ic.isAbrupt()) return ic;
                         v = ic.normal;

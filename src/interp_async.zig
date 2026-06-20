@@ -37,6 +37,7 @@ pub fn createGenerator(self: *Interpreter, func: *Object, args: []const Value, t
         .args = args_copy,
         .this_val = this_val,
         .home_object = if (func.call) |fd| fd.home_object else null,
+        .private_env = if (func.call) |fd| fd.private_env else null,
     };
     // §15.5.2 EvaluateGeneratorBody step 1: FunctionDeclarationInstantiation runs EAGERLY here (on
     // the caller thread), so a param destructuring/default error throws at the call site, before
@@ -310,6 +311,8 @@ pub fn runGeneratorBody(self: *Interpreter, gen: *object_mod.Generator) EvalErro
     if (abrupt) |c| return c;
     self.this_val = gen.this_val;
     self.home_object = gen.home_object;
+    self.private_env = gen.private_env; // §9.2 restore [[PrivateEnvironment]] for `this.#x` in the body
+    self.func_depth += 1; // §13.3.12: the body is a function context (a nested direct eval may use `new.target`)
     // §11.2.2: the generator/async body runs in its own strict context (this fresh body interpreter
     // started sloppy). A strict body's §6.2.5.6 PutValue to an unresolved name must throw.
     self.strict = fd.strict;
@@ -907,6 +910,7 @@ pub fn callAsyncFunction(self: *Interpreter, func: *Object, args: []const Value,
         .args = args_copy,
         .this_val = this_val,
         .home_object = if (func.call) |fd| fd.home_object else null,
+        .private_env = if (func.call) |fd| fd.private_env else null,
         .is_async = true,
         .promise = promise,
     };
@@ -1166,6 +1170,7 @@ pub fn createAsyncGenerator(self: *Interpreter, func: *Object, args: []const Val
         .args = args_copy,
         .this_val = this_val,
         .home_object = if (func.call) |fd| fd.home_object else null,
+        .private_env = if (func.call) |fd| fd.private_env else null,
         .is_async = true,
         .is_async_gen = true,
     };

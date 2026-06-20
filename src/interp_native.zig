@@ -34,6 +34,7 @@ const Interpreter = interpreter.Interpreter;
 const EvalError = interpreter.EvalError;
 const interp_expr = @import("interp_expr.zig");
 const interp_async = @import("interp_async.zig");
+const interp_eval = @import("interp_eval.zig");
 const interp_collection = @import("interp_collection.zig");
 
 const toBoolean = ops.toBoolean;
@@ -536,19 +537,22 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
             // `this_val`/`home_object` around the eval so the caller's frame is unperturbed.
             const saved_this = self.this_val;
             const saved_home = self.home_object;
+            const saved_penv = self.private_env;
             defer {
                 self.this_val = saved_this;
                 self.home_object = saved_home;
+                self.private_env = saved_penv;
             }
             self.this_val = if (genv.lookup("%GlobalThis%")) |b| b.value else .undefined;
             self.home_object = null;
+            self.private_env = null; // §19.2.1.1: indirect eval has no enclosing [[PrivateEnvironment]]
             // §19.2.1.1 steps 11–12: an indirect eval gets a FRESH (declarative) LexicalEnvironment
             // that is a child of the global env — its `let`/`const`/`class` are eval-local (a later
             // outside reference is a ReferenceError, `lex-env-distinct-*`). It is NOT a var scope, so
             // sloppy `var`s still hoist past it to the global var environment (`performEval` promotes
             // it to its own var scope only for a strict eval). `varScope()` reaching genv is preserved.
             const lexenv = try Environment.create(self.arena, genv);
-            return interp_expr.performEval(self, arg.string, lexenv, false, false);
+            return interp_eval.performEval(self, arg.string, lexenv, false, false);
         },
         else => {},
     }
@@ -800,7 +804,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
                 return self.throwError("TypeError", "Object.prototype.toLocaleString called on null or undefined");
             return self.invokeMethod(this_val, "toString", &.{});
         },
-        .function_ctor => return interp_expr.functionConstructor(self, args),
+        .function_ctor => return interp_eval.functionConstructor(self, args),
         .function_proto_noop => return .{ .normal = .undefined }, // §20.2.3 %Function.prototype%() → undefined
         // §20.2.3.6 Function.prototype[@@hasInstance] ( V ) → §7.3.21 OrdinaryHasInstance(this, V).
         .function_has_instance => {

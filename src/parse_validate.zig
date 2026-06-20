@@ -76,7 +76,10 @@ pub fn patternHasStrictReserved(pattern: *const ast.Pattern) bool {
 /// `bindForHead` can write). Destructuring-pattern heads (`for ([a] of …)`) are a later cycle.
 pub fn isSimpleAssignTarget(node: *const ast.Node) bool {
     return switch (node.*) {
-        .identifier, .member, .index => true,
+        // §13.15.2: a MemberExpression `.` PrivateIdentifier is a valid (simple) AssignmentTarget, so
+        // `for (this.#x of …)` / `for (this.#x in …)` are legal. `private_member` is the parsed form
+        // of `obj.#x`; the interpreter's for-head binder writes it via setPrivate.
+        .identifier, .member, .index, .private_member => true,
         else => false,
     };
 }

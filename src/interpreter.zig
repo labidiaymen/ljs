@@ -74,6 +74,20 @@ pub const Interpreter = struct {
     /// `home_object.[[Prototype]]`; `super(...)` invokes `home_object`'s constructor's superclass.
     /// Saved/restored around each [[Call]] alongside `this_val`.
     home_object: ?*Object = null,
+    /// §9.2 the running execution context's [[PrivateEnvironment]] — the chain of in-scope Private
+    /// Names (null at the top level / outside any class). A private reference (`this.#x`, `#x in obj`)
+    /// resolves its spelling against this chain (innermost wins, §8.2.x ResolvePrivateIdentifier) to a
+    /// unique slot key. Installed from the active function's `private_env` (arrows: captured) around
+    /// each [[Call]], alongside `this_val`/`home_object`; a direct `eval` inherits it (not reset).
+    private_env: ?*object_mod.PrivateEnv = null,
+    /// §8.2.x monotonic counter used to mint a UNIQUE slot key per Private Name per class evaluation
+    /// (suffixed onto the spelling). Bumped once for each declared private element in `evalClass`.
+    private_name_counter: u64 = 0,
+    /// §13.3.12: count of ordinary (non-arrow) function bodies currently on the stack. Drives a DIRECT
+    /// `eval`'s §19.2.1.1 parse context — `new.target` is a SyntaxError at Script top level (depth 0)
+    /// but legal inside any function body. Bumped around each ordinary-function [[Call]] body; arrows
+    /// don't bump it (they inherit `new.target` lexically, so an arrow at top level still has depth 0).
+    func_depth: u32 = 0,
     /// §13.3.12 the active function's [[NewTarget]] — the constructor when the running function was
     /// invoked via `new` / a `super(...)` chain (set in `construct`), else `undefined` (cleared for an
     /// ordinary `[[Call]]`). The `new.target` MetaProperty reads it. Saved/restored around each

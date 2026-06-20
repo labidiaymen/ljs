@@ -330,6 +330,9 @@ pub const Generator = struct {
     this_val: Value,
     /// The active [[HomeObject]] for `super` resolution inside the body (null for plain generators).
     home_object: ?*Object,
+    /// §9.2 the active [[PrivateEnvironment]] for private-name resolution inside the body (the
+    /// generator/async function's `private_env`); null when defined outside any class body.
+    private_env: ?*PrivateEnv = null,
     /// §15.5.2 / §15.6.2: for a sync/async GENERATOR, FunctionDeclarationInstantiation (binding the
     /// params — incl. destructuring patterns and default-value expressions — and the `arguments`
     /// object) runs EAGERLY on the CALLER thread when the generator object is created, so a param
@@ -679,6 +682,10 @@ pub const FunctionData = struct {
     /// `super.x` / `super(...)` inside it resolve against the defining method/constructor even when the
     /// arrow is invoked from an unrelated dynamic context. Null for ordinary functions.
     captured_home_object: ?*Object = null,
+    /// §9.2 an arrow lexically captures the enclosing [[PrivateEnvironment]] (arrows only), so a
+    /// private reference inside it resolves against the defining class even when the arrow is invoked
+    /// from an unrelated context. Null for ordinary functions (they install their own `private_env`).
+    captured_private_env: ?*PrivateEnv = null,
     /// §15.7.14: a class constructor carries its instance FieldDefinitions; [[Construct]]
     /// (`evalNew`) runs each initializer on the new instance (with `this` = instance) before the
     /// constructor body. Empty for ordinary functions and for non-constructor class methods.
@@ -688,6 +695,12 @@ pub const FunctionData = struct {
     /// Empty for ordinary functions and non-constructor methods. (Static private members are
     /// installed directly on the constructor object at class-definition time, not here.)
     private_elements: []const PrivateElement = &.{},
+    /// §9.2 the [[PrivateEnvironment]] captured at this function's definition — the chain of in-scope
+    /// Private Names. Set for any function lexically inside a ClassBody (methods, accessors, the
+    /// constructor, and instance/static field initializers via the synthesized field-init context);
+    /// null otherwise. Re-installed while the body runs so `this.#x` resolves to the right Private
+    /// Name (mirrors `home_object`). An arrow captures the enclosing one lexically.
+    private_env: ?*PrivateEnv = null,
     /// §15.7: a class constructor (explicit or default) is flagged so a plain `C()` call (without
     /// `new`) throws a TypeError per §15.7.14 ([[Call]] of a class constructor is not allowed).
     is_class_ctor: bool = false,
@@ -739,6 +752,11 @@ pub const FieldInit = struct {
     /// §15.7.14: a computed FieldDefinition whose name evaluated to a Symbol (`[sym] = …`). When set,
     /// the field is installed under this Symbol key (and `key` is unused); null for ordinary string keys.
     key_symbol: ?*Symbol = null,
+    /// §15.7.14: a PRIVATE instance field (`#x = …`). When true, `key` is the unique Private Name slot
+    /// key and the field installs into the instance's private slots (adding its brand AT this point in
+    /// declaration order — so a forward `this.#x` reference earlier in the field list throws §13.15
+    /// TypeError). `key_symbol` is always null for a private field. False for an ordinary public field.
+    is_private: bool = false,
 };
 
 /// §15.7 one instance PrivateName element to install on each `new` instance (adding its brand).
@@ -750,10 +768,46 @@ pub const FieldInit = struct {
 ///   • `.get`/`.set` — a private accessor `get/set #x(){}`: the shared getter/setter objects merged
 ///     into one accessor descriptor in the instance's private slot.
 pub const PrivateElement = struct {
-    key: []const u8, // the `#name` (the `#` is part of the key)
+    key: []const u8, // the unique per-class-evaluation slot key (see PrivateName.key)
+    spelling: []const u8 = "", // the source `#name` (for diagnostics / name property)
     kind: enum { field, method, get, set },
     init: ?*const ast.Node = null, // field initializer
     func: ?*Object = null, // method body / getter / setter (shared, [[HomeObject]] set)
+};
+
+/// §8.2.x / §6.2.12 Private Name. Each evaluation of a ClassDefinition mints a FRESH Private Name per
+/// declared private element (`#x`, `#m`, `get/set #a`), so two evaluations of the SAME class source —
+/// e.g. a class returned twice from a factory, or a class nested in another — carry DISTINCT Private
+/// Names even though they share the `#x` spelling. The interpreter keys an object's private slots by
+/// `key` (a unique interned string per Private Name), so a `#x` minted by class A is never found on an
+/// instance branded by class B's `#x` (→ the §13.15 PrivateFieldGet/Set "no entry" TypeError).
+pub const PrivateName = struct {
+    /// The source spelling (`#x`, `#` included) — for the §15.7.14 name property and diagnostics.
+    spelling: []const u8,
+    /// The UNIQUE interned slot key for this Private Name (the spelling plus a per-evaluation counter
+    /// suffix). Distinct across class evaluations even for the same spelling; used as the object
+    /// private-slot map key everywhere via ResolvePrivateIdentifier.
+    key: []const u8,
+};
+
+/// §9.2 PrivateEnvironment Record — the lexical chain of in-scope Private Names. Each ClassBody
+/// evaluation pushes one frame holding its declared Private Names; `super.#x` / `obj.#x` /
+/// `#x in obj` resolve a spelling to the INNERMOST matching Private Name (§8.2.x
+/// ResolvePrivateIdentifier), so an inner class's `#x` SHADOWS an outer one. A method/field
+/// initializer/constructor captures the PrivateEnvironment active at its class definition and
+/// re-installs it while running (mirrors [[HomeObject]]); a direct `eval` inherits the caller's.
+pub const PrivateEnv = struct {
+    parent: ?*PrivateEnv = null,
+    names: []const *PrivateName,
+
+    /// §8.2.x ResolvePrivateIdentifier — innermost-out lookup of `spelling` (`#x`) in the chain.
+    pub fn resolve(self: *const PrivateEnv, spelling: []const u8) ?*PrivateName {
+        var cur: ?*const PrivateEnv = self;
+        while (cur) |pe| : (cur = pe.parent) {
+            for (pe.names) |pn| if (std.mem.eql(u8, pn.spelling, spelling)) return pn;
+        }
+        return null;
+    }
 };
 
 /// A property's value half (§6.1.7.1): a data value, or an §10.2 getter/setter accessor pair. The
