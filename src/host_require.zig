@@ -296,7 +296,7 @@ pub fn installEntryRequire(self: *Interpreter, script_path: []const u8, script_d
 //  core module registry: path / fs / os
 // ════════════════════════════════════════════════════════════════════════════
 
-const core_modules = [_][]const u8{ "path", "fs", "os", "events", "util" };
+const core_modules = [_][]const u8{ "path", "fs", "os", "events", "util", "url" };
 
 /// Strip a `node:` prefix (Node accepts `node:path` etc.).
 fn coreName(spec: []const u8) []const u8 {
@@ -338,6 +338,9 @@ fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
         for ([_][]const u8{ "platform", "arch", "type", "release", "homedir", "tmpdir", "hostname", "cpus", "endianness", "totalmem", "freemem" }) |m|
             try defineCoreMethod(self, obj, name, m);
         try obj.defineData("EOL", .{ .string = if (is_windows) "\r\n" else "\n" }, true, true, true);
+    } else if (std.mem.eql(u8, name, "url")) {
+        // HOST (spec 103): require('url') → { URL, URLSearchParams }.
+        return @import("host_url.zig").buildUrlModule(self);
     }
     return obj;
 }

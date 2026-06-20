@@ -149,6 +149,9 @@ pub fn installHostGlobals(self: *Interpreter, ctx: HostCtx) EvalError!void {
     // ── Buffer (spec 101) ───────────────────────────────────────────────────────────────────────────
     try @import("host_buffer.zig").installBuffer(self, function_proto);
 
+    // ── WHATWG URL / URLSearchParams + TextEncoder / TextDecoder globals (spec 103) ───────────────────
+    try @import("host_url.zig").install(self);
+
     // ── CommonJS require / module / exports / __filename / __dirname (spec 102) ──────────────────────
     // Only for `ljs run <file>` (a known script path); `ljs eval` leaves these absent.
     if (ctx.script_path.len > 0)

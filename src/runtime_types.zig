@@ -682,9 +682,11 @@ pub const NativeId = enum {
     /// per run by `host_require`; inert on the Test262 path.
     core_module_fn,
     /// HOST (Node axis, spec 103 — NOT ECMA-262): a `util` core-module method (format/inspect/
-    /// promisify/inherits/deprecate/types.*) — selected by `native_name`, with the promisify/deprecate
-    /// wrappers carrying per-instance state on hidden own `"%…%"` properties. Inert on the Test262 path.
+    /// promisify/inherits/deprecate/types.*) — selected by `native_name`. Inert on the Test262 path.
     util_method,
+    /// HOST (Node axis, spec 103 — NOT ECMA-262): the WHATWG `URL`/`URLSearchParams` + `TextEncoder`/
+    /// `TextDecoder`. Family via a hidden own `"%kind%"`, operation via `native_name`. Inert on Test262.
+    url_method,
     /// §10.4.4.6 %ThrowTypeError% — the unique per-realm function that unconditionally throws a
     /// TypeError. Used as the poison `get`/`set` for `callee` (and historically `caller`) on a
     /// strict / unmapped arguments object. Never returns normally.
