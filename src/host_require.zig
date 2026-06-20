@@ -296,7 +296,7 @@ pub fn installEntryRequire(self: *Interpreter, script_path: []const u8, script_d
 //  core module registry: path / fs / os
 // ════════════════════════════════════════════════════════════════════════════
 
-const core_modules = [_][]const u8{ "path", "fs", "os", "events", "util", "url" };
+const core_modules = [_][]const u8{ "path", "fs", "os", "events", "util", "url", "assert", "assert/strict" };
 
 /// Strip a `node:` prefix (Node accepts `node:path` etc.).
 fn coreName(spec: []const u8) []const u8 {
@@ -323,6 +323,9 @@ fn loadCoreModule(self: *Interpreter, name: []const u8) EvalError!Completion {
 fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
     // The `events` module's exports IS the `EventEmitter` class itself (spec 103, host_events.zig).
     if (std.mem.eql(u8, name, "events")) return @import("host_events.zig").build(self);
+    // HOST assert (spec 104): `require('assert')` (callable + methods) / `require('assert/strict')`.
+    if (std.mem.eql(u8, name, "assert")) return @import("host_assert.zig").build(self);
+    if (std.mem.eql(u8, name, "assert/strict")) return @import("host_assert.zig").buildStrict(self);
     const arena = self.arena;
     if (std.mem.eql(u8, name, "util")) return @import("host_util.zig").build(self); // HOST util (spec 103)
     const obj = try Object.create(arena, self.objectProto());

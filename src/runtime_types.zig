@@ -684,6 +684,11 @@ pub const NativeId = enum {
     /// HOST (Node axis, spec 103 — NOT ECMA-262): a `util` core-module method (format/inspect/
     /// promisify/inherits/deprecate/types.*) — selected by `native_name`. Inert on the Test262 path.
     util_method,
+    /// HOST (Node axis, spec 104 — NOT ECMA-262): an `assert` core-module method (ok/equal/
+    /// strictEqual/deepStrictEqual/throws/rejects/match/... + the `AssertionError` constructor and
+    /// the rejects/doesNotReject promise-reaction natives) — selected by `native_name` / hidden
+    /// per-instance state. Inert on the Test262 path (host core modules are not requireable there).
+    assert_method,
     /// HOST (Node axis, spec 103 — NOT ECMA-262): the WHATWG `URL`/`URLSearchParams` + `TextEncoder`/
     /// `TextDecoder`. Family via a hidden own `"%kind%"`, operation via `native_name`. Inert on Test262.
     url_method,
