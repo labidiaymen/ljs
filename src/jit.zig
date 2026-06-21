@@ -228,6 +228,33 @@ pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16
                 }
                 sp -= 1;
             },
+            // ── bitwise binary: JS `& | ^` are ToInt32-based; on i32 SMIs the result is a clean i32
+            //    (no overflow, no -0), so no guard is needed. ──
+            inline .bit_and, .bit_or, .bit_xor => |o| {
+                if (sp < 2) return null;
+                const a = stack_regs[@intCast(sp - 2)];
+                const b = stack_regs[@intCast(sp - 1)];
+                switch (o) {
+                    .bit_and => e.and32(a, b) catch return null,
+                    .bit_or => e.or32(a, b) catch return null,
+                    .bit_xor => e.xor32(a, b) catch return null,
+                    else => unreachable,
+                }
+                sp -= 1;
+            },
+            .neg => {
+                if (sp < 1) return null;
+                const v = stack_regs[@intCast(sp - 1)];
+                // -x: negating integer 0 must yield IEEE -0 (deopt), and -(i32_min) overflows i32 (jo).
+                e.cmpImm32(v, 0) catch return null;
+                deopts.append(arena, e.jcc(.e) catch return null) catch return null;
+                e.neg32(v) catch return null;
+                deopts.append(arena, e.jcc(.o) catch return null) catch return null;
+            },
+            .pos => {
+                // +x = ToNumber(x); x is already a number (SMI) here, so this is the identity — no code.
+                if (sp < 1) return null;
+            },
             inline .lt, .gt, .le, .ge => |o| {
                 // Must be immediately consumed by a conditional jump (fused compare+branch); the JIT
                 // doesn't materialize boolean values.
@@ -388,6 +415,20 @@ test "jit: duplicate-parameter function is not JIT-able" {
     // `f(x, x)` (sloppy, last-wins) must fall back to the tree-walk: the compiler rejects it (the
     // 1-slot-per-param model can't express last-wins), so it never reaches the JIT.
     try std.testing.expectError(error.NotCompilable, jitOf(a, "function f(x, x){ return x; }"));
+}
+
+test "jit: bitwise + unary" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var ai = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ai.deinit();
+    const a = ai.allocator();
+    const j = try jitOf(a, "function f(a, b){ return (a & b) | (a ^ b); }"); // == a | b
+    try std.testing.expectEqual(@as(i64, 14), runJit(j, &.{ 12, 10 }).result); // 8 | 6
+    const m = try jitOf(a, "function f(a){ return -a; }");
+    try std.testing.expectEqual(@as(i64, -7), runJit(m, &.{7}).result);
+    try std.testing.expectEqual(@as(u8, 1), runJit(m, &.{0}).deopt); // -0 → deopt
+    const p = try jitOf(a, "function f(a){ return +a + 1; }");
+    try std.testing.expectEqual(@as(i64, 6), runJit(p, &.{5}).result);
 }
 
 test "jit: non-integer subset is rejected" {

@@ -188,6 +188,30 @@ pub const Emitter = struct {
         const u: u32 = @bitCast(imm);
         inline for (0..4) |b| try self.byte(@truncate(u >> (b * 8)));
     }
+    // ── 32-bit bitwise ops (JS `& | ^ ~` are ToInt32-based; on i32 SMIs they map directly and the
+    //    result is always a clean i32 — no overflow, no -0). ──
+    pub fn and32(self: *Emitter, dst: Reg, src: Reg) std.mem.Allocator.Error!void {
+        try self.rex32(src, dst);
+        try self.byte(0x21);
+        try self.modrmReg(src, dst);
+    }
+    pub fn or32(self: *Emitter, dst: Reg, src: Reg) std.mem.Allocator.Error!void {
+        try self.rex32(src, dst);
+        try self.byte(0x09);
+        try self.modrmReg(src, dst);
+    }
+    pub fn xor32(self: *Emitter, dst: Reg, src: Reg) std.mem.Allocator.Error!void {
+        try self.rex32(src, dst);
+        try self.byte(0x31);
+        try self.modrmReg(src, dst);
+    }
+    /// dst = -dst  (neg r/m32 — F7 /3). Sets OF if dst == i32_min (the JIT deopts on that).
+    pub fn neg32(self: *Emitter, dst: Reg) std.mem.Allocator.Error!void {
+        if (dst.ext()) try self.byte(0x41);
+        try self.byte(0xF7);
+        try self.byte(0xD8 | @as(u8, dst.low())); // mod=11, /3 = neg
+    }
+
     /// dst(64) = sign-extend src(32)  (movsxd — REX.W 63 /r). Boxes the i32 SMI result back to i64.
     pub fn movsxd(self: *Emitter, dst: Reg, src: Reg) std.mem.Allocator.Error!void {
         try self.rexW(dst, src);

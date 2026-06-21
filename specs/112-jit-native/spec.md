@@ -45,6 +45,8 @@ regressions** + no bench regression. Higher tiers cover more JS but cost more.
   **Beats Node 1.47× on the isolated compute loop** (820 vs 1208 ms). *Honest limit:* it JITs only
   the leaf function — call-heavy code (200k calls/loop) is still bounded by the interpreted caller +
   call dispatch (ljs 861 ms vs Node 674 ms), so Node wins there until the caller is JIT'd too (later tier).
+  *Tier 1.5* broadened the subset with bitwise `& | ^` and unary `-`/`+` (i32-native; `-` deopts on
+  `-0`/`i32_min`). Deferred: `~`, shifts, `div`/`mod` (need compiler+VM support or CL handling).
 - **Tier 2 — float + mixed numerics**: SSE2 `f64` ops, int↔float transitions, `Math.*` intrinsics.
   Covers numeric code that isn't pure small-int.
 - **Tier 3 — strings / arrays / typed-arrays**: JIT property reads, array + typed-array indexing,
