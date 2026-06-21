@@ -403,6 +403,15 @@ fn loadModule(self: *Interpreter, abspath: []const u8) EvalError!Completion {
 /// evaluate it IN THE CURRENT REALM (shares globals/builtins with the running program), drain
 /// microtasks, and return the module namespace as `module.exports`. Node's `require(esm)` shape — so
 /// `require('pkg').named` and `require('pkg').default` both resolve.
+/// HOST entry point: run an ESM file as the program ENTRY (`ljs run x.mjs`). Same machinery as
+/// `require(ESM)` — build + link + evaluate the module graph in the host realm (relative imports
+/// resolve against `abspath`'s dir; bare/core specifiers via the same loader) — but the namespace is
+/// the program's result, not a `require` value. Call AFTER `installHostGlobals`.
+pub fn runEsmEntry(self: *Interpreter, abspath: []const u8, source: []const u8) EvalError!Completion {
+    self.host_referrer_key = abspath;
+    return loadEsm(self, abspath, source);
+}
+
 fn loadEsm(self: *Interpreter, abspath: []const u8, source: []const u8) EvalError!Completion {
     const arena = self.arena;
     var graph: std.StringHashMapUnmanaged(*module_mod.ModuleRecord) = .empty;
@@ -439,42 +448,65 @@ fn esmResolve(ctx: *anyopaque, referrer_key: []const u8, specifier: []const u8) 
     if (isCoreModule(specifier)) return synthCoreEsm(self, specifier) catch return null;
     const dir = path.dirname(referrer_key) orelse referrer_key;
     const abspath = (resolvePath(self, dir, specifier) catch return null) orelse return null;
+    // ESM `import` of a CommonJS (or JSON) module → bridge it to a synthetic ESM shim (default =
+    // module.exports, named = its own identifier keys), mirroring Node's CJS-named-export interop. A
+    // real ESM file is parsed as a module directly.
+    const is_esm = isEsmFile(self, abspath, null) catch false;
+    if (!is_esm) return synthCjsEsm(self, abspath) catch return null;
     const src = (readFileOpt(self, abspath) catch return null) orelse return null;
     return .{ .key = abspath, .source = src };
 }
 
-/// Bridge an ESM `import … from 'node:fs'` (etc.) to the host CommonJS core module: stash the core
-/// module's exports on `globalThis["%coreesm:NAME%"]` and synthesize an ESM source that `export
-/// default`s it plus re-exports each own identifier-named property as a named export. So
-/// `import crypto from 'node:crypto'` and `import { readFileSync } from 'node:fs'` both bind.
+/// Bridge an ESM `import … from 'node:fs'` (etc.) to the host CommonJS core module.
 fn synthCoreEsm(self: *Interpreter, specifier: []const u8) EvalError!?module_mod.ResolvedSource {
     const arena = self.arena;
     const name = coreName(specifier);
     const exports_c = try loadCoreModule(self, name);
-    if (exports_c.normal != .object) return null;
-    const exports = exports_c.normal.object;
-
     const gkey = std.fmt.allocPrint(arena, "%coreesm:{s}%", .{name}) catch return error.OutOfMemory;
-    if (self.globals) |g| if (g.lookup("%GlobalThis%")) |gb| if (gb.value == .object) {
-        try gb.value.object.defineData(gkey, exports_c.normal, true, false, true);
-    };
+    const modkey = std.fmt.allocPrint(arena, "coreesm:{s}", .{name}) catch return error.OutOfMemory;
+    return try esmShim(self, exports_c.normal, gkey, modkey);
+}
 
+/// Bridge an ESM `import … from './thing.js'` where `./thing.js` is CommonJS (or JSON): evaluate it via
+/// `require`, then re-export `module.exports` as an ESM shim. So `import x from './cjs'` /
+/// `import { y } from './cjs'` bind (default = module.exports; named = its own identifier keys).
+fn synthCjsEsm(self: *Interpreter, abspath: []const u8) EvalError!?module_mod.ResolvedSource {
+    const arena = self.arena;
+    const exports_c = try loadModule(self, abspath);
+    if (exports_c.isAbrupt()) return null; // a CJS module that throws on load can't be bridged
+    // Path separators (`\`) are invalid in a JS string literal — normalize to `/` for the gkey only.
+    const safe = arena.dupe(u8, abspath) catch return error.OutOfMemory;
+    for (safe) |*c| if (c.* == '\\') {
+        c.* = '/';
+    };
+    const gkey = std.fmt.allocPrint(arena, "%cjsesm:{s}%", .{safe}) catch return error.OutOfMemory;
+    return try esmShim(self, exports_c.normal, gkey, abspath);
+}
+
+/// Stash `exports_v` on `globalThis[gkey]` and synthesize an ESM source (cache key `modkey`) that
+/// `export default`s it plus re-exports each own identifier-named property (when it's an object).
+fn esmShim(self: *Interpreter, exports_v: Value, gkey: []const u8, modkey: []const u8) EvalError!module_mod.ResolvedSource {
+    const arena = self.arena;
+    if (self.globals) |g| if (g.lookup("%GlobalThis%")) |gb| if (gb.value == .object) {
+        try gb.value.object.defineData(gkey, exports_v, true, false, true);
+    };
     var src: std.ArrayListUnmanaged(u8) = .empty;
     src.appendSlice(arena, "const __m = globalThis[\"") catch return error.OutOfMemory;
     src.appendSlice(arena, gkey) catch return error.OutOfMemory;
     src.appendSlice(arena, "\"];\nexport default __m;\n") catch return error.OutOfMemory;
-    var it = exports.properties.iterator();
-    while (it.next()) |e| {
-        const k = e.key_ptr.*;
-        if (!isIdentifier(k) or std.mem.eql(u8, k, "default")) continue;
-        src.appendSlice(arena, "export const ") catch return error.OutOfMemory;
-        src.appendSlice(arena, k) catch return error.OutOfMemory;
-        src.appendSlice(arena, " = __m.") catch return error.OutOfMemory;
-        src.appendSlice(arena, k) catch return error.OutOfMemory;
-        src.appendSlice(arena, ";\n") catch return error.OutOfMemory;
+    if (exports_v == .object) {
+        var it = exports_v.object.properties.iterator();
+        while (it.next()) |e| {
+            const k = e.key_ptr.*;
+            if (!isIdentifier(k) or std.mem.eql(u8, k, "default")) continue;
+            src.appendSlice(arena, "export const ") catch return error.OutOfMemory;
+            src.appendSlice(arena, k) catch return error.OutOfMemory;
+            src.appendSlice(arena, " = __m.") catch return error.OutOfMemory;
+            src.appendSlice(arena, k) catch return error.OutOfMemory;
+            src.appendSlice(arena, ";\n") catch return error.OutOfMemory;
+        }
     }
-    const key = std.fmt.allocPrint(arena, "coreesm:{s}", .{name}) catch return error.OutOfMemory;
-    return .{ .key = key, .source = src.items };
+    return .{ .key = modkey, .source = src.items };
 }
 
 /// Is `s` a valid JS identifier (ASCII-subset: starts with letter/_/$, then alnum/_/$)?

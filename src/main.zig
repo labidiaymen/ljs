@@ -17,6 +17,20 @@ fn hostPid() i64 {
     return 0;
 }
 
+/// Heuristic ESM-entry detection for a `.js`/extension-less file: does the source have a TOP-LEVEL
+/// static `import`/`export` statement? A dynamic `import(...)` is valid in CommonJS and does NOT count
+/// (it has no space/brace after `import`). Line-based + trim-left, so it ignores indentation and skips
+/// `//` comments, `module.exports`, `exports.x`, `import_foo`, etc.
+fn looksLikeEsm(source: []const u8) bool {
+    var it = std.mem.splitScalar(u8, source, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trimStart(u8, raw, " \t");
+        if (std.mem.startsWith(u8, line, "export ") or std.mem.startsWith(u8, line, "export{") or std.mem.startsWith(u8, line, "export*")) return true;
+        if (std.mem.startsWith(u8, line, "import ") or std.mem.startsWith(u8, line, "import{") or std.mem.startsWith(u8, line, "import*")) return true;
+    }
+    return false;
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
@@ -94,7 +108,13 @@ pub fn main(init: std.process.Init) !void {
         break :blk ljs.HostCtx{ .argv = argv.items, .env_pairs = env_pairs.items, .cwd = cwd, .pid = hostPid(), .script_path = script_path, .script_dir = script_dir };
     };
 
-    const result = if (is_run)
+    // ESM entry detection: a `.mjs` file, or a `.js`/extension-less file whose source uses top-level
+    // `import`/`export` syntax, runs as an ES MODULE (top-level import/export work). Everything else
+    // runs as a CommonJS script (the default — `require`/`module.exports`).
+    const run_as_esm = is_run and (std.mem.endsWith(u8, arg, ".mjs") or looksLikeEsm(source));
+    const result = if (is_run and run_as_esm)
+        try ljs.runHostModule(arena, source, ctx, out, err)
+    else if (is_run)
         try ljs.runHost(arena, source, .sloppy, ctx, out, err)
     else
         try ljs.evalHost(arena, source, .sloppy, ctx, out, err);

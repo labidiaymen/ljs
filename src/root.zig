@@ -10,6 +10,7 @@ pub const RunMode = engine.RunMode;
 pub const EvaluationResult = engine.EvaluationResult;
 pub const evaluate = engine.evaluate;
 pub const runHost = engine.runHost;
+pub const runHostModule = engine.runHostModule;
 pub const evalHost = engine.evalHost;
 pub const HostCtx = engine.HostCtx;
 pub const evaluateWithLimit = engine.evaluateWithLimit;

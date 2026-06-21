@@ -476,6 +476,59 @@ pub fn runHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, ctx:
     };
 }
 
+/// HOST `ljs run <file.mjs>` (Node axis, spec 110): run an ES-module ENTRY. Like `runHost` but the
+/// program is parsed + linked + evaluated as a MODULE graph (top-level `import`/`export` work; relative
+/// imports resolve against the entry's dir; CJS deps are bridged). Host globals + event loop + exit are
+/// identical to `runHost`. `ctx.script_path` is the module's resolved key.
+pub fn runHostModule(arena: std.mem.Allocator, source: []const u8, ctx: HostCtx, out: *std.Io.Writer, err: *std.Io.Writer) error{OutOfMemory}!EvaluationResult {
+    const global = Environment.create(arena, null) catch return error.OutOfMemory;
+    builtins.setup(arena, global) catch return error.OutOfMemory;
+    var gen_registry: std.ArrayListUnmanaged(*@import("object.zig").Generator) = .empty;
+    var job_queue: std.ArrayListUnmanaged(@import("object.zig").Job) = .empty;
+    var interp = Interpreter{ .arena = arena, .step_limit = std.math.maxInt(u64), .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
+    interp.host_out = out;
+    interp.host_err = err;
+    interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
+    host_setup.installHostGlobals(&interp, ctx) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StepLimitExceeded => return .step_limit,
+    };
+    const completion = @import("host_require.zig").runEsmEntry(&interp, ctx.script_path, source) catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
+    if (completion == .throw) {
+        interp.cleanupGenerators();
+        return .{ .thrown = completion.throw };
+    }
+    host_setup.drainNextTicks(&interp) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StepLimitExceeded => {
+            interp.cleanupGenerators();
+            return .step_limit;
+        },
+    };
+    host_timers.runEventLoop(&interp) catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
+    host_setup.emitExit(&interp, host_setup.resolveExitCode(&interp)) catch |e| {
+        interp.cleanupGenerators();
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StepLimitExceeded => .step_limit,
+        };
+    };
+    interp.cleanupGenerators();
+    return .{ .normal = .undefined };
+}
+
 /// HOST `ljs eval` (Node axis, spec 100): like `evaluate`, but installs the host globals (so
 /// `console.log` / `process` work) and threads the run's stdout/stderr writers — WITHOUT running the
 /// event loop (a one-shot REPL-style evaluation; a `setTimeout`/`process.nextTick` scheduled here
