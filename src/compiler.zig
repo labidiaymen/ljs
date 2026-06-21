@@ -173,6 +173,10 @@ const Compiler = struct {
             .boolean => |b| try self.op(if (b) .load_true else .load_false, 1),
             .null => try self.op(.load_null, 1),
             .identifier => |name| {
+                // `arguments` is a per-call binding (installed in the call env by the tree-walk), not a
+                // slot or a free var — the VM can't resolve it, so bail. (`eval` similarly: a direct
+                // `eval(...)` call is handled by falling back on the call below.)
+                if (std.mem.eql(u8, name, "arguments")) return self.fail();
                 if (self.slotOf(name)) |s| {
                     _ = try self.op1(.load_slot, s, 1);
                 } else {
@@ -325,10 +329,14 @@ pub fn compile(arena: std.mem.Allocator, params: []const ast.Param, body: []cons
     const chunk = arena.create(Chunk) catch return null;
     chunk.* = .{};
     var c = Compiler{ .arena = arena, .chunk = chunk };
-    // Params: simple identifiers only, each a leading slot.
+    // Params: simple identifiers only, each a leading slot. A DUPLICATE name (sloppy `f(x, x)`) binds
+    // to one slot but the LAST positional arg must win — the 1-slot-per-param model can't express that,
+    // so bail (→ tree-walk), which handles last-wins correctly.
     for (params) |p| {
         if (p.default != null or p.pattern.* != .identifier) return null;
+        const before = c.n_slots;
         _ = c.addSlot(p.pattern.identifier) catch return null;
+        if (c.n_slots == before) return null; // duplicate parameter name
     }
     n_param_slots.* = c.n_slots;
     for (body) |*st| {

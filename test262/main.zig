@@ -2,6 +2,7 @@
 //! See specs/001-test262-harness/contracts/cli.md.
 const std = @import("std");
 const Io = std.Io;
+const ljs = @import("ljs");
 const runner = @import("runner.zig");
 const rep = @import("report.zig");
 
@@ -9,6 +10,11 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     const io = init.io;
+
+    // PERF (spec 111): differential-test the bytecode VM by running the suite with `LJS_VM=1`.
+    if (init.environ_map.get("LJS_VM")) |v| if (std.mem.eql(u8, v, "1")) ljs.setVmEnabled(true);
+    // PERF (spec 112): differential-test the native JIT by running the suite with `LJS_JIT=1`.
+    if (init.environ_map.get("LJS_JIT")) |v| if (std.mem.eql(u8, v, "1")) ljs.setJitEnabled(true);
 
     var out_buf: [8192]u8 = undefined;
     var out_fw: Io.File.Writer = .init(.stdout(), io, &out_buf);

@@ -31,7 +31,9 @@ inline fn readU16(code: []const u8, ip: *usize) u16 {
 pub fn run(self: *Interpreter, chunk: *const Chunk, slots: []Value, env: *Environment) EvalError!Completion {
     const code = chunk.code.items;
     const consts = chunk.consts.items;
-    const stack = self.arena.alloc(Value, @max(chunk.max_stack, 1)) catch return error.OutOfMemory;
+    // Operand stack: on the Zig stack for the common small case (no per-call heap alloc), else arena.
+    var buf: [64]Value = undefined;
+    const stack = if (chunk.max_stack <= buf.len) buf[0..@max(chunk.max_stack, 1)] else (self.arena.alloc(Value, chunk.max_stack) catch return error.OutOfMemory);
     var sp: usize = 0;
     var ip: usize = 0;
 
@@ -102,14 +104,39 @@ pub fn run(self: *Interpreter, chunk: *const Chunk, slots: []Value, env: *Enviro
                 stack[sp] = stack[sp - 1];
                 sp += 1;
             },
-            // ── binary: string-or-numeric / numeric (delegate to interp_ops) ──
-            inline .add, .sub, .mul, .div, .mod, .exp, .bit_and, .bit_or, .bit_xor, .shl, .shr, .shr_un => |comptime_op| {
+            // ── arithmetic: inline the number×number fast path (no helper/Completion round-trip);
+            //    delegate the polymorphic cases (string concat, ToPrimitive, BigInt) to interp_ops ──
+            inline .add, .sub, .mul, .div, .mod => |comptime_op| {
+                sp -= 1;
+                const r = stack[sp];
+                const l = stack[sp - 1];
+                if (l == .number and r == .number) {
+                    const a = l.number;
+                    const b = r.number;
+                    stack[sp - 1] = .{ .number = switch (comptime_op) {
+                        .add => a + b,
+                        .sub => a - b,
+                        .mul => a * b,
+                        .div => a / b,
+                        .mod => @rem(a, b),
+                        else => unreachable,
+                    } };
+                } else {
+                    const astop: ast.BinaryOp = comptime switch (comptime_op) {
+                        .add => .add,
+                        .sub => .sub,
+                        .mul => .mul,
+                        .div => .div,
+                        .mod => .mod,
+                        else => unreachable,
+                    };
+                    const c = try interp_ops.applyNumericOrStringOp(self, astop, l, r);
+                    if (c.isAbrupt()) return c;
+                    stack[sp - 1] = c.normal;
+                }
+            },
+            inline .exp, .bit_and, .bit_or, .bit_xor, .shl, .shr, .shr_un => |comptime_op| {
                 const astop: ast.BinaryOp = comptime switch (comptime_op) {
-                    .add => .add,
-                    .sub => .sub,
-                    .mul => .mul,
-                    .div => .div,
-                    .mod => .mod,
                     .exp => .exp,
                     .bit_and => .bit_and,
                     .bit_or => .bit_or,
@@ -120,26 +147,36 @@ pub fn run(self: *Interpreter, chunk: *const Chunk, slots: []Value, env: *Enviro
                     else => unreachable,
                 };
                 sp -= 1;
-                const r = stack[sp];
-                const l = stack[sp - 1];
-                const c = try interp_ops.applyNumericOrStringOp(self, astop, l, r);
+                const c = try interp_ops.applyNumericOrStringOp(self, astop, stack[sp - 1], stack[sp]);
                 if (c.isAbrupt()) return c;
                 stack[sp - 1] = c.normal;
             },
             inline .lt, .gt, .le, .ge => |comptime_op| {
-                const relop: ops.RelOp = comptime switch (comptime_op) {
-                    .lt => .lt,
-                    .gt => .gt,
-                    .le => .le,
-                    .ge => .ge,
-                    else => unreachable,
-                };
                 sp -= 1;
                 const r = stack[sp];
                 const l = stack[sp - 1];
-                const c = try interp_ops.relationalV(self, l, r, relop);
-                if (c.isAbrupt()) return c;
-                stack[sp - 1] = c.normal;
+                if (l == .number and r == .number) {
+                    const a = l.number;
+                    const b = r.number;
+                    stack[sp - 1] = .{ .boolean = switch (comptime_op) {
+                        .lt => a < b,
+                        .gt => a > b,
+                        .le => a <= b,
+                        .ge => a >= b,
+                        else => unreachable,
+                    } };
+                } else {
+                    const relop: ops.RelOp = comptime switch (comptime_op) {
+                        .lt => .lt,
+                        .gt => .gt,
+                        .le => .le,
+                        .ge => .ge,
+                        else => unreachable,
+                    };
+                    const c = try interp_ops.relationalV(self, l, r, relop);
+                    if (c.isAbrupt()) return c;
+                    stack[sp - 1] = c.normal;
+                }
             },
             .eq, .ne => |o| {
                 sp -= 1;

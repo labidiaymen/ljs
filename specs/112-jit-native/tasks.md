@@ -7,14 +7,17 @@
 - [x] Wire `_ = @import("jit_x64.zig")` into `src/root.zig` test block
 - [x] `zig build test` green; `zig build lint` green; default build unaffected
 
-## Tier 1 — integer JIT (next cycle)
-- [ ] `src/jit.zig`: compile bytecode integer-subset → native via the emitter
-- [ ] Register allocation: slots → callee-saved regs (push/pop prologue/epilogue), operand stack → caller-saved
-- [ ] SMI entry guard (args are safe integers) + overflow→deopt (≤2^53, f64-exact)
-- [ ] Deopt path: signal caller to fall back to the VM / tree-walk on guard miss / unsupported op
-- [ ] Value↔i64 marshalling at the call boundary; box i64 result → number
-- [ ] Wire into `callFunction` behind `LJS_JIT` (off by default)
-- [ ] Re-prove beats Node in-engine on the 1e9-iter loop; differential Test262 `LJS_JIT=1` = 0 regressions; bench no-regression
+## Tier 1 — integer JIT (this cycle)
+- [x] `src/jit.zig`: compile bytecode integer-subset → native via the emitter
+- [x] Register allocation: slots → callee-saved regs (push/pop prologue/epilogue), operand stack → caller-saved
+- [x] SMI arithmetic: 32-bit ops + single `jo` overflow→deopt (i32 SMI window = f64-exact, exactly V8's window)
+- [x] Peepholes: direct slot compound-update (`x = x OP v` → `op32 slotReg, v; jo`) + assignment-discard (`dup;store;pop`)
+- [x] Entry SMI guard (every arg a safe integer) at the call boundary; box i32 result → number
+- [x] Deopt path: native sets `*deopt`; caller falls back to the **tree-walk** (never the VM) on miss/overflow/`return undefined`
+- [x] Wire into `callFunction` behind `LJS_JIT` (off by default); independent of the bytecode VM
+- [x] Beats Node in-engine on the isolated 1e9-iter loop: **820 ms vs Node 1208 ms (1.47×)**; bench no-regression
+- [x] Soundness: reject duplicate params (compiler), deopt on `-0` product, reject `-0` arg at the SMI guard
+- [x] Differential Test262 `LJS_JIT=1` = **0 regressions** (42308 pass; default path unchanged, JIT off by default)
 
 ## Tiers 2–4 — roadmap (own specs)
 - [ ] Tier 2: SSE2 f64 + int↔float + `Math.*`

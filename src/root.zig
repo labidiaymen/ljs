@@ -11,6 +11,10 @@ pub const EvaluationResult = engine.EvaluationResult;
 pub const evaluate = engine.evaluate;
 pub const runHost = engine.runHost;
 pub const runHostModule = engine.runHostModule;
+/// PERF (spec 111): enable/disable the bytecode-VM fast path (set from `LJS_VM` by the CLI / harness).
+pub const setVmEnabled = @import("bytecode.zig").setEnabled;
+/// PERF (spec 112): enable/disable the native JIT (set from `LJS_JIT` by the CLI / harness).
+pub const setJitEnabled = @import("jit.zig").setEnabled;
 pub const evalHost = engine.evalHost;
 pub const HostCtx = engine.HostCtx;
 pub const evaluateWithLimit = engine.evaluateWithLimit;
@@ -40,6 +44,7 @@ test {
     _ = @import("vm.zig");
     _ = @import("compiler.zig");
     _ = @import("jit_x64.zig");
+    _ = @import("jit.zig");
     _ = @import("unicode_id.zig");
     _ = @import("lexer.zig");
     _ = @import("parser.zig");

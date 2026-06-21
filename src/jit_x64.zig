@@ -118,6 +118,99 @@ pub const Emitter = struct {
         const u: u32 = @bitCast(imm);
         inline for (0..4) |b| try self.byte(@truncate(u >> (b * 8)));
     }
+    // ── 32-bit (SMI) variants: V8-style small-int arithmetic. Overflow is detected with a single
+    //    `jo` (the op sets OF on 32-bit overflow), far cheaper than range compares. Values live in the
+    //    low 32 bits of the GPRs; `movsxd` sign-extends the final result back to i64 for boxing. ──
+    fn rex32(self: *Emitter, reg: Reg, rm: Reg) std.mem.Allocator.Error!void {
+        if (reg.ext() or rm.ext()) try self.byte(0x40 | (@as(u8, @intFromBool(reg.ext())) << 2) | @intFromBool(rm.ext()));
+    }
+    /// dst = imm (mov r32, imm32 — zero-extends to 64). Used for integer constants.
+    pub fn movImm32(self: *Emitter, dst: Reg, imm: i32) std.mem.Allocator.Error!void {
+        if (dst.ext()) try self.byte(0x41); // REX.B
+        try self.byte(0xB8 + @as(u8, dst.low()));
+        const u: u32 = @bitCast(imm);
+        inline for (0..4) |b| try self.byte(@truncate(u >> (b * 8)));
+    }
+    pub fn movReg32(self: *Emitter, dst: Reg, src: Reg) std.mem.Allocator.Error!void {
+        try self.rex32(src, dst);
+        try self.byte(0x89);
+        try self.modrmReg(src, dst);
+    }
+    pub fn add32(self: *Emitter, dst: Reg, src: Reg) std.mem.Allocator.Error!void {
+        try self.rex32(src, dst);
+        try self.byte(0x01);
+        try self.modrmReg(src, dst);
+    }
+    pub fn sub32(self: *Emitter, dst: Reg, src: Reg) std.mem.Allocator.Error!void {
+        try self.rex32(src, dst);
+        try self.byte(0x29);
+        try self.modrmReg(src, dst);
+    }
+    pub fn imul32(self: *Emitter, dst: Reg, src: Reg) std.mem.Allocator.Error!void {
+        try self.rex32(dst, src);
+        try self.byte(0x0F);
+        try self.byte(0xAF);
+        try self.modrmReg(dst, src);
+    }
+    pub fn cmp32(self: *Emitter, a: Reg, b: Reg) std.mem.Allocator.Error!void {
+        try self.rex32(b, a);
+        try self.byte(0x39);
+        try self.modrmReg(b, a);
+    }
+    pub fn cmpImm32(self: *Emitter, a: Reg, imm: i32) std.mem.Allocator.Error!void {
+        if (a.ext()) try self.byte(0x41);
+        try self.byte(0x81);
+        try self.byte(0xF8 | @as(u8, a.low()));
+        const u: u32 = @bitCast(imm);
+        inline for (0..4) |b| try self.byte(@truncate(u >> (b * 8)));
+    }
+    /// dst += imm (add r/m32, imm32 — 81 /0). For compiling `x = x + C` straight onto a slot register.
+    pub fn addImm32(self: *Emitter, dst: Reg, imm: i32) std.mem.Allocator.Error!void {
+        if (dst.ext()) try self.byte(0x41);
+        try self.byte(0x81);
+        try self.byte(0xC0 | @as(u8, dst.low())); // mod=11, /0 = add
+        const u: u32 = @bitCast(imm);
+        inline for (0..4) |b| try self.byte(@truncate(u >> (b * 8)));
+    }
+    /// dst -= imm (sub r/m32, imm32 — 81 /5).
+    pub fn subImm32(self: *Emitter, dst: Reg, imm: i32) std.mem.Allocator.Error!void {
+        if (dst.ext()) try self.byte(0x41);
+        try self.byte(0x81);
+        try self.byte(0xE8 | @as(u8, dst.low())); // mod=11, /5 = sub
+        const u: u32 = @bitCast(imm);
+        inline for (0..4) |b| try self.byte(@truncate(u >> (b * 8)));
+    }
+    /// dst = src * imm (imul r32, r/m32, imm32 — 69 /r id).
+    pub fn imulImm32(self: *Emitter, dst: Reg, src: Reg, imm: i32) std.mem.Allocator.Error!void {
+        try self.rex32(dst, src);
+        try self.byte(0x69);
+        try self.modrmReg(dst, src);
+        const u: u32 = @bitCast(imm);
+        inline for (0..4) |b| try self.byte(@truncate(u >> (b * 8)));
+    }
+    /// dst(64) = sign-extend src(32)  (movsxd — REX.W 63 /r). Boxes the i32 SMI result back to i64.
+    pub fn movsxd(self: *Emitter, dst: Reg, src: Reg) std.mem.Allocator.Error!void {
+        try self.rexW(dst, src);
+        try self.byte(0x63);
+        try self.modrmReg(dst, src);
+    }
+
+    /// dst = [base + disp8]  (mov r64, r/m64 — 8B /r, mod=01 disp8). `base` must not be rsp/rbp/r12/r13
+    /// (those need SIB / special encoding); the JIT only uses rcx (the slots pointer) as a base.
+    pub fn movFromMem(self: *Emitter, dst: Reg, base: Reg, disp: u8) std.mem.Allocator.Error!void {
+        try self.byte(0x48 | (@as(u8, @intFromBool(dst.ext())) << 2) | @intFromBool(base.ext()));
+        try self.byte(0x8B);
+        try self.byte(0x40 | (@as(u8, dst.low()) << 3) | base.low()); // mod=01, reg=dst, rm=base
+        try self.byte(disp);
+    }
+    /// byte [base] = imm8  (mov r/m8, imm8 — C6 /0, mod=00). Used to set the deopt flag (`*deopt = 1`).
+    /// `base` must not be rsp/rbp/r12/r13; the JIT uses r15 (the deopt pointer).
+    pub fn movByteImm(self: *Emitter, base: Reg, imm: u8) std.mem.Allocator.Error!void {
+        if (base.ext()) try self.byte(0x41); // REX.B
+        try self.byte(0xC6);
+        try self.byte(base.low()); // mod=00, reg=000 (/0), rm=base
+        try self.byte(imm);
+    }
     pub fn push(self: *Emitter, r: Reg) std.mem.Allocator.Error!void {
         if (r.ext()) try self.byte(0x41);
         try self.byte(0x50 + @as(u8, r.low()));

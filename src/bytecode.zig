@@ -10,6 +10,17 @@
 const std = @import("std");
 const Value = @import("value.zig").Value;
 
+/// PERF (spec 111): global on/off for the bytecode-VM fast path. Set once at startup from the `LJS_VM`
+/// env var by the CLI / Test262 harness (default OFF — the VM is opt-in until its differential Test262
+/// is clean). A process-global is fine: the VM is a pure-perf execution choice, not realm state.
+var g_vm_enabled: bool = false;
+pub fn setEnabled(on: bool) void {
+    g_vm_enabled = on;
+}
+pub fn enabled() bool {
+    return g_vm_enabled;
+}
+
 pub const Op = enum(u8) {
     // ── stack / constants / locals ──
     load_const, // [k]  push consts[k]

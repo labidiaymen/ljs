@@ -10,6 +10,10 @@ const object_mod = @import("object.zig");
 const Object = object_mod.Object;
 const ops = @import("abstract_ops.zig");
 const bigint = @import("bigint.zig");
+const vm = @import("vm.zig");
+const bytecode = @import("bytecode.zig");
+const compiler = @import("compiler.zig");
+const jit = @import("jit.zig");
 const builtin_proxy = @import("builtin_proxy.zig");
 const builtin_regexp = @import("builtin_regexp.zig");
 const builtin_arraybuffer = @import("builtin_arraybuffer.zig");
@@ -1435,6 +1439,46 @@ pub fn throwTypeErrorIntrinsic(self: *Interpreter) ?*Object {
     return null;
 }
 
+/// PERF (spec 111): is the bytecode-VM fast path enabled? (Set from `LJS_VM` at startup by the CLI /
+/// Test262 harness; default OFF.)
+inline fn vmEnabled() bool {
+    return bytecode.enabled();
+}
+
+/// Compiled chunk for `fd` (cached by body-AST pointer, shared across closures of the same definition).
+/// Returns null when the function isn't VM-compilable (recorded so we don't retry).
+fn vmChunkFor(self: *Interpreter, fd: object_mod.FunctionData) EvalError!?interpreter.VmEntry {
+    const key = @intFromPtr(fd.body.ptr);
+    if (self.vm_chunks.get(key)) |cached| return cached;
+    var nparams: u16 = 0;
+    const entry: ?interpreter.VmEntry = if (compiler.compile(self.arena, fd.params, fd.body, &nparams)) |chunk|
+        .{ .chunk = chunk, .nparams = nparams }
+    else
+        null;
+    self.vm_chunks.put(self.arena, key, entry) catch return error.OutOfMemory;
+    return entry;
+}
+
+/// PERF (spec 112): is the native JIT enabled? (Set from `LJS_JIT`; default OFF, independent of the VM.)
+inline fn jitEnabled() bool {
+    return jit.enabled();
+}
+
+/// Native-JIT entry for `fd` (cached by body-AST pointer). Compiles AST→bytecode→native; null when the
+/// function isn't JIT-able (integer subset only) — recorded so we don't retry. Independent of the VM:
+/// the JIT deopts to the tree-walk, never the bytecode VM.
+fn jitFnFor(self: *Interpreter, fd: object_mod.FunctionData) EvalError!?interpreter.JitEntry {
+    const key = @intFromPtr(fd.body.ptr);
+    if (self.jit_fns.get(key)) |cached| return cached;
+    var nparams: u16 = 0;
+    const entry: ?interpreter.JitEntry = if (compiler.compile(self.arena, fd.params, fd.body, &nparams)) |chunk|
+        (if (jit.compileChunk(self.arena, chunk, nparams)) |f| .{ .fn_ptr = f, .nparams = nparams } else null)
+    else
+        null;
+    self.jit_fns.put(self.arena, key, entry) catch return error.OutOfMemory;
+    return entry;
+}
+
 pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
     // §13.3.12: consume the one-shot [[NewTarget]] hand-off from a preceding `construct` (else
     // `undefined`) and clear the slot immediately — so it cannot leak past this [[Call]] into a
@@ -1495,6 +1539,52 @@ pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this
     defer self.depth -= 1;
     if (self.depth > self.max_depth) return self.throwError("RangeError", "Maximum call stack size exceeded");
     const fd = func.call orelse return self.throwError("TypeError", "value is not a function");
+    // PERF (spec 111): the bytecode-VM fast path. Behind `LJS_VM`; only for functions the compiler
+    // accepts (simple params, no rest, not a class ctor, closure not crossing a `with`). Params bind to
+    // leading slots, body locals to the rest; free vars resolve via `fd.closure`. Everything else (and
+    // any unsupported construct → compile returns null) keeps the tree-walk path below.
+    // PERF (spec 112): the native-JIT fast path (Tier 1, integer subset). Behind `LJS_JIT`. Same
+    // gate as the VM, plus: every parameter must be a safe integer (SMI) at this call. A JIT'd
+    // function is pure (no calls/props/globals), so on any miss — not JIT-able, a non-int arg, or a
+    // runtime overflow/`return undefined` deopt — we fall straight through to the tree-walk below,
+    // which is the JIT's only fallback (never the bytecode VM). Result is always an exact integer.
+    if (jitEnabled() and fd.rest == null and !fd.is_class_ctor and !envHasWith(fd.closure)) {
+        if (try jitFnFor(self, fd)) |je| {
+            var slots: [16]i64 = undefined;
+            var ok = true;
+            var i: usize = 0;
+            while (i < je.nparams) : (i += 1) {
+                if (i < args.len) {
+                    if (jit.asSmi(args[i])) |iv| slots[i] = iv else {
+                        ok = false;
+                        break;
+                    }
+                } else {
+                    ok = false; // missing arg = undefined, not an SMI
+                    break;
+                }
+            }
+            if (ok) {
+                const fnp: jit.JitFn = @ptrCast(@alignCast(je.fn_ptr));
+                var deopt: u8 = 0;
+                const r = fnp(&slots, &deopt);
+                if (deopt == 0) return .{ .normal = .{ .number = @floatFromInt(r) } };
+            }
+        }
+    }
+    if (vmEnabled() and fd.rest == null and !fd.is_class_ctor and !envHasWith(fd.closure)) {
+        if (try vmChunkFor(self, fd)) |entry| {
+            const chunk: *const bytecode.Chunk = @ptrCast(@alignCast(entry.chunk));
+            const slots = self.arena.alloc(Value, @max(chunk.n_slots, 1)) catch return error.OutOfMemory;
+            for (slots) |*s| s.* = .undefined;
+            const np = @min(args.len, entry.nparams);
+            for (0..np) |i| slots[i] = args[i];
+            const saved_strict = self.strict;
+            self.strict = fd.strict;
+            defer self.strict = saved_strict;
+            return vm.run(self, chunk, slots, fd.closure);
+        }
+    }
     const call_env = try Environment.create(self.arena, fd.closure);
     call_env.is_var_scope = true; // §10.2.11: a FunctionBody is a VariableEnvironment (var hoist target)
     // §9.1.2.2 a function CLOSED OVER a `with` resolves its free names through the captured object

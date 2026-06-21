@@ -28,6 +28,14 @@ const toBoolean = ops.toBoolean;
 
 pub const EvalError = error{ StepLimitExceeded, OutOfMemory };
 
+/// PERF (spec 111): a compiled-function cache entry — an opaque `*bytecode.Chunk` (cast in
+/// interp_expr to avoid an import cycle) + how many leading slots are parameters.
+pub const VmEntry = struct { chunk: *anyopaque, nparams: u16 };
+
+/// PERF (spec 112): a compiled native-JIT entry — an opaque `jit.JitFn` (cast in interp_expr) + the
+/// parameter count. Null-cached when the function isn't JIT-able (so we don't recompile every call).
+pub const JitEntry = struct { fn_ptr: *const anyopaque, nparams: u16 };
+
 /// Test262 `[async]` completion state, written by the runner-injected `$DONE` native (`test_done`) and
 /// read by the runner after draining the Job queue. `called` distinguishes "never called" (→ fail:
 /// the async test never reported) from a real outcome; `failed` is true iff `$DONE` was called with a
@@ -189,6 +197,11 @@ pub const Interpreter = struct {
     io_pending: usize = 0,
     io_handles: std.AutoHashMapUnmanaged(u64, *anyopaque) = .empty,
     next_io_id: u64 = 1,
+    /// PERF (spec 111): the bytecode-VM compile cache, keyed by a function's body-AST pointer (shared
+    /// across all closures of the same definition). Value: a compiled chunk (`.some`) or a recorded
+    /// compile failure (`.null` → always tree-walk). Consulted only when the `LJS_VM` fast path is on.
+    vm_chunks: std.AutoHashMapUnmanaged(usize, ?VmEntry) = .empty,
+    jit_fns: std.AutoHashMapUnmanaged(usize, ?JitEntry) = .empty,
     /// HOST (Node axis, spec 100): the `process.nextTick` queue — drained FULLY (including ticks
     /// enqueued by running ticks) at the TOP of each event-loop turn, BEFORE the microtask `job_queue`,
     /// so a nextTick callback runs ahead of any Promise reaction scheduled the same turn. Empty + never

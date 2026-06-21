@@ -36,6 +36,11 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
     const io = init.io;
 
+    // PERF (spec 111): opt into the bytecode-VM fast path with `LJS_VM=1`.
+    if (init.environ_map.get("LJS_VM")) |v| if (std.mem.eql(u8, v, "1")) ljs.setVmEnabled(true);
+    // PERF (spec 112): opt into the native JIT with `LJS_JIT=1`.
+    if (init.environ_map.get("LJS_JIT")) |v| if (std.mem.eql(u8, v, "1")) ljs.setJitEnabled(true);
+
     var out_buf: [4096]u8 = undefined;
     var out_fw: Io.File.Writer = .init(.stdout(), io, &out_buf);
     const out = &out_fw.interface;

@@ -1,6 +1,7 @@
 # Spec 112 — Native JIT (beat Node on compute)
 
-**Status:** In progress — Tier 0 (x86-64 emitter) DONE, tested, lint-clean.
+**Status:** In progress — Tier 0 (emitter) + Tier 1 (integer JIT) DONE. Tier 1 beats Node in-engine
+on the isolated compute loop: **820 ms vs Node 1208 ms (1.47× faster)**, correct + tested + lint-clean.
 **Axis:** Performance (host/runtime). NOT a Test262 conformance change — the JIT is a CLI/host
 fast path that must hold language conformance by construction (deopt to the interpreter on anything
 it can't compile).
@@ -36,10 +37,14 @@ regressions** + no bench regression. Higher tiers cover more JS but cost more.
 - **Tier 0 — x86-64 emitter** *(DONE — `src/jit_x64.zig`)*: a register-only machine-code emitter
   (mov/add/sub/imul/cmp/jcc/jmp/ret + label patching) + RWX `makeExecutable`. Unit-tested: emits a
   `sum` loop and runs it for correct results. This is the codegen backend every tier uses.
-- **Tier 1 — integer JIT** *(NEXT)*: compile the bytecode VM's **integer subset** to native —
-  slots in callee-saved regs, operand stack in caller-saved regs, SMI entry guards, overflow→deopt
-  (≤2^53 to stay f64-exact), deopt-to-VM on guard miss / unsupported op. Wire into `callFunction`
-  behind `LJS_JIT`; re-prove it beats Node **in-engine**. Target: numeric loops ≥ Node.
+- **Tier 1 — integer JIT** *(DONE — `src/jit.zig`)*: compiles the bytecode integer subset to native —
+  slots in callee-saved regs, operand stack in caller-saved regs, **32-bit SMI arithmetic with a single
+  `jo` overflow guard** (i32 window = f64-exact, V8's SMI window), peepholes that compile `x = x OP v`
+  straight onto a slot register, SMI entry guard at the call boundary, deopt-to-tree-walk on
+  miss/overflow/`return undefined`. Behind `LJS_JIT` (off by default), independent of the VM.
+  **Beats Node 1.47× on the isolated compute loop** (820 vs 1208 ms). *Honest limit:* it JITs only
+  the leaf function — call-heavy code (200k calls/loop) is still bounded by the interpreted caller +
+  call dispatch (ljs 861 ms vs Node 674 ms), so Node wins there until the caller is JIT'd too (later tier).
 - **Tier 2 — float + mixed numerics**: SSE2 `f64` ops, int↔float transitions, `Math.*` intrinsics.
   Covers numeric code that isn't pure small-int.
 - **Tier 3 — strings / arrays / typed-arrays**: JIT property reads, array + typed-array indexing,
