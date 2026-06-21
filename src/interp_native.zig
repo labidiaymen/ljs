@@ -3,6 +3,7 @@
 const std = @import("std");
 const Value = @import("value.zig").Value;
 const Completion = @import("completion.zig").Completion;
+const sutf16 = @import("string_utf16.zig");
 const Environment = @import("environment.zig").Environment;
 const object_mod = @import("object.zig");
 const Object = object_mod.Object;
@@ -146,6 +147,8 @@ pub fn globalFn(self: *Interpreter, name: []const u8, args: []const Value) EvalE
     if (std.mem.eql(u8, name, "encodeURIComponent")) return uriEncode(self, arg0, .component);
     if (std.mem.eql(u8, name, "decodeURI")) return uriDecode(self, arg0, .uri);
     if (std.mem.eql(u8, name, "decodeURIComponent")) return uriDecode(self, arg0, .component);
+    if (std.mem.eql(u8, name, "escape")) return escapeFn(self, arg0); // §B.2.1.1
+    if (std.mem.eql(u8, name, "unescape")) return unescapeFn(self, arg0); // §B.2.1.2
     unreachable;
 }
 
@@ -309,6 +312,85 @@ pub fn uriDecode(self: *Interpreter, v: Value, kind: UriKind) EvalError!Completi
         i += n * 3;
     }
     return .{ .normal = .{ .string = out.items } };
+}
+
+/// §B.2.1.1 escape(string) — legacy URI-ish encoder operating on UTF-16 CODE UNITS: preserve the
+/// unescaped set `A-Za-z0-9@*_+-./`, emit `%XX` for a code unit < 256, else `%uXXXX`.
+fn escapeFn(self: *Interpreter, v: Value) EvalError!Completion {
+    const sc = try self.toStringThrowing(v);
+    if (sc.isAbrupt()) return sc;
+    const s = sc.normal.string;
+    const n = sutf16.utf16Length(s);
+    const hex = "0123456789ABCDEF";
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const cu = sutf16.codeUnitAt(s, i) orelse break;
+        if (isEscapePreserved(cu)) {
+            try out.append(self.arena, @intCast(cu));
+        } else if (cu < 256) {
+            try out.appendSlice(self.arena, &[_]u8{ '%', hex[(cu >> 4) & 0xf], hex[cu & 0xf] });
+        } else {
+            try out.appendSlice(self.arena, &[_]u8{ '%', 'u', hex[(cu >> 12) & 0xf], hex[(cu >> 8) & 0xf], hex[(cu >> 4) & 0xf], hex[cu & 0xf] });
+        }
+    }
+    return .{ .normal = .{ .string = out.items } };
+}
+
+fn isEscapePreserved(cu: u16) bool {
+    if ((cu >= 'A' and cu <= 'Z') or (cu >= 'a' and cu <= 'z') or (cu >= '0' and cu <= '9')) return true;
+    return switch (cu) {
+        '@', '*', '_', '+', '-', '.', '/' => true,
+        else => false,
+    };
+}
+
+/// §B.2.1.2 unescape(string) — decode `%XX` / `%uXXXX` back to code units (other chars pass through;
+/// a malformed `%` is left literal). Operates over UTF-16 code units, re-encoded to WTF-8.
+fn unescapeFn(self: *Interpreter, v: Value) EvalError!Completion {
+    const sc = try self.toStringThrowing(v);
+    if (sc.isAbrupt()) return sc;
+    const s = sc.normal.string;
+    const n = sutf16.utf16Length(s);
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < n) {
+        var cu = sutf16.codeUnitAt(s, i) orelse break;
+        if (cu == '%') {
+            if (i + 6 <= n and (sutf16.codeUnitAt(s, i + 1) orelse 0) == 'u') {
+                if (hexUnits(s, i + 2, 4)) |val| {
+                    cu = val;
+                    i += 6;
+                } else i += 1;
+            } else if (i + 3 <= n) {
+                if (hexUnits(s, i + 1, 2)) |val| {
+                    cu = val;
+                    i += 3;
+                } else i += 1;
+            } else i += 1;
+        } else i += 1;
+        var buf: [3]u8 = undefined;
+        try out.appendSlice(self.arena, sutf16.codeUnitToWtf8(cu, &buf));
+    }
+    return .{ .normal = .{ .string = out.items } };
+}
+
+/// Parse `count` hex digits starting at code-unit index `pos` → their value, or null if any is not a
+/// hex digit.
+fn hexUnits(s: []const u8, pos: usize, count: usize) ?u16 {
+    var val: u16 = 0;
+    var k: usize = 0;
+    while (k < count) : (k += 1) {
+        const cu = sutf16.codeUnitAt(s, pos + k) orelse return null;
+        const d: u16 = switch (cu) {
+            '0'...'9' => cu - '0',
+            'a'...'f' => cu - 'a' + 10,
+            'A'...'F' => cu - 'A' + 10,
+            else => return null,
+        };
+        val = val * 16 + d;
+    }
+    return val;
 }
 
 /// Dispatch a built-in function (§19/§20). Behavior keyed by `func.native`.
@@ -542,6 +624,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .nodetest_method => return @import("host_nodetest.zig").method(self, func, this_val, args), // HOST node:test runner (spec 106)
         .vm_method => return @import("host_vm.zig").method(self, func, this_val, args), // HOST vm (spec 106)
         .net_method => return @import("host_net.zig").method(self, func, this_val, args), // HOST net/TCP (spec 107)
+        .crypto_method => return @import("host_crypto.zig").method(self, func, this_val, args), // HOST crypto (spec 108)
         .eval_fn => {
             // §19.2.1: reaching `callNative` means INDIRECT eval (`(0,eval)(s)`, `var e=eval; e(s)`,
             // `globalThis.eval(s)`) — the direct case is intercepted in `evalCall` before dispatch.
@@ -866,7 +949,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .bigint_method => return builtin_bigint.bigintMethod(self, func.native_name, this_val, args), // §21.2.3 toString/valueOf
         .symbol_ctor => return builtin_symbol.constructor(self, args), // §20.4.1.1 Symbol([description])
         .promise_ctor => return interp_async.promiseConstructor(self, this_val, args), // §27.2.3.1 Promise(executor)
-        .timer_fn, .console_log, .process_method, .buffer_fn, .events_method, .util_method, .qs_method, .timers_method, .assert_method, .url_method, .nodetest_method, .vm_method, .net_method, .require_fn, .core_module_fn => unreachable, // HOST (spec 098/100/101/102/103/104/105/106/107) — handled in the first switch
+        .timer_fn, .console_log, .process_method, .buffer_fn, .events_method, .util_method, .qs_method, .timers_method, .assert_method, .url_method, .nodetest_method, .vm_method, .net_method, .crypto_method, .require_fn, .core_module_fn => unreachable, // HOST (spec 098/100/101/102/103/104/105/106/107/108) — handled in the first switch
         .array_ctor, .array_method, .array_static, .string_method, .string_static, .math_method, .reflect_method => unreachable, // handled in the first switch
         .species_getter, .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
         .symbol_static, .symbol_description => unreachable, // handled in the first switch

@@ -193,13 +193,18 @@ pub fn installHostGlobals(self: *Interpreter, ctx: HostCtx) EvalError!void {
         try @import("host_require.zig").installEntryRequire(self, ctx.script_path, ctx.script_dir);
 
     // process is also an own property of the global object (so `globalThis.process` works).
+    // Web Crypto GLOBAL (`crypto.getRandomValues` / `randomUUID`) — Node ≥ 20 + browsers expose it as a
+    // global (e.g. `uuid`'s rng reaches for the global `crypto`). Distinct from `require('crypto')`.
+    const webcrypto = try @import("host_crypto.zig").buildWebCrypto(self);
+    try env.declare("crypto", .{ .object = webcrypto }, true, true);
+
     if (env.lookup("%GlobalThis%")) |gb| if (gb.value == .object) {
         try gb.value.object.defineData("process", .{ .object = process }, true, false, true);
         // global = globalThis (Node alias).
         try env.declare("global", gb.value, true, true);
         try gb.value.object.defineData("global", gb.value, true, false, true);
         // Mirror the host globals onto the reified global object too (so globalThis.console etc. work).
-        for ([_][]const u8{ "console", "setTimeout", "setInterval", "clearTimeout", "clearInterval", "queueMicrotask", "setImmediate", "clearImmediate" }) |name| {
+        for ([_][]const u8{ "console", "crypto", "setTimeout", "setInterval", "clearTimeout", "clearInterval", "queueMicrotask", "setImmediate", "clearImmediate" }) |name| {
             if (env.lookup(name)) |b| try gb.value.object.defineData(name, b.value, true, false, true);
         }
     };

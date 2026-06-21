@@ -708,6 +708,9 @@ pub const NativeId = enum {
     /// `Server`) and Socket/Server instance methods (native_name prefixed `s.`/`v.` to disambiguate).
     /// Backed by libxev TCP; dispatched in `host_net.zig`.
     net_method,
+    /// HOST (Node axis, spec 108): minimal `crypto` — `randomBytes`/`randomFillSync`/`randomUUID`/
+    /// `getRandomValues`. Dispatched in `host_crypto.zig`.
+    crypto_method,
     /// §10.4.4.6 %ThrowTypeError% — the unique per-realm function that unconditionally throws a
     /// TypeError. Used as the poison `get`/`set` for `callee` (and historically `caller`) on a
     /// strict / unmapped arguments object. Never returns normally.

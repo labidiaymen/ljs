@@ -25,6 +25,8 @@ const Parser = @import("parser.zig").Parser;
 const interpreter = @import("interpreter.zig");
 const Interpreter = interpreter.Interpreter;
 const EvalError = interpreter.EvalError;
+const module_mod = @import("module.zig");
+const interp_module = @import("interp_module.zig");
 
 const path = std.fs.path;
 
@@ -119,9 +121,28 @@ fn resolvePath(self: *Interpreter, dir: []const u8, spec: []const u8) EvalError!
         const base = if (path.isAbsolute(spec)) spec else (path.resolve(arena, &.{ dir, spec }) catch return error.OutOfMemory);
         return try resolveAsFileOrDir(self, base);
     }
-    // Bare specifier: walk up <d>/node_modules/<spec> from `dir` to the root.
+    // Bare specifier: walk up <d>/node_modules/<pkg> from `dir` to the root. At each level, prefer the
+    // package's `"exports"` map (modern packages have no `main`); fall back to the classic
+    // file/dir/main/index resolution.
+    const split = try splitPackage(self, spec);
     var cur: []const u8 = dir;
     while (true) {
+        const pkg_dir = path.resolve(arena, &.{ cur, "node_modules", split.name }) catch return error.OutOfMemory;
+        const pkg_json = path.resolve(arena, &.{ pkg_dir, "package.json" }) catch return error.OutOfMemory;
+        if (try readFileOpt(self, pkg_json)) |content| {
+            if (try parsePackageJson(self, content)) |obj| {
+                if (obj.get("exports")) |exports_v| {
+                    if (try resolveExports(self, exports_v, split.subpath)) |rel| {
+                        const target = path.resolve(arena, &.{ pkg_dir, rel }) catch return error.OutOfMemory;
+                        if (try fileExists(self, target)) return target;
+                        if (try resolveAsFileOrDir(self, target)) |p| return p;
+                    }
+                    // `exports` present but the subpath is not exported → do NOT fall through to
+                    // legacy resolution (Node treats exports as the authoritative gate) for this pkg.
+                }
+            }
+        }
+        // No exports (or no package.json): classic resolution of the full spec under this node_modules.
         const candidate = path.resolve(arena, &.{ cur, "node_modules", spec }) catch return error.OutOfMemory;
         if (try resolveAsFileOrDir(self, candidate)) |p| return p;
         const parent = path.dirname(cur) orelse break;
@@ -168,6 +189,132 @@ fn readPackageMain(self: *Interpreter, content: []const u8) EvalError!?[]const u
     return main_v.string;
 }
 
+// ── package.json "exports" / "type" resolution (Node subpath + conditional exports) ──────────────
+
+/// Parse a package.json's source into its top-level object Value (or null on malformed JSON).
+fn parsePackageJson(self: *Interpreter, content: []const u8) EvalError!?*Object {
+    const parsed = try jsonParse(self, content);
+    if (parsed.isAbrupt() or parsed.normal != .object) return null;
+    return parsed.normal.object;
+}
+
+/// `"type"` field of a package.json object ("module" / "commonjs" / null).
+fn packageType(pkg: *Object) ?[]const u8 {
+    if (pkg.get("type")) |v| if (v == .string) return v.string;
+    return null;
+}
+
+/// Split a bare specifier into its package name and the requested subpath (`"."` or `"./sub"`).
+/// Scoped packages (`@scope/name`) keep both segments in the name.
+const PkgSplit = struct { name: []const u8, subpath: []const u8 };
+fn splitPackage(self: *Interpreter, spec: []const u8) EvalError!PkgSplit {
+    var slash_count: usize = if (std.mem.startsWith(u8, spec, "@")) @as(usize, 2) else 1;
+    var i: usize = 0;
+    var name_end: usize = spec.len;
+    while (i < spec.len) : (i += 1) {
+        if (spec[i] == '/') {
+            slash_count -= 1;
+            if (slash_count == 0) {
+                name_end = i;
+                break;
+            }
+        }
+    }
+    const name = spec[0..name_end];
+    if (name_end >= spec.len) return .{ .name = name, .subpath = "." };
+    const rest = spec[name_end + 1 ..];
+    const sub = std.fmt.allocPrint(self.arena, "./{s}", .{rest}) catch return error.OutOfMemory;
+    return .{ .name = name, .subpath = sub };
+}
+
+/// The condition names we resolve for, in priority order (the CommonJS `require` world). `"import"` is
+/// intentionally absent — an ESM target is reached via `"node"`/`"default"` and then detected by
+/// extension / `"type"` (see `isEsmFile`).
+const require_conditions = [_][]const u8{ "node", "require", "default" };
+
+/// Resolve a package's `"exports"` map for `subpath` (`"."`/`"./x"`) → a package-relative target
+/// (e.g. `"./dist/index.js"`), or null if unmapped. Handles string targets, conditional-object
+/// targets (recursing the condition set), the subpath-map vs conditions-for-"." ambiguity, and a
+/// single trailing `*` wildcard.
+fn resolveExports(self: *Interpreter, exports_v: Value, subpath: []const u8) EvalError!?[]const u8 {
+    // A bare string export is the `"."` target.
+    if (exports_v == .string) return if (std.mem.eql(u8, subpath, ".")) exports_v.string else null;
+    if (exports_v != .object) return null;
+    const obj = exports_v.object;
+
+    // Distinguish a SUBPATH map (keys start with ".") from a CONDITIONS object (keys are condition
+    // names) by the first own key.
+    var it = obj.properties.iterator();
+    const first = it.next();
+    const is_subpath_map = if (first) |e| std.mem.startsWith(u8, e.key_ptr.*, ".") else false;
+
+    if (is_subpath_map) {
+        // Exact subpath match first.
+        if (obj.get(subpath)) |t| return resolveExportTarget(self, t);
+        // Wildcard: a key like "./lib/*" mapping to "./lib/*.js".
+        var it2 = obj.properties.iterator();
+        while (it2.next()) |e| {
+            const key = e.key_ptr.*;
+            if (std.mem.indexOfScalar(u8, key, '*')) |star| {
+                const prefix = key[0..star];
+                const suffix = key[star + 1 ..];
+                if (std.mem.startsWith(u8, subpath, prefix) and std.mem.endsWith(u8, subpath, suffix) and subpath.len >= prefix.len + suffix.len) {
+                    const matched = subpath[prefix.len .. subpath.len - suffix.len];
+                    if (e.value_ptr.payload == .data and e.value_ptr.payload.data == .string) {
+                        const tmpl = e.value_ptr.payload.data.string;
+                        if (std.mem.indexOfScalar(u8, tmpl, '*')) |tstar| {
+                            return std.fmt.allocPrint(self.arena, "{s}{s}{s}", .{ tmpl[0..tstar], matched, tmpl[tstar + 1 ..] }) catch return error.OutOfMemory;
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+    // Conditions object — only valid for the "." subpath.
+    if (!std.mem.eql(u8, subpath, ".")) return null;
+    return resolveExportTarget(self, exports_v);
+}
+
+/// Resolve an export TARGET (a string, or a conditions object) to a package-relative path.
+fn resolveExportTarget(self: *Interpreter, target: Value) EvalError!?[]const u8 {
+    if (target == .string) return target.string;
+    if (target != .object) return null;
+    for (require_conditions) |cond| {
+        if (target.object.get(cond)) |sub| {
+            if (try resolveExportTarget(self, sub)) |p| return p;
+        }
+    }
+    return null;
+}
+
+/// Is the resolved file an ES module? `.mjs` → yes, `.cjs`/`.json` → no, `.js` → the nearest enclosing
+/// `package.json`'s `"type" === "module"`.
+fn isEsmFile(self: *Interpreter, abspath: []const u8, pkg_dir_type: ?[]const u8) EvalError!bool {
+    if (std.mem.endsWith(u8, abspath, ".mjs")) return true;
+    if (std.mem.endsWith(u8, abspath, ".cjs") or std.mem.endsWith(u8, abspath, ".json")) return false;
+    if (std.mem.endsWith(u8, abspath, ".js")) {
+        if (pkg_dir_type) |t| return std.mem.eql(u8, t, "module");
+        // Walk up for the nearest package.json "type".
+        if (try nearestPackageType(self, abspath)) |t| return std.mem.eql(u8, t, "module");
+    }
+    return false;
+}
+
+/// The `"type"` of the nearest `package.json` at or above `file`'s directory (null if none/commonjs).
+fn nearestPackageType(self: *Interpreter, file: []const u8) EvalError!?[]const u8 {
+    var dir = path.dirname(file) orelse return null;
+    while (true) {
+        const pkg = path.resolve(self.arena, &.{ dir, "package.json" }) catch return error.OutOfMemory;
+        if (try readFileOpt(self, pkg)) |content| {
+            if (try parsePackageJson(self, content)) |obj| return packageType(obj);
+        }
+        const parent = path.dirname(dir) orelse return null;
+        if (std.mem.eql(u8, parent, dir)) return null;
+        dir = parent;
+    }
+}
+
 fn fileExists(self: *Interpreter, p: []const u8) EvalError!bool {
     const st = std.Io.Dir.cwd().statFile(self.io, p, .{}) catch return false;
     return st.kind == .file;
@@ -196,6 +343,10 @@ fn loadModule(self: *Interpreter, abspath: []const u8) EvalError!Completion {
         self.require_cache.put(arena, abspath, parsed.normal) catch return error.OutOfMemory;
         return parsed;
     }
+
+    // ESM target (`.mjs`, or `.js` under `"type":"module"`) → load + evaluate as a module graph in the
+    // CURRENT realm; `module.exports` is the §10.4.6 namespace object (named exports + `default`).
+    if (try isEsmFile(self, abspath, null)) return loadEsm(self, abspath, content);
 
     const dir = path.dirname(abspath) orelse abspath;
 
@@ -244,6 +395,123 @@ fn loadModule(self: *Interpreter, abspath: []const u8) EvalError!Completion {
     self.require_cache.put(arena, abspath, exports_v) catch return error.OutOfMemory;
     try module_obj.defineData("loaded", .{ .boolean = true }, true, true, true);
     return .{ .normal = exports_v };
+}
+
+// ── require(ESM): load + evaluate an ES module graph from CommonJS require ────────────────────────
+
+/// Load an ESM file at `abspath` (already read into `source`): build its module-record graph, link +
+/// evaluate it IN THE CURRENT REALM (shares globals/builtins with the running program), drain
+/// microtasks, and return the module namespace as `module.exports`. Node's `require(esm)` shape — so
+/// `require('pkg').named` and `require('pkg').default` both resolve.
+fn loadEsm(self: *Interpreter, abspath: []const u8, source: []const u8) EvalError!Completion {
+    const arena = self.arena;
+    var graph: std.StringHashMapUnmanaged(*module_mod.ModuleRecord) = .empty;
+    const loader = module_mod.ModuleLoader{ .ctx = self, .resolve = esmResolve };
+    const root = loadModuleGraph(self, loader, &graph, abspath, source) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SyntaxError => return self.throwError("SyntaxError", "ESM parse/resolve error"),
+    };
+
+    // runModule sets strict + module `this`; save/restore so the requiring CJS context is unchanged.
+    const saved_strict = self.strict;
+    const saved_this = self.this_val;
+    const saved_referrer = self.host_referrer_key;
+    defer {
+        self.strict = saved_strict;
+        self.this_val = saved_this;
+        self.host_referrer_key = saved_referrer;
+    }
+    const c = try interp_module.runModule(self, root, self.globals.?);
+    if (c.isAbrupt()) return c;
+    try self.drainJobs(); // settle any Promise reactions the module scheduled (sync packages)
+
+    const ns = try interp_module.moduleNamespace(self, root);
+    const ns_v = Value{ .object = ns };
+    self.require_cache.put(arena, abspath, ns_v) catch return error.OutOfMemory;
+    return .{ .normal = ns_v };
+}
+
+/// `ModuleLoader.resolve` for the require(ESM) graph: a core-module specifier (`fs`, `node:crypto`, …)
+/// is bridged to a synthetic ESM shim re-exporting the host core module; otherwise resolve the
+/// (relative/bare) specifier against the referrer's directory like `require` and read its source.
+fn esmResolve(ctx: *anyopaque, referrer_key: []const u8, specifier: []const u8) ?module_mod.ResolvedSource {
+    const self: *Interpreter = @ptrCast(@alignCast(ctx));
+    if (isCoreModule(specifier)) return synthCoreEsm(self, specifier) catch return null;
+    const dir = path.dirname(referrer_key) orelse referrer_key;
+    const abspath = (resolvePath(self, dir, specifier) catch return null) orelse return null;
+    const src = (readFileOpt(self, abspath) catch return null) orelse return null;
+    return .{ .key = abspath, .source = src };
+}
+
+/// Bridge an ESM `import … from 'node:fs'` (etc.) to the host CommonJS core module: stash the core
+/// module's exports on `globalThis["%coreesm:NAME%"]` and synthesize an ESM source that `export
+/// default`s it plus re-exports each own identifier-named property as a named export. So
+/// `import crypto from 'node:crypto'` and `import { readFileSync } from 'node:fs'` both bind.
+fn synthCoreEsm(self: *Interpreter, specifier: []const u8) EvalError!?module_mod.ResolvedSource {
+    const arena = self.arena;
+    const name = coreName(specifier);
+    const exports_c = try loadCoreModule(self, name);
+    if (exports_c.normal != .object) return null;
+    const exports = exports_c.normal.object;
+
+    const gkey = std.fmt.allocPrint(arena, "%coreesm:{s}%", .{name}) catch return error.OutOfMemory;
+    if (self.globals) |g| if (g.lookup("%GlobalThis%")) |gb| if (gb.value == .object) {
+        try gb.value.object.defineData(gkey, exports_c.normal, true, false, true);
+    };
+
+    var src: std.ArrayListUnmanaged(u8) = .empty;
+    src.appendSlice(arena, "const __m = globalThis[\"") catch return error.OutOfMemory;
+    src.appendSlice(arena, gkey) catch return error.OutOfMemory;
+    src.appendSlice(arena, "\"];\nexport default __m;\n") catch return error.OutOfMemory;
+    var it = exports.properties.iterator();
+    while (it.next()) |e| {
+        const k = e.key_ptr.*;
+        if (!isIdentifier(k) or std.mem.eql(u8, k, "default")) continue;
+        src.appendSlice(arena, "export const ") catch return error.OutOfMemory;
+        src.appendSlice(arena, k) catch return error.OutOfMemory;
+        src.appendSlice(arena, " = __m.") catch return error.OutOfMemory;
+        src.appendSlice(arena, k) catch return error.OutOfMemory;
+        src.appendSlice(arena, ";\n") catch return error.OutOfMemory;
+    }
+    const key = std.fmt.allocPrint(arena, "coreesm:{s}", .{name}) catch return error.OutOfMemory;
+    return .{ .key = key, .source = src.items };
+}
+
+/// Is `s` a valid JS identifier (ASCII-subset: starts with letter/_/$, then alnum/_/$)?
+fn isIdentifier(s: []const u8) bool {
+    if (s.len == 0) return false;
+    const c0 = s[0];
+    if (!(std.ascii.isAlphabetic(c0) or c0 == '_' or c0 == '$')) return false;
+    for (s[1..]) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '$')) return false;
+    return true;
+}
+
+/// Parse + recursively load an ES module graph rooted at `root_key`/`root_source` (mirrors the engine's
+/// loadGraph), caching each record by resolved key so a diamond/cycle is shared + terminates.
+fn loadModuleGraph(
+    self: *Interpreter,
+    loader: module_mod.ModuleLoader,
+    cache: *std.StringHashMapUnmanaged(*module_mod.ModuleRecord),
+    root_key: []const u8,
+    root_source: []const u8,
+) error{ OutOfMemory, SyntaxError }!*module_mod.ModuleRecord {
+    const arena = self.arena;
+    if (cache.get(root_key)) |m| return m;
+    const program = Parser.parseModule(arena, root_source) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.SyntaxError,
+    };
+    const rec = arena.create(module_mod.ModuleRecord) catch return error.OutOfMemory;
+    rec.* = .{ .key = root_key, .program = program };
+    cache.put(arena, root_key, rec) catch return error.OutOfMemory;
+    var deps: std.ArrayListUnmanaged(*module_mod.ModuleRecord) = .empty;
+    for (program.requested_modules) |spec| {
+        const resolved = loader.resolve(loader.ctx, root_key, spec) orelse return error.SyntaxError;
+        const dep = try loadModuleGraph(self, loader, cache, resolved.key, resolved.source);
+        deps.append(arena, dep) catch return error.OutOfMemory;
+    }
+    rec.deps = deps.items;
+    return rec;
 }
 
 /// Run the engine's `JSON.parse(text)` on `content`. Returns the parsed Value completion (or an abrupt
@@ -296,7 +564,7 @@ pub fn installEntryRequire(self: *Interpreter, script_path: []const u8, script_d
 //  core module registry: path / fs / os
 // ════════════════════════════════════════════════════════════════════════════
 
-const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test", "timers", "timers/promises", "vm", "net" };
+const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test", "timers", "timers/promises", "vm", "net", "crypto" };
 
 /// Strip a `node:` prefix (Node accepts `node:path` etc.).
 fn coreName(spec: []const u8) []const u8 {
@@ -372,6 +640,8 @@ fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
     if (std.mem.eql(u8, name, "vm")) return @import("host_vm.zig").build(self);
     // HOST (spec 107): `require('net')` / `require('node:net')` → TCP Socket/Server backed by libxev.
     if (std.mem.eql(u8, name, "net")) return @import("host_net.zig").build(self);
+    // HOST (spec 108): `require('crypto')` → minimal randomness surface (randomBytes/UUID/getRandomValues).
+    if (std.mem.eql(u8, name, "crypto")) return @import("host_crypto.zig").build(self);
     const obj = try Object.create(arena, self.objectProto());
     if (std.mem.eql(u8, name, "fs")) {
         for ([_][]const u8{ "readFileSync", "existsSync", "writeFileSync", "statSync", "readdirSync", "mkdirSync" }) |m|

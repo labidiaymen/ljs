@@ -104,6 +104,23 @@ fn stateObj(self: *Interpreter) ?*Object {
     return null;
 }
 
+/// Print a line of TAP output to the host stdout (best-effort; no-op off the host path).
+fn tap(self: *Interpreter, text: []const u8) void {
+    const w = self.host_out orelse return;
+    w.writeAll(text) catch return;
+    w.writeAll("\n") catch return;
+    w.flush() catch return;
+}
+
+/// Report a finished test as a TAP line: `ok N - name` / `not ok N - name` (N = the running total).
+fn reportTest(self: *Interpreter, name: []const u8, ok: bool) void {
+    const obj = stateObj(self) orelse return;
+    const n: u64 = @intFromFloat(@max(readCount(obj, TOTAL_KEY), 0));
+    const label = if (name.len > 0) name else "(anonymous)";
+    const line = std.fmt.allocPrint(self.arena, "{s} {d} - {s}", .{ if (ok) "ok" else "not ok", n, label }) catch return;
+    tap(self, line);
+}
+
 fn readCount(obj: *Object, key: []const u8) f64 {
     if (obj.get(key)) |v| if (v == .number) return v.number;
     return 0;
@@ -212,11 +229,15 @@ fn runTest(self: *Interpreter, args: []const Value, mode: Mode) EvalError!Comple
     const c = try self.callFunction(fn_obj, &.{.{ .object = t }}, .undefined);
     if (c == .throw) {
         try bumpFailed(self);
+        reportTest(self, p.name, false);
         return .{ .normal = .undefined }; // SWALLOW: a failing test does not abort the file
     }
-    // An async body: await its settlement so a rejection is recorded as a failure.
+    // An async body: await its settlement so a rejection is recorded as a failure (the per-test TAP
+    // line for async tests is omitted — only the end-of-run summary reflects them).
     if (c.normal == .object and c.normal.object.promise != null) {
         try awaitResult(self, c.normal.object);
+    } else {
+        reportTest(self, p.name, true);
     }
     return .{ .normal = .undefined };
 }
@@ -351,7 +372,14 @@ fn ensureExitHook(self: *Interpreter) EvalError!void {
 /// event has already fired, so it is not re-emitted).
 fn exitHandler(self: *Interpreter) EvalError!Completion {
     const obj = stateObj(self) orelse return .{ .normal = .undefined };
-    if (readCount(obj, FAILED_KEY) <= 0) return .{ .normal = .undefined };
+    // End-of-run TAP summary: the plan line + pass/fail tallies.
+    const total: u64 = @intFromFloat(@max(readCount(obj, TOTAL_KEY), 0));
+    const failed: u64 = @intFromFloat(@max(readCount(obj, FAILED_KEY), 0));
+    if (total > 0) {
+        const summary = std.fmt.allocPrint(self.arena, "1..{d}\n# tests {d}\n# pass {d}\n# fail {d}", .{ total, total, total - failed, failed }) catch return .{ .normal = .undefined };
+        tap(self, summary);
+    }
+    if (failed == 0) return .{ .normal = .undefined };
 
     // Drive `process.exit(1)`.
     const process = self.process_obj orelse return .{ .normal = .undefined };

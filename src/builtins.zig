@@ -1080,6 +1080,7 @@ pub fn setup(arena: std.mem.Allocator, env: *Environment) std.mem.Allocator.Erro
     const global_fns = [_][]const u8{
         "isNaN",     "isFinite",           "parseInt",  "parseFloat",
         "encodeURI", "encodeURIComponent", "decodeURI", "decodeURIComponent",
+        "escape", "unescape", // §B.2.1 Annex B legacy URI handlers
     };
     for (global_fns) |gf| {
         const fn_obj = try Object.createNative(arena, .global_fn, gf);
