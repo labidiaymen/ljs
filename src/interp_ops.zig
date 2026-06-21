@@ -395,6 +395,11 @@ pub fn instanceofOperator(self: *Interpreter, v: Value, target: Value) EvalError
 /// (ToPrimitive default, concat if either is a String); the rest are purely numeric.
 pub fn applyNumericOrStringOp(self: *Interpreter, op: ast.BinaryOp, l: Value, r: Value) EvalError!Completion {
     if (op == .add) {
+        // Fast paths (no observable difference): ToPrimitive is identity on a primitive, so two numbers
+        // are a pure numeric add and two strings are a pure concat — skip the Completion-wrapped
+        // ToPrimitive/ToString machinery that dominates hot arithmetic / string-building loops.
+        if (l == .number and r == .number) return .{ .normal = .{ .number = l.number + r.number } };
+        if (l == .string and r == .string) return .{ .normal = .{ .string = try std.mem.concat(self.arena, u8, &.{ l.string, r.string }) } };
         // §13.15.3: ToPrimitive(default) both operands (left then right), then concat if either is a
         // String, else numeric. An object's @@toPrimitive/valueOf/toString runs here.
         const lpc = try self.toPrimitive(l, .default);
@@ -420,18 +425,25 @@ pub fn applyNumericOrStringOp(self: *Interpreter, op: ast.BinaryOp, l: Value, r:
 /// `+`): ToNumber (via ToPrimitive number-hint) both operands left-to-right, then the IEEE-754 /
 /// Int32 / UInt32 operation. A Symbol operand → TypeError (raised by `toNumberV`).
 pub fn numericBinary(self: *Interpreter, l: Value, r: Value, op: ast.BinaryOp) EvalError!Completion {
-    // §13.15.3 / §7.1.3 ToNumeric: process the operands STRICTLY in order — ToNumeric(lhs) fully
-    // (ToPrimitive + the Symbol→TypeError check) BEFORE ToNumeric(rhs) begins, so the side-effect
-    // ordering matches the spec (a Symbol lhs throws before rhs's valueOf runs). A BigInt primitive
-    // is left as-is for the operator step (which enforces the no-mixing TypeError).
-    const lpc = try self.toPrimitive(l, .number);
-    if (lpc.isAbrupt()) return lpc;
-    const lp = lpc.normal;
-    if (lp == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a number");
-    const rpc = try self.toPrimitive(r, .number);
-    if (rpc.isAbrupt()) return rpc;
-    const rp = rpc.normal;
-    if (rp == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a number");
+    // Fast path: two numbers — ToPrimitive(.number) is identity on a number and neither is a
+    // Symbol/BigInt, so this is exactly the numeric branch below with no Completion machinery (the
+    // hot path for `*`/`-`/`%`/bit-ops in loops).
+    var lp: Value = l;
+    var rp: Value = r;
+    if (!(l == .number and r == .number)) {
+        // §13.15.3 / §7.1.3 ToNumeric: process the operands STRICTLY in order — ToNumeric(lhs) fully
+        // (ToPrimitive + the Symbol→TypeError check) BEFORE ToNumeric(rhs) begins, so the side-effect
+        // ordering matches the spec (a Symbol lhs throws before rhs's valueOf runs). A BigInt primitive
+        // is left as-is for the operator step (which enforces the no-mixing TypeError).
+        const lpc = try self.toPrimitive(l, .number);
+        if (lpc.isAbrupt()) return lpc;
+        lp = lpc.normal;
+        if (lp == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a number");
+        const rpc = try self.toPrimitive(r, .number);
+        if (rpc.isAbrupt()) return rpc;
+        rp = rpc.normal;
+        if (rp == .symbol) return self.throwError("TypeError", "Cannot convert a Symbol value to a number");
+    }
     if (lp == .bigint or rp == .bigint) return bigintBinary(self, lp, rp, op);
     const a = toNumber(lp);
     const b = toNumber(rp);
@@ -504,6 +516,9 @@ pub fn bigintError(self: *Interpreter, e: bigint.Error) EvalError!Completion {
 /// §7.2.13 IsLessThan / §13.10 relational comparison with object coercion: ToPrimitive(number) each
 /// operand (left first), then the pure comparison (string-vs-string is lexical, else numeric).
 pub fn relationalV(self: *Interpreter, l: Value, r: Value, op: ops.RelOp) EvalError!Completion {
+    // Fast path: two numbers — ToPrimitive is identity, so this is the numeric comparison directly
+    // (the hot path for loop conditions like `i < n`).
+    if (l == .number and r == .number) return .{ .normal = .{ .boolean = relational(l, r, op) } };
     // §13.10.1: in `a < b` LeftFirst, ToPrimitive(a) THEN ToPrimitive(b). (`numToPrimNumber`
     // is a no-op on primitives, so the common number/string case keeps its fast path.)
     const lpc = try self.toPrimitive(l, .number);
