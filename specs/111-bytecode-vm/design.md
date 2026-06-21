@@ -1,6 +1,19 @@
 # Design — ljs bytecode VM (the "Ignition" tier): replace tree-walk on the hot path
 
-Status: **Design proposal** (not yet scheduled) · Owner: Aymen
+Status: **In progress** — Phase 0 core landed (isolated + tested); integration next · Owner: Aymen
+
+## Progress log
+- **Phase 0a (done):** the VM core, isolated + unit-tested, NOT yet wired into the engine (zero impact
+  on behavior/bench/conformance by construction). `src/bytecode.zig` (Chunk + Op set), `src/vm.zig`
+  (the `while/switch` dispatch loop — delegates every operator/property/call to the existing runtime
+  helpers), `src/compiler.zig` (AST→bytecode for the Phase 0 subset + 4 end-to-end tests that parse →
+  compile → run on the VM and check results: arithmetic, while-loop sum `f(100)=4950`, for+if+compound
+  `=20`, conditional+logical). Slots = locals (no hashmap walks). `compile()` returns null (→ tree-walk)
+  for anything outside the subset.
+- **Phase 0b (next):** wire into `interp_expr.callFunction` behind `LJS_VM` (compile a simple function
+  lazily on first call, cache the `*Chunk`, run on the VM; else tree-walk). Then run the FULL Test262
+  with `LJS_VM=1` as a differential check (must hold 95.1%), and a microbench (VM vs tree-walk on a
+  compute loop) to confirm the speedup. Add `++`/`--` (a value-discarding `inc_slot`/`dec_slot`).
 
 ## 1. Problem & goal
 ljs evaluates the AST directly (tree-walk): every operation is a recursive Zig call returning a

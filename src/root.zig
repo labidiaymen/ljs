@@ -36,6 +36,9 @@ test {
     _ = @import("builtin_array.zig");
     _ = @import("builtin_string.zig");
     _ = @import("ast.zig");
+    _ = @import("bytecode.zig");
+    _ = @import("vm.zig");
+    _ = @import("compiler.zig");
     _ = @import("unicode_id.zig");
     _ = @import("lexer.zig");
     _ = @import("parser.zig");
