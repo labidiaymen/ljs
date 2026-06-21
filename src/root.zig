@@ -39,6 +39,7 @@ test {
     _ = @import("bytecode.zig");
     _ = @import("vm.zig");
     _ = @import("compiler.zig");
+    _ = @import("jit_x64.zig");
     _ = @import("unicode_id.zig");
     _ = @import("lexer.zig");
     _ = @import("parser.zig");
