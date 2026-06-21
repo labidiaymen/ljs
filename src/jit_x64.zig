@@ -205,6 +205,29 @@ pub const Emitter = struct {
         try self.byte(0x31);
         try self.modrmReg(src, dst);
     }
+    // ── 32-bit shifts by an immediate count (C1 /r ib). The JIT only uses these for constant-count
+    //    shifts, which sidesteps the CL-register constraint of variable shifts. ──
+    /// dst <<= imm  (shl r/m32, imm8 — C1 /4).
+    pub fn shlImm32(self: *Emitter, dst: Reg, imm: u8) std.mem.Allocator.Error!void {
+        if (dst.ext()) try self.byte(0x41);
+        try self.byte(0xC1);
+        try self.byte(0xE0 | @as(u8, dst.low())); // /4 = shl
+        try self.byte(imm);
+    }
+    /// dst >>= imm, arithmetic / sign-propagating  (sar r/m32, imm8 — C1 /7). JS `>>`.
+    pub fn sarImm32(self: *Emitter, dst: Reg, imm: u8) std.mem.Allocator.Error!void {
+        if (dst.ext()) try self.byte(0x41);
+        try self.byte(0xC1);
+        try self.byte(0xF8 | @as(u8, dst.low())); // /7 = sar
+        try self.byte(imm);
+    }
+    /// dst >>>= imm, logical / zero-fill  (shr r/m32, imm8 — C1 /5). JS `>>>` (result is uint32).
+    pub fn shrImm32(self: *Emitter, dst: Reg, imm: u8) std.mem.Allocator.Error!void {
+        if (dst.ext()) try self.byte(0x41);
+        try self.byte(0xC1);
+        try self.byte(0xE8 | @as(u8, dst.low())); // /5 = shr
+        try self.byte(imm);
+    }
     /// dst = -dst  (neg r/m32 — F7 /3). Sets OF if dst == i32_min (the JIT deopts on that).
     pub fn neg32(self: *Emitter, dst: Reg) std.mem.Allocator.Error!void {
         if (dst.ext()) try self.byte(0x41);

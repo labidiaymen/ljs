@@ -23,7 +23,12 @@
 - [x] Bitwise `& | ^` (clean i32, no guard) — native `and32`/`or32`/`xor32`
 - [x] Unary `-` (neg, with -0 + i32_min overflow deopt) and `+` (identity no-op)
 - [x] Unit tests + in-engine JIT-vs-tree-walk parity (bitops/hash/neg); differential `LJS_JIT=1` 0 regressions
-- [ ] Deferred: `~` (needs compiler+VM `bit_not` support), shifts `<< >> >>>` (CL register), `div`/`mod`
+- [ ] Deferred: `~` (needs compiler+VM `bit_not` support), `div`/`mod`
+
+## Tier 1.6 — constant-count shifts (this cycle)
+- [x] `<< >> >>>` by a constant via the immediate shift form (`shlImm32`/`sarImm32`/`shrImm32`) — no CL
+- [x] Peephole `<a>, load_const C, shift` → shift a by `C & 31`; `>>` arithmetic, `>>>` logical + deopt if result ≥ 2^31
+- [x] Variable-count shifts bail (would need CL); unit tests + in-engine parity (fnv/pack/`>>>`) + differential 0 regressions
 
 ## Tiers 2–4 — roadmap (own specs)
 - [ ] Tier 2: SSE2 f64 + int↔float + `Math.*`

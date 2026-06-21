@@ -132,9 +132,38 @@ pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16
         switch (op) {
             .load_const => {
                 const k = readU16(code, ip);
-                ip += 2;
                 const v = consts[k];
                 const iv = asSmi(v) orelse return null;
+                // Peephole: `<a>, load_const C, (shl|shr|shr_un)` → shift a by (C & 31) using the
+                // immediate form (no count register, so no CL juggling). `>>` is arithmetic (sar),
+                // `>>>` is logical (shr) and deopts if the uint32 result exceeds the i32 SMI window.
+                if (sp >= 1 and ip + 2 < code.len) {
+                    const nxt: Op = @enumFromInt(code[ip + 2]);
+                    const dst = stack_regs[@intCast(sp - 1)];
+                    const amt: u8 = @intCast(iv & 31);
+                    switch (nxt) {
+                        .shl => {
+                            e.shlImm32(dst, amt) catch return null;
+                            ip += 3;
+                            continue;
+                        },
+                        .shr => {
+                            e.sarImm32(dst, amt) catch return null;
+                            ip += 3;
+                            continue;
+                        },
+                        .shr_un => {
+                            e.shrImm32(dst, amt) catch return null;
+                            // uint32 result with bit 31 set is ≥ 2^31 → not an SMI → deopt.
+                            e.cmpImm32(dst, 0) catch return null;
+                            deopts.append(arena, e.jcc(.l) catch return null) catch return null;
+                            ip += 3;
+                            continue;
+                        },
+                        else => {},
+                    }
+                }
+                ip += 2;
                 if (sp >= stack_regs.len) return null;
                 e.movImm32(stack_regs[@intCast(sp)], @intCast(iv)) catch return null;
                 sp += 1;
@@ -429,6 +458,22 @@ test "jit: bitwise + unary" {
     try std.testing.expectEqual(@as(u8, 1), runJit(m, &.{0}).deopt); // -0 → deopt
     const p = try jitOf(a, "function f(a){ return +a + 1; }");
     try std.testing.expectEqual(@as(i64, 6), runJit(p, &.{5}).result);
+}
+
+test "jit: constant shifts" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var ai = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ai.deinit();
+    const a = ai.allocator();
+    try std.testing.expectEqual(@as(i64, 20), runJit(try jitOf(a, "function f(a){ return a << 2; }"), &.{5}).result);
+    try std.testing.expectEqual(@as(i64, -4), runJit(try jitOf(a, "function f(a){ return a >> 1; }"), &.{-8}).result); // arithmetic
+    try std.testing.expectEqual(@as(i64, 4), runJit(try jitOf(a, "function f(a){ return a >>> 1; }"), &.{8}).result); // logical
+    // -1 >>> 0 = 4294967295 > i32 max → must deopt; 5 >>> 0 = 5 (no deopt).
+    const u = try jitOf(a, "function f(a){ return a >>> 0; }");
+    try std.testing.expectEqual(@as(u8, 1), runJit(u, &.{-1}).deopt);
+    try std.testing.expectEqual(@as(i64, 5), runJit(u, &.{5}).result);
+    // variable-count shift is not JIT-able (would need CL) → bails to tree-walk.
+    try std.testing.expectError(error.NotJitable, jitOf(a, "function f(a, b){ return a << b; }"));
 }
 
 test "jit: non-integer subset is rejected" {
