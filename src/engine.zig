@@ -415,7 +415,9 @@ pub fn runHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, ctx:
     builtins.setup(arena, global) catch return error.OutOfMemory;
     var gen_registry: std.ArrayListUnmanaged(*@import("object.zig").Generator) = .empty;
     var job_queue: std.ArrayListUnmanaged(@import("object.zig").Job) = .empty;
-    var interp = Interpreter{ .arena = arena, .step_limit = default_step_limit, .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
+    // HOST CLI path: real programs run UNBOUNDED (like Node). The step limit is a Test262-determinism
+    // guard (no hangs in the conformance harness); a `ljs run` of a real program must not hit it.
+    var interp = Interpreter{ .arena = arena, .step_limit = std.math.maxInt(u64), .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
     interp.host_out = out;
     interp.host_err = err;
     interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
@@ -488,7 +490,9 @@ pub fn evalHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, ctx
     builtins.setup(arena, global) catch return error.OutOfMemory;
     var gen_registry: std.ArrayListUnmanaged(*@import("object.zig").Generator) = .empty;
     var job_queue: std.ArrayListUnmanaged(@import("object.zig").Job) = .empty;
-    var interp = Interpreter{ .arena = arena, .step_limit = default_step_limit, .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
+    // HOST CLI path: real programs run UNBOUNDED (like Node). The step limit is a Test262-determinism
+    // guard (no hangs in the conformance harness); a `ljs run` of a real program must not hit it.
+    var interp = Interpreter{ .arena = arena, .step_limit = std.math.maxInt(u64), .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
     interp.host_out = out;
     interp.host_err = err;
     interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
