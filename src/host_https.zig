@@ -12,14 +12,17 @@ const Completion = @import("completion.zig").Completion;
 const host_require = @import("host_require.zig");
 const emitEvent = @import("host_process.zig").emitEvent;
 
+pub const Header = struct { name: []const u8, value: []const u8 };
 pub const HttpsResult = struct {
     status: u16,
+    reason: []const u8 = "",
     body: []const u8,
-    content_type: []const u8 = "",
+    headers: []const Header = &.{},
 };
 
-/// One-shot blocking HTTPS request via `std.http.Client`. Returns the status + body (arena-owned), or
-/// an error string. `method` is an uppercase HTTP method; `headers` are `name`/`value` pairs.
+/// One-shot blocking HTTPS request via `std.http.Client` (bundles TLS + redirects). Uses the lower-level
+/// `request`/`receiveHead` path (not `fetch`) so the response status line, reason, and HEADERS are
+/// captured — node-fetch/axios read `content-type`/`content-length`/etc. All slices are arena-owned.
 pub fn fetchBlocking(
     self: *Interpreter,
     method_str: []const u8,
@@ -30,20 +33,47 @@ pub fn fetchBlocking(
     const arena = self.arena;
     var client: std.http.Client = .{ .allocator = arena, .io = self.io };
     defer client.deinit();
-    // Load the system trust store so the TLS handshake can verify the server certificate.
     // Without the system trust store the TLS handshake can't verify the server cert → fail the request.
     client.ca_bundle.rescan(arena, self.io, std.Io.Clock.now(.real, self.io)) catch return null;
 
-    var body: std.Io.Writer.Allocating = .init(arena);
-    const m: std.http.Method = methodOf(method_str);
-    const res = client.fetch(.{
-        .location = .{ .url = url },
-        .method = m,
-        .payload = payload,
-        .response_writer = &body.writer,
+    const uri = std.Uri.parse(url) catch return null;
+    // Force `Accept-Encoding: identity` so the body streams without a decompressor (keeps this simple
+    // and avoids a struct out-param). Transparent gzip is a follow-up if a server ignores this.
+    var req = client.request(methodOf(method_str), uri, .{
         .extra_headers = extra_headers,
+        .headers = .{ .accept_encoding = .{ .override = "identity" } },
     }) catch return null;
-    return .{ .status = @intFromEnum(res.status), .body = body.written() };
+    defer req.deinit();
+
+    if (payload) |p| {
+        req.transfer_encoding = .{ .content_length = p.len };
+        var bw = req.sendBodyUnflushed(&.{}) catch return null;
+        bw.writer.writeAll(p) catch return null;
+        bw.end() catch return null;
+        (req.connection orelse return null).flush() catch return null;
+    } else {
+        req.sendBodiless() catch return null;
+    }
+
+    const redirect_buffer = arena.alloc(u8, 8 * 1024) catch return null;
+    var response = req.receiveHead(redirect_buffer) catch return null;
+
+    // Capture response headers (arena-dupe — the head buffer is reused once we read the body).
+    var hdrs: std.ArrayList(Header) = .empty;
+    var it = response.head.iterateHeaders();
+    while (it.next()) |h| {
+        const n = arena.dupe(u8, h.name) catch return null;
+        const v = arena.dupe(u8, h.value) catch return null;
+        hdrs.append(arena, .{ .name = n, .value = v }) catch return null;
+    }
+    const reason = arena.dupe(u8, response.head.reason) catch return null;
+
+    // Read the body (identity-encoded — see the Accept-Encoding override above).
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const reader = response.reader(&.{});
+    _ = reader.streamRemaining(&out.writer) catch return null;
+
+    return .{ .status = @intFromEnum(response.head.status), .reason = reason, .body = out.written(), .headers = hdrs.items };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -224,8 +254,14 @@ fn httpsEnd(self: *Interpreter, this_val: Value) EvalError!Completion {
     };
     const res = try newEmitter(self);
     try res.defineData("statusCode", .{ .number = @floatFromInt(r.status) }, true, true, true);
-    try res.defineData("statusMessage", .{ .string = "" }, true, true, true);
-    try res.defineData("headers", .{ .object = try Object.create(self.arena, self.objectProto()) }, true, true, true);
+    try res.defineData("statusMessage", .{ .string = r.reason }, true, true, true);
+    // res.headers — Node lower-cases header names and joins duplicates; this is the common-case shape.
+    const headers_obj = try Object.create(self.arena, self.objectProto());
+    for (r.headers) |h| {
+        const lower = try std.ascii.allocLowerString(self.arena, h.name);
+        try headers_obj.defineData(lower, .{ .string = h.value }, true, true, true);
+    }
+    try res.defineData("headers", .{ .object = headers_obj }, true, true, true);
     try res.defineData("setEncoding", .{ .object = try fn_(self, "setEncoding") }, true, false, true);
     // emit 'response' (the handler registers res.on('data')/on('end')), then deliver the body.
     _ = try emitEvent(self, .{ .object = req }, "response", &.{.{ .object = res }});
