@@ -482,7 +482,23 @@ pub const Parser = struct {
                 const expr_start = i;
                 var depth: usize = 1;
                 while (i < raw.len and depth > 0) {
-                    if (raw[i] == '{') depth += 1 else if (raw[i] == '}') {
+                    const ch = raw[i];
+                    // Skip string / template literals so braces INSIDE them aren't counted (e.g.
+                    // `${'(\\d{1,'}` in regex-building code — semver et al.). A naive `{`/`}` count
+                    // mismatches on an unbalanced brace inside a string.
+                    if (ch == '\'' or ch == '"' or ch == '`') {
+                        i += 1;
+                        while (i < raw.len) : (i += 1) {
+                            if (raw[i] == '\\') {
+                                i += 1; // skip the escaped char
+                                continue;
+                            }
+                            if (raw[i] == ch) break;
+                        }
+                        i += 1; // past the closing quote
+                        continue;
+                    }
+                    if (ch == '{') depth += 1 else if (ch == '}') {
                         depth -= 1;
                         if (depth == 0) break;
                     }
