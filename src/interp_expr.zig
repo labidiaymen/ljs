@@ -1498,6 +1498,87 @@ fn jitFnFor(self: *Interpreter, fd: object_mod.FunctionData) EvalError!?interpre
     return entry;
 }
 
+// PERF (spec 122): does a [[Call]] of this function need an `arguments` exotic? True iff the body (or a
+// default-param initializer) references `arguments`, contains a direct `eval` (could reference it
+// dynamically), or a `with` (dynamic name resolution). Descends ARROWS (they inherit `arguments`) but
+// NOT nested non-arrow functions / classes (those bind their own). Conservative: returns true on any
+// unhandled node, so a false "not needed" never happens (correctness over the optimization).
+fn argsExprUses(n: *const ast.Node) bool {
+    return switch (n.*) {
+        .identifier => |s| std.mem.eql(u8, s, "arguments"),
+        .number, .bigint, .string, .boolean, .null, .regex_literal, .this, .new_target, .elision, .super_member => false,
+        .function => |f| f.is_arrow and argsFnUses(f.params, f.body), // arrow inherits; ordinary fn shadows
+        .unary => |u| argsExprUses(u.operand),
+        .update => |u| argsExprUses(u.target),
+        .spread => |s| argsExprUses(s),
+        .await_expr => |a| argsExprUses(a),
+        .member => |m| argsExprUses(m.object),
+        .private_member => |m| argsExprUses(m.object),
+        .private_in => |m| argsExprUses(m.object),
+        .comma => |b| argsExprUses(b.left) or argsExprUses(b.right),
+        .binary => |b| argsExprUses(b.left) or argsExprUses(b.right),
+        .logical => |b| argsExprUses(b.left) or argsExprUses(b.right),
+        .index => |b| argsExprUses(b.object) or argsExprUses(b.key),
+        .assign => |a| std.mem.eql(u8, a.name, "arguments") or argsExprUses(a.value),
+        .assign_member => |a| argsExprUses(a.object) or argsExprUses(a.value),
+        .assign_index => |a| argsExprUses(a.object) or argsExprUses(a.key) or argsExprUses(a.value),
+        .compound_assign => |a| argsExprUses(a.target) or argsExprUses(a.value),
+        .logical_assign => |a| argsExprUses(a.target) or argsExprUses(a.value),
+        .private_assign => |a| argsExprUses(a.object) or argsExprUses(a.value),
+        .conditional => |c| argsExprUses(c.cond) or argsExprUses(c.then) or argsExprUses(c.otherwise),
+        .call => |c| (c.callee.* == .identifier and std.mem.eql(u8, c.callee.identifier, "eval")) or argsExprUses(c.callee) or argsArgsUse(c.args),
+        .new_expr => |c| argsExprUses(c.callee) or argsArgsUse(c.args),
+        .super_call => |a| argsArgsUse(a),
+        .array_literal => |a| argsArgsUse(a),
+        .template => |t| argsArgsUse(t.exprs),
+        else => true, // object_literal/class_expr/tagged_template/import_call/yield/optional/… → conservative
+    };
+}
+fn argsArgsUse(args: []const *const ast.Node) bool {
+    for (args) |a| if (argsExprUses(a)) return true;
+    return false;
+}
+fn argsStmtUses(stmt: *const ast.Stmt) bool {
+    return switch (stmt.*) {
+        .break_stmt, .continue_stmt, .func_decl => false, // a nested fn-decl binds its OWN arguments
+        .expr => |e| argsExprUses(e),
+        .ret => |e| if (e) |n| argsExprUses(n) else false,
+        .throw_stmt => |e| argsExprUses(e),
+        .block => |b| for (b) |st| {
+            if (argsStmtUses(&st)) break true;
+        } else false,
+        .declaration => |d| for (d.decls) |dec| {
+            if (dec.init) |v| if (argsExprUses(v)) break true;
+        } else false,
+        .if_stmt => |s| argsExprUses(s.cond) or argsStmtUses(s.then) or (s.otherwise != null and argsStmtUses(s.otherwise.?)),
+        .while_stmt => |s| argsExprUses(s.cond) or argsStmtUses(s.body),
+        .do_while_stmt => |s| argsExprUses(s.cond) or argsStmtUses(s.body),
+        .for_stmt => |s| (s.init != null and argsStmtUses(s.init.?)) or (s.cond != null and argsExprUses(s.cond.?)) or (s.update != null and argsExprUses(s.update.?)) or argsStmtUses(s.body),
+        .labeled_stmt => |s| argsStmtUses(s.body),
+        else => true, // for-in/of, try, switch, with, class_decl → conservative
+    };
+}
+fn argsFnUses(params: []const ast.Param, body: []const ast.Stmt) bool {
+    for (params) |p| if (p.default) |d| if (argsExprUses(d)) return true;
+    for (body) |st| if (argsStmtUses(&st)) return true;
+    return false;
+}
+/// Cached per-function answer (mutates `FunctionData.arg_state` on first call).
+fn argFnNeedsArgs(func: *Object) bool {
+    if (func.call) |*fdp| {
+        switch (fdp.arg_state) {
+            .needed => return true,
+            .not_needed => return false,
+            .unknown => {
+                const need = argsFnUses(fdp.params, fdp.body);
+                fdp.arg_state = if (need) .needed else .not_needed;
+                return need;
+            },
+        }
+    }
+    return true;
+}
+
 pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
     // §13.3.12: consume the one-shot [[NewTarget]] hand-off from a preceding `construct` (else
     // `undefined`) and clear the slot immediately — so it cannot leak past this [[Call]] into a
@@ -1740,7 +1821,8 @@ pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this
     // `arguments.length` / `arguments[i]` — what propertyHelper.js's `verifyProperty` reads. Skipped
     // when a parameter (or the rest binding) already binds the name `arguments` (it shadows). Arrows
     // inherit the enclosing `arguments` lexically, so they get none of their own.
-    if (!fd.is_arrow and call_env.lookupLocal("arguments") == null) {
+    // PERF (spec 122): only materialize the `arguments` exotic if the body actually needs it (cached).
+    if (!fd.is_arrow and argFnNeedsArgs(func) and call_env.lookupLocal("arguments") == null) {
         const ao = try interp_native.makeArgumentsObject(self, args, func, call_env, fd);
         try call_env.declare("arguments", .{ .object = ao }, true, true);
     }

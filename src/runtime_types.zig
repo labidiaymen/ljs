@@ -857,6 +857,12 @@ pub const FunctionData = struct {
     /// ReferenceError (strict) instead of creating a global property (sloppy). Class constructors are
     /// always strict (§15.7) — set true when synthesizing the constructor's FunctionData.
     strict: bool = false,
+    /// PERF (spec 122): lazily-cached answer to "does a [[Call]] of this function need an `arguments`
+    /// exotic object?" V8 only materializes `arguments` when the body references it; ljs used to build
+    /// one on EVERY non-arrow call (a per-call Object alloc — ~75% of call cost on `arguments`-free
+    /// functions). Computed once (scan the body for an `arguments` reference / direct `eval` / `with`,
+    /// descending arrows but not nested non-arrow functions) and cached here. `.unknown` until first call.
+    arg_state: enum { unknown, needed, not_needed } = .unknown,
     /// HOST/V8 stack traces (spec 119): the source text + filename in which this function was DEFINED,
     /// stamped at creation from the running module's source. Used to map a frame's byte `cur_pos` to
     /// `file:line:col`. Empty for engine-synthesized functions (default ctors) and natives.
