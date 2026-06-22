@@ -10,6 +10,27 @@ const parse_class = @import("parse_class.zig");
 
 pub const ParseError = error{ UnexpectedToken, UnexpectedEof } || lex.LexError;
 
+/// DIAGNOSTICS: the lexeme of the token the parser was at when it last failed. Captured in
+/// `parseProgram`'s error unwind (single site — `self.idx` points at the offending token). The lexeme
+/// is a slice INTO the original source, so the engine derives the byte offset (and thus line:col) from
+/// its pointer. Process-global is fine (parsing is single-threaded; read only right after a failed parse).
+pub var last_error_lexeme: []const u8 = "";
+
+/// 1-based line/column for `pos` in `src` (for SyntaxError messages).
+pub fn lineColOf(src: []const u8, pos: usize) struct { line: usize, col: usize } {
+    var line: usize = 1;
+    var col: usize = 1;
+    const end = @min(pos, src.len);
+    var i: usize = 0;
+    while (i < end) : (i += 1) {
+        if (src[i] == '\n') {
+            line += 1;
+            col = 1;
+        } else col += 1;
+    }
+    return .{ .line = line, .col = col };
+}
+
 // ── Aliases for early-error / scope-validation helpers extracted to parse_validate.zig.
 // Keeps every retained call site (`isEvalOrArguments(…)`, `validateScope(…)`, …) unchanged.
 const isEvalOrArguments = parse_validate.isEvalOrArguments;
@@ -966,6 +987,16 @@ pub const Parser = struct {
     // ── statements ──────────────────────────────────────────────────────────
 
     pub fn parseProgram(self: *Parser) ParseError!ast.Program {
+        // DIAGNOSTICS: on any parse failure, `self.idx` is at the offending token — record its position
+        // + lexeme for the engine's `line:col` SyntaxError message.
+        errdefer {
+            if (self.idx < self.tokens.len)
+                last_error_lexeme = self.tokens[self.idx].lexeme
+            else if (self.tokens.len > 0)
+                last_error_lexeme = self.tokens[self.tokens.len - 1].lexeme
+            else
+                last_error_lexeme = "";
+        }
         // §11.2.1 / §15.1.1: a Script is strict if it carries a "use strict" directive prologue.
         // Detect it on the token stream before parsing statements so the §13.x Early Errors below
         // fire for the whole Script. (`self.strict` may already be true from a strict `RunMode`.)
@@ -1419,7 +1450,10 @@ pub const Parser = struct {
                 _ = self.advance();
                 var arg: ?*const ast.Node = null;
                 const k = self.peek().kind;
-                if (k != .semicolon and k != .rbrace and k != .eof) arg = try self.parseAssignment();
+                // §12.9.1: `return [no LineTerminator here] Expression` — a LineTerminator before the next
+                // token forces ASI (`return;`). Without the `newline_before` check, `if (a) return\n
+                // if (b) …` mis-parses the following line as the return argument.
+                if (k != .semicolon and k != .rbrace and k != .eof and !self.peek().newline_before) arg = try self.parseAssignment();
                 if (self.peek().kind == .semicolon) _ = self.advance();
                 return .{ .ret = arg };
             },

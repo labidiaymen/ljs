@@ -3,6 +3,21 @@
 const std = @import("std");
 const Value = @import("value.zig").Value;
 const Parser = @import("parser.zig").Parser;
+const parser_mod = @import("parser.zig");
+
+/// Build a `line:col` SyntaxError message from the parser's last-failure position (set in
+/// `parseProgram`'s error unwind). Falls back to the bare error name if formatting fails.
+fn syntaxMsg(arena: std.mem.Allocator, src: []const u8, e: anyerror) []const u8 {
+    const lx = parser_mod.last_error_lexeme;
+    // Only use the lexeme if it is provably a slice fully WITHIN `src` (for escaped-identifier / EOF
+    // tokens the lexeme can be a decoded/arena value that doesn't point into the source — reading it as
+    // a source slice would be unsafe). Otherwise fall back to the bare error name.
+    const base = @intFromPtr(src.ptr);
+    const lp = @intFromPtr(lx.ptr);
+    if (lx.len == 0 or src.len == 0 or lp < base or lp + lx.len > base + src.len) return @errorName(e);
+    const lc = parser_mod.lineColOf(src, lp - base);
+    return std.fmt.allocPrint(arena, "{s} near '{s}' (line {d}:{d})", .{ @errorName(e), lx, lc.line, lc.col }) catch @errorName(e);
+}
 const Interpreter = @import("interpreter.zig").Interpreter;
 const Environment = @import("environment.zig").Environment;
 const builtins = @import("builtins.zig");
@@ -56,7 +71,7 @@ pub fn evaluateAsyncTestL(arena: std.mem.Allocator, source: []const u8, mode: Ru
     const obj_mod = @import("object.zig");
     const program = Parser.parseMode(arena, source, mode == .strict) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .syntax_error = @errorName(e) },
+        else => return .{ .syntax_error = syntaxMsg(arena, source, e) },
     };
     const global = Environment.create(arena, null) catch return error.OutOfMemory;
     builtins.setup(arena, global) catch return error.OutOfMemory;
@@ -348,7 +363,7 @@ pub fn evaluateWithLimitL(arena: std.mem.Allocator, source: []const u8, mode: Ru
     // directive prologue is detected independently inside the parser.
     const program = Parser.parseMode(arena, source, mode == .strict) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .syntax_error = @errorName(e) },
+        else => return .{ .syntax_error = syntaxMsg(arena, source, e) },
     };
     const global = Environment.create(arena, null) catch return error.OutOfMemory;
     builtins.setup(arena, global) catch return error.OutOfMemory;
@@ -409,7 +424,7 @@ pub const HostCtx = host_setup.HostCtx;
 pub fn runHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, ctx: HostCtx, out: *std.Io.Writer, err: *std.Io.Writer) error{OutOfMemory}!EvaluationResult {
     const program = Parser.parseMode(arena, source, mode == .strict) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .syntax_error = @errorName(e) },
+        else => return .{ .syntax_error = syntaxMsg(arena, source, e) },
     };
     const global = Environment.create(arena, null) catch return error.OutOfMemory;
     builtins.setup(arena, global) catch return error.OutOfMemory;
@@ -537,7 +552,7 @@ pub fn runHostModule(arena: std.mem.Allocator, source: []const u8, ctx: HostCtx,
 pub fn evalHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, ctx: HostCtx, out: *std.Io.Writer, err: *std.Io.Writer) error{OutOfMemory}!EvaluationResult {
     const program = Parser.parseMode(arena, source, mode == .strict) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .syntax_error = @errorName(e) },
+        else => return .{ .syntax_error = syntaxMsg(arena, source, e) },
     };
     const global = Environment.create(arena, null) catch return error.OutOfMemory;
     builtins.setup(arena, global) catch return error.OutOfMemory;
