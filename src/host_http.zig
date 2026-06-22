@@ -308,9 +308,14 @@ pub fn method(self: *Interpreter, func: *Object, this_val: Value, args: []const 
 // ── handle registry (per-connection / per-response native state) ───────────────────
 
 fn registerHandle(self: *Interpreter, js: *Object, key: []const u8, ptr: *anyopaque) EvalError!void {
-    const id = self.next_io_id;
-    self.next_io_id += 1;
-    self.io_handles.put(self.arena, id, ptr) catch return error.OutOfMemory;
+    // Route to the ROOT (event-loop) interpreter: an http.request issued inside an async BODY thread
+    // must register its ClientState in the root's `io_handles` (keyed by the root's id counter), or the
+    // loop-thread connect/read callbacks — which run on the root — would look up a colliding id in the
+    // wrong per-interp map and dereference a wrong-typed pointer (segfault).
+    const root = self.hostLoop();
+    const id = root.next_io_id;
+    root.next_io_id += 1;
+    root.io_handles.put(root.arena, id, ptr) catch return error.OutOfMemory;
     try js.defineData(key, .{ .number = @floatFromInt(id) }, false, false, false);
 }
 
@@ -318,7 +323,7 @@ fn handlePtr(self: *Interpreter, js: *Object, key: []const u8) ?*anyopaque {
     const v = js.get(key) orelse return null;
     if (v != .number) return null;
     const id: u64 = @intFromFloat(v.number);
-    return self.io_handles.get(id);
+    return self.hostLoop().io_handles.get(id);
 }
 
 fn connStateOf(self: *Interpreter, js: *Object) ?*ConnState {

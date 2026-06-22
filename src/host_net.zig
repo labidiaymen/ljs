@@ -206,9 +206,12 @@ fn classifyIp(args: []const Value) u8 {
 // ── handle registry ──────────────────────────────────────────────────────────────
 
 fn registerHandle(self: *Interpreter, js: *Object, ptr: *anyopaque) EvalError!void {
-    const id = self.next_io_id;
-    self.next_io_id += 1;
-    self.io_handles.put(self.arena, id, ptr) catch return error.OutOfMemory;
+    // Route to the ROOT interpreter (see host_http.registerHandle): a socket opened inside an async
+    // body thread must register in the root's io_handles so the loop-thread callbacks resolve it.
+    const root = self.hostLoop();
+    const id = root.next_io_id;
+    root.next_io_id += 1;
+    root.io_handles.put(root.arena, id, ptr) catch return error.OutOfMemory;
     try js.defineData(IO_KEY, .{ .number = @floatFromInt(id) }, false, false, false);
 }
 
@@ -216,7 +219,7 @@ fn handlePtr(self: *Interpreter, js: *Object) ?*anyopaque {
     const v = js.get(IO_KEY) orelse return null;
     if (v != .number) return null;
     const id: u64 = @intFromFloat(v.number);
-    return self.io_handles.get(id);
+    return self.hostLoop().io_handles.get(id);
 }
 
 pub fn socketStateOf(self: *Interpreter, js: *Object) ?*SocketState {
@@ -242,7 +245,7 @@ pub fn writeRaw(self: *Interpreter, st: *SocketState, bytes: []const u8, end_aft
     const wc = self.arena.create(WriteCtx) catch return error.OutOfMemory;
     wc.* = .{ .state = st, .data = bytes, .cb = null, .end_after = end_after };
     const loop = try host_io.ensureLoop(self);
-    self.io_pending += 1;
+    self.hostLoop().io_pending += 1;
     st.tcp.write(loop, &wc.completion, .{ .slice = wc.data }, WriteCtx, wc, onWrite);
 }
 
@@ -261,7 +264,7 @@ fn newSocketObject(self: *Interpreter) EvalError!*SocketState {
     };
     const js = try Object.create(self.arena, proto);
     const st = self.arena.create(SocketState) catch return error.OutOfMemory;
-    st.* = .{ .interp = self, .js = js };
+    st.* = .{ .interp = self.hostLoop(), .js = js };
     try registerHandle(self, js, st);
     return st;
 }
@@ -271,7 +274,7 @@ fn newSocketObject(self: *Interpreter) EvalError!*SocketState {
 fn socketCtor(self: *Interpreter, this_val: Value) EvalError!Completion {
     if (self.native_new_target != .undefined and this_val == .object) {
         const st = self.arena.create(SocketState) catch return error.OutOfMemory;
-        st.* = .{ .interp = self, .js = this_val.object };
+        st.* = .{ .interp = self.hostLoop(), .js = this_val.object };
         try registerHandle(self, this_val.object, st);
         return .{ .normal = this_val };
     }
@@ -281,7 +284,7 @@ fn socketCtor(self: *Interpreter, this_val: Value) EvalError!Completion {
 fn serverCtor(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
     if (self.native_new_target != .undefined and this_val == .object) {
         const st = self.arena.create(ServerState) catch return error.OutOfMemory;
-        st.* = .{ .interp = self, .js = this_val.object };
+        st.* = .{ .interp = self.hostLoop(), .js = this_val.object };
         try registerHandle(self, this_val.object, st);
         try addConnectionListener(self, this_val.object, args);
         return .{ .normal = this_val };
@@ -370,15 +373,6 @@ fn connect(self: *Interpreter, args: []const Value) EvalError!Completion {
 }
 
 fn startConnect(self: *Interpreter, st: *SocketState, ca: ConnArgs) EvalError!void {
-    // libxev is single-threaded: a connect submitted from an async/generator BODY thread (which runs
-    // on its own OS thread, see interp_async.asyncBodyThread) is never serviced by the loop thread and
-    // would hang forever. Fail fast with a connect 'error' instead — the http client surfaces it as a
-    // rejected fetch()/request promise. (Lifting this needs cross-thread libxev submission marshaling —
-    // a future cycle; `fetch().then(...)` initiated on the main turn is the supported path today.)
-    if (self.host_timer_parent != null) {
-        emitSafe(self, st.js, "error", &.{try makeError(self, "ERR_ASYNC_SOCKET_IO", "socket I/O initiated inside an async function body is not yet supported (run the request on the main turn, e.g. fetch(...).then(...))")});
-        return;
-    }
     const addr = resolveAddr(ca.host, ca.port) orelse {
         emitSafe(self, st.js, "error", &.{try makeError(self, "ENOTFOUND", "getaddrinfo ENOTFOUND")});
         return;
@@ -392,7 +386,7 @@ fn startConnect(self: *Interpreter, st: *SocketState, ca: ConnArgs) EvalError!vo
     };
     st.has_tcp = true;
     st.peer = addr;
-    self.io_pending += 1;
+    self.hostLoop().io_pending += 1;
     st.tcp.connect(loop, &st.connect_c, addr, SocketState, st, onConnect);
 }
 
@@ -492,7 +486,7 @@ fn socketWrite(self: *Interpreter, st: *SocketState, args: []const Value, end_af
     const wc = self.arena.create(WriteCtx) catch return error.OutOfMemory;
     wc.* = .{ .state = st, .data = bytes, .cb = if (cb == .object) cb.object else null, .end_after = end_after };
     const loop = try host_io.ensureLoop(self);
-    self.io_pending += 1;
+    self.hostLoop().io_pending += 1;
     st.tcp.write(loop, &wc.completion, .{ .slice = wc.data }, WriteCtx, wc, onWrite);
     return .{ .normal = .{ .boolean = true } };
 }
@@ -627,7 +621,7 @@ fn createServer(self: *Interpreter, args: []const Value) EvalError!Completion {
     };
     const js = try Object.create(self.arena, proto);
     const st = self.arena.create(ServerState) catch return error.OutOfMemory;
-    st.* = .{ .interp = self, .js = js };
+    st.* = .{ .interp = self.hostLoop(), .js = js };
     try registerHandle(self, js, st);
     try addConnectionListener(self, js, args);
     return .{ .normal = .{ .object = js } };
@@ -683,7 +677,7 @@ fn startListen(self: *Interpreter, st: *ServerState, ca: ConnArgs) EvalError!voi
     };
     st.addr = addr;
     st.listening = true;
-    self.io_pending += 1;
+    self.hostLoop().io_pending += 1;
     st.tcp.accept(loop, &st.accept_c, ServerState, st, onAccept);
     emitSafe(self, st.js, "listening", &.{});
 }

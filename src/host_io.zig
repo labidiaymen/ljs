@@ -29,17 +29,20 @@ fn box(p: *anyopaque) *IoLoop {
 }
 
 /// The loop, creating it on first use. Bumps no counters — the caller manages `io_pending`.
+/// Resolves to the ROOT (event-loop) interpreter so a submission from an async/generator BODY thread
+/// targets the one loop `runEventLoop` drives — NOT a fresh orphan loop on the transient body interp.
 pub fn ensureLoop(self: *Interpreter) EvalError!*xev.Loop {
-    if (self.io_loop) |p| return &box(p).loop;
-    const io = self.arena.create(IoLoop) catch return error.OutOfMemory;
+    const root = self.hostLoop();
+    if (root.io_loop) |p| return &box(p).loop;
+    const io = root.arena.create(IoLoop) catch return error.OutOfMemory;
     io.* = .{ .loop = xev.Loop.init(.{}) catch return error.OutOfMemory };
-    self.io_loop = io;
+    root.io_loop = io;
     return &io.loop;
 }
 
-/// The loop if it exists (no allocation), else null.
+/// The loop if it exists (no allocation), else null. Resolves to the root interpreter (see ensureLoop).
 pub fn maybeLoop(self: *Interpreter) ?*xev.Loop {
-    if (self.io_loop) |p| return &box(p).loop;
+    if (self.hostLoop().io_loop) |p| return &box(p).loop;
     return null;
 }
 
