@@ -734,6 +734,8 @@ pub const NativeId = enum {
     /// V8 (spec 119): a CallSite object's method (getFileName/getLineNumber/…) built for
     /// `Error.prepareStackTrace`. Dispatched in `error_stack.zig`. Inert on Test262.
     callsite_method,
+    /// HOST (Node): the `zlib` module (createGunzip/gzipSync/constants/…). Dispatched in `host_zlib.zig`.
+    zlib_method,
     /// §10.4.4.6 %ThrowTypeError% — the unique per-realm function that unconditionally throws a
     /// TypeError. Used as the poison `get`/`set` for `callee` (and historically `caller`) on a
     /// strict / unmapped arguments object. Never returns normally.

@@ -101,17 +101,20 @@ pub fn build(self: *Interpreter) EvalError!*Object {
     const passthrough_proto = try Object.create(arena, transform_proto);
     const passthrough_ctor = try makeCtor(self, "PassThrough", passthrough_proto);
 
-    // The `Stream` legacy export is the Readable ctor's base (we alias it to Readable for simplicity).
-    const mod = try Object.create(arena, self.objectProto());
-    try mod.defineData("Readable", .{ .object = readable_ctor }, true, false, true);
-    try mod.defineData("Writable", .{ .object = writable_ctor }, true, false, true);
-    try mod.defineData("Duplex", .{ .object = duplex_ctor }, true, false, true);
-    try mod.defineData("Transform", .{ .object = transform_ctor }, true, false, true);
-    try mod.defineData("PassThrough", .{ .object = passthrough_ctor }, true, false, true);
-    // `stream` itself is also a constructor in Node (the base Stream class). We expose `Stream` as an
-    // alias of Readable, and make the module callable-ish by also referencing it.
-    try mod.defineData("Stream", .{ .object = readable_ctor }, true, false, true);
-    return mod;
+    // In Node `require('stream')` IS the legacy `Stream` base CLASS (a function with a `.prototype`
+    // inheriting EventEmitter, plus a `.pipe`), and the concrete classes hang off it as properties —
+    // so `util.inherits(X, require('stream'))` (e.g. `send`'s SendStream) works. Return that ctor as
+    // the module, not a plain object.
+    const stream_proto = try Object.create(arena, ee_proto);
+    try defineMethod(self, stream_proto, "pipe", "r.pipe");
+    const stream_ctor = try makeCtor(self, "Stream", stream_proto);
+    try stream_ctor.defineData("Readable", .{ .object = readable_ctor }, true, false, true);
+    try stream_ctor.defineData("Writable", .{ .object = writable_ctor }, true, false, true);
+    try stream_ctor.defineData("Duplex", .{ .object = duplex_ctor }, true, false, true);
+    try stream_ctor.defineData("Transform", .{ .object = transform_ctor }, true, false, true);
+    try stream_ctor.defineData("PassThrough", .{ .object = passthrough_ctor }, true, false, true);
+    try stream_ctor.defineData("Stream", .{ .object = stream_ctor }, true, false, true); // `stream.Stream === stream`
+    return stream_ctor;
 }
 
 /// `%EventEmitter.prototype%` from the (cached) `events` core module.

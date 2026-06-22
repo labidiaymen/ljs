@@ -140,6 +140,10 @@ pub fn main(init: std.process.Init) !void {
             try err.flush();
             std.process.exit(1);
         },
+        .thrown_reported => {
+            // runHost already printed the V8 stack trace to stderr; just exit non-zero (spec 119).
+            std.process.exit(1);
+        },
         .syntax_error => |m| {
             try err.print("SyntaxError: {s}\n", .{m});
             try err.flush();

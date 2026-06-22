@@ -144,23 +144,32 @@ pub fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError
             // Re-running here refreshes the binding to a closure captured over the CURRENT env — this
             // matters for a declaration inside a block / loop body that is re-entered with a fresh
             // scope per iteration (each closure must see that iteration's bindings).
-            const obj = try instantiateFunctionObject(self, f, env);
+            // §14.1.21 FunctionDeclaration : Evaluation returns ~empty~ — reaching the declaration at
+            // runtime does NOTHING. FunctionDeclarationInstantiation / the per-scope hoist
+            // (`hoistFunctionDeclarations`, run at every Script / function-body / block scope entry,
+            // including a fresh closure per loop-body re-entry) already created and bound the ONE
+            // function object. Re-instantiating here would mint a SECOND object — breaking identity for
+            // a reference captured before this line: `var a = R; function R(){}; a === R` must be true,
+            // and `module.exports = R; …; R.prototype.m = …` (the Express/CommonJS pattern) must put `m`
+            // on the SAME object require() returns.
             if (f.name) |name| {
-                // §19.2.1.3: inside a sloppy direct eval body (non-var-scope eval env), a TOP-LEVEL
-                // FunctionDeclaration's binding was already instantiated in the caller's var scope by
-                // the hoist (as a DELETABLE binding). The declaration STATEMENT must NOT re-bind into
-                // the eval env (that would shadow / resurrect a name a prior `delete` removed) — refresh
-                // the existing var-scope binding in place if present, else do nothing (it was deleted).
-                // Gated on `eval_var_deletable`, so ordinary block-scoped / B.3.3 functions are untouched.
+                // §19.2.1.3: a sloppy direct-eval TOP-LEVEL FunctionDeclaration's binding lives in the
+                // caller's var scope (a DELETABLE binding); refresh it in place (a fresh closure over the
+                // eval env), never re-declaring into the eval env.
                 if (self.eval_var_deletable and !env.is_var_scope and env.parent != null and env.parent.?.is_var_scope) {
                     if (env.varScope().lookupLocal(name)) |b| {
-                        b.value = .{ .object = obj };
+                        b.value = .{ .object = try instantiateFunctionObject(self, f, env) };
                         b.mutable = true;
                         b.initialized = true;
                     }
-                    return .empty; // §15.2.6 a FunctionDeclaration's Evaluation is ~empty~ (§6.2.4)
+                    return .empty;
                 }
-                try env.declare(name, .{ .object = obj }, true, true);
+                // At a VAR scope (Script / function / module-body top level), the hoist bound the single
+                // object → no-op, preserving its identity (§14.1.21). In a BLOCK / loop body (not a var
+                // scope), re-instantiate so each scope entry gets a FRESH closure over that entry's
+                // bindings — required for per-iteration `let` capture (`for(let i){ function f(){return i} }`).
+                if (env.is_var_scope and env.lookupLocal(name) != null) return .empty;
+                try env.declare(name, .{ .object = try instantiateFunctionObject(self, f, env) }, true, true);
             }
             return .empty; // §15.2.6 a FunctionDeclaration's Evaluation is ~empty~ (§6.2.4)
         },

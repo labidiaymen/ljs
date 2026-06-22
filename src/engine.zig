@@ -29,6 +29,9 @@ pub const RunMode = enum { sloppy, strict };
 pub const EvaluationResult = union(enum) {
     normal: Value,
     thrown: Value,
+    /// A host-run uncaught throw whose V8 stack trace was ALREADY printed to stderr by `runHost`
+    /// (spec 119). `main` just exits non-zero without re-printing a one-liner.
+    thrown_reported,
     syntax_error: []const u8,
     step_limit,
 };
@@ -456,8 +459,9 @@ pub fn runHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, ctx:
     // A synchronous throw aborts the host run before the loop (like Node printing an uncaught error and
     // exiting) — surface it; don't run timers scheduled before the throw.
     if (completion == .throw) {
+        host_timers.hostReportError(&interp, completion.throw); // print the V8 stack trace (like Node)
         interp.cleanupGenerators();
-        return .{ .thrown = completion.throw };
+        return .thrown_reported;
     }
     // §process.nextTick: drain ticks scheduled by the top-level script BEFORE the first microtask
     // checkpoint, so a `process.nextTick` runs ahead of a same-turn `Promise.then` (Node ordering). The
@@ -528,8 +532,9 @@ pub fn runHostModule(arena: std.mem.Allocator, source: []const u8, ctx: HostCtx,
         };
     };
     if (completion == .throw) {
+        host_timers.hostReportError(&interp, completion.throw); // print the V8 stack trace (like Node)
         interp.cleanupGenerators();
-        return .{ .thrown = completion.throw };
+        return .thrown_reported;
     }
     host_setup.drainNextTicks(&interp) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,

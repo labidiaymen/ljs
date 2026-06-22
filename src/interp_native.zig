@@ -632,6 +632,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .fetch_body_method => return @import("host_fetch_body.zig").method(self, func, this_val, args), // HOST Response/Request
         .abort_method => return @import("host_abort.zig").method(self, func, this_val, args), // HOST AbortController/Signal
         .callsite_method => return @import("error_stack.zig").callsiteMethod(self, func.native_name, this_val), // V8 CallSite
+        .zlib_method => return @import("host_zlib.zig").method(self, func, this_val, args), // HOST zlib
         .eval_fn => {
             // §19.2.1: reaching `callNative` means INDIRECT eval (`(0,eval)(s)`, `var e=eval; e(s)`,
             // `globalThis.eval(s)`) — the direct case is intercepted in `evalCall` before dispatch.
@@ -960,7 +961,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .bigint_method => return builtin_bigint.bigintMethod(self, func.native_name, this_val, args), // §21.2.3 toString/valueOf
         .symbol_ctor => return builtin_symbol.constructor(self, args), // §20.4.1.1 Symbol([description])
         .promise_ctor => return interp_async.promiseConstructor(self, this_val, args), // §27.2.3.1 Promise(executor)
-        .timer_fn, .console_log, .process_method, .buffer_fn, .events_method, .util_method, .qs_method, .timers_method, .assert_method, .url_method, .nodetest_method, .vm_method, .net_method, .crypto_method, .stream_method, .string_decoder_method, .http_method, .headers_method, .fetch_body_method, .abort_method, .callsite_method, .require_fn, .core_module_fn => unreachable, // HOST (spec 098/100/101/102/103/104/105/106/107/108/119) — handled in the first switch
+        .timer_fn, .console_log, .process_method, .buffer_fn, .events_method, .util_method, .qs_method, .timers_method, .assert_method, .url_method, .nodetest_method, .vm_method, .net_method, .crypto_method, .stream_method, .string_decoder_method, .http_method, .headers_method, .fetch_body_method, .abort_method, .callsite_method, .zlib_method, .require_fn, .core_module_fn => unreachable, // HOST (spec 098/100/101/102/103/104/105/106/107/108/119/120) — handled in the first switch
         .array_ctor, .array_method, .array_static, .string_method, .string_static, .math_method, .reflect_method => unreachable, // handled in the first switch
         .species_getter, .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
         .symbol_static, .symbol_description => unreachable, // handled in the first switch

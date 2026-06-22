@@ -388,7 +388,15 @@ fn loadModule(self: *Interpreter, abspath: []const u8) EvalError!Completion {
         .{ .string = abspath },
         .{ .string = dir },
     };
+    // spec 119: stamp this module's source + filename while its body runs, so functions DEFINED here
+    // map their stack frames to THIS file (not the entry script). Restored after (modules nest).
+    const saved_src = self.script_source;
+    const saved_name = self.script_name;
+    self.script_source = wrapped;
+    self.script_name = abspath;
     const body_c = try self.callFunction(wrapper, &call_args, .undefined);
+    self.script_source = saved_src;
+    self.script_name = saved_name;
     if (body_c.isAbrupt()) return body_c;
 
     // The body may have reassigned `module.exports`; the authoritative exports is module.exports now.
@@ -597,7 +605,7 @@ pub fn installEntryRequire(self: *Interpreter, script_path: []const u8, script_d
 //  core module registry: path / fs / os
 // ════════════════════════════════════════════════════════════════════════════
 
-const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test", "timers", "timers/promises", "vm", "net", "crypto", "stream", "string_decoder", "http", "tty" };
+const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test", "timers", "timers/promises", "vm", "net", "crypto", "stream", "string_decoder", "http", "tty", "zlib" };
 
 /// Strip a `node:` prefix (Node accepts `node:path` etc.).
 fn coreName(spec: []const u8) []const u8 {
@@ -678,6 +686,7 @@ fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
     if (std.mem.eql(u8, name, "stream")) return @import("host_stream.zig").build(self);
     if (std.mem.eql(u8, name, "string_decoder")) return @import("host_string_decoder.zig").build(self);
     if (std.mem.eql(u8, name, "http")) return @import("host_http.zig").build(self);
+    if (std.mem.eql(u8, name, "zlib")) return @import("host_zlib.zig").build(self);
     const obj = try Object.create(arena, self.objectProto());
     if (std.mem.eql(u8, name, "fs")) {
         for ([_][]const u8{ "readFileSync", "existsSync", "writeFileSync", "statSync", "readdirSync", "mkdirSync", "appendFileSync", "unlinkSync", "rmSync", "rmdirSync", "renameSync", "copyFileSync", "accessSync", "lstatSync", "realpathSync", "readlinkSync", "truncateSync" }) |m|

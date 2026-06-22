@@ -277,6 +277,7 @@ pub fn classify(meta: md.Metadata, result: ljs.EvaluationResult, mode: Mode, pat
                 .syntax_error => r.mk(path, mode, .fail, .parse_error),
                 .step_limit => r.mk(path, mode, .fail, .step_limit),
                 .normal => r.mk(path, mode, .fail, .no_error_expected_throw),
+                .thrown_reported => unreachable, // host-only (runHost); never produced on the Test262 path
             },
         }
     }
@@ -287,6 +288,7 @@ pub fn classify(meta: md.Metadata, result: ljs.EvaluationResult, mode: Mode, pat
         .thrown => r.mk(path, mode, .fail, .unexpected_error),
         .syntax_error => r.mk(path, mode, .fail, .parse_error),
         .step_limit => r.mk(path, mode, .fail, .step_limit),
+        .thrown_reported => unreachable, // host-only (runHost); never produced on the Test262 path
     };
 }
 

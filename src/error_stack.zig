@@ -27,6 +27,13 @@ pub fn build(self: *Interpreter, err: *Object) EvalError!Completion {
     return .{ .normal = .{ .string = try formatString(self, err, frames) } };
 }
 
+/// The V8-format stack STRING, always (ignores `Error.prepareStackTrace`). For uncaught-error
+/// reporting, where we want the human-readable trace even when a hook would return a non-string.
+pub fn buildStringOnly(self: *Interpreter, err: *Object) ?[]const u8 {
+    const frames: []rt.StackFrame = err.error_stack orelse &.{};
+    return formatString(self, err, frames) catch null;
+}
+
 /// `Error.prepareStackTrace` if it is currently a callable function, else null.
 fn prepareHook(self: *Interpreter) ?*Object {
     const g = self.globals orelse return null;

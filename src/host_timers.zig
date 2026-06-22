@@ -220,6 +220,15 @@ pub fn consoleLog(self: *Interpreter, args: []const Value) EvalError!Completion 
 /// `drainJobs` (the queueMicrotask path).
 pub fn hostReportError(self: *Interpreter, v: Value) void {
     const w = self.host_err orelse return;
+    // For an Error, print its V8 stack trace (like Node prints an uncaught exception), else the value.
+    if (v == .object and v.object.error_data) {
+        if (@import("error_stack.zig").buildStringOnly(self, v.object)) |s| {
+            w.writeAll(s) catch return;
+            w.writeAll("\n") catch return;
+            w.flush() catch return;
+            return;
+        }
+    }
     w.writeAll("Uncaught ") catch return;
     v.writeDisplay(w) catch return;
     w.writeAll("\n") catch return;
