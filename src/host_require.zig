@@ -609,7 +609,7 @@ pub fn installEntryRequire(self: *Interpreter, script_path: []const u8, script_d
 //  core module registry: path / fs / os
 // ════════════════════════════════════════════════════════════════════════════
 
-const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test", "timers", "timers/promises", "vm", "net", "crypto", "stream", "string_decoder", "http", "tty", "zlib" };
+const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test", "timers", "timers/promises", "vm", "net", "crypto", "stream", "string_decoder", "http", "tty", "zlib", "https", "tls", "punycode", "v8", "http2", "diagnostics_channel", "worker_threads" };
 
 /// Strip a `node:` prefix (Node accepts `node:path` etc.).
 fn coreName(spec: []const u8) []const u8 {
@@ -691,6 +691,13 @@ fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
     if (std.mem.eql(u8, name, "string_decoder")) return @import("host_string_decoder.zig").build(self);
     if (std.mem.eql(u8, name, "http")) return @import("host_http.zig").build(self);
     if (std.mem.eql(u8, name, "zlib")) return @import("host_zlib.zig").build(self);
+    if (std.mem.eql(u8, name, "https")) return @import("host_https.zig").build(self);
+    if (std.mem.eql(u8, name, "tls")) return @import("host_https.zig").buildTls(self);
+    if (std.mem.eql(u8, name, "punycode")) return @import("host_https.zig").buildPunycode(self);
+    if (std.mem.eql(u8, name, "v8")) return @import("host_https.zig").buildV8(self);
+    if (std.mem.eql(u8, name, "http2")) return @import("host_https.zig").buildHttp2(self);
+    if (std.mem.eql(u8, name, "diagnostics_channel")) return @import("host_https.zig").buildDiagnosticsChannel(self);
+    if (std.mem.eql(u8, name, "worker_threads")) return @import("host_https.zig").buildWorkerThreads(self);
     const obj = try Object.create(arena, self.objectProto());
     if (std.mem.eql(u8, name, "fs")) {
         for ([_][]const u8{ "readFileSync", "existsSync", "writeFileSync", "statSync", "readdirSync", "mkdirSync", "appendFileSync", "unlinkSync", "rmSync", "rmdirSync", "renameSync", "copyFileSync", "accessSync", "lstatSync", "realpathSync", "readlinkSync", "truncateSync" }) |m|
