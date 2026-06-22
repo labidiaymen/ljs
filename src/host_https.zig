@@ -256,12 +256,19 @@ fn httpsEnd(self: *Interpreter, this_val: Value) EvalError!Completion {
     try res.defineData("statusCode", .{ .number = @floatFromInt(r.status) }, true, true, true);
     try res.defineData("statusMessage", .{ .string = r.reason }, true, true, true);
     // res.headers — Node lower-cases header names and joins duplicates; this is the common-case shape.
+    // res.rawHeaders — the original-case flat [name, value, name, value, …] array (axios/others read it).
     const headers_obj = try Object.create(self.arena, self.objectProto());
+    const raw = try Object.createArray(self.arena, self.arrayProto());
+    var ri: usize = 0;
     for (r.headers) |h| {
         const lower = try std.ascii.allocLowerString(self.arena, h.name);
         try headers_obj.defineData(lower, .{ .string = h.value }, true, true, true);
+        try raw.arraySet(self.arena, ri, .{ .string = h.name });
+        try raw.arraySet(self.arena, ri + 1, .{ .string = h.value });
+        ri += 2;
     }
     try res.defineData("headers", .{ .object = headers_obj }, true, true, true);
+    try res.defineData("rawHeaders", .{ .object = raw }, true, true, true);
     try res.defineData("setEncoding", .{ .object = try fn_(self, "setEncoding") }, true, false, true);
     // emit 'response' (the handler registers res.on('data')/on('end')), then deliver the body.
     _ = try emitEvent(self, .{ .object = req }, "response", &.{.{ .object = res }});
