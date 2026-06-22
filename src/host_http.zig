@@ -35,6 +35,7 @@ const EvalError = interpreter.EvalError;
 const host_require = @import("host_require.zig");
 const host_buffer = @import("host_buffer.zig");
 const host_process = @import("host_process.zig");
+const host_net = @import("host_net.zig");
 
 const CONN_KEY = "%http%"; // hidden own prop on a socket → its *ConnState id in io_handles
 const RES_KEY = "%httpres%"; // hidden own prop on a res → its *ResState id in io_handles
@@ -475,7 +476,6 @@ fn buildAndDispatch(self: *Interpreter, st: *ConnState, header_block: []const u8
     try req.defineData("url", .{ .string = try self.arena.dupe(u8, url_s) }, true, true, true);
     try req.defineData("httpVersion", .{ .string = try self.arena.dupe(u8, http_version) }, true, true, true);
     try req.defineData("headers", .{ .object = headers_obj }, true, true, true);
-    try req.defineData("rawHeaders", .{ .object = try Object.createArray(self.arena, self.arrayProto()) }, true, true, true);
     try req.defineData("socket", .{ .object = st.socket }, true, true, true);
     try req.defineData("connection", .{ .object = st.socket }, true, true, true);
     try req.defineData("complete", .{ .boolean = false }, true, true, true);
@@ -671,9 +671,15 @@ fn resEnd(self: *Interpreter, js: *Object, this_val: Value, args: []const Value)
             const cl = std.fmt.allocPrint(self.arena, "{d}", .{chunk.len}) catch return error.OutOfMemory;
             _ = try resSetHeader(self, js, this_val, &.{ .{ .string = "Content-Length" }, .{ .string = cl } });
         }
-        try ensureHeadersSent(self, st);
+        // Coalesce the header block + body into ONE socket write (one libxev write / syscall per
+        // response instead of two) — this is the common `res.end(body)` fast path.
+        var out = std.ArrayListUnmanaged(u8).empty;
+        try appendResponseHead(self, st, &out);
+        if (chunk.len > 0) out.appendSlice(self.arena, chunk) catch return error.OutOfMemory;
+        try socketWrite(self, st.socket, out.items);
+    } else if (chunk.len > 0) {
+        try socketWrite(self, st.socket, chunk);
     }
-    if (chunk.len > 0) try socketWrite(self, st.socket, chunk);
 
     st.finished = true;
     try js.set("finished", .{ .boolean = true });
@@ -699,6 +705,14 @@ fn resEnd(self: *Interpreter, js: *Object, this_val: Value, args: []const Value)
 /// ends at EOF.
 fn ensureHeadersSent(self: *Interpreter, st: *ResState) EvalError!void {
     if (st.headers_sent) return;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    try appendResponseHead(self, st, &out);
+    try socketWrite(self, st.socket, out.items);
+}
+
+/// Serialize the status line + header block into `out` (NOT written — the caller writes, so `res.end`
+/// can coalesce head + body into a single socket write). Marks `headers_sent` + decides keep-alive.
+fn appendResponseHead(self: *Interpreter, st: *ResState, out: *std.ArrayListUnmanaged(u8)) EvalError!void {
     st.headers_sent = true;
     try st.res.set("headersSent", .{ .boolean = true });
 
@@ -712,7 +726,6 @@ fn ensureHeadersSent(self: *Interpreter, st: *ResState) EvalError!void {
         msg = mv.string;
     };
 
-    var out = std.ArrayListUnmanaged(u8).empty;
     const status_line = std.fmt.allocPrint(self.arena, "HTTP/1.1 {d} {s}\r\n", .{ code, msg }) catch return error.OutOfMemory;
     out.appendSlice(self.arena, status_line) catch return error.OutOfMemory;
 
@@ -744,12 +757,14 @@ fn ensureHeadersSent(self: *Interpreter, st: *ResState) EvalError!void {
         out.appendSlice(self.arena, if (st.keep_alive) "Connection: keep-alive\r\n" else "Connection: close\r\n") catch return error.OutOfMemory;
     }
     out.appendSlice(self.arena, "\r\n") catch return error.OutOfMemory;
-    try socketWrite(self, st.socket, out.items);
 }
 
 // ── socket I/O helpers (drive the net Socket via its JS API) ─────────────────────────
 
 fn socketWrite(self: *Interpreter, socket: *Object, data: []const u8) EvalError!void {
+    // Fast path: queue the bytes straight to libxev (no JS `socket.write` call, no Buffer wrapping).
+    // `data` is always arena-stable / static at every call site, so it outlives the async write.
+    if (host_net.socketStateOf(self, socket)) |st| return host_net.writeRaw(self, st, data, false);
     const w = socket.get("write") orelse return;
     if (w != .object or w.object.kind != .function) return;
     const buf = try host_buffer.makeBufferFromBytes(self, data);
@@ -757,6 +772,7 @@ fn socketWrite(self: *Interpreter, socket: *Object, data: []const u8) EvalError!
 }
 
 fn socketEnd(self: *Interpreter, socket: *Object) EvalError!void {
+    if (host_net.socketStateOf(self, socket)) |st| return host_net.writeRaw(self, st, "", true);
     const e = socket.get("end") orelse return;
     if (e != .object or e.object.kind != .function) return;
     _ = try self.callFunction(e.object, &.{}, .{ .object = socket });

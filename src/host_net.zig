@@ -219,9 +219,31 @@ fn handlePtr(self: *Interpreter, js: *Object) ?*anyopaque {
     return self.io_handles.get(id);
 }
 
-fn socketStateOf(self: *Interpreter, js: *Object) ?*SocketState {
+pub fn socketStateOf(self: *Interpreter, js: *Object) ?*SocketState {
     const p = handlePtr(self, js) orelse return null;
     return @ptrCast(@alignCast(p));
+}
+
+/// PERF: queue a raw-bytes write straight to the libxev TCP, bypassing the JS `socket.write` method
+/// (no property lookup / callFunction / Buffer wrapping). `bytes` must outlive the async write
+/// (arena-allocated). Used by `http` on the hot response path. `end_after` shuts down once it completes.
+pub fn writeRaw(self: *Interpreter, st: *SocketState, bytes: []const u8, end_after: bool) EvalError!void {
+    if (!st.has_tcp or st.closed) {
+        if (end_after) doShutdown(st);
+        return;
+    }
+    if (bytes.len == 0) {
+        if (end_after) {
+            st.write_ended = true;
+            doShutdown(st);
+        }
+        return;
+    }
+    const wc = self.arena.create(WriteCtx) catch return error.OutOfMemory;
+    wc.* = .{ .state = st, .data = bytes, .cb = null, .end_after = end_after };
+    const loop = try host_io.ensureLoop(self);
+    self.io_pending += 1;
+    st.tcp.write(loop, &wc.completion, .{ .slice = wc.data }, WriteCtx, wc, onWrite);
 }
 
 fn serverStateOf(self: *Interpreter, js: *Object) ?*ServerState {
