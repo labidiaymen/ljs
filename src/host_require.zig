@@ -609,7 +609,7 @@ pub fn installEntryRequire(self: *Interpreter, script_path: []const u8, script_d
 //  core module registry: path / fs / os
 // ════════════════════════════════════════════════════════════════════════════
 
-const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test", "timers", "timers/promises", "vm", "net", "crypto", "stream", "string_decoder", "http", "tty", "zlib", "https", "tls", "punycode", "v8", "http2", "diagnostics_channel", "worker_threads" };
+const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test", "timers", "timers/promises", "vm", "net", "crypto", "stream", "string_decoder", "http", "tty", "zlib", "https", "tls", "punycode", "v8", "http2", "diagnostics_channel", "worker_threads", "module" };
 
 /// Strip a `node:` prefix (Node accepts `node:path` etc.).
 fn coreName(spec: []const u8) []const u8 {
@@ -725,6 +725,23 @@ fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
     } else if (std.mem.eql(u8, name, "buffer")) {
         // HOST (spec 105): require('buffer') → { Buffer, kMaxLength, constants, SlowBuffer, ... }.
         return buildBufferModule(self, obj);
+    } else if (std.mem.eql(u8, name, "module")) {
+        // HOST: require('module') — `createRequire(path)` (REAL: a per-dir require), `builtinModules`,
+        // and inert stubs (`_resolveFilename`/`syncBuiltinESMExports`/`findSourceMap`/`register`).
+        for ([_][]const u8{ "createRequire", "_resolveFilename", "syncBuiltinESMExports", "findSourceMap", "register" }) |m|
+            try defineCoreMethod(self, obj, name, m);
+        const list = try Object.createArray(arena, self.arrayProto());
+        for (core_modules, 0..) |cm, i| try list.arraySet(arena, i, .{ .string = cm });
+        try obj.defineData("builtinModules", .{ .object = list }, true, false, true);
+        try obj.defineData("_cache", .{ .object = try Object.create(arena, self.objectProto()) }, true, false, true);
+        // `Module` (a stub ctor that also carries createRequire/builtinModules — Node's Module === this).
+        const mod_ctor = try Object.createNative(arena, .core_module_fn, "Module");
+        mod_ctor.prototype = self.functionProto();
+        try mod_ctor.defineData("name", .{ .string = "Module" }, false, false, true);
+        try mod_ctor.defineData("%mod%", .{ .string = name }, false, false, true);
+        try defineCoreMethod(self, mod_ctor, name, "createRequire");
+        try mod_ctor.defineData("builtinModules", .{ .object = list }, true, false, true);
+        try obj.defineData("Module", .{ .object = mod_ctor }, true, false, true);
     }
     return obj;
 }
@@ -781,6 +798,16 @@ pub fn coreModuleFn(self: *Interpreter, func: *Object, this_val: Value, args: []
     const method = func.native_name;
     if (std.mem.eql(u8, mod, "fs")) return host_fs.fsMethod(self, method, args);
     if (std.mem.eql(u8, mod, "os")) return host_fs.osMethod(self, method, args);
+    if (std.mem.eql(u8, mod, "module")) {
+        // `createRequire(filename)` → a real require resolving relative to dirname(filename).
+        if (std.mem.eql(u8, method, "createRequire")) {
+            const p = if (args.len > 0 and args[0] == .string) args[0].string else "";
+            const dir = path.dirname(p) orelse p;
+            return .{ .normal = .{ .object = try makeRequire(self, dir) } };
+        }
+        if (std.mem.eql(u8, method, "_resolveFilename")) return .{ .normal = if (args.len > 0) args[0] else .undefined };
+        return .{ .normal = .undefined }; // syncBuiltinESMExports / findSourceMap / register / Module(no-op)
+    }
     if (std.mem.eql(u8, mod, "tty")) {
         // `isatty(fd)` → false (no TTY detection); the stream placeholder ctors are no-ops.
         if (std.mem.eql(u8, method, "isatty")) return .{ .normal = .{ .boolean = false } };
