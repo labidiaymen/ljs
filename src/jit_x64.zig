@@ -45,6 +45,7 @@ pub const Cond = enum(u8) {
     le = 0xE, // <=
     g = 0xF, // >
     o = 0x0, // overflow
+    a = 0x7, // above (unsigned >)
 };
 
 pub const Emitter = struct {
@@ -221,6 +222,37 @@ pub const Emitter = struct {
         try self.byte(0xF8 | @as(u8, dst.low())); // /7 = sar
         try self.byte(imm);
     }
+    /// dst >>= imm (arithmetic, 64-bit). REX.W + C1 /7 ib.
+    pub fn sarImm(self: *Emitter, dst: Reg, imm: u8) std.mem.Allocator.Error!void {
+        try self.byte(0x48 | @as(u8, @intFromBool(dst.ext())));
+        try self.byte(0xC1);
+        try self.byte(0xF8 | @as(u8, dst.low())); // /7 = sar
+        try self.byte(imm);
+    }
+    /// dst += imm (64-bit, sign-extended imm32). REX.W + 81 /0 id.
+    pub fn addImm(self: *Emitter, dst: Reg, imm: i32) std.mem.Allocator.Error!void {
+        try self.byte(0x48 | @as(u8, @intFromBool(dst.ext())));
+        try self.byte(0x81);
+        try self.byte(0xC0 | @as(u8, dst.low())); // mod=11, /0 = add
+        const u: u32 = @bitCast(imm);
+        inline for (0..4) |b| try self.byte(@truncate(u >> (b * 8)));
+    }
+    /// dst -= imm (64-bit, sign-extended imm32). REX.W + 81 /5 id.
+    pub fn subImm(self: *Emitter, dst: Reg, imm: i32) std.mem.Allocator.Error!void {
+        try self.byte(0x48 | @as(u8, @intFromBool(dst.ext())));
+        try self.byte(0x81);
+        try self.byte(0xE8 | @as(u8, dst.low())); // mod=11, /5 = sub
+        const u: u32 = @bitCast(imm);
+        inline for (0..4) |b| try self.byte(@truncate(u >> (b * 8)));
+    }
+    /// dst *= imm (64-bit, imul r64, r/m64, imm32 — 69 /r id).
+    pub fn imulImm(self: *Emitter, dst: Reg, imm: i32) std.mem.Allocator.Error!void {
+        try self.rexW(dst, dst);
+        try self.byte(0x69);
+        try self.modrmReg(dst, dst);
+        const u: u32 = @bitCast(imm);
+        inline for (0..4) |b| try self.byte(@truncate(u >> (b * 8)));
+    }
     /// dst >>>= imm, logical / zero-fill  (shr r/m32, imm8 — C1 /5). JS `>>>` (result is uint32).
     pub fn shrImm32(self: *Emitter, dst: Reg, imm: u8) std.mem.Allocator.Error!void {
         if (dst.ext()) try self.byte(0x41);
@@ -231,6 +263,12 @@ pub const Emitter = struct {
     /// dst = -dst  (neg r/m32 — F7 /3). Sets OF if dst == i32_min (the JIT deopts on that).
     pub fn neg32(self: *Emitter, dst: Reg) std.mem.Allocator.Error!void {
         if (dst.ext()) try self.byte(0x41);
+        try self.byte(0xF7);
+        try self.byte(0xD8 | @as(u8, dst.low())); // mod=11, /3 = neg
+    }
+    /// dst = -dst (64-bit). REX.W F7 /3.
+    pub fn neg(self: *Emitter, dst: Reg) std.mem.Allocator.Error!void {
+        try self.byte(0x48 | @as(u8, @intFromBool(dst.ext())));
         try self.byte(0xF7);
         try self.byte(0xD8 | @as(u8, dst.low())); // mod=11, /3 = neg
     }

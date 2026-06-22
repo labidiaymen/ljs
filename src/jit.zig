@@ -9,9 +9,11 @@
 //!     jump / jump_if_false / jump_if_true (integer truthiness), ret, ret_undef. ANYTHING else →
 //!     `compileChunk` returns null → caller uses the tree-walk. So a JIT'd function is a pure
 //!     function of its integer args (no calls, no property/global access, no closures).
-//!   * Values are unboxed to **i64** but every result is guarded to the **i32 SMI range** (exactly
-//!     V8's 32-bit SMI window) — so i64 arithmetic == f64 arithmetic (integers ≤ 2^31 are f64-exact).
-//!     On overflow the native code sets `*deopt` and returns; the caller re-runs on the interpreter.
+//!   * Values are unboxed to **i64** and arithmetic (`+ - *`) is 64-bit, guarded to the SAFE-INTEGER
+//!     range |v| < 2^53 (spec 124) — the window where an exact integer equals the f64 a JS Number
+//!     holds. A result that escapes 2^53 sets `*deopt` and returns; the caller re-runs the interpreter
+//!     (whose f64 rounding is authoritative beyond 2^53). Bitwise/shift stay 32-bit (ToInt32 semantics)
+//!     with a `movsxd` back to a valid i64.
 //!   * The caller guards that every arg is a safe integer before calling; a non-int arg → no JIT.
 //!     Locals must be written before read (a store that dominates — conservatively, a store before
 //!     any branch); else the chunk is rejected. Together these make the unboxing sound.
@@ -91,8 +93,23 @@ fn fuseSlotUpdate(code: []const u8, consts: []const Value, ip: usize, x: u16) ?S
     return .{ .op = arith, .operand = operand, .end_ip = ip + 9 };
 }
 
+/// Emit the SAFE-INTEGER deopt guard after a 64-bit add/sub/mul: deopt if |result| >= 2^53 (the point
+/// where an exact i64 and the f64 a JS Number would hold diverge — beyond it the tree-walk's f64
+/// rounding is authoritative). `reg` holds the result; `tmp` is a scratch register free at this point.
+/// `tmp = reg; tmp >>= 53 (arith); tmp += 1; cmp tmp, 1; ja deopt` → safe iff reg in [-2^53, 2^53).
+fn emitSafeIntGuard(e: *x64.Emitter, reg: x64.Reg, tmp: x64.Reg, deopts: *std.ArrayListUnmanaged(usize), arena: std.mem.Allocator) bool {
+    e.movReg(tmp, reg) catch return false;
+    e.sarImm(tmp, 53) catch return false;
+    e.addImm(tmp, 1) catch return false;
+    e.cmpImm(tmp, 1) catch return false;
+    deopts.append(arena, e.jcc(.a) catch return false) catch return false;
+    return true;
+}
+
 /// Compile `chunk` (whose first `n_params` slots are the parameters) to native code, or null if it
-/// uses anything outside the integer subset. The returned `JitFn` lives in `arena`-owned RWX memory.
+/// uses anything outside the integer subset. Values live as full i64 (safe-integer range) — arithmetic
+/// is 64-bit + a 2^53 guard; bitwise/shift stay 32-bit (ToInt32 semantics) + a movsxd back to i64.
+/// The returned `JitFn` lives in `arena`-owned RWX memory.
 pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16) ?JitFn {
     if (chunk.n_slots > slot_regs.len) return null;
     if (chunk.max_stack > stack_regs.len) return null;
@@ -141,14 +158,17 @@ pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16
                     const nxt: Op = @enumFromInt(code[ip + 2]);
                     const dst = stack_regs[@intCast(sp - 1)];
                     const amt: u8 = @intCast(iv & 31);
+                    // Shifts are ToInt32-based (32-bit) → sign-extend the i32 result back to a valid i64.
                     switch (nxt) {
                         .shl => {
                             e.shlImm32(dst, amt) catch return null;
+                            e.movsxd(dst, dst) catch return null;
                             ip += 3;
                             continue;
                         },
                         .shr => {
                             e.sarImm32(dst, amt) catch return null;
+                            e.movsxd(dst, dst) catch return null;
                             ip += 3;
                             continue;
                         },
@@ -157,6 +177,7 @@ pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16
                             // uint32 result with bit 31 set is ≥ 2^31 → not an SMI → deopt.
                             e.cmpImm32(dst, 0) catch return null;
                             deopts.append(arena, e.jcc(.l) catch return null) catch return null;
+                            e.movsxd(dst, dst) catch return null;
                             ip += 3;
                             continue;
                         },
@@ -165,7 +186,7 @@ pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16
                 }
                 ip += 2;
                 if (sp >= stack_regs.len) return null;
-                e.movImm32(stack_regs[@intCast(sp)], @intCast(iv)) catch return null;
+                e.movImm(stack_regs[@intCast(sp)], iv) catch return null; // full i64 (sign-correct)
                 sp += 1;
             },
             .load_slot => {
@@ -176,27 +197,29 @@ pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16
                 // pop) compiles straight onto the slot register — `op32 slotReg[s], operand; jo` — with
                 // no load/temp/store round-trip. This is the dominant hot-loop shape (i = i + 1, s += i).
                 if (fuseSlotUpdate(code, consts, ip + 2, s)) |fu| {
+                    if (sp >= stack_regs.len) return null; // need one free stack reg for the guard scratch
                     const dst = slot_regs[s];
+                    const tmp = stack_regs[@intCast(sp)]; // free (stack height unchanged by the fusion)
                     switch (fu.operand) {
                         .imm => |c| switch (fu.op) {
-                            .add => e.addImm32(dst, c) catch return null,
-                            .sub => e.subImm32(dst, c) catch return null,
-                            .mul => e.imulImm32(dst, dst, c) catch return null,
+                            .add => e.addImm(dst, c) catch return null,
+                            .sub => e.subImm(dst, c) catch return null,
+                            .mul => e.imulImm(dst, c) catch return null,
                             else => unreachable,
                         },
                         .slot => |y| {
                             if (y >= chunk.n_slots or !written[y]) return null;
                             switch (fu.op) {
-                                .add => e.add32(dst, slot_regs[y]) catch return null,
-                                .sub => e.sub32(dst, slot_regs[y]) catch return null,
-                                .mul => e.imul32(dst, slot_regs[y]) catch return null,
+                                .add => e.add(dst, slot_regs[y]) catch return null,
+                                .sub => e.sub(dst, slot_regs[y]) catch return null,
+                                .mul => e.imul(dst, slot_regs[y]) catch return null,
                                 else => unreachable,
                             }
                         },
                     }
-                    deopts.append(arena, e.jcc(.o) catch return null) catch return null;
+                    if (!emitSafeIntGuard(&e, dst, tmp, &deopts, arena)) return null;
                     if (fu.op == .mul) { // zero product may be -0 (see above)
-                        e.cmpImm32(dst, 0) catch return null;
+                        e.cmpImm(dst, 0) catch return null;
                         deopts.append(arena, e.jcc(.e) catch return null) catch return null;
                     }
                     ip = fu.end_ip; // net stack height unchanged
@@ -204,7 +227,7 @@ pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16
                 }
                 ip += 2;
                 if (sp >= stack_regs.len) return null;
-                e.movReg32(stack_regs[@intCast(sp)], slot_regs[s]) catch return null;
+                e.movReg(stack_regs[@intCast(sp)], slot_regs[s]) catch return null;
                 sp += 1;
             },
             .store_slot => {
@@ -212,7 +235,7 @@ pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16
                 ip += 2;
                 if (s >= chunk.n_slots or sp < 1) return null;
                 sp -= 1;
-                e.movReg32(slot_regs[s], stack_regs[@intCast(sp)]) catch return null;
+                e.movReg(slot_regs[s], stack_regs[@intCast(sp)]) catch return null;
                 if (!branched) written[s] = true;
             },
             .pop => {
@@ -227,32 +250,32 @@ pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16
                 {
                     const s = readU16(code, ip + 1);
                     if (s >= chunk.n_slots or sp < 1) return null;
-                    e.movReg32(slot_regs[s], stack_regs[@intCast(sp - 1)]) catch return null;
+                    e.movReg(slot_regs[s], stack_regs[@intCast(sp - 1)]) catch return null;
                     sp -= 1;
                     if (!branched) written[s] = true;
                     ip += 4; // skip store_slot (3) + pop (1)
                     continue;
                 }
                 if (sp < 1 or sp >= stack_regs.len) return null;
-                e.movReg32(stack_regs[@intCast(sp)], stack_regs[@intCast(sp - 1)]) catch return null;
+                e.movReg(stack_regs[@intCast(sp)], stack_regs[@intCast(sp - 1)]) catch return null;
                 sp += 1;
             },
             inline .add, .sub, .mul => |o| {
                 if (sp < 2) return null;
                 const a = stack_regs[@intCast(sp - 2)];
-                const b = stack_regs[@intCast(sp - 1)];
+                const b = stack_regs[@intCast(sp - 1)]; // consumed → free as the guard's scratch
                 switch (o) {
-                    .add => e.add32(a, b) catch return null,
-                    .sub => e.sub32(a, b) catch return null,
-                    .mul => e.imul32(a, b) catch return null,
+                    .add => e.add(a, b) catch return null,
+                    .sub => e.sub(a, b) catch return null,
+                    .mul => e.imul(a, b) catch return null,
                     else => unreachable,
                 }
-                // SMI overflow guard: the 32-bit op set OF on i32 overflow — a single `jo` to deopt
-                // (vs. range compares). Operands are i32-range, so i32 arithmetic == f64 arithmetic.
-                deopts.append(arena, e.jcc(.o) catch return null) catch return null;
+                // 64-bit arithmetic + a safe-integer (2^53) deopt: exact while the result is a JS-safe
+                // integer; beyond it the tree-walk's f64 is authoritative.
+                if (!emitSafeIntGuard(&e, a, b, &deopts, arena)) return null;
                 // A zero product may be IEEE -0 (e.g. -1*0); integer 0 boxes to +0, so deopt on it.
                 if (o == .mul) {
-                    e.cmpImm32(a, 0) catch return null;
+                    e.cmpImm(a, 0) catch return null;
                     deopts.append(arena, e.jcc(.e) catch return null) catch return null;
                 }
                 sp -= 1;
@@ -263,22 +286,25 @@ pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16
                 if (sp < 2) return null;
                 const a = stack_regs[@intCast(sp - 2)];
                 const b = stack_regs[@intCast(sp - 1)];
+                // §7.1.6 ToInt32: a 32-bit op on the low bits IS ToInt32(x) op ToInt32(y) for safe-int
+                // operands; sign-extend the i32 result back to a valid i64 for downstream 64-bit ops.
                 switch (o) {
                     .bit_and => e.and32(a, b) catch return null,
                     .bit_or => e.or32(a, b) catch return null,
                     .bit_xor => e.xor32(a, b) catch return null,
                     else => unreachable,
                 }
+                e.movsxd(a, a) catch return null;
                 sp -= 1;
             },
             .neg => {
                 if (sp < 1) return null;
                 const v = stack_regs[@intCast(sp - 1)];
-                // -x: negating integer 0 must yield IEEE -0 (deopt), and -(i32_min) overflows i32 (jo).
-                e.cmpImm32(v, 0) catch return null;
+                // -x: negating integer 0 must yield IEEE -0 (deopt). Negating a safe integer stays a
+                // safe integer (|-x| == |x|), so no range guard is needed after the 64-bit neg.
+                e.cmpImm(v, 0) catch return null;
                 deopts.append(arena, e.jcc(.e) catch return null) catch return null;
-                e.neg32(v) catch return null;
-                deopts.append(arena, e.jcc(.o) catch return null) catch return null;
+                e.neg(v) catch return null;
             },
             .pos => {
                 // +x = ToNumber(x); x is already a number (SMI) here, so this is the identity — no code.
@@ -300,7 +326,7 @@ pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16
                 ip += 2;
                 const a = stack_regs[@intCast(sp - 2)];
                 const b = stack_regs[@intCast(sp - 1)];
-                e.cmp32(a, b) catch return null; // flags = a - b (32-bit signed)
+                e.cmp(a, b) catch return null; // flags = a - b (32-bit signed)
                 // branch-when-true uses the op's condition; branch-when-false uses its negation.
                 const cond: x64.Cond = switch (o) {
                     .lt => if (on_true) .l else .ge,
@@ -335,7 +361,7 @@ pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16
             },
             .ret => {
                 if (sp < 1) return null;
-                e.movsxd(.rax, stack_regs[@intCast(sp - 1)]) catch return null; // sign-extend i32 SMI → i64
+                e.movReg(.rax, stack_regs[@intCast(sp - 1)]) catch return null; // value is already a full i64
                 epi_jumps.append(arena, e.jmp() catch return null) catch return null;
                 sp -= 1;
             },
