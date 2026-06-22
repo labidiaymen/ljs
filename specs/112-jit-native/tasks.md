@@ -30,6 +30,11 @@
 - [x] Peephole `<a>, load_const C, shift` → shift a by `C & 31`; `>>` arithmetic, `>>>` logical + deopt if result ≥ 2^31
 - [x] Variable-count shifts bail (would need CL); unit tests + in-engine parity (fnv/pack/`>>>`) + differential 0 regressions
 
+## Tier 1.7 — fused integer equality (this cycle)
+- [x] `== === != !==` fused with a following conditional jump → integer `cmp32` + `je`/`jne`
+- [x] Operands are always SMIs, so loose/strict equality both reduce to an integer compare (no coercion, no NaN/-0)
+- [x] Unit tests + in-engine parity (`!==` loop cond, `===`/`==`/`!=` in `if`); differential `LJS_JIT=1` 0 regressions
+
 ## Tiers 2–4 — roadmap (own specs)
 - [ ] Tier 2: SSE2 f64 + int↔float + `Math.*`
 - [ ] Tier 3: strings / arrays / typed-arrays (the uuid-formatting tier)

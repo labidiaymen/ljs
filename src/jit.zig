@@ -284,9 +284,10 @@ pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16
                 // +x = ToNumber(x); x is already a number (SMI) here, so this is the identity — no code.
                 if (sp < 1) return null;
             },
-            inline .lt, .gt, .le, .ge => |o| {
-                // Must be immediately consumed by a conditional jump (fused compare+branch); the JIT
-                // doesn't materialize boolean values.
+            // Relational + equality, FUSED with the following conditional jump (the JIT doesn't
+            // materialize booleans). `==`/`===` (and `!=`/`!==`) are identical here: both operands are
+            // always SMIs, so loose and strict equality both reduce to an integer compare.
+            inline .lt, .gt, .le, .ge, .eq, .ne, .seq, .sne => |o| {
                 if (ip >= code.len or sp < 2) return null;
                 const next: Op = @enumFromInt(code[ip]);
                 const on_true = switch (next) {
@@ -306,6 +307,8 @@ pub fn compileChunk(arena: std.mem.Allocator, chunk: *const Chunk, n_params: u16
                     .gt => if (on_true) .g else .le,
                     .le => if (on_true) .le else .g,
                     .ge => if (on_true) .ge else .l,
+                    .eq, .seq => if (on_true) .e else .ne,
+                    .ne, .sne => if (on_true) .ne else .e,
                     else => unreachable,
                 };
                 jumps.append(arena, .{ .at = e.jcc(cond) catch return null, .target_pc = target }) catch return null;
@@ -474,6 +477,23 @@ test "jit: constant shifts" {
     try std.testing.expectEqual(@as(i64, 5), runJit(u, &.{5}).result);
     // variable-count shift is not JIT-able (would need CL) → bails to tree-walk.
     try std.testing.expectError(error.NotJitable, jitOf(a, "function f(a, b){ return a << b; }"));
+}
+
+test "jit: fused integer equality (== === != !==)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var ai = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ai.deinit();
+    const a = ai.allocator();
+    // === inside a loop body
+    const j = try jitOf(a, "function f(n){ var s=0; var i=0; while(i<n){ if(i===3) s=s+100; s=s+1; i=i+1; } return s; }");
+    try std.testing.expectEqual(@as(i64, 110), runJit(j, &.{10}).result); // 10 + 100 once
+    // !== as the loop condition
+    const k = try jitOf(a, "function f(n){ var i=0; while(i!==n){ i=i+1; } return i; }");
+    try std.testing.expectEqual(@as(i64, 7), runJit(k, &.{7}).result);
+    // == / !=
+    const m = try jitOf(a, "function f(a){ if(a==5) return 1; return 0; }");
+    try std.testing.expectEqual(@as(i64, 1), runJit(m, &.{5}).result);
+    try std.testing.expectEqual(@as(i64, 0), runJit(m, &.{4}).result);
 }
 
 test "jit: non-integer subset is rejected" {
