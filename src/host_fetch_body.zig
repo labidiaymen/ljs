@@ -172,6 +172,22 @@ fn fetchImpl(self: *Interpreter, args: []const Value) EvalError!Completion {
         if (init.object.get("body")) |b| body_val = b;
     }
 
+    // HTTPS → the blocking std.http.Client TLS path (the async http client is plaintext-only). Builds a
+    // Response directly from the one-shot result. (v1: no custom request headers / streaming.)
+    if (url_val == .string and std.mem.startsWith(u8, url_val.string, "https://")) {
+        const method_s: []const u8 = if (opts.get("method")) |m| (if (m == .string) m.string else "GET") else "GET";
+        const body_bytes: ?[]const u8 = if (body_val == .string) body_val.string else null;
+        if (@import("host_https.zig").fetchBlocking(self, method_s, url_val.string, &.{}, body_bytes)) |r| {
+            const ri = try Object.create(arena, self.objectProto());
+            try ri.defineData("status", .{ .number = @floatFromInt(r.status) }, true, true, true);
+            const resp = try makeResponseInstance(self, &.{ .{ .string = r.body }, .{ .object = ri } });
+            if (resp.isAbrupt()) try async_mod.rejectPromise(self, promise, resp.throw) else try async_mod.fulfillPromise(self, promise, resp.normal);
+        } else {
+            try async_mod.rejectPromise(self, promise, (try self.throwError("TypeError", "https request failed (TLS)")).throw);
+        }
+        return .{ .normal = .{ .object = promise } };
+    }
+
     // shared context: the promise + accumulated chunks (a JS Array).
     const ctx = try Object.create(arena, self.objectProto());
     try ctx.defineData("%promise%", .{ .object = promise }, false, false, true);
