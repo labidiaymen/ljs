@@ -399,8 +399,12 @@ fn loadModule(self: *Interpreter, abspath: []const u8) EvalError!Completion {
     self.script_name = saved_name;
     if (body_c.isAbrupt()) return body_c;
 
-    // The body may have reassigned `module.exports`; the authoritative exports is module.exports now.
-    exports_v = module_obj.get("exports") orelse exports_v;
+    // The body may have reassigned `module.exports` — OR defined it as a lazy GETTER
+    // (`Object.defineProperty(module, 'exports', { get })`, e.g. ansi-styles). Read it through
+    // `getProperty` so an accessor is INVOKED (a raw own-property read would return undefined).
+    const ev = try self.getProperty(.{ .object = module_obj }, "exports");
+    if (ev.isAbrupt()) return ev;
+    if (ev.normal != .undefined) exports_v = ev.normal;
     self.require_cache.put(arena, abspath, exports_v) catch return error.OutOfMemory;
     try module_obj.defineData("loaded", .{ .boolean = true }, true, true, true);
     return .{ .normal = exports_v };
