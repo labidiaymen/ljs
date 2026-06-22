@@ -41,9 +41,10 @@ fn setImmediate(self: *Interpreter, args: []const Value) EvalError!Completion {
     if (cb != .object or cb.object.kind != .function)
         return self.throwError("TypeError", "callback is not a function");
     const extra: []const Value = if (args.len > 1) try self.arena.dupe(Value, args[1..]) else &.{};
-    const id = self.next_immediate_id;
-    self.next_immediate_id += 1;
-    self.immediates.append(self.arena, .{ .id = id, .callback = cb.object, .args = extra }) catch return error.OutOfMemory;
+    const loop = self.hostLoop();
+    const id = loop.next_immediate_id;
+    loop.next_immediate_id += 1;
+    loop.immediates.append(self.arena, .{ .id = id, .callback = cb.object, .args = extra }) catch return error.OutOfMemory;
     return .{ .normal = .{ .number = @floatFromInt(id) } };
 }
 
@@ -54,7 +55,7 @@ fn clearImmediate(self: *Interpreter, args: []const Value) EvalError!Completion 
     if (nd.isAbrupt()) return nd;
     if (std.math.isNan(nd.normal.number)) return .{ .normal = .undefined };
     const id: u64 = @intFromFloat(@max(nd.normal.number, 0));
-    for (self.immediates.items) |*im| {
+    for (self.hostLoop().immediates.items) |*im| {
         if (im.id == id) {
             im.cancelled = true;
             break;
@@ -77,9 +78,10 @@ fn schedule(self: *Interpreter, args: []const Value, repeat: bool) EvalError!Com
         if (std.math.isNan(delay) or delay < 0) delay = 0;
     }
     const extra: []const Value = if (args.len > 2) try self.arena.dupe(Value, args[2..]) else &.{};
-    const id = self.next_timer_id;
-    self.next_timer_id += 1;
-    self.timers.append(self.arena, .{
+    const loop = self.hostLoop();
+    const id = loop.next_timer_id;
+    loop.next_timer_id += 1;
+    loop.timers.append(self.arena, .{
         .id = id,
         .callback = cb.object,
         .args = extra,
@@ -97,7 +99,7 @@ fn cancel(self: *Interpreter, args: []const Value) EvalError!Completion {
     const id_f = nd.normal.number;
     if (std.math.isNan(id_f)) return .{ .normal = .undefined };
     const id: u64 = @intFromFloat(@max(id_f, 0));
-    for (self.timers.items) |*t| {
+    for (self.hostLoop().timers.items) |*t| {
         if (t.id == id) {
             t.cancelled = true;
             break;

@@ -370,6 +370,15 @@ fn connect(self: *Interpreter, args: []const Value) EvalError!Completion {
 }
 
 fn startConnect(self: *Interpreter, st: *SocketState, ca: ConnArgs) EvalError!void {
+    // libxev is single-threaded: a connect submitted from an async/generator BODY thread (which runs
+    // on its own OS thread, see interp_async.asyncBodyThread) is never serviced by the loop thread and
+    // would hang forever. Fail fast with a connect 'error' instead — the http client surfaces it as a
+    // rejected fetch()/request promise. (Lifting this needs cross-thread libxev submission marshaling —
+    // a future cycle; `fetch().then(...)` initiated on the main turn is the supported path today.)
+    if (self.host_timer_parent != null) {
+        emitSafe(self, st.js, "error", &.{try makeError(self, "ERR_ASYNC_SOCKET_IO", "socket I/O initiated inside an async function body is not yet supported (run the request on the main turn, e.g. fetch(...).then(...))")});
+        return;
+    }
     const addr = resolveAddr(ca.host, ca.port) orelse {
         emitSafe(self, st.js, "error", &.{try makeError(self, "ENOTFOUND", "getaddrinfo ENOTFOUND")});
         return;

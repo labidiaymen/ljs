@@ -263,7 +263,7 @@ pub fn processMethod(self: *Interpreter, func: *Object, this_val: Value, args: [
         if (cb != .object or cb.object.kind != .function)
             return @import("host_process.zig").throwCodedPub(self, "TypeError", "ERR_INVALID_ARG_TYPE", "The \"callback\" argument must be of type function.");
         const extra: []const Value = if (args.len > 1) try self.arena.dupe(Value, args[1..]) else &.{};
-        self.next_tick_queue.append(self.arena, .{ .callback = cb.object, .args = extra }) catch return error.OutOfMemory;
+        self.hostLoop().next_tick_queue.append(self.arena, .{ .callback = cb.object, .args = extra }) catch return error.OutOfMemory;
         return .{ .normal = .undefined };
     }
     if (std.mem.eql(u8, name, "stdoutWrite")) return writeStream(self, self.host_out, args);

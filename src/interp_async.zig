@@ -160,6 +160,14 @@ pub fn generatorBodyThread(parent: *Interpreter, gen: *object_mod.Generator) voi
         .module_cache = parent.module_cache,
         .host_referrer_key = parent.host_referrer_key,
         .async_done = parent.async_done,
+        // HOST: inherit stdout/stderr + process context + the loop's timer/microtask queues so
+        // `console.log` / `process.*` / `setTimeout` work inside a generator body (see asyncBodyThread).
+        .host_out = parent.host_out,
+        .host_err = parent.host_err,
+        .host_cwd = parent.host_cwd,
+        .process_obj = parent.process_obj,
+        .host_start_ms = parent.host_start_ms,
+        .host_timer_parent = parent.host_timer_parent orelse parent,
     };
     const comp = body.runGeneratorBody(gen) catch |e| blk: {
         // §27.5.3.3: an engine error (step-limit / OOM) on the body thread completes the generator
@@ -1019,6 +1027,15 @@ pub fn asyncBodyThread(parent: *Interpreter, gen: *object_mod.Generator) void {
         .module_cache = parent.module_cache,
         .host_referrer_key = parent.host_referrer_key,
         .async_done = parent.async_done,
+        // HOST (Node axis): inherit the run's stdout/stderr writers + process context so `console.log`
+        // and `process.*` work INSIDE an async body (the body runs on its own thread with a fresh
+        // Interpreter — without this its `host_out` is null and all output is silently dropped).
+        .host_out = parent.host_out,
+        .host_err = parent.host_err,
+        .host_cwd = parent.host_cwd,
+        .process_obj = parent.process_obj,
+        .host_start_ms = parent.host_start_ms,
+        .host_timer_parent = parent.host_timer_parent orelse parent,
     };
     const comp = body.runGeneratorBody(gen) catch |e| blk: {
         const kind: []const u8 = if (e == error.StepLimitExceeded) "RangeError" else "Error";

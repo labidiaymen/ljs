@@ -180,6 +180,12 @@ pub const Interpreter = struct {
     /// host loop runs there), so conformance is unaffected. `next_timer_id` hands out timer ids.
     timers: std.ArrayListUnmanaged(object_mod.TimerEntry) = .empty,
     next_timer_id: u64 = 1,
+    /// HOST (Node axis): on an async/generator BODY-thread interpreter, points at the root (event-loop)
+    /// interpreter so `setTimeout`/`setInterval`/`setImmediate`/`process.nextTick` scheduled INSIDE an
+    /// async body land in the loop's queues (the body's own queues are never drained). Null on the root.
+    /// Safe without locking: the threads hand off cooperatively (only one runs at a time). Use
+    /// `self.hostLoop()` to resolve "the interpreter that owns the timer/microtask queues".
+    host_timer_parent: ?*Interpreter = null,
     /// HOST (Node axis, spec 099): the `setImmediate` queue — fired in the event loop's "check" phase
     /// (before timers). Inert on the Test262 path. `next_immediate_id` hands out ids.
     immediates: std.ArrayListUnmanaged(object_mod.ImmediateEntry) = .empty,
@@ -498,6 +504,13 @@ pub const Interpreter = struct {
 
     pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this_val: Value) EvalError!Completion {
         return interp_expr.callFunction(self, func, args, this_val);
+    }
+
+    /// The interpreter that OWNS the host timer / microtask / next-tick queues — i.e. the root
+    /// event-loop interpreter. On a body-thread interpreter this redirects to the parent so work
+    /// scheduled inside an async/generator body reaches the loop; on the root it is `self`.
+    pub inline fn hostLoop(self: *Interpreter) *Interpreter {
+        return self.host_timer_parent orelse self;
     }
 
     /// §10.1.8 [[Get]]. Property access on null/undefined throws (§13.3); other primitives
