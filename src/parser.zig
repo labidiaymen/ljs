@@ -653,7 +653,7 @@ pub const Parser = struct {
     pub fn parseIf(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // if
         _ = try self.expect(.lparen);
-        const cond = try self.parseAssignment();
+        const cond = try self.parseExpression(); // §14.6/14.7: `( Expression )` — comma/sequence allowed
         _ = try self.expect(.rparen);
         const then = try self.allocStmt(try self.parseSubStmt(false));
         var otherwise: ?*const ast.Stmt = null;
@@ -684,7 +684,7 @@ pub const Parser = struct {
     pub fn parseWhile(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // while
         _ = try self.expect(.lparen);
-        const cond = try self.parseAssignment();
+        const cond = try self.parseExpression(); // §14.6/14.7: `( Expression )` — comma/sequence allowed
         _ = try self.expect(.rparen);
         self.iteration_depth += 1;
         defer self.iteration_depth -= 1;
@@ -704,7 +704,7 @@ pub const Parser = struct {
         };
         _ = try self.expect(.kw_while);
         _ = try self.expect(.lparen);
-        const cond = try self.parseAssignment();
+        const cond = try self.parseExpression(); // §14.6/14.7: `( Expression )` — comma/sequence allowed
         _ = try self.expect(.rparen);
         if (self.peek().kind == .semicolon) _ = self.advance();
         return .{ .do_while_stmt = .{ .cond = cond, .body = body } };
@@ -916,7 +916,7 @@ pub const Parser = struct {
     pub fn parseSwitch(self: *Parser) ParseError!ast.Stmt {
         _ = self.advance(); // switch
         _ = try self.expect(.lparen);
-        const disc = try self.parseAssignment();
+        const disc = try self.parseExpression(); // §14.12: `switch ( Expression )` — comma/sequence allowed
         _ = try self.expect(.rparen);
         _ = try self.expect(.lbrace);
         self.switch_depth += 1;
@@ -1452,8 +1452,10 @@ pub const Parser = struct {
                 const k = self.peek().kind;
                 // §12.9.1: `return [no LineTerminator here] Expression` — a LineTerminator before the next
                 // token forces ASI (`return;`). Without the `newline_before` check, `if (a) return\n
-                // if (b) …` mis-parses the following line as the return argument.
-                if (k != .semicolon and k != .rbrace and k != .eof and !self.peek().newline_before) arg = try self.parseAssignment();
+                // if (b) …` mis-parses the following line as the return argument. The argument is a full
+                // Expression (§13.16) — `parseExpression`, NOT `parseAssignment` — so the comma/sequence
+                // operator works (`return _typeof = …, _typeof(o)`, ubiquitous in Babel-compiled code).
+                if (k != .semicolon and k != .rbrace and k != .eof and !self.peek().newline_before) arg = try self.parseExpression();
                 if (self.peek().kind == .semicolon) _ = self.advance();
                 return .{ .ret = arg };
             },
@@ -1466,7 +1468,8 @@ pub const Parser = struct {
             .kw_try => return self.parseTry(),
             .kw_throw => {
                 _ = self.advance();
-                const e = try self.parseAssignment();
+                // §14.14: `throw Expression ;` — a full Expression (comma/sequence allowed).
+                const e = try self.parseExpression();
                 if (self.peek().kind == .semicolon) _ = self.advance();
                 return .{ .throw_stmt = e };
             },
