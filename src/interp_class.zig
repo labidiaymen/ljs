@@ -288,6 +288,8 @@ pub fn evalClass(self: *Interpreter, c: *const ast.Class, env: *Environment) Eva
         .is_default_ctor = ctor_fn == null, // no explicit `constructor` → synthesized default
         .super_ctor = super_ctor,
         .strict = true, // §15.7: a class body (and thus its constructor) is always strict
+        .src = self.script_source,
+        .src_name = self.script_name,
     });
     ctor.prototype = self.functionProto(); // §20.2.3 default; a derived class overrides to Super below
     // The constructor's `.prototype` object holds the instance methods.

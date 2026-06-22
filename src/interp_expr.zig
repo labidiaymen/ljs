@@ -736,11 +736,13 @@ pub fn evalNew(self: *Interpreter, n: anytype, env: *Environment) EvalError!Comp
         const alc = try evalSpreadList(self, n.args, env, &call_args);
         if (alc.isAbrupt()) return alc;
         const merged = try concatArgs(self, bound_prefix, call_args.items);
+        self.pending_call_pos = n.pos; // spec 119
         return self.construct(inner, merged);
     }
     var args: std.ArrayListUnmanaged(Value) = .empty;
     const alc = try evalSpreadList(self, n.args, env, &args);
     if (alc.isAbrupt()) return alc;
+    self.pending_call_pos = n.pos; // spec 119: the `new` site, recorded into the caller's frame
     return self.construct(cc.normal.object, args.items);
 }
 
@@ -1293,6 +1295,8 @@ pub fn evalFunctionExpr(self: *Interpreter, f: *const ast.Function, env: *Enviro
         .captured_private_env = if (f.is_arrow) self.private_env else null, // §9.2 lexical [[PrivateEnvironment]]
         .private_env = if (f.is_arrow) null else self.private_env, // §9.2 a method/fn inside a class body
         .strict = f.strict,
+        .src = self.script_source,
+        .src_name = self.script_name,
     });
     obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
     // §20.2.4.1/.2: install `length` (ExpectedArgumentCount) and `name` (the declared name, or
@@ -1418,6 +1422,7 @@ pub fn evalCall(self: *Interpreter, c: anytype, env: *Environment) EvalError!Com
     if (callee.object.call) |fd| {
         if (fd.is_class_ctor) return self.throwError("TypeError", "Class constructor cannot be invoked without 'new'");
     }
+    self.pending_call_pos = c.pos; // spec 119: this call's source offset, recorded into the caller's frame
     return self.callFunction(callee.object, args.items, this_for_call);
 }
 
@@ -1524,6 +1529,8 @@ pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this
         // `super(...)` chain (defined → construct) must initialize the instance, while a plain call
         // (undefined) throws "requires 'new'". Reset by every dispatch so it never leaks.
         self.native_new_target = pending_new_target;
+        self.pushFrame(func, this_val, .native); // spec 119: a native frame (e.g. an Array.map callback site)
+        defer self.popFrame();
         return interp_native.callNative(self, func, args, this_val);
     }
     // §15.5.4 / §27.5: calling a generator function does NOT run the body — it returns a fresh
@@ -1553,6 +1560,8 @@ pub fn callFunction(self: *Interpreter, func: *Object, args: []const Value, this
     defer self.depth -= 1;
     if (self.depth > self.max_depth) return self.throwError("RangeError", "Maximum call stack size exceeded");
     const fd = func.call orelse return self.throwError("TypeError", "value is not a function");
+    self.pushFrame(func, this_val, .normal); // spec 119: a user-function frame (records its call site as it calls inward)
+    defer self.popFrame();
     // PERF (spec 111): the bytecode-VM fast path. Behind `LJS_VM`; only for functions the compiler
     // accepts (simple params, no rest, not a class ctor, closure not crossing a `with`). Params bind to
     // leading slots, body locals to the rest; free vars resolve via `fd.closure`. Everything else (and

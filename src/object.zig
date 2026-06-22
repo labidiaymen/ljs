@@ -195,6 +195,11 @@ pub const Object = struct {
     /// constructors, or the engine's internal `throwError`). Read ONLY by §20.1.3.6
     /// Object.prototype.toString to yield the `"Error"` builtin tag. Null/false for every other object.
     error_data: bool = false,
+    /// V8/Node stack traces (spec 119): the call stack snapshotted at this Error's construction (top
+    /// `stackTraceLimit` frames, innermost first). Null until captured; consumed by the `stack` getter
+    /// (formatted V8-style) / `Error.prepareStackTrace` (built into CallSite objects). Only ever set on
+    /// [[ErrorData]] objects (and captureStackTrace targets).
+    error_stack: ?[]rt.StackFrame = null,
     /// §10.4.4 [[ParameterMap]] presence — set iff this object is an `arguments` exotic. The M-subset
     /// arguments object is otherwise ordinary; this flag exists only so §20.1.3.6 Object.prototype.toString
     /// yields the `"Arguments"` builtin tag.

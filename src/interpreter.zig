@@ -9,6 +9,7 @@ const Symbol = @import("value.zig").Symbol;
 const Completion = @import("completion.zig").Completion;
 const Environment = @import("environment.zig").Environment;
 const object_mod = @import("object.zig");
+const rt = @import("runtime_types.zig");
 const Object = object_mod.Object;
 const ops = @import("abstract_ops.zig");
 const bigint = @import("bigint.zig");
@@ -180,6 +181,16 @@ pub const Interpreter = struct {
     /// host loop runs there), so conformance is unaffected. `next_timer_id` hands out timer ids.
     timers: std.ArrayListUnmanaged(object_mod.TimerEntry) = .empty,
     next_timer_id: u64 = 1,
+    /// V8/Node stack traces (spec 119): the runtime call stack. `callFunction` pushes a frame on entry
+    /// and pops on return (best-effort — an OOM on push just skips recording). An Error snapshots the
+    /// top `stackTraceLimit` frames at construction. `pending_call_pos` carries the call-site byte
+    /// offset from `evalCall`/`evalNew` into `callFunction` so the CALLER frame records where it called
+    /// from. `script_source`/`script_name` are the CURRENT module's source + filename (set per program /
+    /// per module evaluation), stamped onto each function created while they are in effect.
+    call_stack: std.ArrayListUnmanaged(rt.StackFrame) = .empty,
+    pending_call_pos: u32 = 0,
+    script_source: []const u8 = "",
+    script_name: []const u8 = "",
     /// HOST (Node axis): on an async/generator BODY-thread interpreter, points at the root (event-loop)
     /// interpreter so `setTimeout`/`setInterval`/`setImmediate`/`process.nextTick` scheduled INSIDE an
     /// async body land in the loop's queues (the body's own queues are never drained). Null on the root.
@@ -511,6 +522,78 @@ pub const Interpreter = struct {
     /// scheduled inside an async/generator body reaches the loop; on the root it is `self`.
     pub inline fn hostLoop(self: *Interpreter) *Interpreter {
         return self.host_timer_parent orelse self;
+    }
+
+    /// Push a call-stack frame (spec 119). First records the CALLER's current call-site offset
+    /// (`pending_call_pos`, set by `evalCall`/`evalNew`) into the current top frame — so a frame's
+    /// `cur_pos` is always where it last called inward. Best-effort: an OOM on growth silently skips
+    /// recording (a stack trace is never load-bearing). Hot path → kept tiny + inlined.
+    pub inline fn pushFrame(self: *Interpreter, func: ?*Object, this_val: Value, kind: rt.FrameKind) void {
+        const n = self.call_stack.items.len;
+        if (n != 0) self.call_stack.items[n - 1].cur_pos = self.pending_call_pos;
+        // Best-effort: a stack trace is never load-bearing, so on an allocation failure just skip
+        // recording this frame (OOM is imminently fatal regardless). `catch return` keeps lint happy.
+        self.call_stack.append(self.arena, .{ .func = func, .this_val = this_val, .cur_pos = 0, .kind = kind }) catch return;
+    }
+
+    pub inline fn popFrame(self: *Interpreter) void {
+        const n = self.call_stack.items.len;
+        if (n != 0) self.call_stack.items.len = n - 1;
+    }
+
+    /// Snapshot the current call stack into `err` (spec 119), innermost first, capped at
+    /// `Error.stackTraceLimit` (default 10). Records each frame's CALLER call-site by first folding in
+    /// `pending_call_pos` for the top frame (the `new Error()` / throw site). Called at Error
+    /// construction + `captureStackTrace`.
+    pub fn captureStack(self: *Interpreter, err: *Object) void {
+        if (self.call_stack.items.len != 0) self.call_stack.items[self.call_stack.items.len - 1].cur_pos = self.pending_call_pos;
+        // V8 omits the Error constructor's own frame(s) from the trace — skip leading error-ctor natives.
+        var n = self.call_stack.items.len;
+        while (n != 0) : (n -= 1) {
+            const f = self.call_stack.items[n - 1];
+            const is_err_ctor = f.kind == .native and f.func != null and switch (f.func.?.native) {
+                .error_ctor, .aggregate_error_ctor, .suppressed_error_ctor => true,
+                else => false,
+            };
+            if (!is_err_ctor) break;
+        }
+        const limit: usize = blk: {
+            const ec = self.globals orelse break :blk 10;
+            const eo = (ec.lookup("Error") orelse break :blk 10).value;
+            if (eo != .object) break :blk 10;
+            const lv = eo.object.get("stackTraceLimit") orelse break :blk 10;
+            if (lv != .number or lv.number <= 0) break :blk if (lv == .number) 0 else 10;
+            break :blk @intFromFloat(@min(lv.number, 1000));
+        };
+        const take = @min(n, limit);
+        if (take == 0) {
+            err.error_stack = &.{};
+            return;
+        }
+        const frames = self.arena.alloc(rt.StackFrame, take) catch return;
+        // innermost first: copy the top `take` frames in reverse.
+        var i: usize = 0;
+        while (i < take) : (i += 1) frames[i] = self.call_stack.items[n - 1 - i];
+        err.error_stack = frames;
+    }
+
+    /// `Error.captureStackTrace(target[, ctorOpt])` (spec 119). Snapshots the stack into `target`,
+    /// dropping the `captureStackTrace` native frame itself and — if `ctor_opt` is given — every frame
+    /// from the innermost up to and INCLUDING the frame whose function is `ctor_opt` (so the trace
+    /// begins at `ctor_opt`'s caller, matching V8 — this is how `depd` finds the deprecation call site).
+    pub fn captureStackTraceInto(self: *Interpreter, target: *Object, ctor_opt: ?*Object) void {
+        self.captureStack(target);
+        var frames = target.error_stack orelse return;
+        if (frames.len != 0) frames = frames[1..]; // drop the captureStackTrace native frame itself
+        if (ctor_opt) |co| {
+            var start: usize = 0;
+            for (frames, 0..) |fr, i| if (fr.func == co) {
+                start = i + 1;
+                break;
+            };
+            if (start <= frames.len) frames = frames[start..];
+        }
+        target.error_stack = frames;
     }
 
     /// §10.1.8 [[Get]]. Property access on null/undefined throws (§13.3); other primitives
@@ -1042,6 +1125,7 @@ pub const Interpreter = struct {
         err.error_data = true; // §20.5 [[ErrorData]] → §20.1.3.6 "Error" tag
         try err.set("name", .{ .string = kind });
         try err.set("message", .{ .string = msg });
+        self.captureStack(err); // spec 119: snapshot the call stack for engine-thrown errors too
         return .{ .throw = .{ .object = err } };
     }
 

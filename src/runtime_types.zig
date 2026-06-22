@@ -731,6 +731,9 @@ pub const NativeId = enum {
     fetch_body_method,
     /// HOST (WHATWG): the global `AbortController`/`AbortSignal`. Dispatched in `host_abort.zig`. Inert on Test262.
     abort_method,
+    /// V8 (spec 119): a CallSite object's method (getFileName/getLineNumber/…) built for
+    /// `Error.prepareStackTrace`. Dispatched in `error_stack.zig`. Inert on Test262.
+    callsite_method,
     /// §10.4.4.6 %ThrowTypeError% — the unique per-realm function that unconditionally throws a
     /// TypeError. Used as the poison `get`/`set` for `callee` (and historically `caller`) on a
     /// strict / unmapped arguments object. Never returns normally.
@@ -852,6 +855,22 @@ pub const FunctionData = struct {
     /// ReferenceError (strict) instead of creating a global property (sloppy). Class constructors are
     /// always strict (§15.7) — set true when synthesizing the constructor's FunctionData.
     strict: bool = false,
+    /// HOST/V8 stack traces (spec 119): the source text + filename in which this function was DEFINED,
+    /// stamped at creation from the running module's source. Used to map a frame's byte `cur_pos` to
+    /// `file:line:col`. Empty for engine-synthesized functions (default ctors) and natives.
+    src: []const u8 = "",
+    src_name: []const u8 = "",
+};
+
+/// One entry in the interpreter's runtime call stack (spec 119). Pushed/popped by `callFunction`;
+/// snapshotted into an Error's structured stack. Kept minimal so the hot-path push is cheap — the
+/// name / source / line:col are DERIVED from `func` lazily at capture/format time.
+pub const FrameKind = enum { normal, ctor, native };
+pub const StackFrame = struct {
+    func: ?*Object, // the called function object (ordinary or native); null for a synthetic frame
+    this_val: Value, // the call's `this` (for CallSite.getThis / getTypeName)
+    cur_pos: u32, // byte offset of the CALL SITE currently active in this frame (where it calls inward / throws)
+    kind: FrameKind = .normal,
 };
 
 /// §15.7.14 one resolved instance FieldDefinition: the property key (computed keys are evaluated at

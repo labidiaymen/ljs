@@ -231,6 +231,21 @@ fn defineHostMethod(self: *Interpreter, target: *Object, key: []const u8, impl: 
 pub fn processMethod(self: *Interpreter, func: *Object, this_val: Value, args: []const Value) EvalError!Completion {
     const name = func.native_name;
     if (std.mem.eql(u8, name, "process_ctor")) return .{ .normal = .undefined }; // `new process.constructor()` no-op
+    if (std.mem.eql(u8, name, "captureStackTrace")) {
+        // V8 (spec 119): snapshot the current stack onto `target` + install an own lazy `stack` accessor.
+        if (args.len == 0 or args[0] != .object) return .{ .normal = .undefined };
+        const target = args[0].object;
+        const ctor_opt: ?*Object = if (args.len > 1 and args[1] == .object and args[1].object.kind == .function) args[1].object else null;
+        self.captureStackTraceInto(target, ctor_opt);
+        const getter = try Object.createNative(self.arena, .error_stack_getter, "get stack");
+        const setter = try Object.createNative(self.arena, .error_stack_setter, "set stack");
+        getter.prototype = self.functionProto();
+        setter.prototype = self.functionProto();
+        _ = getter.properties.orderedRemove("prototype");
+        _ = setter.properties.orderedRemove("prototype");
+        try target.defineAccessorEx("stack", getter, setter, false);
+        return .{ .normal = .undefined };
+    }
     if (std.mem.eql(u8, name, "cwd")) {
         return .{ .normal = .{ .string = self.host_cwd } };
     }

@@ -435,6 +435,12 @@ pub fn runHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, ctx:
     var interp = Interpreter{ .arena = arena, .step_limit = std.math.maxInt(u64), .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
     interp.host_out = out;
     interp.host_err = err;
+    interp.script_source = source; // spec 119: stack-trace source + filename for the entry script
+    interp.script_name = ctx.script_path;
+    // spec 119: a synthetic top-level frame so traces end at `Object.<anonymous> (file:line:col)` like Node.
+    if (@import("object.zig").Object.createFunction(arena, .{ .params = &.{}, .body = &.{}, .closure = global, .src = source, .src_name = ctx.script_path })) |top_fn| {
+        interp.pushFrame(top_fn, .undefined, .normal);
+    } else |_| {}
     interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
     host_setup.installHostGlobals(&interp, ctx) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -503,6 +509,12 @@ pub fn runHostModule(arena: std.mem.Allocator, source: []const u8, ctx: HostCtx,
     var interp = Interpreter{ .arena = arena, .step_limit = std.math.maxInt(u64), .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
     interp.host_out = out;
     interp.host_err = err;
+    interp.script_source = source; // spec 119: stack-trace source + filename for the entry script
+    interp.script_name = ctx.script_path;
+    // spec 119: a synthetic top-level frame so traces end at `Object.<anonymous> (file:line:col)` like Node.
+    if (@import("object.zig").Object.createFunction(arena, .{ .params = &.{}, .body = &.{}, .closure = global, .src = source, .src_name = ctx.script_path })) |top_fn| {
+        interp.pushFrame(top_fn, .undefined, .normal);
+    } else |_| {}
     interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
     host_setup.installHostGlobals(&interp, ctx) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -563,6 +575,12 @@ pub fn evalHost(arena: std.mem.Allocator, source: []const u8, mode: RunMode, ctx
     var interp = Interpreter{ .arena = arena, .step_limit = std.math.maxInt(u64), .globals = global, .gen_registry = &gen_registry, .job_queue = &job_queue };
     interp.host_out = out;
     interp.host_err = err;
+    interp.script_source = source; // spec 119: stack-trace source + filename for the entry script
+    interp.script_name = ctx.script_path;
+    // spec 119: a synthetic top-level frame so traces end at `Object.<anonymous> (file:line:col)` like Node.
+    if (@import("object.zig").Object.createFunction(arena, .{ .params = &.{}, .body = &.{}, .closure = global, .src = source, .src_name = ctx.script_path })) |top_fn| {
+        interp.pushFrame(top_fn, .undefined, .normal);
+    } else |_| {}
     interp.this_val = if (global.lookup("%GlobalThis%")) |b| b.value else .undefined;
     host_setup.installHostGlobals(&interp, ctx) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,

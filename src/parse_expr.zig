@@ -467,12 +467,13 @@ pub fn parsePostfix(self: *Parser) ParseError!*const ast.Node {
     // §13.3 SuperProperty / SuperCall — `super` is never a standalone primary; it must be the
     // base of `super.name`, `super[expr]`, or `super(args)`. Handle it here so the early errors
     // (must be inside a method / derived constructor) fire and the form is captured directly.
+    const start_off = self.tokenOffset(self.peek()); // callee start — V8 points a call frame here
     if (self.peek().kind == .kw_super) {
         const sup = try self.parseSuper();
-        return self.continuePostfix(sup, false);
+        return self.continuePostfix(sup, false, start_off);
     }
     const expr = try self.parsePrimary();
-    return self.continuePostfix(expr, false);
+    return self.continuePostfix(expr, false, start_off);
 }
 
 /// §13.3.7 SuperCall / §13.3.5 SuperProperty — current token is `super`. A `super(args)` is only
@@ -507,7 +508,7 @@ pub fn parseSuper(self: *Parser) ParseError!*const ast.Node {
 
 /// Continue a Member/Call postfix chain from an already-parsed base (`expr`). Shared by the
 /// ordinary-primary path and the `super.x` base. `in_chain` records whether a `?.` has appeared.
-pub fn continuePostfix(self: *Parser, base: *const ast.Node, started_in_chain: bool) ParseError!*const ast.Node {
+pub fn continuePostfix(self: *Parser, base: *const ast.Node, started_in_chain: bool, base_off: u32) ParseError!*const ast.Node {
     var expr = base;
     var in_chain = started_in_chain; // have we seen a `?.` for the current chain root?
     while (true) {
@@ -568,7 +569,7 @@ pub fn continuePostfix(self: *Parser, base: *const ast.Node, started_in_chain: b
                 expr = if (in_chain)
                     try self.alloc(.{ .optional = .{ .base = expr, .optional = false, .link = .{ .call = args } } })
                 else
-                    try self.alloc(.{ .call = .{ .callee = expr, .args = args } });
+                    try self.alloc(.{ .call = .{ .callee = expr, .args = args, .pos = base_off } }); // V8 call site = callee start
             },
             .template => { // §13.2.8 TaggedTemplate `expr\`…\``
                 // §13.3.9.1 Early Error: a tagged template may not be applied to an OptionalChain

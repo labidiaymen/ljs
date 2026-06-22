@@ -406,7 +406,7 @@ pub fn instantiateFunctionObject(self: *Interpreter, f: *const ast.Function, env
     // §9.2: a function DECLARATION lexically inside a class body captures the running
     // [[PrivateEnvironment]] (declarations are never arrows), so `obj.#x` in its body resolves to the
     // enclosing class's Private Names even when the function is called from an unrelated context.
-    const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env, .is_generator = f.is_generator, .is_async = f.is_async, .strict = f.strict, .private_env = self.private_env });
+    const obj = try Object.createFunction(self.arena, .{ .params = f.params, .rest = f.rest, .body = f.body, .closure = env, .is_generator = f.is_generator, .is_async = f.is_async, .strict = f.strict, .private_env = self.private_env, .src = self.script_source, .src_name = self.script_name });
     obj.prototype = self.functionProto(); // §20.2.3 so `f.call`/`.apply`/`.bind` resolve
     // §20.2.4.1/.2: a declaration always has a name; install `length` + `name`.
     try setFunctionLength(obj, paramCount(f.params));

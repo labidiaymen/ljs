@@ -631,6 +631,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .headers_method => return @import("host_headers.zig").method(self, func, this_val, args), // HOST WHATWG Headers
         .fetch_body_method => return @import("host_fetch_body.zig").method(self, func, this_val, args), // HOST Response/Request
         .abort_method => return @import("host_abort.zig").method(self, func, this_val, args), // HOST AbortController/Signal
+        .callsite_method => return @import("error_stack.zig").callsiteMethod(self, func.native_name, this_val), // V8 CallSite
         .eval_fn => {
             // §19.2.1: reaching `callNative` means INDIRECT eval (`(0,eval)(s)`, `var e=eval; e(s)`,
             // `globalThis.eval(s)`) — the direct case is intercepted in `evalCall` before dispatch.
@@ -674,6 +675,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
                 break :blk try Object.create(self.arena, if (pv == .object) pv.object else null);
             };
             err.error_data = true; // §20.5 [[ErrorData]] → §20.1.3.6 "Error" tag
+            self.captureStack(err); // spec 119: snapshot the call stack at construction
             // §20.5.1.1 step 3: if `message` is not undefined, install a non-enumerable own
             // `message` (writable/configurable). When undefined, NO own `message` is created (the
             // prototype's empty-string `message` shows through). `name` lives on the prototype.
@@ -697,6 +699,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
                 break :blk try Object.create(self.arena, if (pv != null and pv.? == .object) pv.?.object else null);
             };
             err.error_data = true; // §20.5 [[ErrorData]] → §20.1.3.6 "Error" tag
+            self.captureStack(err); // spec 119: snapshot the call stack at construction
             // §20.5.7.1.1: superclass-then-subclass order — `message` ToString first, then
             // InstallErrorCause, then ToList(errors). (Test order-of-args-evaluation depends on this.)
             if (args.len > 1 and args[1] != .undefined) {
@@ -730,6 +733,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
                 break :blk try Object.create(self.arena, if (pv != null and pv.? == .object) pv.?.object else null);
             };
             err.error_data = true; // §20.5 [[ErrorData]] → §20.1.3.6 "Error" tag
+            self.captureStack(err); // spec 119: snapshot the call stack at construction
             if (args.len > 2 and args[2] != .undefined) {
                 const ms = try self.toStringThrowing(args[2]);
                 if (ms.isAbrupt()) return ms;
@@ -768,8 +772,9 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .error_stack_getter => {
             // §1: this must be an Object; §3: no [[ErrorData]] slot → undefined; else a string.
             if (this_val != .object) return self.throwError("TypeError", "get Error.prototype.stack called on a non-object");
-            if (!this_val.object.error_data) return .{ .normal = .undefined };
-            return .{ .normal = .{ .string = "" } }; // implementation-defined stack trace string
+            if (!this_val.object.error_data and this_val.object.error_stack == null) return .{ .normal = .undefined };
+            return @import("error_stack.zig").build(self, this_val.object); // spec 119: V8 string / prepareStackTrace
+
         },
         .error_stack_setter => {
             // §1: this must be an Object; §3: v must be a String; then
@@ -955,7 +960,7 @@ pub fn callNative(self: *Interpreter, func: *Object, args: []const Value, this_v
         .bigint_method => return builtin_bigint.bigintMethod(self, func.native_name, this_val, args), // §21.2.3 toString/valueOf
         .symbol_ctor => return builtin_symbol.constructor(self, args), // §20.4.1.1 Symbol([description])
         .promise_ctor => return interp_async.promiseConstructor(self, this_val, args), // §27.2.3.1 Promise(executor)
-        .timer_fn, .console_log, .process_method, .buffer_fn, .events_method, .util_method, .qs_method, .timers_method, .assert_method, .url_method, .nodetest_method, .vm_method, .net_method, .crypto_method, .stream_method, .string_decoder_method, .http_method, .headers_method, .fetch_body_method, .abort_method, .require_fn, .core_module_fn => unreachable, // HOST (spec 098/100/101/102/103/104/105/106/107/108) — handled in the first switch
+        .timer_fn, .console_log, .process_method, .buffer_fn, .events_method, .util_method, .qs_method, .timers_method, .assert_method, .url_method, .nodetest_method, .vm_method, .net_method, .crypto_method, .stream_method, .string_decoder_method, .http_method, .headers_method, .fetch_body_method, .abort_method, .callsite_method, .require_fn, .core_module_fn => unreachable, // HOST (spec 098/100/101/102/103/104/105/106/107/108/119) — handled in the first switch
         .array_ctor, .array_method, .array_static, .string_method, .string_static, .math_method, .reflect_method => unreachable, // handled in the first switch
         .species_getter, .array_values, .array_keys, .array_entries, .string_iterator, .iterator_next, .symbol_to_string => unreachable, // handled in the first switch
         .symbol_static, .symbol_description => unreachable, // handled in the first switch

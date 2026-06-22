@@ -57,6 +57,9 @@ pub const Parser = struct {
     tokens: []const lex.Token,
     idx: usize = 0,
     arena: std.mem.Allocator,
+    /// The full source text (spec 119): a token's lexeme points into it, so a node's byte offset for
+    /// stack traces is `lexeme.ptr - source.ptr`. Empty for sub-parsers (template substitutions).
+    source: []const u8 = "",
     /// §13.13.1 mixing check: set true when the most recently parsed *operand* was a parenthesized
     /// expression `( … )`. Parentheses make `a ?? (b || c)` legal where `a ?? b || c` is not, but a
     /// parenthesized expression's AST node is indistinguishable from its content — so we record the
@@ -205,7 +208,7 @@ pub const Parser = struct {
             try toks.append(arena, t);
             if (t.kind == .eof) break;
         }
-        var p = Parser{ .tokens = toks.items, .arena = arena, .strict = strict };
+        var p = Parser{ .tokens = toks.items, .arena = arena, .strict = strict, .source = src };
         return p.parseProgram();
     }
 
@@ -237,7 +240,7 @@ pub const Parser = struct {
             try toks.append(arena, t);
             if (t.kind == .eof) break;
         }
-        var p = Parser{ .tokens = toks.items, .arena = arena, .strict = strict };
+        var p = Parser{ .tokens = toks.items, .arena = arena, .strict = strict, .source = src };
         p.in_function = ctx.in_function;
         p.in_method = ctx.in_method;
         p.in_derived_ctor = ctx.in_derived_ctor;
@@ -266,12 +269,22 @@ pub const Parser = struct {
         // BindingIdentifier. Reuse the `in_async` flag (which already gates the await operator in
         // `parseUnary`, rejects `await` bindings, and is reset across nested non-async functions so
         // `await` does NOT propagate into them, per §16.2.1.6 / the `early-does-not-propagate` tests).
-        var p = Parser{ .tokens = toks.items, .arena = arena, .strict = true, .is_module = true, .in_async = true };
+        var p = Parser{ .tokens = toks.items, .arena = arena, .strict = true, .is_module = true, .in_async = true, .source = src };
         return p.parseModuleProgram();
     }
 
     pub fn peek(self: *Parser) lex.Token {
         return self.tokens[self.idx];
+    }
+
+    /// Byte offset of `tok` within `source` (spec 119), via its lexeme pointer. 0 when unknown (no
+    /// source, a decoded lexeme not pointing into source, or out of range) — a benign "no position".
+    pub fn tokenOffset(self: *const Parser, tok: lex.Token) u32 {
+        if (self.source.len == 0 or tok.lexeme.len == 0) return 0;
+        const base = @intFromPtr(self.source.ptr);
+        const p = @intFromPtr(tok.lexeme.ptr);
+        if (p < base or (p - base) > self.source.len) return 0;
+        return @intCast(p - base);
     }
 
     pub fn advance(self: *Parser) lex.Token {
@@ -573,6 +586,7 @@ pub const Parser = struct {
     /// §13.3.5 `new Callee(args)`. Callee is a member expression (no call); the argument list
     /// binds to the `new`, so `new a.b.C(x)` constructs `a.b.C`.
     pub fn parseNew(self: *Parser) ParseError!*const ast.Node {
+        const new_pos: u32 = self.tokenOffset(self.peek()); // the `new` offset — the stack-trace construction site
         _ = self.advance(); // new
         // §13.3.12 NewTarget MetaProperty `new` `.` `target`. The only MetaProperty in the grammar is
         // `new.target`: after the `.`, the IdentifierName must be exactly `target` (no escapes), else a
@@ -636,7 +650,7 @@ pub const Parser = struct {
             _ = try self.expect(.rparen);
             args = list.items;
         }
-        return self.alloc(.{ .new_expr = .{ .callee = callee, .args = args } });
+        return self.alloc(.{ .new_expr = .{ .callee = callee, .args = args, .pos = new_pos } });
     }
 
     /// §13.3.10 ImportCall — current token is `import`, next is `(`. Parses
@@ -2062,8 +2076,8 @@ pub const Parser = struct {
     pub fn parseSuper(self: *Parser) ParseError!*const ast.Node {
         return parse_expr.parseSuper(self);
     }
-    pub inline fn continuePostfix(self: *Parser, base: *const ast.Node, started_in_chain: bool) ParseError!*const ast.Node {
-        return parse_expr.continuePostfix(self, base, started_in_chain);
+    pub inline fn continuePostfix(self: *Parser, base: *const ast.Node, started_in_chain: bool, base_off: u32) ParseError!*const ast.Node {
+        return parse_expr.continuePostfix(self, base, started_in_chain, base_off);
     }
     pub fn parseMethodBody(self: *Parser, pl: ParamList, strict_out: ?*bool) ParseError![]const ast.Stmt {
         return parse_expr.parseMethodBody(self, pl, strict_out);

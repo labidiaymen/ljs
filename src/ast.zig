@@ -77,7 +77,7 @@ pub const Node = union(enum) {
     /// desugared to `t = t op v`) so a side-effecting base/key expression runs exactly once (§13.15.2).
     compound_assign: struct { op: BinaryOp, target: *const Node, value: *const Node },
     function: *const Function, // §15.2 function expression
-    call: struct { callee: *const Node, args: []const *const Node }, // §13.3.6 call
+    call: struct { callee: *const Node, args: []const *const Node, pos: u32 = 0 }, // §13.3.6 call (pos = call-site byte offset, for stack traces)
     /// §13.3.10 ImportCall — the dynamic `import( specifier [, options] )` expression. `specifier`
     /// is the AssignmentExpression first argument; `options` (non-null) is the optional second
     /// argument (import options / attributes object). ImportCall is a CallExpression but NOT a
@@ -85,7 +85,7 @@ pub const Node = union(enum) {
     /// module loader, the interpreter ToString-es the specifier and returns a Promise rejected with
     /// a TypeError (a throwing ToString rejects the promise instead).
     import_call: struct { specifier: *const Node, options: ?*const Node },
-    new_expr: struct { callee: *const Node, args: []const *const Node }, // §13.3.5 new
+    new_expr: struct { callee: *const Node, args: []const *const Node, pos: u32 = 0 }, // §13.3.5 new (pos = new-site byte offset)
     logical: struct { op: LogicalOp, left: *const Node, right: *const Node }, // §13.13
     conditional: struct { cond: *const Node, then: *const Node, otherwise: *const Node }, // §13.14 ?:
     update: struct { op: UpdateOp, prefix: bool, target: *const Node }, // §13.4 ++ / --
