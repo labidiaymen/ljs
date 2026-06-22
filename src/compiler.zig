@@ -264,6 +264,27 @@ const Compiler = struct {
                 try self.expr(ix.key);
                 try self.op(.get_index, -1);
             },
+            // §13.4 `i++` / `i--` / `++i` / `--i` on a SLOT-backed identifier (the common loop counter).
+            // `.pos` is ToNumber(old) (a JIT no-op for SMIs). Prefix leaves the NEW value, postfix the OLD.
+            .update => |u| {
+                if (u.target.* != .identifier) return self.fail();
+                const name = u.target.identifier;
+                if (self.slotOf(name) == null) return self.fail(); // a global counter → tree-walk
+                const o: Op = if (u.op == .inc) .add else .sub;
+                try self.loadName(name);
+                try self.op(.pos, 0); // ToNumber(old)
+                if (u.prefix) {
+                    try self.constOp(.{ .number = 1 });
+                    try self.op(o, -1);
+                    try self.op(.dup, 1);
+                    try self.storeName(name); // result = new value
+                } else {
+                    try self.op(.dup, 1); // keep the old number as the result
+                    try self.constOp(.{ .number = 1 });
+                    try self.op(o, -1);
+                    try self.storeName(name); // stores new, leaves old
+                }
+            },
             else => self.fail(),
         }
     }
