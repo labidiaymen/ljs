@@ -1,9 +1,11 @@
 //! HOST runtime (Node axis, spec 108 — NOT ECMA-262): a MINIMAL `crypto` core module that common
 //! packages (e.g. `uuid`, `nanoid`) reach for: `randomBytes`, `randomFillSync`, `randomUUID`,
-//! `getRandomValues`, `randomInt`, and `createHash` (md5/sha1/sha256/sha512 via `std.crypto.hash`).
-//! Randomness comes from the host `Io` CSPRNG (`self.io.random`). HOST-only (`require('crypto')` /
-//! `require('node:crypto')`; the Web-Crypto subset is also installed as a global). NOT a full crypto
-//! implementation — no ciphers/keys/HMAC; absent rather than wrong.
+//! `getRandomValues`, `randomInt`, `createHash` (md5/sha1/sha224/sha256/sha384/sha512 via
+//! `std.crypto.hash`), `createHmac` (same algos via `std.crypto.auth.hmac`), `pbkdf2Sync`
+//! (`std.crypto.pwhash.pbkdf2`), and `timingSafeEqual`. Randomness comes from the host `Io` CSPRNG
+//! (`self.io.random`). HOST-only (`require('crypto')` / `require('node:crypto')`; the Web-Crypto
+//! subset is also installed as a global). NOT a full crypto implementation — no ciphers/keys;
+//! absent rather than wrong.
 const std = @import("std");
 const Value = @import("value.zig").Value;
 const object_mod = @import("object.zig");
@@ -17,7 +19,7 @@ const host_buffer = @import("host_buffer.zig");
 /// Build the `crypto` core-module exports.
 pub fn build(self: *Interpreter) EvalError!*Object {
     const obj = try Object.create(self.arena, self.objectProto());
-    for ([_][]const u8{ "randomBytes", "randomFillSync", "randomUUID", "getRandomValues", "randomInt", "createHash" }) |m|
+    for ([_][]const u8{ "randomBytes", "randomFillSync", "randomUUID", "getRandomValues", "randomInt", "createHash", "createHmac", "pbkdf2Sync", "timingSafeEqual" }) |m|
         try defineMethod(self, obj, m);
     // `crypto.webcrypto` self-reference (some packages read `crypto.webcrypto.getRandomValues`).
     try obj.defineData("webcrypto", .{ .object = obj }, true, true, true);
@@ -52,8 +54,13 @@ pub fn method(self: *Interpreter, func: *Object, this_val: Value, args: []const 
     if (eq(u8, name, "randomUUID")) return randomUUID(self);
     if (eq(u8, name, "randomInt")) return randomInt(self, args);
     if (eq(u8, name, "createHash")) return createHash(self, args);
+    if (eq(u8, name, "createHmac")) return createHmac(self, args);
+    if (eq(u8, name, "pbkdf2Sync")) return pbkdf2Sync(self, args);
+    if (eq(u8, name, "timingSafeEqual")) return timingSafeEqual(self, args);
     if (eq(u8, name, "h.update")) return hashUpdate(self, this_val, args);
     if (eq(u8, name, "h.digest")) return hashDigest(self, this_val, args);
+    if (eq(u8, name, "m.update")) return hmacUpdate(self, this_val, args);
+    if (eq(u8, name, "m.digest")) return hmacDigest(self, this_val, args);
     return .{ .normal = .undefined };
 }
 
@@ -109,10 +116,14 @@ fn hashDigest(self: *Interpreter, this_val: Value, args: []const Value) EvalErro
 
     var buf: [64]u8 = undefined;
     const digest = computeDigest(algo, data, &buf) orelse return self.throwError("Error", "Digest method not supported");
+    return encodeDigest(self, digest, if (args.len > 0) args[0] else .undefined);
+}
 
-    // Encoding: 'hex' / 'base64' → a string; else a Buffer.
-    if (args.len > 0 and args[0] == .string) {
-        const enc = args[0].string;
+/// Format a finalized `digest` per an optional encoding arg: `'hex'`/`'base64'`/`'latin1'`/`'binary'`
+/// → a string; anything else (incl. `undefined`) → a Buffer. Shared by `Hash` and `Hmac`.
+fn encodeDigest(self: *Interpreter, digest: []const u8, enc_v: Value) EvalError!Completion {
+    if (enc_v == .string) {
+        const enc = enc_v.string;
         if (std.mem.eql(u8, enc, "hex")) {
             const out = self.arena.alloc(u8, digest.len * 2) catch return error.OutOfMemory;
             const hex = "0123456789abcdef";
@@ -126,6 +137,24 @@ fn hashDigest(self: *Interpreter, this_val: Value, args: []const Value) EvalErro
             const Enc = std.base64.standard.Encoder;
             const out = self.arena.alloc(u8, Enc.calcSize(digest.len)) catch return error.OutOfMemory;
             return .{ .normal = .{ .string = Enc.encode(out, digest) } };
+        }
+        if (std.mem.eql(u8, enc, "latin1") or std.mem.eql(u8, enc, "binary")) {
+            // latin1: each byte is one code point; the string storage is WTF-8 (1-2 bytes/code point).
+            var nbytes: usize = 0;
+            for (digest) |b| nbytes += @as(usize, if (b < 0x80) 1 else 2);
+            const out = self.arena.alloc(u8, nbytes) catch return error.OutOfMemory;
+            var i: usize = 0;
+            for (digest) |b| {
+                if (b < 0x80) {
+                    out[i] = b;
+                    i += 1;
+                } else {
+                    out[i] = 0xc0 | (b >> 6);
+                    out[i + 1] = 0x80 | (b & 0x3f);
+                    i += 2;
+                }
+            }
+            return .{ .normal = .{ .string = out } };
         }
     }
     const out_buf = try host_buffer.makeBufferFromBytes(self, digest);
@@ -144,15 +173,174 @@ fn computeDigest(algo: []const u8, data: []const u8, out: *[64]u8) ?[]u8 {
         std.crypto.hash.Sha1.hash(data, out[0..20], .{});
         return out[0..20];
     }
+    if (eq(u8, algo, "sha224")) {
+        std.crypto.hash.sha2.Sha224.hash(data, out[0..28], .{});
+        return out[0..28];
+    }
     if (eq(u8, algo, "sha256")) {
         std.crypto.hash.sha2.Sha256.hash(data, out[0..32], .{});
         return out[0..32];
+    }
+    if (eq(u8, algo, "sha384")) {
+        std.crypto.hash.sha2.Sha384.hash(data, out[0..48], .{});
+        return out[0..48];
     }
     if (eq(u8, algo, "sha512")) {
         std.crypto.hash.sha2.Sha512.hash(data, out[0..64], .{});
         return out[0..64];
     }
     return null;
+}
+
+// ── createHmac (md5 / sha1 / sha224 / sha256 / sha384 / sha512) ─────────────────────────────────────
+
+const KEY_KEY = "%key%";
+
+/// `crypto.createHmac(algorithm, key)` → an Hmac object with `update(data)` / `digest([enc])`. Like
+/// `createHash`, the algorithm + key + accumulated bytes live in hidden own props; the MAC is computed
+/// one-shot at `digest` time (HMAC is deterministic, so accumulate-then-finalize is identical).
+fn createHmac(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const algo_v = if (args.len > 0) args[0] else .undefined;
+    if (algo_v != .string) return self.throwError("TypeError", "algorithm must be a string");
+    const key_bytes = bytesOf(if (args.len > 1) args[1] else .undefined) orelse
+        return self.throwError("TypeError", "key must be a string or Buffer");
+    if (!hmacSupported(algo_v.string)) return self.throwError("Error", "Digest method not supported");
+    const m = try Object.create(self.arena, self.objectProto());
+    try m.defineData(ALGO_KEY, .{ .string = try self.arena.dupe(u8, algo_v.string) }, false, false, false);
+    const key_buf = try host_buffer.makeBufferFromBytes(self, key_bytes);
+    try m.defineData(KEY_KEY, .{ .object = key_buf }, false, false, false);
+    const empty = try host_buffer.makeBufferFromBytes(self, "");
+    try m.defineData(BUF_KEY, .{ .object = empty }, true, false, false);
+    try defineHashMethod(self, m, "update", "m.update");
+    try defineHashMethod(self, m, "digest", "m.digest");
+    return .{ .normal = .{ .object = m } };
+}
+
+fn hmacUpdate(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
+    if (this_val != .object) return self.throwError("TypeError", "Hmac.update called on non-object");
+    const m = this_val.object;
+    const prev = bytesOf(m.get(BUF_KEY) orelse .undefined) orelse "";
+    const add = bytesOf(if (args.len > 0) args[0] else .undefined) orelse "";
+    const joined = self.arena.alloc(u8, prev.len + add.len) catch return error.OutOfMemory;
+    @memcpy(joined[0..prev.len], prev);
+    @memcpy(joined[prev.len..], add);
+    const nbuf = try host_buffer.makeBufferFromBytes(self, joined);
+    try m.defineData(BUF_KEY, .{ .object = nbuf }, true, false, false);
+    return .{ .normal = this_val };
+}
+
+fn hmacDigest(self: *Interpreter, this_val: Value, args: []const Value) EvalError!Completion {
+    if (this_val != .object) return self.throwError("TypeError", "Hmac.digest called on non-object");
+    const m = this_val.object;
+    const algo = if (m.get(ALGO_KEY)) |v| (if (v == .string) v.string else "") else "";
+    const key = bytesOf(m.get(KEY_KEY) orelse .undefined) orelse "";
+    const data = bytesOf(m.get(BUF_KEY) orelse .undefined) orelse "";
+
+    var buf: [64]u8 = undefined;
+    const mac = computeHmac(algo, key, data, &buf) orelse return self.throwError("Error", "Digest method not supported");
+    return encodeDigest(self, mac, if (args.len > 0) args[0] else .undefined);
+}
+
+fn hmacSupported(algo: []const u8) bool {
+    const eq = std.mem.eql;
+    return eq(u8, algo, "md5") or eq(u8, algo, "sha1") or eq(u8, algo, "sha224") or
+        eq(u8, algo, "sha256") or eq(u8, algo, "sha384") or eq(u8, algo, "sha512");
+}
+
+/// HMAC of `data` under `key` for `algorithm` into `out` (≤ 64 bytes), returning the used slice, or
+/// null for an unsupported algorithm.
+fn computeHmac(algo: []const u8, key: []const u8, data: []const u8, out: *[64]u8) ?[]u8 {
+    const eq = std.mem.eql;
+    const hmac = std.crypto.auth.hmac;
+    if (eq(u8, algo, "md5")) {
+        hmac.Hmac(std.crypto.hash.Md5).create(out[0..16], data, key);
+        return out[0..16];
+    }
+    if (eq(u8, algo, "sha1")) {
+        hmac.Hmac(std.crypto.hash.Sha1).create(out[0..20], data, key);
+        return out[0..20];
+    }
+    if (eq(u8, algo, "sha224")) {
+        hmac.Hmac(std.crypto.hash.sha2.Sha224).create(out[0..28], data, key);
+        return out[0..28];
+    }
+    if (eq(u8, algo, "sha256")) {
+        hmac.Hmac(std.crypto.hash.sha2.Sha256).create(out[0..32], data, key);
+        return out[0..32];
+    }
+    if (eq(u8, algo, "sha384")) {
+        hmac.Hmac(std.crypto.hash.sha2.Sha384).create(out[0..48], data, key);
+        return out[0..48];
+    }
+    if (eq(u8, algo, "sha512")) {
+        hmac.Hmac(std.crypto.hash.sha2.Sha512).create(out[0..64], data, key);
+        return out[0..64];
+    }
+    return null;
+}
+
+// ── pbkdf2Sync (sha1 / sha224 / sha256 / sha384 / sha512) ────────────────────────────────────────────
+
+/// `crypto.pbkdf2Sync(password, salt, iterations, keylen, digest)` → a Buffer of `keylen` derived bytes
+/// via `std.crypto.pwhash.pbkdf2` with the named HMAC PRF. `password`/`salt` may be strings or Buffers.
+fn pbkdf2Sync(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const password = bytesOf(if (args.len > 0) args[0] else .undefined) orelse
+        return self.throwError("TypeError", "password must be a string or Buffer");
+    const salt = bytesOf(if (args.len > 1) args[1] else .undefined) orelse
+        return self.throwError("TypeError", "salt must be a string or Buffer");
+    const iter_c = try self.toNumberV(if (args.len > 2) args[2] else .undefined);
+    if (iter_c.isAbrupt()) return iter_c;
+    const klen_c = try self.toNumberV(if (args.len > 3) args[3] else .undefined);
+    if (klen_c.isAbrupt()) return klen_c;
+    const iter_n = iter_c.normal.number;
+    const klen_n = klen_c.normal.number;
+    if (std.math.isNan(iter_n) or iter_n < 1 or iter_n > 0x7fff_ffff)
+        return self.throwError("RangeError", "iterations must be a positive integer");
+    if (std.math.isNan(klen_n) or klen_n < 0 or klen_n > 0x7fff_ffff)
+        return self.throwError("RangeError", "invalid keylen");
+    const digest_v = if (args.len > 4) args[4] else .undefined;
+    if (digest_v != .string) return self.throwError("TypeError", "digest must be a string");
+    const rounds: u32 = @intFromFloat(iter_n);
+    const keylen: usize = @intFromFloat(klen_n);
+
+    const dk = self.arena.alloc(u8, keylen) catch return error.OutOfMemory;
+    const eq = std.mem.eql;
+    const hmac = std.crypto.auth.hmac;
+    const digest = digest_v.string;
+    if (eq(u8, digest, "sha1")) {
+        pbkdf2Run(hmac.HmacSha1, dk, password, salt, rounds) catch return self.throwError("Error", "pbkdf2 failed");
+    } else if (eq(u8, digest, "sha224")) {
+        pbkdf2Run(hmac.sha2.HmacSha224, dk, password, salt, rounds) catch return self.throwError("Error", "pbkdf2 failed");
+    } else if (eq(u8, digest, "sha256")) {
+        pbkdf2Run(hmac.sha2.HmacSha256, dk, password, salt, rounds) catch return self.throwError("Error", "pbkdf2 failed");
+    } else if (eq(u8, digest, "sha384")) {
+        pbkdf2Run(hmac.sha2.HmacSha384, dk, password, salt, rounds) catch return self.throwError("Error", "pbkdf2 failed");
+    } else if (eq(u8, digest, "sha512")) {
+        pbkdf2Run(hmac.sha2.HmacSha512, dk, password, salt, rounds) catch return self.throwError("Error", "pbkdf2 failed");
+    } else {
+        return self.throwError("Error", "Digest method not supported");
+    }
+    const out_buf = try host_buffer.makeBufferFromBytes(self, dk);
+    return .{ .normal = .{ .object = out_buf } };
+}
+
+fn pbkdf2Run(comptime Prf: type, dk: []u8, password: []const u8, salt: []const u8, rounds: u32) !void {
+    try std.crypto.pwhash.pbkdf2(dk, password, salt, rounds, Prf);
+}
+
+// ── timingSafeEqual ──────────────────────────────────────────────────────────────────────────────────
+
+/// `crypto.timingSafeEqual(a, b)` → boolean. Constant-time comparison of two equal-length byte views;
+/// throws `RangeError` when the lengths differ (matching Node).
+fn timingSafeEqual(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const a = bytesOf(if (args.len > 0) args[0] else .undefined) orelse
+        return self.throwError("TypeError", "arguments must be Buffers/TypedArrays");
+    const b = bytesOf(if (args.len > 1) args[1] else .undefined) orelse
+        return self.throwError("TypeError", "arguments must be Buffers/TypedArrays");
+    if (a.len != b.len) return self.throwError("RangeError", "Input buffers must have the same byte length");
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return .{ .normal = .{ .boolean = diff == 0 } };
 }
 
 /// Raw bytes of a string / Buffer / TypedArray value, or null.

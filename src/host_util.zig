@@ -35,9 +35,13 @@ pub fn build(self: *Interpreter) EvalError!*Object {
     // util.types — a sub-object of predicate natives.
     const types = try Object.create(arena, self.objectProto());
     for ([_][]const u8{
-        "isDate",          "isRegExp",     "isNativeError", "isPromise",
-        "isArrayBuffer",   "isTypedArray", "isMap",         "isSet",
-        "isAsyncFunction",
+        "isDate",            "isRegExp",               "isNativeError",   "isPromise",
+        "isArrayBuffer",     "isTypedArray",           "isMap",           "isSet",
+        "isAsyncFunction",   "isGeneratorFunction",    "isWeakMap",       "isWeakSet",
+        "isDataView",        "isProxy",                "isBooleanObject", "isNumberObject",
+        "isStringObject",    "isSymbolObject",         "isBigIntObject",  "isSharedArrayBuffer",
+        "isAnyArrayBuffer",  "isBoxedPrimitive",       "isMapIterator",   "isSetIterator",
+        "isGeneratorObject", "isAsyncGeneratorObject",
     }) |m|
         try defineMethod(self, types, m);
     try obj.defineData("types", .{ .object = types }, true, true, true);
@@ -66,6 +70,8 @@ pub fn method(self: *Interpreter, func: *Object, this_val: Value, args: []const 
     // distinguished by a hidden own state property.
     if (func.get("%promisify_fn%") != null) return promisifyWrapper(self, func, args);
     if (func.get("%promisify_promise%") != null) return promisifyCallback(self, func, args);
+    if (func.get("%callbackify_fn%") != null) return callbackifyWrapper(self, func, args);
+    if (func.get("%callbackify_cb%") != null) return callbackifyReaction(self, func, args);
     if (func.get("%deprecated_fn%") != null) return deprecateWrapper(self, func, args);
 
     if (eql(u8, name, "format")) return format(self, args, 0);
@@ -422,14 +428,82 @@ fn truthy(v: Value) bool {
 
 // ── callbackify ─────────────────────────────────────────────────────────────────
 
-/// `util.callbackify(fn)` (minimal): validate + return the original. Full callbackify (await the
-/// returned thenable, invoke a trailing node-style callback) is deferred — sufficient for the smoke
-/// path and never on the conformance surface.
+/// `util.callbackify(original)` → the inverse of promisify: a function `(...args, callback)` that
+/// calls `original(...args)`, awaits the returned promise, and invokes `callback(err, value)` —
+/// `callback(null, value)` on fulfill, `callback(reason)` on reject.
 fn callbackify(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const arena = self.arena;
     const fn_v: Value = if (args.len > 0) args[0] else .undefined;
     if (fn_v != .object or fn_v.object.kind != .function)
         return self.throwError("TypeError", "The \"original\" argument must be of type function");
-    return .{ .normal = fn_v };
+    const wrapper = try Object.createNative(arena, .util_method, "");
+    wrapper.prototype = self.functionProto();
+    _ = wrapper.properties.orderedRemove("prototype");
+    try wrapper.defineData("%callbackify_fn%", fn_v, false, false, true);
+    try wrapper.defineData("name", .{ .string = "" }, false, false, true);
+    return .{ .normal = .{ .object = wrapper } };
+}
+
+/// The callbackify wrapper's behavior: the LAST argument is the node-style callback; call the
+/// original with the rest, coerce its result to a Promise, and settle the callback off the promise's
+/// fulfill/reject reactions. A non-function trailing callback throws (Node's contract).
+fn callbackifyWrapper(self: *Interpreter, func: *Object, args: []const Value) EvalError!Completion {
+    const arena = self.arena;
+    const fn_v = func.get("%callbackify_fn%") orelse return self.throwError("TypeError", "callbackify: missing original");
+    if (fn_v != .object) return self.throwError("TypeError", "callbackify: original not callable");
+    if (args.len == 0 or args[args.len - 1] != .object or args[args.len - 1].object.kind != .function)
+        return self.throwError("TypeError", "The last argument must be of type function");
+
+    const cb = args[args.len - 1];
+    const fwd = args[0 .. args.len - 1];
+
+    // Call original(...fwd). A synchronous throw becomes the rejection path.
+    const c = try self.callFunction(fn_v.object, fwd, .undefined);
+    const promise = try async_mod.newPromise(self);
+    if (c == .throw) {
+        try async_mod.rejectPromise(self, promise, c.throw);
+    } else {
+        // Coerce the returned value (promise / thenable / plain) into our promise.
+        try async_mod.resolvePromise(self, promise, c.normal);
+    }
+
+    // fulfill reaction → cb(null, value); reject reaction → cb(reason).
+    const on_fulfill = try Object.createNative(arena, .util_method, "");
+    on_fulfill.prototype = self.functionProto();
+    _ = on_fulfill.properties.orderedRemove("prototype");
+    try on_fulfill.defineData("%callbackify_cb%", cb, false, false, true);
+    try on_fulfill.defineData("%callbackify_reject%", .{ .boolean = false }, false, false, true);
+
+    const on_reject = try Object.createNative(arena, .util_method, "");
+    on_reject.prototype = self.functionProto();
+    _ = on_reject.properties.orderedRemove("prototype");
+    try on_reject.defineData("%callbackify_cb%", cb, false, false, true);
+    try on_reject.defineData("%callbackify_reject%", .{ .boolean = true }, false, false, true);
+
+    try async_mod.performPromiseThen(self, promise, on_fulfill, on_reject, null);
+    return .{ .normal = .undefined };
+}
+
+/// A callbackify reaction: invoke the carried node-style callback. The fulfill reaction (its
+/// `%callbackify_reject%` is false) calls `cb(null, value)`; the reject reaction calls `cb(reason)`.
+fn callbackifyReaction(self: *Interpreter, func: *Object, args: []const Value) EvalError!Completion {
+    const arena = self.arena;
+    const cb_v = func.get("%callbackify_cb%") orelse return .{ .normal = .undefined };
+    if (cb_v != .object) return .{ .normal = .undefined };
+    const is_reject = blk: {
+        const r = func.get("%callbackify_reject%") orelse break :blk false;
+        break :blk r == .boolean and r.boolean;
+    };
+    const settle: Value = if (args.len > 0) args[0] else .undefined;
+
+    var call_args: std.ArrayListUnmanaged(Value) = .empty;
+    if (is_reject) {
+        call_args.append(arena, settle) catch return error.OutOfMemory;
+    } else {
+        call_args.append(arena, .null) catch return error.OutOfMemory;
+        call_args.append(arena, settle) catch return error.OutOfMemory;
+    }
+    return self.callFunction(cb_v.object, call_args.items, .undefined);
 }
 
 // ── inherits ────────────────────────────────────────────────────────────────────
@@ -548,7 +622,29 @@ fn typesPredicate(name: []const u8, args: []const Value) EvalError!Completion {
         if (eql(u8, name, "isTypedArray")) break :blk o.typed_array != null;
         if (eql(u8, name, "isMap")) break :blk o.collection != null and o.collection.?.kind == .map;
         if (eql(u8, name, "isSet")) break :blk o.collection != null and o.collection.?.kind == .set;
-        if (eql(u8, name, "isAsyncFunction")) break :blk o.kind == .function and o.call != null and o.call.?.is_async;
+        if (eql(u8, name, "isWeakMap")) break :blk o.collection != null and o.collection.?.kind == .weakmap;
+        if (eql(u8, name, "isWeakSet")) break :blk o.collection != null and o.collection.?.kind == .weakset;
+        if (eql(u8, name, "isDataView")) break :blk o.kind == .data_view;
+        if (eql(u8, name, "isProxy")) break :blk o.proxy != null;
+        if (eql(u8, name, "isGeneratorObject")) break :blk o.generator != null and !o.generator.?.is_async;
+        if (eql(u8, name, "isAsyncGeneratorObject")) break :blk o.async_generator != null;
+        // SharedArrayBuffer is not distinctly modelled — treat as a plain ArrayBuffer (never shared).
+        if (eql(u8, name, "isSharedArrayBuffer")) break :blk false;
+        if (eql(u8, name, "isAnyArrayBuffer")) break :blk o.kind == .array_buffer;
+        // Map/Set iterators are not branded distinctly in this engine.
+        if (eql(u8, name, "isMapIterator")) break :blk false;
+        if (eql(u8, name, "isSetIterator")) break :blk false;
+        if (eql(u8, name, "isGeneratorFunction"))
+            break :blk o.kind == .function and o.call != null and o.call.?.is_generator and !o.call.?.is_async;
+        if (eql(u8, name, "isAsyncFunction"))
+            break :blk o.kind == .function and o.call != null and o.call.?.is_async;
+        // Boxed primitives: `new Number/String/Boolean/Symbol(x)` carry `primitive`.
+        if (eql(u8, name, "isBooleanObject")) break :blk o.primitive != null and o.primitive.? == .boolean;
+        if (eql(u8, name, "isNumberObject")) break :blk o.primitive != null and o.primitive.? == .number;
+        if (eql(u8, name, "isStringObject")) break :blk o.primitive != null and o.primitive.? == .string;
+        if (eql(u8, name, "isSymbolObject")) break :blk o.primitive != null and o.primitive.? == .symbol;
+        if (eql(u8, name, "isBigIntObject")) break :blk o.primitive != null and o.primitive.? == .bigint;
+        if (eql(u8, name, "isBoxedPrimitive")) break :blk o.primitive != null;
         break :blk false;
     };
     return .{ .normal = .{ .boolean = r } };

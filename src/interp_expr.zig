@@ -792,6 +792,13 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
             // HOST (spec 105): `new Buffer(...)` (the deprecated constructor) is `new`-able; the
             // shared `.buffer_fn` prototype/static methods are not.
             .buffer_fn => std.mem.eql(u8, ctor.native_name, "Buffer"),
+            // HOST: `new stream.Readable()` / `Writable` / `Duplex` / `Transform` / `PassThrough` are
+            // `new`-able; the shared `.stream_method` prototype methods (prefixed names) are not.
+            .stream_method => std.mem.eql(u8, ctor.native_name, "Readable") or std.mem.eql(u8, ctor.native_name, "Writable") or
+                std.mem.eql(u8, ctor.native_name, "Duplex") or std.mem.eql(u8, ctor.native_name, "Transform") or
+                std.mem.eql(u8, ctor.native_name, "PassThrough"),
+            // HOST: `new StringDecoder(...)` is `new`-able; its `write`/`end` methods are not.
+            .string_decoder_method => std.mem.eql(u8, ctor.native_name, "StringDecoder"),
             else => false,
         };
         if (!constructible) return self.throwError("TypeError", "value is not a constructor");

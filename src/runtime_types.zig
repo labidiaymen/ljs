@@ -711,6 +711,15 @@ pub const NativeId = enum {
     /// HOST (Node axis, spec 108): minimal `crypto` — `randomBytes`/`randomFillSync`/`randomUUID`/
     /// `getRandomValues`. Dispatched in `host_crypto.zig`.
     crypto_method,
+    /// HOST (Node axis): the `stream` module — `Readable`/`Writable`/`Duplex`/`Transform`/
+    /// `PassThrough` constructors + their prototype methods (`push`/`read`/`pipe`/`write`/`end`/...).
+    /// `native_name` selects the constructor / prefixed instance method / deferred trampoline.
+    /// Dispatched in `host_stream.zig`. Inert on the Test262 path.
+    stream_method,
+    /// HOST (Node axis): the `string_decoder` module — the `StringDecoder` constructor + its
+    /// `write`/`end` prototype methods. `native_name` selects which; per-instance encoding + buffered
+    /// partial bytes live on hidden own props. Dispatched in `host_string_decoder.zig`. Inert on Test262.
+    string_decoder_method,
     /// §10.4.4.6 %ThrowTypeError% — the unique per-realm function that unconditionally throws a
     /// TypeError. Used as the poison `get`/`set` for `callee` (and historically `caller`) on a
     /// strict / unmapped arguments object. Never returns normally.
