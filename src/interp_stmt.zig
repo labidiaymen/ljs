@@ -222,10 +222,10 @@ pub fn evalStmt(self: *Interpreter, stmt: ast.Stmt, env: *Environment) EvalError
                 (i.*.declaration.kind == .using_decl or i.*.declaration.kind == .await_using_decl) else false;
             if (for_uses) {
                 const marker = self.disposables.items.len;
-                const lc = try runForBody(self, s, loop_env, my_labels);
+                const lc = try runForBody(self, s, loop_env, my_labels, head_is_lexical);
                 return self.disposeFrom(marker, lc);
             }
-            return runForBody(self, s, loop_env, my_labels);
+            return runForBody(self, s, loop_env, my_labels, head_is_lexical);
         },
         .for_in_stmt => |s| return evalForIn(self, s, env, my_labels),
         .for_of_stmt => |s| return if (s.is_await) evalForAwaitOf(self, s, env, my_labels) else evalForOf(self, s, env, my_labels),
@@ -811,20 +811,101 @@ pub fn evalSwitch(self: *Interpreter, s: anytype, env: *Environment, my_labels: 
 /// §14.7.4 ForStatement body — the init/cond/body/update loop (the `using`-head dispose epilogue,
 /// when present, is applied by the caller around this). Returns the loop's completion; a `break`
 /// targeting this loop is consumed (→ normal), other abrupt completions propagate.
-pub fn runForBody(self: *Interpreter, s: anytype, loop_env: *Environment, my_labels: []const []const u8) EvalError!Completion {
+/// PERF (§14.7.4): CreatePerIterationEnvironment is only OBSERVABLE if the loop body creates a closure
+/// that could capture a loop-head binding. A closure-free body (the common `for(let i…){ s += a[i] }`)
+/// can reuse one environment — skipping a per-iteration allocation that otherwise makes a `let` loop
+/// several× slower than the equivalent `var` loop. This conservatively returns `true` (needs
+/// per-iteration) for anything that might contain a function/class/object-method; `false` only for
+/// provably closure-free statement/expression shapes.
+fn mayCreateClosure(stmt: *const ast.Stmt) bool {
+    return switch (stmt.*) {
+        .break_stmt, .continue_stmt => false,
+        .expr => |e| exprMayCreateClosure(e),
+        .ret => |e| if (e) |n| exprMayCreateClosure(n) else false,
+        .throw_stmt => |e| exprMayCreateClosure(e),
+        .block => |b| for (b) |st| {
+            if (mayCreateClosure(&st)) break true;
+        } else false,
+        .declaration => |d| for (d.decls) |dec| {
+            if (dec.init) |v| if (exprMayCreateClosure(v)) break true;
+        } else false,
+        .if_stmt => |s| exprMayCreateClosure(s.cond) or mayCreateClosure(s.then) or (s.otherwise != null and mayCreateClosure(s.otherwise.?)),
+        .while_stmt => |s| exprMayCreateClosure(s.cond) or mayCreateClosure(s.body),
+        .do_while_stmt => |s| exprMayCreateClosure(s.cond) or mayCreateClosure(s.body),
+        .for_stmt => |s| (s.cond != null and exprMayCreateClosure(s.cond.?)) or (s.update != null and exprMayCreateClosure(s.update.?)) or mayCreateClosure(s.body) or (s.init != null and mayCreateClosure(s.init.?)),
+        .labeled_stmt => |s| mayCreateClosure(s.body),
+        else => true, // func_decl/class_decl/for-in/for-of/try/switch/with/… → assume yes (conservative)
+    };
+}
+
+fn exprMayCreateClosure(node: *const ast.Node) bool {
+    return switch (node.*) {
+        .number, .bigint, .string, .boolean, .null, .regex_literal, .identifier, .this, .new_target, .elision, .super_member => false,
+        .unary => |u| exprMayCreateClosure(u.operand),
+        .update => |u| exprMayCreateClosure(u.target),
+        .spread => |s| exprMayCreateClosure(s),
+        .await_expr => |a| exprMayCreateClosure(a),
+        .member => |m| exprMayCreateClosure(m.object),
+        .private_member => |m| exprMayCreateClosure(m.object),
+        .private_in => |m| exprMayCreateClosure(m.object),
+        .comma => |b| exprMayCreateClosure(b.left) or exprMayCreateClosure(b.right),
+        .binary => |b| exprMayCreateClosure(b.left) or exprMayCreateClosure(b.right),
+        .logical => |b| exprMayCreateClosure(b.left) or exprMayCreateClosure(b.right),
+        .index => |b| exprMayCreateClosure(b.object) or exprMayCreateClosure(b.key),
+        .assign => |a| exprMayCreateClosure(a.value),
+        .assign_member => |a| exprMayCreateClosure(a.object) or exprMayCreateClosure(a.value),
+        .assign_index => |a| exprMayCreateClosure(a.object) or exprMayCreateClosure(a.key) or exprMayCreateClosure(a.value),
+        .compound_assign => |a| exprMayCreateClosure(a.target) or exprMayCreateClosure(a.value),
+        .logical_assign => |a| exprMayCreateClosure(a.target) or exprMayCreateClosure(a.value),
+        .private_assign => |a| exprMayCreateClosure(a.object) or exprMayCreateClosure(a.value),
+        .conditional => |c| exprMayCreateClosure(c.cond) or exprMayCreateClosure(c.then) or exprMayCreateClosure(c.otherwise),
+        .call => |c| exprMayCreateClosure(c.callee) or argsMayCreateClosure(c.args),
+        .new_expr => |c| exprMayCreateClosure(c.callee) or argsMayCreateClosure(c.args),
+        .super_call => |a| argsMayCreateClosure(a),
+        .array_literal => |a| argsMayCreateClosure(a),
+        .template => |t| argsMayCreateClosure(t.exprs),
+        else => true, // function/class_expr/object_literal/tagged_template/import_call/yield/optional/… → conservative
+    };
+}
+
+fn argsMayCreateClosure(args: []const *const ast.Node) bool {
+    for (args) |a| if (exprMayCreateClosure(a)) return true;
+    return false;
+}
+
+/// §14.7.4.4 CreatePerIterationEnvironment: a fresh declarative env (sibling of `prev` under the
+/// loop's OUTER env) holding a COPY of every loop-head lexical binding's current value — so a closure
+/// created in one iteration captures that iteration's value (`for(let i…){ a.push(()=>i) }` → 0,1,2).
+fn createPerIterationEnv(self: *Interpreter, prev: *Environment) EvalError!*Environment {
+    const new_env = try Environment.create(self.arena, prev.parent);
+    var it = prev.vars.iterator();
+    while (it.next()) |entry| {
+        const b = entry.value_ptr.*;
+        try new_env.declare(entry.key_ptr.*, b.value, b.mutable, true);
+    }
+    return new_env;
+}
+
+pub fn runForBody(self: *Interpreter, s: anytype, loop_env: *Environment, my_labels: []const []const u8, per_iter: bool) EvalError!Completion {
     if (s.init) |i| {
         const ic = try self.evalStmt(i.*, loop_env);
         if (ic.isAbrupt()) return ic;
     }
     // §14.7.4.2 ForBodyEvaluation: V starts undefined; each body completion UpdateEmpty-accumulates.
+    // A LEXICAL head (`per_iter` from the caller) gets a fresh per-iteration environment — but ONLY
+    // when the body might create a closure that captures a loop binding (else the copy is unobservable
+    // and would needlessly slow a `let` loop; see `mayCreateClosure`).
+    const need_copy = per_iter and mayCreateClosure(s.body);
     var v: Value = .undefined;
+    var cur = loop_env;
+    if (need_copy) cur = try createPerIterationEnv(self, loop_env); // first copy (after init)
     while (true) {
         if (s.cond) |t| {
-            const tc = try self.evalExpr(t, loop_env);
+            const tc = try self.evalExpr(t, cur);
             if (tc.isAbrupt()) return tc;
             if (!toBoolean(tc.normal)) break;
         }
-        const bc = try self.evalStmt(s.body.*, loop_env);
+        const bc = try self.evalStmt(s.body.*, cur);
         switch (bc) {
             .normal => |bv| v = bv, // fall through to the update
             .empty => {},
@@ -836,8 +917,9 @@ pub fn runForBody(self: *Interpreter, s: anytype, loop_env: *Environment, my_lab
             } else return bc.updateEmpty(v),
             .ret, .throw => return bc,
         }
+        if (need_copy) cur = try createPerIterationEnv(self, cur); // copy before the update (§14.7.4.2)
         if (s.update) |u| {
-            const uc = try self.evalExpr(u, loop_env);
+            const uc = try self.evalExpr(u, cur);
             if (uc.isAbrupt()) return uc;
         }
     }
