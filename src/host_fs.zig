@@ -167,6 +167,58 @@ pub fn fsMethod(self: *Interpreter, method: []const u8, args: []const Value) Eva
             return fsError(self, "ENOENT", method, pc.normal.string);
         return .{ .normal = .undefined };
     }
+    if (eq(u8, method, "lstatSync")) {
+        const pc = try argString(self, if (args.len > 0) args[0] else .undefined);
+        if (pc.isAbrupt()) return pc;
+        // lstat = stat WITHOUT following symlinks (on Windows this is effectively the same as statSync).
+        const st = std.Io.Dir.cwd().statFile(self.io, pc.normal.string, .{ .follow_symlinks = false }) catch
+            return fsError(self, "ENOENT", method, pc.normal.string);
+        return .{ .normal = .{ .object = try makeStats(self, st) } };
+    }
+    if (eq(u8, method, "realpathSync")) {
+        const pc = try argString(self, if (args.len > 0) args[0] else .undefined);
+        if (pc.isAbrupt()) return pc;
+        // The path must exist (Node throws ENOENT otherwise): verify, then resolve to an absolute path.
+        std.Io.Dir.cwd().access(self.io, pc.normal.string, .{}) catch
+            return fsError(self, "ENOENT", method, pc.normal.string);
+        // std.Io.Dir has no realpath in 0.16 → resolve against cwd (no symlink-collapse, but absolute+normalized).
+        const cwd = std.process.currentPathAlloc(self.io, arena) catch return fsError(self, "ENOENT", method, pc.normal.string);
+        const resolved = std.fs.path.resolve(arena, &.{ cwd, pc.normal.string }) catch return error.OutOfMemory;
+        return .{ .normal = .{ .string = resolved } };
+    }
+    if (eq(u8, method, "readlinkSync")) {
+        const pc = try argString(self, if (args.len > 0) args[0] else .undefined);
+        if (pc.isAbrupt()) return pc;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = std.Io.Dir.cwd().readLink(self.io, pc.normal.string, &buf) catch
+            return fsError(self, "EINVAL", method, pc.normal.string);
+        const target = arena.dupe(u8, buf[0..n]) catch return error.OutOfMemory;
+        return .{ .normal = .{ .string = target } };
+    }
+    if (eq(u8, method, "truncateSync")) {
+        const pc = try argString(self, if (args.len > 0) args[0] else .undefined);
+        if (pc.isAbrupt()) return pc;
+        // Default length is 0; coerce the second arg to a number (Node truncates/extends to `len` bytes).
+        var len: usize = 0;
+        if (args.len > 1 and args[1] != .undefined) {
+            const nc = try self.toNumberV(args[1]);
+            if (nc.isAbrupt()) return nc;
+            const n = nc.normal.number;
+            len = if (n > 0 and std.math.isFinite(n)) @intFromFloat(n) else 0;
+        }
+        const existing = std.Io.Dir.cwd().readFileAlloc(self.io, pc.normal.string, arena, .limited(64 << 20)) catch
+            return fsError(self, "ENOENT", method, pc.normal.string);
+        const out: []const u8 = if (len <= existing.len) existing[0..len] else blk: {
+            // Extend: copy existing then zero-pad up to `len` (Node grows the file with NUL bytes).
+            const grown = arena.alloc(u8, len) catch return error.OutOfMemory;
+            @memcpy(grown[0..existing.len], existing);
+            @memset(grown[existing.len..], 0);
+            break :blk grown;
+        };
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = pc.normal.string, .data = out }) catch
+            return fsError(self, "EACCES", method, pc.normal.string);
+        return .{ .normal = .undefined };
+    }
     return .{ .normal = .undefined };
 }
 

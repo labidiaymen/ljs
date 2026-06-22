@@ -677,7 +677,7 @@ fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
     if (std.mem.eql(u8, name, "crypto")) return @import("host_crypto.zig").build(self);
     const obj = try Object.create(arena, self.objectProto());
     if (std.mem.eql(u8, name, "fs")) {
-        for ([_][]const u8{ "readFileSync", "existsSync", "writeFileSync", "statSync", "readdirSync", "mkdirSync", "appendFileSync", "unlinkSync", "rmSync", "rmdirSync", "renameSync", "copyFileSync", "accessSync" }) |m|
+        for ([_][]const u8{ "readFileSync", "existsSync", "writeFileSync", "statSync", "readdirSync", "mkdirSync", "appendFileSync", "unlinkSync", "rmSync", "rmdirSync", "renameSync", "copyFileSync", "accessSync", "lstatSync", "realpathSync", "readlinkSync", "truncateSync" }) |m|
             try defineCoreMethod(self, obj, name, m);
     } else if (std.mem.eql(u8, name, "os")) {
         for ([_][]const u8{ "platform", "arch", "type", "release", "homedir", "tmpdir", "hostname", "cpus", "endianness", "totalmem", "freemem" }) |m|
