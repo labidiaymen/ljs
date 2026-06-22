@@ -881,7 +881,7 @@ pub const Object = struct {
             if (d.get) |gv| g = gv;
             if (d.set) |sv| s = sv;
             payload = .{ .accessor = .{ .get = g, .set = s } };
-        } else {
+        } else if (d.isData()) {
             if (d.writable) |w| writable = w;
             if (d.has_value) {
                 payload = .{ .data = d.value.? };
@@ -889,6 +889,7 @@ pub const Object = struct {
                 payload = .{ .data = .undefined };
             }
         }
+        // else: GENERIC descriptor (§10.1.6.3) — keep the existing payload type unchanged.
         const pv: PropertyValue = .{ .payload = payload, .writable = writable, .enumerable = enumerable, .configurable = configurable };
         if (existing) |cur| {
             cur.* = pv;
@@ -992,8 +993,8 @@ pub const Object = struct {
             if (d.get) |gv| g = gv;
             if (d.set) |sv| s = sv;
             payload = .{ .accessor = .{ .get = g, .set = s } };
-        } else {
-            // a data descriptor (or attributes-only on an existing data prop)
+        } else if (d.isData()) {
+            // a data descriptor (value and/or writable present): may convert an accessor → data.
             if (d.writable) |w| writable = w;
             if (d.has_value) {
                 payload = .{ .data = d.value.? };
@@ -1001,6 +1002,8 @@ pub const Object = struct {
                 payload = .{ .data = .undefined }; // accessor→data with no value: value defaults undefined
             }
         }
+        // else: a GENERIC descriptor (only enumerable/configurable) — §10.1.6.3 keeps the existing
+        // payload type unchanged (must NOT clobber an accessor's get/set or a data value).
         return .{ .payload = payload, .writable = writable, .enumerable = enumerable, .configurable = configurable };
     }
 
