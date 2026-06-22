@@ -720,6 +720,10 @@ pub const NativeId = enum {
     /// `write`/`end` prototype methods. `native_name` selects which; per-instance encoding + buffered
     /// partial bytes live on hidden own props. Dispatched in `host_string_decoder.zig`. Inert on Test262.
     string_decoder_method,
+    /// HOST (Node axis): the `http` module — `createServer`/`Server`/`ServerResponse`/`IncomingMessage`
+    /// constructors + their prototype methods + an internal connection trampoline. `native_name` selects
+    /// which. Built on the `net` module. Dispatched in `host_http.zig`. Inert on the Test262 path.
+    http_method,
     /// §10.4.4.6 %ThrowTypeError% — the unique per-realm function that unconditionally throws a
     /// TypeError. Used as the poison `get`/`set` for `callee` (and historically `caller`) on a
     /// strict / unmapped arguments object. Never returns normally.

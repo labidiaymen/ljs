@@ -799,6 +799,8 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
                 std.mem.eql(u8, ctor.native_name, "PassThrough"),
             // HOST: `new StringDecoder(...)` is `new`-able; its `write`/`end` methods are not.
             .string_decoder_method => std.mem.eql(u8, ctor.native_name, "StringDecoder"),
+            // HOST: `new http.Server()` is `new`-able; the `.http_method` statics / proto methods are not.
+            .http_method => std.mem.eql(u8, ctor.native_name, "Server"),
             else => false,
         };
         if (!constructible) return self.throwError("TypeError", "value is not a constructor");
