@@ -724,6 +724,13 @@ pub const NativeId = enum {
     /// constructors + their prototype methods + an internal connection trampoline. `native_name` selects
     /// which. Built on the `net` module. Dispatched in `host_http.zig`. Inert on the Test262 path.
     http_method,
+    /// HOST (Node/WHATWG): the global `Headers` class. Dispatched in `host_headers.zig`. Inert on Test262.
+    headers_method,
+    /// HOST (WHATWG fetch): the global `Response`/`Request` classes (Body mixin). Dispatched in
+    /// `host_fetch_body.zig`. Inert on Test262.
+    fetch_body_method,
+    /// HOST (WHATWG): the global `AbortController`/`AbortSignal`. Dispatched in `host_abort.zig`. Inert on Test262.
+    abort_method,
     /// §10.4.4.6 %ThrowTypeError% — the unique per-realm function that unconditionally throws a
     /// TypeError. Used as the poison `get`/`set` for `callee` (and historically `caller`) on a
     /// strict / unmapped arguments object. Never returns normally.

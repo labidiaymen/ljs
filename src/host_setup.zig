@@ -186,6 +186,10 @@ pub fn installHostGlobals(self: *Interpreter, ctx: HostCtx) EvalError!void {
 
     // ── WHATWG URL / URLSearchParams + TextEncoder / TextDecoder globals (spec 103) ───────────────────
     try @import("host_url.zig").install(self);
+    // ── WHATWG fetch stack globals: Headers, Response/Request, AbortController/AbortSignal ─────────────
+    try @import("host_headers.zig").install(self);
+    try @import("host_fetch_body.zig").install(self);
+    try @import("host_abort.zig").install(self);
 
     // ── CommonJS require / module / exports / __filename / __dirname (spec 102) ──────────────────────
     // Only for `ljs run <file>` (a known script path); `ljs eval` leaves these absent.

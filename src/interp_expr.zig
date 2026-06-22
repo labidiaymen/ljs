@@ -801,6 +801,11 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
             .string_decoder_method => std.mem.eql(u8, ctor.native_name, "StringDecoder"),
             // HOST: `new http.Server()` is `new`-able; the `.http_method` statics / proto methods are not.
             .http_method => std.mem.eql(u8, ctor.native_name, "Server"),
+            // HOST WHATWG globals: `new Headers/Response/Request/AbortController(...)`. AbortSignal is NOT
+            // constructible (only its statics create one), so it's deliberately excluded.
+            .headers_method => std.mem.eql(u8, ctor.native_name, "Headers"),
+            .fetch_body_method => std.mem.eql(u8, ctor.native_name, "Response") or std.mem.eql(u8, ctor.native_name, "Request"),
+            .abort_method => std.mem.eql(u8, ctor.native_name, "AbortController"),
             else => false,
         };
         if (!constructible) return self.throwError("TypeError", "value is not a constructor");

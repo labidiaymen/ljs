@@ -21,9 +21,16 @@
 //! Per-connection parser state (`*ConnState`) is kept in `interp.io_handles` keyed by a hidden
 //! `"%http%"` own prop on the socket JS object (same registry pattern as host_net's `*SocketState`).
 //!
-//! SKIPPED (noted, not bugs): keep-alive / pipelining (every response is `Connection: close`), chunked
-//! transfer-encoding (we always emit a fixed `Content-Length`), the `http.request`/`http.get` CLIENT
-//! (server only — Express serving doesn't need it), `Expect: 100-continue`, trailers, HTTPS.
+//! CLIENT (added): `http.request(options|url[, options][, cb])` / `http.get(...)` → a `ClientRequest`
+//! (a writable EventEmitter). On `.end()` it drives a `net.Socket` (connect, write the request, then
+//! accumulate the response), parses the status line + headers + body, and emits `'response'` with a
+//! readable IncomingMessage (`.statusCode`/`.statusMessage`/`.httpVersion`/`.headers`, `'data'`/`'end'`).
+//! Body framing: `Content-Length`, `Transfer-Encoding: chunked` (decoded), else read-until-close.
+//! Plaintext `http://` only — NO TLS (`https://` is a later slice).
+//!
+//! SKIPPED (noted, not bugs): server keep-alive / pipelining (every RESPONSE is `Connection: close`),
+//! server chunked send (responses always emit a fixed `Content-Length`), HTTPS/TLS, `Expect:
+//! 100-continue`, trailers, client redirects / connection-pooling / agents.
 const std = @import("std");
 const Value = @import("value.zig").Value;
 const object_mod = @import("object.zig");
@@ -39,6 +46,7 @@ const host_net = @import("host_net.zig");
 
 const CONN_KEY = "%http%"; // hidden own prop on a socket → its *ConnState id in io_handles
 const RES_KEY = "%httpres%"; // hidden own prop on a res → its *ResState id in io_handles
+const CLIENT_KEY = "%httpclient%"; // hidden own prop on a ClientRequest / its socket → its *ClientState id
 
 // ── per-connection parser state ───────────────────────────────────────────────────
 
@@ -72,6 +80,44 @@ const ResState = struct {
     status_code: u16 = 200,
     status_message: ?[]const u8 = null,
     keep_alive: bool = false, // decided at header-serialize time (client wants it AND body framing is known)
+};
+
+/// CLIENT request/response state for one outgoing `http.request`. Arena-allocated (stable address).
+/// Owns the outgoing header list (built via setHeader/options) + body buffer, and once connected the
+/// incoming response parser state. Registered on the ClientRequest JS object (and its socket) via
+/// `CLIENT_KEY` in `io_handles`.
+const ClientState = struct {
+    interp: *Interpreter,
+    req: *Object, // the ClientRequest JS object (a writable EventEmitter)
+    socket: ?*Object = null, // the net.Socket once connect() is called
+
+    // Request line + outgoing headers (parallel name/lower/value lists, like ResState).
+    method: []const u8 = "GET",
+    path: []const u8 = "/",
+    host: []const u8 = "127.0.0.1", // for the Host header (hostname[:port])
+    hostname: []const u8 = "127.0.0.1", // for net.connect
+    port: u16 = 80,
+    names: std.ArrayListUnmanaged([]const u8) = .empty, // original case
+    lower: std.ArrayListUnmanaged([]const u8) = .empty,
+    values: std.ArrayListUnmanaged([]const u8) = .empty,
+    body: std.ArrayListUnmanaged(u8) = .empty,
+
+    sent: bool = false, // request bytes written (end() called)
+    aborted: bool = false,
+
+    // ── incoming response parser ──
+    in: std.ArrayListUnmanaged(u8) = .empty,
+    headers_done: bool = false,
+    res: ?*Object = null, // the response IncomingMessage once headers parsed
+    res_emitted: bool = false,
+    body_start: usize = 0,
+    content_length: usize = 0,
+    have_content_length: bool = false,
+    chunked: bool = false,
+    body_consumed: usize = 0, // bytes of the (content-length) body already emitted as 'data'
+    chunk_offset: usize = 0, // parser cursor into `in` for chunked decoding
+    finished: bool = false, // 'end' emitted on the response
+    res_encoding: ?[]const u8 = null, // setEncoding on the response → emit strings not Buffers
 };
 
 // ── module construction ─────────────────────────────────────────────────────────
@@ -111,16 +157,35 @@ pub fn build(self: *Interpreter) EvalError!*Object {
     try res_ctor.defineData("prototype", .{ .object = res_proto }, false, false, false);
     try res_proto.defineData("constructor", .{ .object = res_ctor }, true, false, true);
 
+    // ClientRequest.prototype + constructor (a writable EventEmitter — the http.request return value).
+    const creq_proto = try Object.create(arena, ee_proto);
+    for ([_][]const u8{
+        "write",      "end",          "setHeader", "getHeader",
+        "hasHeader",  "removeHeader", "abort",     "destroy",
+        "setTimeout", "flushHeaders",
+    }) |m| try defineHttpMethod(self, creq_proto, m, m);
+    const creq_ctor = try makeCtor(self, "ClientRequest");
+    try creq_ctor.defineData("prototype", .{ .object = creq_proto }, false, false, false);
+    try creq_proto.defineData("constructor", .{ .object = creq_ctor }, true, false, true);
+
     try mod.defineData("Server", .{ .object = server_ctor }, true, false, true);
     try mod.defineData("IncomingMessage", .{ .object = req_ctor }, true, false, true);
     try mod.defineData("ServerResponse", .{ .object = res_ctor }, true, false, true);
+    try mod.defineData("ClientRequest", .{ .object = creq_ctor }, true, false, true);
     try defineHttpMethod(self, mod, "createServer", "createServer");
+    try defineHttpMethod(self, mod, "request", "request");
+    try defineHttpMethod(self, mod, "get", "get");
 
     // The internal connection trampoline — a `.http_method` native bound to a server, registered as
     // net 'connection' / socket 'data'/'end' listeners. Hidden behind `native_name`.
     try defineHttpMethod(self, mod, "%onConnection%", "%onConnection%");
     try defineHttpMethod(self, mod, "%onData%", "%onData%");
     try defineHttpMethod(self, mod, "%onEnd%", "%onEnd%");
+    // Client-side socket trampolines (registered as net 'connect'/'data'/'end'/'error'/'close').
+    try defineHttpMethod(self, mod, "%clConnect%", "%clConnect%");
+    try defineHttpMethod(self, mod, "%clData%", "%clData%");
+    try defineHttpMethod(self, mod, "%clEnd%", "%clEnd%");
+    try defineHttpMethod(self, mod, "%clError%", "%clError%");
 
     return mod;
 }
@@ -157,8 +222,10 @@ pub fn method(self: *Interpreter, func: *Object, this_val: Value, args: []const 
     const eq = std.mem.eql;
 
     if (eq(u8, name, "createServer")) return createServer(self, args, null);
+    if (eq(u8, name, "request")) return clientRequest(self, args, false);
+    if (eq(u8, name, "get")) return clientRequest(self, args, true);
     if (eq(u8, name, "Server")) return serverCtor(self, this_val, args);
-    if (eq(u8, name, "IncomingMessage") or eq(u8, name, "ServerResponse")) {
+    if (eq(u8, name, "IncomingMessage") or eq(u8, name, "ServerResponse") or eq(u8, name, "ClientRequest")) {
         // Direct construction is allowed but uncommon; return the receiver (state attached lazily).
         return .{ .normal = if (self.native_new_target != .undefined) this_val else .undefined };
     }
@@ -168,10 +235,41 @@ pub fn method(self: *Interpreter, func: *Object, this_val: Value, args: []const 
     if (eq(u8, name, "%onData%")) return onData(self, this_val, args);
     if (eq(u8, name, "%onEnd%")) return onEnd(self, this_val);
     if (eq(u8, name, "%relay%")) return relayFire(self, func, args);
+    if (eq(u8, name, "%clConnect%")) return clOnConnect(self, func);
+    if (eq(u8, name, "%clData%")) return clOnData(self, func, args);
+    if (eq(u8, name, "%clEnd%")) return clOnEnd(self, func);
+    if (eq(u8, name, "%clError%")) return clOnError(self, func, args);
 
     // Instance methods — receiver must be an object.
     if (this_val != .object) return self.throwError("TypeError", "http method called on non-object");
     const js = this_val.object;
+
+    // ClientRequest methods (dispatched FIRST when the receiver carries a ClientState, since several
+    // method NAMES — write/end/setHeader/... — collide with ServerResponse's).
+    if (clientStateOf(self, js)) |cl| {
+        if (eq(u8, name, "write")) return clientWrite(self, cl, this_val, args);
+        if (eq(u8, name, "end")) return clientEnd(self, cl, this_val, args);
+        if (eq(u8, name, "setHeader")) return clientSetHeader(self, cl, this_val, args);
+        if (eq(u8, name, "getHeader")) return clientGetHeader(self, cl, args);
+        if (eq(u8, name, "hasHeader")) return .{ .normal = .{ .boolean = clientHeaderIndex(cl, try lowerDup(self, headerArgName(args))) != null } };
+        if (eq(u8, name, "removeHeader")) return clientRemoveHeader(self, cl, this_val, args);
+        if (eq(u8, name, "abort") or eq(u8, name, "destroy")) {
+            cl.aborted = true;
+            if (cl.socket) |s| try socketEnd(self, s);
+            return .{ .normal = this_val };
+        }
+        if (eq(u8, name, "setTimeout")) {
+            if (args.len > 1 and args[1] == .object and args[1].object.kind == .function)
+                try jsAddListener(self, js, "timeout", args[1], true);
+            return .{ .normal = this_val };
+        }
+        if (eq(u8, name, "flushHeaders")) return .{ .normal = this_val };
+        if (eq(u8, name, "setEncoding")) {
+            // A client-side RESPONSE IncomingMessage also carries CLIENT_KEY.
+            cl.res_encoding = if (args.len > 0 and args[0] == .string) self.arena.dupe(u8, args[0].string) catch null else null;
+            return .{ .normal = this_val };
+        }
+    }
 
     // Server methods.
     if (eq(u8, name, "listen")) return serverListen(self, js, this_val, args);
@@ -230,6 +328,11 @@ fn connStateOf(self: *Interpreter, js: *Object) ?*ConnState {
 
 fn resStateOf(self: *Interpreter, js: *Object) ?*ResState {
     const p = handlePtr(self, js, RES_KEY) orelse return null;
+    return @ptrCast(@alignCast(p));
+}
+
+fn clientStateOf(self: *Interpreter, js: *Object) ?*ClientState {
+    const p = handlePtr(self, js, CLIENT_KEY) orelse return null;
     return @ptrCast(@alignCast(p));
 }
 
@@ -757,6 +860,472 @@ fn appendResponseHead(self: *Interpreter, st: *ResState, out: *std.ArrayListUnma
         out.appendSlice(self.arena, if (st.keep_alive) "Connection: keep-alive\r\n" else "Connection: close\r\n") catch return error.OutOfMemory;
     }
     out.appendSlice(self.arena, "\r\n") catch return error.OutOfMemory;
+}
+
+// ── http CLIENT (http.request / http.get) ───────────────────────────────────────────
+
+/// The `prototype` of `http.ClientRequest`.
+fn clientReqProto(self: *Interpreter) EvalError!?*Object {
+    const http_mod = (try host_require.loadCoreModulePub(self, "http")).normal.object;
+    if (http_mod.get("ClientRequest")) |c| if (c == .object)
+        if (c.object.get("prototype")) |p| if (p == .object) return p.object;
+    return self.objectProto();
+}
+
+/// First arg of a header method, as a string (`""` if absent / not a string).
+fn headerArgName(args: []const Value) []const u8 {
+    if (args.len > 0 and args[0] == .string) return args[0].string;
+    return "";
+}
+
+/// `http.request(url | options [, options][, callback])` (and `http.get` = request then `.end()`).
+/// Builds a ClientRequest, parses the target into method/host/port/path + headers, and adds the
+/// trailing callback (if any) as a `'response'` listener. `auto_end` runs `.end()` before returning.
+fn clientRequest(self: *Interpreter, args: []const Value, auto_end: bool) EvalError!Completion {
+    const proto = try clientReqProto(self);
+    const js = try Object.create(self.arena, proto.?);
+    const cl = self.arena.create(ClientState) catch return error.OutOfMemory;
+    cl.* = .{ .interp = self, .req = js };
+    try registerHandle(self, js, CLIENT_KEY, cl);
+
+    // Walk args: a leading string is a URL; an object is options; a function is the 'response' cb.
+    var cb: Value = .undefined;
+    var opts: ?*Object = null;
+    for (args, 0..) |a, i| {
+        if (i == 0 and a == .string) {
+            try applyUrl(self, cl, a.string);
+        } else if (a == .object and a.object.kind == .function) {
+            cb = a;
+        } else if (a == .object) {
+            opts = a.object;
+        }
+    }
+    if (opts) |o| try applyOptions(self, cl, o);
+
+    // Default + public props mirroring Node.
+    try js.defineData("method", .{ .string = try self.arena.dupe(u8, cl.method) }, true, false, true);
+    try js.defineData("path", .{ .string = try self.arena.dupe(u8, cl.path) }, true, false, true);
+    try js.defineData("host", .{ .string = try self.arena.dupe(u8, cl.host) }, true, false, true);
+    try js.defineData("finished", .{ .boolean = false }, true, true, true);
+    try js.defineData("aborted", .{ .boolean = false }, true, true, true);
+
+    if (cb != .undefined) try jsAddListener(self, js, "response", cb, false);
+    if (auto_end) _ = try clientEnd(self, cl, .{ .object = js }, &.{});
+    return .{ .normal = .{ .object = js } };
+}
+
+/// Parse a `http://host[:port]/path?query` URL into the ClientState. Plaintext http only.
+fn applyUrl(self: *Interpreter, cl: *ClientState, url: []const u8) EvalError!void {
+    var rest = url;
+    if (std.mem.startsWith(u8, rest, "http://")) {
+        rest = rest["http://".len..];
+    } else if (std.mem.startsWith(u8, rest, "https://")) {
+        // No TLS this slice: still parse the authority/path so the request is well-formed; the connect
+        // will target the given port (default 443 won't speak plaintext, but we don't reject here).
+        rest = rest["https://".len..];
+        cl.port = 443;
+    }
+    // authority = up to the first '/', '?' or '#'.
+    var auth_end: usize = rest.len;
+    for (rest, 0..) |c, i| if (c == '/' or c == '?' or c == '#') {
+        auth_end = i;
+        break;
+    };
+    const authority = rest[0..auth_end];
+    const path_part = rest[auth_end..];
+    // Strip any userinfo@.
+    var hostport = authority;
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| hostport = authority[at + 1 ..];
+    // host[:port] (IPv6 in [..] not handled — out of scope for the plaintext client).
+    if (std.mem.lastIndexOfScalar(u8, hostport, ':')) |colon| {
+        cl.hostname = try self.arena.dupe(u8, hostport[0..colon]);
+        cl.port = std.fmt.parseInt(u16, hostport[colon + 1 ..], 10) catch cl.port;
+    } else {
+        cl.hostname = try self.arena.dupe(u8, hostport);
+        if (cl.port == 0) cl.port = 80;
+    }
+    cl.host = try self.arena.dupe(u8, hostport); // Host header value (host[:port] as given)
+    cl.path = if (path_part.len == 0) "/" else try self.arena.dupe(u8, path_part);
+}
+
+/// Apply an options object `{ host/hostname, port, path, method, headers }` over the ClientState.
+fn applyOptions(self: *Interpreter, cl: *ClientState, o: *Object) EvalError!void {
+    if (o.get("hostname")) |v| if (v == .string) {
+        cl.hostname = try self.arena.dupe(u8, v.string);
+        cl.host = cl.hostname;
+    };
+    if (cl.hostname.len == 0 or std.mem.eql(u8, cl.hostname, "127.0.0.1")) {
+        if (o.get("host")) |v| if (v == .string) {
+            cl.hostname = try self.arena.dupe(u8, v.string);
+            cl.host = cl.hostname;
+        };
+    }
+    if (o.get("port")) |v| {
+        const n = try self.toNumberV(v);
+        if (!n.isAbrupt()) {
+            const p = n.normal.number;
+            if (!std.math.isNan(p) and p >= 0 and p <= 65535) cl.port = @intFromFloat(p);
+        }
+    }
+    if (o.get("path")) |v| if (v == .string) {
+        cl.path = try self.arena.dupe(u8, v.string);
+    };
+    if (o.get("method")) |v| if (v == .string) {
+        cl.method = try upperDup(self, v.string);
+    };
+    // If both host[:port] are present and the Host header wasn't set from a URL, compose host:port for
+    // the header when a non-default port is used.
+    if (cl.port != 80 and cl.port != 0 and std.mem.indexOfScalar(u8, cl.host, ':') == null) {
+        cl.host = std.fmt.allocPrint(self.arena, "{s}:{d}", .{ cl.hostname, cl.port }) catch cl.host;
+    }
+    if (o.get("headers")) |hv| if (hv == .object) {
+        var it = hv.object.properties.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.payload != .data) continue;
+            const k = e.key_ptr.*;
+            try clientSetHeaderRaw(self, cl, k, e.value_ptr.payload.data);
+        }
+    };
+}
+
+fn clientHeaderIndex(cl: *ClientState, lname: []const u8) ?usize {
+    for (cl.lower.items, 0..) |l, i| if (std.ascii.eqlIgnoreCase(l, lname)) return i;
+    return null;
+}
+
+fn clientSetHeaderRaw(self: *Interpreter, cl: *ClientState, name: []const u8, val_v: Value) EvalError!void {
+    const val = try headerValueToString(self, val_v);
+    const lname = try lowerDup(self, name);
+    if (clientHeaderIndex(cl, lname)) |i| {
+        cl.values.items[i] = val;
+        cl.names.items[i] = self.arena.dupe(u8, name) catch return error.OutOfMemory;
+    } else {
+        cl.names.append(self.arena, self.arena.dupe(u8, name) catch return error.OutOfMemory) catch return error.OutOfMemory;
+        cl.lower.append(self.arena, lname) catch return error.OutOfMemory;
+        cl.values.append(self.arena, val) catch return error.OutOfMemory;
+    }
+}
+
+fn clientSetHeader(self: *Interpreter, cl: *ClientState, this_val: Value, args: []const Value) EvalError!Completion {
+    if (cl.sent) return self.throwError("Error", "Cannot set headers after they are sent to the client");
+    if (args.len >= 1 and args[0] == .string)
+        try clientSetHeaderRaw(self, cl, args[0].string, if (args.len > 1) args[1] else .undefined);
+    return .{ .normal = this_val };
+}
+
+fn clientGetHeader(self: *Interpreter, cl: *ClientState, args: []const Value) EvalError!Completion {
+    if (args.len < 1 or args[0] != .string) return .{ .normal = .undefined };
+    const lname = try lowerDup(self, args[0].string);
+    if (clientHeaderIndex(cl, lname)) |i| return .{ .normal = .{ .string = cl.values.items[i] } };
+    return .{ .normal = .undefined };
+}
+
+fn clientRemoveHeader(self: *Interpreter, cl: *ClientState, this_val: Value, args: []const Value) EvalError!Completion {
+    if (args.len < 1 or args[0] != .string) return .{ .normal = this_val };
+    const lname = try lowerDup(self, args[0].string);
+    if (clientHeaderIndex(cl, lname)) |i| {
+        _ = cl.names.orderedRemove(i);
+        _ = cl.lower.orderedRemove(i);
+        _ = cl.values.orderedRemove(i);
+    }
+    return .{ .normal = this_val };
+}
+
+/// `req.write(chunk)` — buffer the body chunk (sent on `.end()`; the whole request is written at once).
+fn clientWrite(self: *Interpreter, cl: *ClientState, _: Value, args: []const Value) EvalError!Completion {
+    if (cl.sent) return .{ .normal = .{ .boolean = false } };
+    const chunk = try valueToBytes(self, if (args.len > 0) args[0] else .undefined);
+    cl.body.appendSlice(self.arena, chunk) catch return error.OutOfMemory;
+    for (args[@min(1, args.len)..]) |a| if (a == .object and a.object.kind == .function) {
+        _ = try self.callFunction(a.object, &.{}, .undefined);
+    };
+    return .{ .normal = .{ .boolean = true } };
+}
+
+/// `req.end([chunk])` — append the final chunk, then connect a net.Socket and (on 'connect') write the
+/// full request. Idempotent.
+fn clientEnd(self: *Interpreter, cl: *ClientState, this_val: Value, args: []const Value) EvalError!Completion {
+    if (cl.sent) return .{ .normal = this_val };
+    const chunk_v: Value = if (args.len > 0 and !(args[0] == .object and args[0].object.kind == .function)) args[0] else .undefined;
+    const chunk = try valueToBytes(self, chunk_v);
+    cl.body.appendSlice(self.arena, chunk) catch return error.OutOfMemory;
+    cl.sent = true;
+    try cl.req.set("finished", .{ .boolean = true });
+
+    // Create the net.Socket and wire client trampolines, then connect.
+    const net_mod = (try host_require.loadCoreModulePub(self, "net")).normal.object;
+    const sock_ctor = net_mod.get("Socket") orelse return self.throwError("Error", "net.Socket unavailable");
+    if (sock_ctor != .object) return self.throwError("Error", "net.Socket unavailable");
+    const sock_c = try self.construct(sock_ctor.object, &.{});
+    if (sock_c.isAbrupt()) return sock_c;
+    if (sock_c.normal != .object) return self.throwError("Error", "net.Socket construction failed");
+    const socket = sock_c.normal.object;
+    cl.socket = socket;
+    // Tie the ClientState to the socket too, so the trampolines can recover it from `this`.
+    try socket.defineData(CLIENT_KEY, cl.req.get(CLIENT_KEY).?, false, false, false);
+
+    const on_connect = try clTrampoline(self, "%clConnect%", cl.req);
+    const on_data = try clTrampoline(self, "%clData%", cl.req);
+    const on_end = try clTrampoline(self, "%clEnd%", cl.req);
+    const on_error = try clTrampoline(self, "%clError%", cl.req);
+    try jsAddListener(self, socket, "connect", .{ .object = on_connect }, true);
+    try jsAddListener(self, socket, "data", .{ .object = on_data }, false);
+    try jsAddListener(self, socket, "end", .{ .object = on_end }, true);
+    try jsAddListener(self, socket, "close", .{ .object = on_end }, true);
+    try jsAddListener(self, socket, "error", .{ .object = on_error }, false);
+
+    // socket.connect(port, host) — drive via the JS method (mirrors host_http server-side wiring).
+    const conn_v = socket.get("connect") orelse return self.throwError("Error", "socket.connect unavailable");
+    if (conn_v != .object) return self.throwError("Error", "socket.connect unavailable");
+    const host_arg = if (cl.hostname.len == 0) "127.0.0.1" else cl.hostname;
+    const cc = try self.callFunction(conn_v.object, &.{
+        .{ .number = @floatFromInt(cl.port) },
+        .{ .string = try self.arena.dupe(u8, host_arg) },
+    }, .{ .object = socket });
+    if (cc.isAbrupt()) return cc;
+
+    for (args[@min(1, args.len)..]) |a| if (a == .object and a.object.kind == .function) {
+        _ = try self.callFunction(a.object, &.{}, .undefined);
+    };
+    return .{ .normal = this_val };
+}
+
+/// Make a `.http_method` trampoline bound to the ClientRequest (`%req%`).
+fn clTrampoline(self: *Interpreter, native_name: []const u8, req: *Object) EvalError!*Object {
+    const fn_obj = try Object.createNative(self.arena, .http_method, native_name);
+    fn_obj.prototype = self.functionProto();
+    _ = fn_obj.properties.orderedRemove("prototype");
+    try fn_obj.defineData("%req%", .{ .object = req }, false, false, false);
+    return fn_obj;
+}
+
+fn clientOf(self: *Interpreter, func: *Object) ?*ClientState {
+    const rv = func.get("%req%") orelse return null;
+    if (rv != .object) return null;
+    return clientStateOf(self, rv.object);
+}
+
+/// Socket 'connect': serialize the request line + headers (+ body) and write it.
+fn clOnConnect(self: *Interpreter, func: *Object) EvalError!Completion {
+    const cl = clientOf(self, func) orelse return .{ .normal = .undefined };
+    const socket = cl.socket orelse return .{ .normal = .undefined };
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    const rl = std.fmt.allocPrint(self.arena, "{s} {s} HTTP/1.1\r\n", .{ cl.method, cl.path }) catch return error.OutOfMemory;
+    out.appendSlice(self.arena, rl) catch return error.OutOfMemory;
+
+    var have_host = false;
+    var have_cl = false;
+    var have_conn = false;
+    for (cl.names.items, 0..) |name, i| {
+        out.appendSlice(self.arena, name) catch return error.OutOfMemory;
+        out.appendSlice(self.arena, ": ") catch return error.OutOfMemory;
+        out.appendSlice(self.arena, cl.values.items[i]) catch return error.OutOfMemory;
+        out.appendSlice(self.arena, "\r\n") catch return error.OutOfMemory;
+        const l = cl.lower.items[i];
+        if (std.ascii.eqlIgnoreCase(l, "host")) have_host = true;
+        if (std.ascii.eqlIgnoreCase(l, "content-length")) have_cl = true;
+        if (std.ascii.eqlIgnoreCase(l, "connection")) have_conn = true;
+    }
+    if (!have_host) {
+        const h = std.fmt.allocPrint(self.arena, "Host: {s}\r\n", .{cl.host}) catch return error.OutOfMemory;
+        out.appendSlice(self.arena, h) catch return error.OutOfMemory;
+    }
+    // Add Content-Length when there is a body and none was set (no chunked client-send this slice).
+    if (!have_cl and cl.body.items.len > 0) {
+        const c = std.fmt.allocPrint(self.arena, "Content-Length: {d}\r\n", .{cl.body.items.len}) catch return error.OutOfMemory;
+        out.appendSlice(self.arena, c) catch return error.OutOfMemory;
+    }
+    if (!have_conn) out.appendSlice(self.arena, "Connection: close\r\n") catch return error.OutOfMemory;
+    out.appendSlice(self.arena, "\r\n") catch return error.OutOfMemory;
+    if (cl.body.items.len > 0) out.appendSlice(self.arena, cl.body.items) catch return error.OutOfMemory;
+
+    try socketWrite(self, socket, out.items);
+    return .{ .normal = .undefined };
+}
+
+/// Socket 'data': accumulate response bytes + advance the response parser.
+fn clOnData(self: *Interpreter, func: *Object, args: []const Value) EvalError!Completion {
+    const cl = clientOf(self, func) orelse return .{ .normal = .undefined };
+    const chunk = try valueToBytes(self, if (args.len > 0) args[0] else .undefined);
+    cl.in.appendSlice(self.arena, chunk) catch return error.OutOfMemory;
+    try clientAdvance(self, cl);
+    return .{ .normal = .undefined };
+}
+
+/// Socket 'end'/'close': a connection-close-delimited body is now complete → flush + 'end'.
+fn clOnEnd(self: *Interpreter, func: *Object) EvalError!Completion {
+    const cl = clientOf(self, func) orelse return .{ .normal = .undefined };
+    if (cl.finished) return .{ .normal = .undefined };
+    // Parse headers if not yet (a response with no body and a tiny header block could arrive in one go).
+    try clientAdvance(self, cl);
+    if (cl.res != null and !cl.finished) {
+        if (!cl.have_content_length and !cl.chunked) {
+            // read-until-close: everything after the header block is the body.
+            try clientEmitRemainingBody(self, cl);
+        }
+        try clientFinishResponse(self, cl);
+    }
+    return .{ .normal = .undefined };
+}
+
+/// Socket 'error': forward to the ClientRequest as 'error'.
+fn clOnError(self: *Interpreter, func: *Object, args: []const Value) EvalError!Completion {
+    const cl = clientOf(self, func) orelse return .{ .normal = .undefined };
+    emitSafe(self, cl.req, "error", args);
+    return .{ .normal = .undefined };
+}
+
+/// Advance the response parser with whatever is buffered: parse the header block once (build the
+/// response IncomingMessage + emit 'response'), then stream the body per its framing.
+fn clientAdvance(self: *Interpreter, cl: *ClientState) EvalError!void {
+    if (!cl.headers_done) {
+        const sep = std.mem.indexOf(u8, cl.in.items, "\r\n\r\n") orelse return;
+        cl.headers_done = true;
+        cl.body_start = sep + 4;
+        cl.chunk_offset = cl.body_start;
+        try clientBuildResponse(self, cl, cl.in.items[0..sep]);
+    }
+    if (cl.res == null or cl.finished) return;
+    if (cl.chunked) {
+        try clientDecodeChunks(self, cl);
+    } else if (cl.have_content_length) {
+        try clientEmitContentLength(self, cl);
+    }
+    // read-until-close bodies stream on socket 'end' (clOnEnd).
+}
+
+/// Parse the status line + headers, build the response IncomingMessage, emit 'response'.
+fn clientBuildResponse(self: *Interpreter, cl: *ClientState, header_block: []const u8) EvalError!void {
+    var lines = std.mem.splitSequence(u8, header_block, "\r\n");
+    const status_line = lines.next() orelse return;
+
+    // HTTP/x.y SP code SP message
+    var sl = std.mem.splitScalar(u8, status_line, ' ');
+    const version_tok = sl.next() orelse "HTTP/1.1";
+    const http_version = if (std.mem.startsWith(u8, version_tok, "HTTP/")) version_tok["HTTP/".len..] else "1.1";
+    const code_tok = sl.next() orelse "0";
+    const status_code: u16 = std.fmt.parseInt(u16, std.mem.trim(u8, code_tok, " "), 10) catch 0;
+    const status_message = sl.rest(); // remainder after "HTTP/x.y CODE " (may contain spaces)
+
+    const res_proto = try ctorProto(self, "IncomingMessage");
+    const res = try Object.create(self.arena, res_proto.?);
+    // Mark the response with CLIENT_KEY so setEncoding routes to the ClientState.
+    try res.defineData(CLIENT_KEY, cl.req.get(CLIENT_KEY).?, false, false, false);
+    const headers_obj = try Object.create(self.arena, self.objectProto());
+
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const raw_name = std.mem.trim(u8, line[0..colon], " \t");
+        const raw_val = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (raw_name.len == 0) continue;
+        const lname = try lowerDup(self, raw_name);
+        const val = self.arena.dupe(u8, raw_val) catch return error.OutOfMemory;
+        try headers_obj.defineData(lname, .{ .string = val }, true, true, true);
+        if (std.ascii.eqlIgnoreCase(lname, "content-length")) {
+            cl.content_length = std.fmt.parseInt(usize, raw_val, 10) catch 0;
+            cl.have_content_length = true;
+        }
+        if (std.ascii.eqlIgnoreCase(lname, "transfer-encoding") and
+            std.ascii.indexOfIgnoreCase(raw_val, "chunked") != null)
+        {
+            cl.chunked = true;
+        }
+    }
+
+    try res.defineData("statusCode", .{ .number = @floatFromInt(status_code) }, true, true, true);
+    try res.defineData("statusMessage", .{ .string = try self.arena.dupe(u8, std.mem.trim(u8, status_message, " ")) }, true, true, true);
+    try res.defineData("httpVersion", .{ .string = try self.arena.dupe(u8, http_version) }, true, true, true);
+    try res.defineData("headers", .{ .object = headers_obj }, true, true, true);
+    try res.defineData("complete", .{ .boolean = false }, true, true, true);
+    if (cl.socket) |s| {
+        try res.defineData("socket", .{ .object = s }, true, true, true);
+        try res.defineData("connection", .{ .object = s }, true, true, true);
+    }
+    cl.res = res;
+    cl.res_emitted = true;
+    emitSafe(self, cl.req, "response", &.{.{ .object = res }});
+}
+
+/// Emit any newly-available Content-Length body bytes as 'data', and 'end' when complete.
+fn clientEmitContentLength(self: *Interpreter, cl: *ClientState) EvalError!void {
+    const res = cl.res orelse return;
+    const total = cl.in.items.len;
+    const have = if (total > cl.body_start) total - cl.body_start else 0;
+    const want = @min(cl.content_length, have);
+    if (want > cl.body_consumed) {
+        const slice = cl.in.items[cl.body_start + cl.body_consumed .. cl.body_start + want];
+        clientEmitData(self, cl, res, slice);
+        cl.body_consumed = want;
+    }
+    if (cl.body_consumed >= cl.content_length) try clientFinishResponse(self, cl);
+}
+
+/// read-until-close: emit everything after the header block that hasn't been emitted yet.
+fn clientEmitRemainingBody(self: *Interpreter, cl: *ClientState) EvalError!void {
+    const res = cl.res orelse return;
+    const total = cl.in.items.len;
+    const start = cl.body_start + cl.body_consumed;
+    if (total > start) {
+        const slice = cl.in.items[start..total];
+        clientEmitData(self, cl, res, slice);
+        cl.body_consumed += slice.len;
+    }
+}
+
+/// Decode `Transfer-Encoding: chunked` incrementally: `<hex-size>\r\n<data>\r\n` … `0\r\n\r\n`.
+/// `chunk_offset` is the cursor; we only consume complete chunks.
+fn clientDecodeChunks(self: *Interpreter, cl: *ClientState) EvalError!void {
+    const res = cl.res orelse return;
+    const buf = cl.in.items;
+    while (true) {
+        const line_end = std.mem.indexOfPos(u8, buf, cl.chunk_offset, "\r\n") orelse return; // need full size line
+        const size_line = std.mem.trim(u8, buf[cl.chunk_offset..line_end], " \t");
+        // size may carry chunk-extensions after ';' — ignore them.
+        const semi = std.mem.indexOfScalar(u8, size_line, ';');
+        const hex = if (semi) |s| size_line[0..s] else size_line;
+        const size = std.fmt.parseInt(usize, hex, 16) catch 0;
+        const data_start = line_end + 2;
+        if (size == 0) {
+            // Last chunk; consume the trailing CRLF (and any trailers up to the blank line) if present.
+            try clientFinishResponse(self, cl);
+            return;
+        }
+        const data_end = data_start + size;
+        if (data_end + 2 > buf.len) return; // need the full chunk + its trailing CRLF
+        clientEmitData(self, cl, res, buf[data_start..data_end]);
+        cl.chunk_offset = data_end + 2; // skip the data's trailing CRLF
+    }
+}
+
+/// Emit a body slice as 'data' — a Buffer by default, or a decoded string after `res.setEncoding`.
+fn clientEmitData(self: *Interpreter, cl: *ClientState, res: *Object, slice: []const u8) void {
+    if (slice.len == 0) return;
+    if (cl.res_encoding) |_| {
+        const s = self.arena.dupe(u8, slice) catch return;
+        emitSafe(self, res, "data", &.{.{ .string = s }});
+    } else {
+        const buf = host_buffer.makeBufferFromBytes(self, slice) catch return;
+        emitSafe(self, res, "data", &.{.{ .object = buf }});
+    }
+}
+
+/// Mark the response complete and emit 'end' exactly once.
+fn clientFinishResponse(self: *Interpreter, cl: *ClientState) EvalError!void {
+    const res = cl.res orelse return;
+    if (cl.finished) return;
+    cl.finished = true;
+    try res.defineData("complete", .{ .boolean = true }, true, true, true);
+    emitSafe(self, res, "end", &.{});
+    // Close our side of the socket now that the response is fully read (Connection: close).
+    if (cl.socket) |s| try socketEnd(self, s);
+}
+
+fn upperDup(self: *Interpreter, s: []const u8) EvalError![]const u8 {
+    const out = self.arena.alloc(u8, s.len) catch return error.OutOfMemory;
+    for (s, 0..) |c, i| out[i] = std.ascii.toUpper(c);
+    return out;
 }
 
 // ── socket I/O helpers (drive the net Socket via its JS API) ─────────────────────────
