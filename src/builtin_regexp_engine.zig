@@ -84,6 +84,7 @@ const Parser = struct {
     arena: std.mem.Allocator,
     src: []const u8,
     pos: usize = 0,
+    last_atom_codepoint: u32 = 0,
     group_count: usize = 0, // capturing groups seen
     names: std.ArrayListUnmanaged(NamedGroup) = .empty,
     /// §22.2.1 `\k<name>` references, resolved to group indices after the whole pattern is parsed (so
@@ -332,13 +333,19 @@ const Parser = struct {
             // `parseClassAtom` returns the byte for a single-char atom, or null when it appended a
             // CharacterClassEscape (\d\w\s…) directly to `ranges`.
             const lo = try self.parseClassAtom(&ranges);
+            const lo_cp = self.last_atom_codepoint;
             // a range `X-Y` (only when a `-` follows and it is not the closing `]`)
             if (self.peek() == '-' and self.pos + 1 < self.src.len and self.src[self.pos + 1] != ']') {
                 self.pos += 1; // '-'
                 const hi = try self.parseClassAtom(&ranges);
+                const hi_cp = self.last_atom_codepoint;
                 if (lo != null and hi != null) {
-                    if (lo.? > hi.?) return CompileError.SyntaxError; // z-a
-                    try ranges.append(self.arena, .{ .lo = lo.?, .hi = hi.? });
+                    // §22.2.1: order check on the FULL code points so a genuinely inverted range
+                    // (z-a, or uFFFF-u0000) is a SyntaxError, while a valid astral range like
+                    // uFDF0-uFFEF (whose truncated bytes 0xF0-0xEF only LOOK inverted) is accepted;
+                    // store it only if representable in bytes, else drop it (byte-engine deviation).
+                    if (lo_cp > hi_cp) return CompileError.SyntaxError;
+                    if (lo.? <= hi.?) try ranges.append(self.arena, .{ .lo = lo.?, .hi = hi.? });
                 } else {
                     // §22.2.1 NonemptyClassRanges: a range endpoint that is a CharacterClassEscape
                     // (e.g. `\d-a`, `a-\d`, `\s-\d`) is a SyntaxError in UnicodeMode; Annex B treats the
@@ -370,23 +377,34 @@ const Parser = struct {
                     try appendClassEscape(self.arena, ranges, e);
                     return null;
                 },
-                'n' => return '\n',
-                'r' => return '\r',
-                't' => return '\t',
-                'f' => return 0x0C,
-                'v' => return 0x0B,
-                'b' => return 0x08, // \b in a class is backspace
-                '0' => return 0,
-                'x' => return @as(u8, try self.parseHex(2)),
-                'u' => return @as(u8, try self.parseHex(4)),
-                else => return e, // identity escape (Annex B lenient)
+                'n' => return self.recordCp('\n'),
+                'r' => return self.recordCp('\r'),
+                't' => return self.recordCp('\t'),
+                'f' => return self.recordCp(0x0C),
+                'v' => return self.recordCp(0x0B),
+                'b' => return self.recordCp(0x08), // \b in a class is backspace
+                '0' => return self.recordCp(0),
+                'x' => return self.recordCp(try self.parseHexFull(2)),
+                'u' => return self.recordCp(try self.parseHexFull(4)),
+                else => return self.recordCp(e), // identity escape (Annex B lenient)
             }
         }
         self.pos += 1;
-        return c;
+        return self.recordCp(c);
+    }
+
+    /// Record an atom's FULL code point (for the range-order check) and return it truncated to a byte
+    /// (the engine is byte-oriented; code points > 0xFF are a documented matching deviation).
+    fn recordCp(self: *Parser, v: u32) u8 {
+        self.last_atom_codepoint = v;
+        return @truncate(v);
     }
 
     fn parseHex(self: *Parser, n: usize) CompileError!u8 {
+        return @truncate(try self.parseHexFull(n)); // byte-oriented: code points > 0xFF truncate (deviation)
+    }
+
+    fn parseHexFull(self: *Parser, n: usize) CompileError!u32 {
         var v: u32 = 0;
         var i: usize = 0;
         while (i < n) : (i += 1) {
@@ -400,7 +418,7 @@ const Parser = struct {
             v = v * 16 + nib;
             self.pos += 1;
         }
-        return @truncate(v); // byte-oriented: code points > 0xFF truncate (deviation)
+        return v;
     }
 
     fn parseAtomEscape(self: *Parser) CompileError!*Node {
