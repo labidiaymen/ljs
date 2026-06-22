@@ -597,7 +597,7 @@ pub fn installEntryRequire(self: *Interpreter, script_path: []const u8, script_d
 //  core module registry: path / fs / os
 // ════════════════════════════════════════════════════════════════════════════
 
-const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test", "timers", "timers/promises", "vm", "net", "crypto", "stream", "string_decoder", "http" };
+const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test", "timers", "timers/promises", "vm", "net", "crypto", "stream", "string_decoder", "http", "tty" };
 
 /// Strip a `node:` prefix (Node accepts `node:path` etc.).
 fn coreName(spec: []const u8) []const u8 {
@@ -686,6 +686,19 @@ fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
         for ([_][]const u8{ "platform", "arch", "type", "release", "homedir", "tmpdir", "hostname", "cpus", "endianness", "totalmem", "freemem" }) |m|
             try defineCoreMethod(self, obj, name, m);
         try obj.defineData("EOL", .{ .string = if (is_windows) "\r\n" else "\n" }, true, true, true);
+    } else if (std.mem.eql(u8, name, "tty")) {
+        // HOST: minimal `tty` — `isatty(fd)` (always false here; packages like debug/colorette/
+        // supports-color use it to decide on ANSI colors) + `ReadStream`/`WriteStream` placeholder
+        // constructors (referenced for `instanceof` checks).
+        try defineCoreMethod(self, obj, name, "isatty");
+        for ([_][]const u8{ "ReadStream", "WriteStream" }) |c| {
+            const ctor = try Object.createNative(self.arena, .core_module_fn, c);
+            ctor.prototype = self.functionProto();
+            try ctor.defineData("name", .{ .string = c }, false, false, true);
+            try ctor.defineData("%mod%", .{ .string = name }, false, false, true);
+            try ctor.defineData("prototype", .{ .object = try Object.create(self.arena, self.objectProto()) }, false, false, false);
+            try obj.defineData(c, .{ .object = ctor }, true, false, true);
+        }
     } else if (std.mem.eql(u8, name, "url")) {
         // HOST (spec 103): require('url') → { URL, URLSearchParams }.
         return @import("host_url.zig").buildUrlModule(self);
@@ -748,6 +761,11 @@ pub fn coreModuleFn(self: *Interpreter, func: *Object, this_val: Value, args: []
     const method = func.native_name;
     if (std.mem.eql(u8, mod, "fs")) return host_fs.fsMethod(self, method, args);
     if (std.mem.eql(u8, mod, "os")) return host_fs.osMethod(self, method, args);
+    if (std.mem.eql(u8, mod, "tty")) {
+        // `isatty(fd)` → false (no TTY detection); the stream placeholder ctors are no-ops.
+        if (std.mem.eql(u8, method, "isatty")) return .{ .normal = .{ .boolean = false } };
+        return .{ .normal = .undefined };
+    }
     if (std.mem.eql(u8, mod, "fs_stats")) {
         // A Stats predicate (isFile/isDirectory) — read the baked-in flag off the receiver object.
         const recv = if (this_val == .object) this_val.object else return .{ .normal = .{ .boolean = false } };
