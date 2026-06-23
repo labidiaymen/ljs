@@ -267,6 +267,9 @@ pub const Interpreter = struct {
     /// evaluation sets it (save/restore) to the active module's key so a nested `import()` resolves
     /// relative to that module.
     host_referrer_key: []const u8 = "",
+    /// HOST (ESM loader): a precise detail message for the last ESM graph failure (which specifier could
+    /// not be resolved / which file failed to parse), surfaced in the thrown SyntaxError. Best-effort.
+    esm_resolve_detail: ?[]const u8 = null,
     /// The process-global threaded Io — supplies the raw-OS-futex backing `std.Io.Semaphore.wait/post`
     /// for the generator ping-pong handoff. `global_single_threaded` spins up no thread pool (futex ops
     /// are pool-independent), so this is free for ordinary (non-generator) execution.

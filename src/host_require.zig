@@ -431,7 +431,7 @@ fn loadEsm(self: *Interpreter, abspath: []const u8, source: []const u8) EvalErro
     const loader = module_mod.ModuleLoader{ .ctx = self, .resolve = esmResolve };
     const root = loadModuleGraph(self, loader, &graph, abspath, source) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.SyntaxError => return self.throwError("SyntaxError", "ESM parse/resolve error"),
+        error.SyntaxError => return self.throwError("SyntaxError", self.esm_resolve_detail orelse "ESM parse/resolve error"),
     };
 
     // runModule sets strict + module `this`; save/restore so the requiring CJS context is unchanged.
@@ -544,14 +544,21 @@ fn loadModuleGraph(
     if (cache.get(root_key)) |m| return m;
     const program = Parser.parseModule(arena, root_source) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.SyntaxError,
+        else => {
+            self.esm_resolve_detail = std.fmt.allocPrint(arena, "parse error in {s}", .{root_key}) catch null;
+            return error.SyntaxError;
+        },
     };
     const rec = arena.create(module_mod.ModuleRecord) catch return error.OutOfMemory;
     rec.* = .{ .key = root_key, .program = program };
     cache.put(arena, root_key, rec) catch return error.OutOfMemory;
     var deps: std.ArrayListUnmanaged(*module_mod.ModuleRecord) = .empty;
     for (program.requested_modules) |spec| {
-        const resolved = loader.resolve(loader.ctx, root_key, spec) orelse return error.SyntaxError;
+        const resolved = loader.resolve(loader.ctx, root_key, spec) orelse {
+            // Record which specifier (and from which module) failed to resolve, for a precise message.
+            self.esm_resolve_detail = std.fmt.allocPrint(arena, "Cannot find module '{s}' imported from {s}", .{ spec, root_key }) catch null;
+            return error.SyntaxError;
+        };
         const dep = try loadModuleGraph(self, loader, cache, resolved.key, resolved.source);
         deps.append(arena, dep) catch return error.OutOfMemory;
     }
@@ -609,7 +616,7 @@ pub fn installEntryRequire(self: *Interpreter, script_path: []const u8, script_d
 //  core module registry: path / fs / os
 // ════════════════════════════════════════════════════════════════════════════
 
-const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test", "timers", "timers/promises", "vm", "net", "crypto", "stream", "string_decoder", "http", "tty", "zlib", "https", "tls", "punycode", "v8", "http2", "diagnostics_channel", "worker_threads", "module", "async_hooks" };
+const core_modules = [_][]const u8{ "path", "path/posix", "path/win32", "fs", "os", "events", "util", "util/types", "url", "assert", "assert/strict", "buffer", "querystring", "test", "timers", "timers/promises", "vm", "net", "crypto", "stream", "string_decoder", "http", "tty", "zlib", "https", "tls", "punycode", "v8", "http2", "diagnostics_channel", "worker_threads", "module", "async_hooks", "child_process", "process" };
 
 /// Strip a `node:` prefix (Node accepts `node:path` etc.).
 fn coreName(spec: []const u8) []const u8 {
@@ -699,6 +706,9 @@ fn buildCoreModule(self: *Interpreter, name: []const u8) EvalError!*Object {
     if (std.mem.eql(u8, name, "diagnostics_channel")) return @import("host_https.zig").buildDiagnosticsChannel(self);
     if (std.mem.eql(u8, name, "worker_threads")) return @import("host_https.zig").buildWorkerThreads(self);
     if (std.mem.eql(u8, name, "async_hooks")) return @import("host_https.zig").buildAsyncHooks(self);
+    if (std.mem.eql(u8, name, "child_process")) return @import("host_https.zig").buildChildProcess(self);
+    // `process` / `node:process` — the global process object reified as a module (Node allows importing it).
+    if (std.mem.eql(u8, name, "process")) return self.process_obj orelse Object.create(arena, self.objectProto());
     const obj = try Object.create(arena, self.objectProto());
     if (std.mem.eql(u8, name, "fs")) {
         for ([_][]const u8{ "readFileSync", "existsSync", "writeFileSync", "statSync", "readdirSync", "mkdirSync", "appendFileSync", "unlinkSync", "rmSync", "rmdirSync", "renameSync", "copyFileSync", "accessSync", "lstatSync", "realpathSync", "readlinkSync", "truncateSync" }) |m|

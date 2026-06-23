@@ -173,6 +173,14 @@ pub fn buildAsyncHooks(self: *Interpreter) EvalError!*Object {
     return mod;
 }
 
+/// Minimal `child_process` — present so packages that `require`/`import` it can LOAD (commander imports it
+/// for executable subcommands). spawn/exec/… return an inert ChildProcess-ish EventEmitter; real process
+/// spawning is a later cycle. execSync/spawnSync return an empty buffer/string.
+pub fn buildChildProcess(self: *Interpreter) EvalError!*Object {
+    const mod = try buildStub(self, &.{ "spawn", "exec", "execFile", "fork", "spawnSync", "execSync", "execFileSync" });
+    return mod;
+}
+
 pub fn buildWorkerThreads(self: *Interpreter) EvalError!*Object {
     const mod = try buildStub(self, &.{ "Worker", "MessageChannel", "MessagePort", "moveMessagePortToContext", "receiveMessageOnPort", "markAsUntransferable", "getEnvironmentData", "setEnvironmentData", "BroadcastChannel" });
     try mod.defineData("isMainThread", .{ .boolean = true }, true, false, true);

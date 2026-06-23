@@ -27,8 +27,9 @@ pub fn build(self: *Interpreter) EvalError!*Object {
     const obj = try Object.create(arena, self.objectProto());
 
     for ([_][]const u8{
-        "format",      "formatWithOptions", "inspect",   "promisify",
-        "callbackify", "inherits",          "deprecate", "isDeepStrictEqual",
+        "format",                   "formatWithOptions", "inspect",   "promisify",
+        "callbackify",              "inherits",          "deprecate", "isDeepStrictEqual",
+        "stripVTControlCharacters",
     }) |m|
         try defineMethod(self, obj, m);
 
@@ -74,6 +75,7 @@ pub fn method(self: *Interpreter, func: *Object, this_val: Value, args: []const 
     if (func.get("%callbackify_cb%") != null) return callbackifyReaction(self, func, args);
     if (func.get("%deprecated_fn%") != null) return deprecateWrapper(self, func, args);
 
+    if (eql(u8, name, "stripVTControlCharacters")) return stripVT(self, args);
     if (eql(u8, name, "format")) return format(self, args, 0);
     if (eql(u8, name, "formatWithOptions")) return format(self, args, 1);
     if (eql(u8, name, "inspect")) {
@@ -92,6 +94,40 @@ pub fn method(self: *Interpreter, func: *Object, this_val: Value, args: []const 
     }
     // util.types.* predicates.
     return typesPredicate(name, args);
+}
+
+/// `util.stripVTControlCharacters(str)` — remove ANSI/VT escape sequences (color codes etc.). Handles
+/// CSI (`ESC [ … final-byte`), OSC (`ESC ] … BEL|ST`), and 2-byte (`ESC <byte>`) forms. Used by commander
+/// (and other CLIs) to measure printed width.
+fn stripVT(self: *Interpreter, args: []const Value) EvalError!Completion {
+    const sc = try self.toStringValuePub(if (args.len > 0) args[0] else .{ .string = "" });
+    if (sc.isAbrupt()) return sc;
+    const s = sc.normal.string;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == 0x1b and i + 1 < s.len) {
+            const next = s[i + 1];
+            if (next == '[') { // CSI: ESC [ … final byte 0x40..0x7e
+                i += 2;
+                while (i < s.len and !(s[i] >= 0x40 and s[i] <= 0x7e)) : (i += 1) {}
+                if (i < s.len) i += 1;
+                continue;
+            } else if (next == ']') { // OSC: ESC ] … BEL (0x07) or ST (ESC \)
+                i += 2;
+                while (i < s.len and s[i] != 0x07 and !(s[i] == 0x1b and i + 1 < s.len and s[i + 1] == '\\')) : (i += 1) {}
+                if (i < s.len and s[i] == 0x1b) i += 1;
+                if (i < s.len) i += 1;
+                continue;
+            } else { // ESC + single byte
+                i += 2;
+                continue;
+            }
+        }
+        out.append(self.arena, s[i]) catch return error.OutOfMemory;
+        i += 1;
+    }
+    return .{ .normal = .{ .string = out.items } };
 }
 
 // ── format ──────────────────────────────────────────────────────────────────────
