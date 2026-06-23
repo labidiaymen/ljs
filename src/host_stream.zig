@@ -62,18 +62,25 @@ pub fn build(self: *Interpreter) EvalError!*Object {
     const arena = self.arena;
     const ee_proto = try eventEmitterProto(self);
 
+    // Stream.prototype — the legacy base CLASS, chaining EventEmitter. The concrete classes inherit
+    // FROM it (Node: Stream extends EventEmitter; Readable/Writable extend Stream), so
+    // `new Readable() instanceof Stream` is true (node-fetch's Body relies on `body instanceof Stream`).
+    const stream_proto = try Object.create(arena, ee_proto);
+    try defineMethod(self, stream_proto, "pipe", "r.pipe");
+
     // Readable.prototype.
-    const readable_proto = try Object.create(arena, ee_proto);
+    const readable_proto = try Object.create(arena, stream_proto);
     for ([_][2][]const u8{
         .{ "push", "r.push" },     .{ "read", "r.read" },
         .{ "pipe", "r.pipe" },     .{ "pause", "r.pause" },
         .{ "resume", "r.resume" }, .{ "_read", "r._read" },
         .{ "unpipe", "r.unpipe" }, .{ "setEncoding", "r.setEncoding" },
+        .{ "on", "r.on" },         .{ "addListener", "r.on" },
     }) |pair| try defineMethod(self, readable_proto, pair[0], pair[1]);
     const readable_ctor = try makeCtor(self, "Readable", readable_proto);
 
     // Writable.prototype.
-    const writable_proto = try Object.create(arena, ee_proto);
+    const writable_proto = try Object.create(arena, stream_proto);
     for ([_][2][]const u8{
         .{ "write", "w.write" },   .{ "end", "w.end" },
         .{ "_write", "w._write" }, .{ "cork", "w.cork" },
@@ -104,9 +111,7 @@ pub fn build(self: *Interpreter) EvalError!*Object {
     // In Node `require('stream')` IS the legacy `Stream` base CLASS (a function with a `.prototype`
     // inheriting EventEmitter, plus a `.pipe`), and the concrete classes hang off it as properties —
     // so `util.inherits(X, require('stream'))` (e.g. `send`'s SendStream) works. Return that ctor as
-    // the module, not a plain object.
-    const stream_proto = try Object.create(arena, ee_proto);
-    try defineMethod(self, stream_proto, "pipe", "r.pipe");
+    // the module, not a plain object. `stream_proto` was built above so the concrete classes inherit it.
     const stream_ctor = try makeCtor(self, "Stream", stream_proto);
     try stream_ctor.defineData("Readable", .{ .object = readable_ctor }, true, false, true);
     try stream_ctor.defineData("Writable", .{ .object = writable_ctor }, true, false, true);
@@ -246,6 +251,20 @@ fn readableCtor(self: *Interpreter, this_val: Value, args: []const Value) EvalEr
 
 fn readableMethod(self: *Interpreter, js: *Object, op: []const u8, this_val: Value, args: []const Value) EvalError!Completion {
     const eq = std.mem.eql;
+    if (eq(u8, op, "on") or eq(u8, op, "addListener")) {
+        // Delegate to EventEmitter.prototype.on, then auto-resume on a 'data' listener — Node switches a
+        // paused stream to flowing the moment a 'data' handler is attached (node-fetch relies on this).
+        if (try eventEmitterProto(self)) |eep| {
+            if (eep.get("on")) |onf| {
+                if (onf == .object) _ = try self.callFunction(onf.object, args, this_val);
+            }
+        }
+        if (args.len > 0 and args[0] == .string and eq(u8, args[0].string, "data")) {
+            try setBool(js, FLOWING_KEY, true);
+            try scheduleFlush(self, js);
+        }
+        return .{ .normal = this_val };
+    }
     if (eq(u8, op, "push")) return rPush(self, js, this_val, args);
     if (eq(u8, op, "read")) return rRead(self, js, args);
     if (eq(u8, op, "pipe")) return rPipe(self, js, this_val, args);

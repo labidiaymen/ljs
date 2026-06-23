@@ -158,6 +158,21 @@ fn newEmitter(self: *Interpreter) EvalError!*Object {
     return Object.create(self.arena, self.objectProto());
 }
 
+/// A fresh `stream.Readable` instance — a real readable stream (has `.pipe`/`.on`/`.push`), used for the
+/// IncomingMessage `res`. node-fetch does `res.pipe(new PassThrough())`; a bare EventEmitter has no `.pipe`
+/// and would throw inside its 'response' handler. `rPipe` attaches `on('data')`/`on('end')` listeners, so
+/// the direct `emit('data'/'end')` below still reaches both the pipe AND plain `on('data')` consumers (axios).
+fn newReadable(self: *Interpreter) EvalError!*Object {
+    const sc = try host_require.loadCoreModulePub(self, "stream");
+    if (sc.normal == .object) {
+        if (sc.normal.object.get("Readable")) |rd| if (rd == .object) {
+            const c = try self.construct(rd.object, &.{});
+            if (c.normal == .object) return c.normal.object;
+        };
+    }
+    return newEmitter(self);
+}
+
 pub fn method(self: *Interpreter, func: *Object, this_val: Value, args: []const Value) EvalError!Completion {
     const name = func.native_name;
     const eq = std.mem.eql;
@@ -252,7 +267,7 @@ fn httpsEnd(self: *Interpreter, this_val: Value) EvalError!Completion {
         _ = try emitEvent(self, .{ .object = req }, "error", &.{(try self.throwError("Error", "https request failed (TLS)")).throw});
         return .{ .normal = .undefined };
     };
-    const res = try newEmitter(self);
+    const res = try newReadable(self);
     try res.defineData("statusCode", .{ .number = @floatFromInt(r.status) }, true, true, true);
     try res.defineData("statusMessage", .{ .string = r.reason }, true, true, true);
     // res.headers — Node lower-cases header names and joins duplicates; this is the common-case shape.
@@ -270,9 +285,13 @@ fn httpsEnd(self: *Interpreter, this_val: Value) EvalError!Completion {
     try res.defineData("headers", .{ .object = headers_obj }, true, true, true);
     try res.defineData("rawHeaders", .{ .object = raw }, true, true, true);
     try res.defineData("setEncoding", .{ .object = try fn_(self, "setEncoding") }, true, false, true);
-    // emit 'response' (the handler registers res.on('data')/on('end')), then deliver the body.
+    // emit 'response' (the handler registers res.on('data')/on('end')), then deliver the body as a
+    // Buffer chunk — Node HTTP 'data' events carry Buffers; consumers (node-fetch) `Buffer.concat` them.
     _ = try emitEvent(self, .{ .object = req }, "response", &.{.{ .object = res }});
-    if (r.body.len != 0) _ = try emitEvent(self, .{ .object = res }, "data", &.{.{ .string = r.body }});
+    if (r.body.len != 0) {
+        const chunk = try @import("host_buffer.zig").makeBufferFromBytes(self, r.body);
+        _ = try emitEvent(self, .{ .object = res }, "data", &.{.{ .object = chunk }});
+    }
     _ = try emitEvent(self, .{ .object = res }, "end", &.{});
     return .{ .normal = .{ .object = req } };
 }
