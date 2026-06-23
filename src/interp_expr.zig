@@ -808,6 +808,9 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
             .headers_method => std.mem.eql(u8, ctor.native_name, "Headers"),
             .fetch_body_method => std.mem.eql(u8, ctor.native_name, "Response") or std.mem.eql(u8, ctor.native_name, "Request"),
             .abort_method => std.mem.eql(u8, ctor.native_name, "AbortController"),
+            // HOST: `new AsyncLocalStorage()` / `new AsyncResource()` (async_hooks). Other `.https_method`
+            // natives (request/get/als.* methods) are not constructors.
+            .https_method => std.mem.eql(u8, ctor.native_name, "AsyncLocalStorage") or std.mem.eql(u8, ctor.native_name, "AsyncResource"),
             else => false,
         };
         if (!constructible) return self.throwError("TypeError", "value is not a constructor");
@@ -883,6 +886,9 @@ pub fn constructNT(self: *Interpreter, ctor: *Object, args: []const Value, new_t
         // HOST (spec 105): `new Buffer(...)` delegates to the Buffer constructor logic (which itself
         // allocates a fresh byte-backed instance), ignoring `new_obj`.
         .buffer_fn => return @import("host_buffer.zig").bufferFn(self, "Buffer", .undefined, args),
+        // HOST async_hooks: `new AsyncLocalStorage()` / `new AsyncResource()` — the fresh `new_obj`
+        // (already proto-linked) IS the instance; per-instance store is created lazily by run/enterWith.
+        .https_method => return .{ .normal = .{ .object = new_obj } },
         else => {},
     }
 

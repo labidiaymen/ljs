@@ -137,6 +137,42 @@ pub fn buildHttp2(self: *Interpreter) EvalError!*Object {
 pub fn buildDiagnosticsChannel(self: *Interpreter) EvalError!*Object {
     return buildStub(self, &.{ "channel", "hasSubscribers", "subscribe", "unsubscribe", "tracingChannel" });
 }
+/// `async_hooks` — a functional `AsyncLocalStorage` (run/getStore/enterWith/exit, store kept on the
+/// instance under a hidden key; correct for synchronous + simple async use) plus AsyncResource/createHook
+/// stubs. Enough for koa (which keys its per-request context on AsyncLocalStorage).
+pub fn buildAsyncHooks(self: *Interpreter) EvalError!*Object {
+    const arena = self.arena;
+    const mod = try Object.create(arena, self.objectProto());
+
+    // AsyncLocalStorage — a `new`-able ctor whose prototype carries run/getStore/enterWith/exit/disable.
+    const als_proto = try Object.create(arena, self.objectProto());
+    for ([_][2][]const u8{
+        .{ "run", "als.run" },             .{ "getStore", "als.getStore" },
+        .{ "enterWith", "als.enterWith" }, .{ "exit", "als.exit" },
+        .{ "disable", "als.disable" },     .{ "runSyncAndReturn", "als.run" },
+    }) |pair| {
+        const m = try fn_(self, pair[1]);
+        try m.defineData("name", .{ .string = pair[0] }, false, false, true);
+        try als_proto.defineData(pair[0], .{ .object = m }, true, false, true);
+    }
+    const als_ctor = try fn_(self, "AsyncLocalStorage");
+    try als_ctor.defineData("prototype", .{ .object = als_proto }, false, false, false);
+    try als_proto.defineData("constructor", .{ .object = als_ctor }, true, false, true);
+    try mod.defineData("AsyncLocalStorage", .{ .object = als_ctor }, true, false, true);
+
+    // AsyncResource — a `new`-able stub with runInAsyncScope/emitDestroy/bind.
+    const ar_proto = try Object.create(arena, self.objectProto());
+    for ([_][]const u8{ "runInAsyncScope", "emitDestroy", "bind", "asyncId", "triggerAsyncId" }) |n|
+        try ar_proto.defineData(n, .{ .object = try fn_(self, n) }, true, false, true);
+    const ar_ctor = try fn_(self, "AsyncResource");
+    try ar_ctor.defineData("prototype", .{ .object = ar_proto }, false, false, false);
+    try mod.defineData("AsyncResource", .{ .object = ar_ctor }, true, false, true);
+
+    for ([_][]const u8{ "createHook", "executionAsyncId", "triggerAsyncId", "executionAsyncResource" }) |n|
+        try mod.defineData(n, .{ .object = try fn_(self, n) }, true, false, true);
+    return mod;
+}
+
 pub fn buildWorkerThreads(self: *Interpreter) EvalError!*Object {
     const mod = try buildStub(self, &.{ "Worker", "MessageChannel", "MessagePort", "moveMessagePortToContext", "receiveMessageOnPort", "markAsUntransferable", "getEnvironmentData", "setEnvironmentData", "BroadcastChannel" });
     try mod.defineData("isMainThread", .{ .boolean = true }, true, false, true);
@@ -187,6 +223,44 @@ pub fn method(self: *Interpreter, func: *Object, this_val: Value, args: []const 
         }
         return .{ .normal = this_val };
     }
+    // ── async_hooks: AsyncLocalStorage (functional) + AsyncResource/createHook stubs ──
+    if (eq(u8, name, "als.getStore")) {
+        if (this_val == .object) if (this_val.object.get("%als%")) |s| return .{ .normal = s };
+        return .{ .normal = .undefined };
+    }
+    if (eq(u8, name, "als.enterWith")) {
+        if (this_val == .object) try this_val.object.defineData("%als%", if (args.len > 0) args[0] else .undefined, true, false, false);
+        return .{ .normal = .undefined };
+    }
+    if (eq(u8, name, "als.disable")) return .{ .normal = .undefined };
+    if (eq(u8, name, "als.run") or eq(u8, name, "als.exit")) {
+        // run(store, cb, ...args): set the store, call cb, restore. exit(cb, ...args): clear, call, restore.
+        const is_run = eq(u8, name, "als.run");
+        const store: Value = if (is_run and args.len > 0) args[0] else .undefined;
+        const cb_i: usize = if (is_run) 1 else 0;
+        const cb: Value = if (args.len > cb_i) args[cb_i] else .undefined;
+        if (cb != .object or cb.object.kind != .function) return .{ .normal = .undefined };
+        const prev: Value = if (this_val == .object) (this_val.object.get("%als%") orelse .undefined) else .undefined;
+        if (this_val == .object) try this_val.object.defineData("%als%", store, true, false, false);
+        const call_args = if (args.len > cb_i + 1) args[cb_i + 1 ..] else &[_]Value{};
+        const r = self.callFunction(cb.object, call_args, .undefined);
+        if (this_val == .object) try this_val.object.defineData("%als%", prev, true, false, false);
+        return r;
+    }
+    if (eq(u8, name, "runInAsyncScope")) {
+        // AsyncResource.runInAsyncScope(fn, thisArg, ...args) → fn.apply(thisArg, args).
+        const cb: Value = if (args.len > 0) args[0] else .undefined;
+        if (cb != .object or cb.object.kind != .function) return .{ .normal = .undefined };
+        const this_arg: Value = if (args.len > 1) args[1] else .undefined;
+        const call_args = if (args.len > 2) args[2..] else &[_]Value{};
+        return self.callFunction(cb.object, call_args, this_arg);
+    }
+    if (eq(u8, name, "createHook")) {
+        const h = try Object.create(self.arena, self.objectProto());
+        for ([_][]const u8{ "enable", "disable" }) |m| try h.defineData(m, .{ .object = try fn_(self, m) }, true, false, true);
+        return .{ .normal = .{ .object = h } };
+    }
+    if (eq(u8, name, "executionAsyncId") or eq(u8, name, "triggerAsyncId") or eq(u8, name, "asyncId")) return .{ .normal = .{ .number = 0 } };
     if (eq(u8, name, "checkServerIdentity")) return .{ .normal = .undefined }; // undefined = identity OK
     // punycode: ASCII-domain passthrough (good enough for non-IDN hostnames, the common case).
     if (eq(u8, name, "toASCII") or eq(u8, name, "toUnicode") or eq(u8, name, "encode") or eq(u8, name, "decode"))
