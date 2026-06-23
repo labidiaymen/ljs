@@ -85,6 +85,9 @@ pub const Node = union(enum) {
     /// module loader, the interpreter ToString-es the specifier and returns a Promise rejected with
     /// a TypeError (a throwing ToString rejects the promise instead).
     import_call: struct { specifier: *const Node, options: ?*const Node },
+    /// §13.3.12 ImportMeta — the `import.meta` meta-property (Module goal only). Evaluates to the host
+    /// import-meta object (`{ url, … }`); a marker the interpreter fills from the current module's key.
+    import_meta: void,
     new_expr: struct { callee: *const Node, args: []const *const Node, pos: u32 = 0 }, // §13.3.5 new (pos = new-site byte offset)
     logical: struct { op: LogicalOp, left: *const Node, right: *const Node }, // §13.13
     conditional: struct { cond: *const Node, then: *const Node, otherwise: *const Node }, // §13.14 ?:

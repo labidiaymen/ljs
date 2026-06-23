@@ -270,6 +270,10 @@ pub const Interpreter = struct {
     /// HOST (ESM loader): a precise detail message for the last ESM graph failure (which specifier could
     /// not be resolved / which file failed to parse), surfaced in the thrown SyntaxError. Best-effort.
     esm_resolve_detail: ?[]const u8 = null,
+    /// §13.3.12 import.meta — the cached per-module import-meta object + the module key it belongs to, so
+    /// `import.meta === import.meta` holds within a module's evaluation.
+    import_meta_obj: ?*object_mod.Object = null,
+    import_meta_key: []const u8 = "",
     /// The process-global threaded Io — supplies the raw-OS-futex backing `std.Io.Semaphore.wait/post`
     /// for the generator ping-pong handoff. `global_single_threaded` spins up no thread pool (futex ops
     /// are pool-independent), so this is free for ordinary (non-generator) execution.

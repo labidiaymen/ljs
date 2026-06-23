@@ -473,7 +473,7 @@ pub fn collectBoundNames(pattern: *const ast.Pattern, names: *std.ArrayList([]co
 pub fn containsArguments(node: *const ast.Node) bool {
     switch (node.*) {
         .identifier => |n| return std.mem.eql(u8, n, "arguments"),
-        .number, .bigint, .string, .boolean, .null, .this, .new_target, .regex_literal => return false,
+        .number, .bigint, .string, .boolean, .null, .this, .new_target, .regex_literal, .import_meta => return false,
         .unary => |u| return containsArguments(u.operand),
         .update => |u| return containsArguments(u.target),
         .comma => |c| return containsArguments(c.left) or containsArguments(c.right),

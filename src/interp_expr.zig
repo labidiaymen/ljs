@@ -238,6 +238,7 @@ pub fn evalExpr(self: *Interpreter, node: *const ast.Node, env: *Environment) Ev
         .call => |c| return evalCall(self, c, env),
         .new_expr => |n| return evalNew(self, n, env),
         .import_call => |ic| return evalImportCall(self, ic, env),
+        .import_meta => return evalImportMeta(self),
         .logical => |l| {
             // §13.13 short-circuit: `||` returns left if truthy, `&&` returns left if falsy,
             // `??` returns left unless it is null/undefined (then the right operand).
@@ -1918,6 +1919,30 @@ pub fn concatArgs(self: *Interpreter, a: []const Value, b: []const Value) EvalEr
 /// specifier, or a throwing `toString`/`valueOf`) rejects the Promise with that error
 /// (IfAbruptRejectPromise, step 7). The result is always a genuine Promise object, so `.then`/
 /// `.catch` and synchronous `assert.throws` on the call site behave per spec.
+/// §13.3.12 ImportMeta evaluation — the host import-meta object for the current module. Node exposes
+/// `url` (a `file://` URL of the module), plus `dirname`/`filename` (≥20.11). Cached per module key so
+/// `import.meta === import.meta` holds within a module. `host_referrer_key` is the current module's path.
+pub fn evalImportMeta(self: *Interpreter) EvalError!Completion {
+    const arena = self.arena;
+    const key = self.host_referrer_key;
+    if (self.import_meta_obj) |obj| {
+        if (std.mem.eql(u8, self.import_meta_key, key)) return .{ .normal = .{ .object = obj } };
+    }
+    // Build a `file://` URL: forward slashes; a Windows drive path (`C:\…`) gets the extra leading slash.
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    buf.appendSlice(arena, "file://") catch return error.OutOfMemory;
+    if (key.len > 0 and key[0] != '/') buf.append(arena, '/') catch return error.OutOfMemory;
+    for (key) |c| buf.append(arena, if (c == '\\') '/' else c) catch return error.OutOfMemory;
+    const obj = try Object.create(arena, self.objectProto());
+    try obj.defineData("url", .{ .string = buf.items }, true, true, true);
+    try obj.defineData("filename", .{ .string = key }, true, true, true);
+    const dir = std.fs.path.dirname(key) orelse key;
+    try obj.defineData("dirname", .{ .string = dir }, true, true, true);
+    self.import_meta_obj = obj;
+    self.import_meta_key = key;
+    return .{ .normal = .{ .object = obj } };
+}
+
 pub fn evalImportCall(self: *Interpreter, ic: anytype, env: *Environment) EvalError!Completion {
     // Step 3–4: evaluate the AssignmentExpression specifier and GetValue.
     const sc = try self.evalExpr(ic.specifier, env);

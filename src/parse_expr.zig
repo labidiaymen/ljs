@@ -1142,6 +1142,17 @@ pub fn parsePrimary(self: *Parser) ParseError!*const ast.Node {
                 self.last_was_paren = false;
                 return ic;
             }
+            // §13.3.12 ImportMeta: `import . meta` — valid only in the Module goal (a SyntaxError in a
+            // Script). The member name MUST be exactly `meta` (import.source/defer/etc. stay errors).
+            if (self.idx + 2 < self.tokens.len and self.tokens[self.idx + 1].kind == .dot and
+                self.tokens[self.idx + 2].kind == .identifier and
+                std.mem.eql(u8, self.tokens[self.idx + 2].lexeme, "meta"))
+            {
+                if (!self.is_module) return ParseError.UnexpectedToken; // import.meta outside a module
+                self.idx += 3; // consume `import` `.` `meta`
+                self.last_was_paren = false;
+                return self.alloc(.{ .import_meta = {} });
+            }
             return ParseError.UnexpectedToken;
         },
         // §15.7 ClassExpression (primary position). The name is optional (`class { … }`).
