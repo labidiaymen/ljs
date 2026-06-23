@@ -129,10 +129,15 @@ pub fn runEventLoop(self: *Interpreter) EvalError!void {
         }
         // 3. Timer + I/O phase.
         compactCancelled(self);
-        // Liveness: keep running while a timer is pending OR libxev I/O is in flight. (Immediates were
-        // handled above; microtasks/nextTicks drained at the top.) Off the host I/O path `io_pending`
-        // is always 0, so this is exactly the historical `if (timers.len == 0) break`.
-        if (self.timers.items.len == 0 and host_io.pendingIo(self) == 0) break;
+        // Liveness: keep running while a timer is pending OR libxev I/O is in flight OR more work was
+        // queued. The microtask drain (step 1) can schedule NEW nextTicks/immediates (e.g. a stream's
+        // auto-resume flush when a consumer attaches a late 'data' listener — node-fetch's body consume);
+        // those must be processed, not dropped, so include them in the liveness test.
+        if (self.timers.items.len == 0 and host_io.pendingIo(self) == 0 and
+            self.next_tick_queue.items.len == 0 and self.immediates.items.len == 0) break;
+        // If only ticks/immediates remain (no timers, no I/O in flight), loop back to drain them at the
+        // top — DON'T fall through to the timer path below, which assumes `timers.len > 0`.
+        if (self.timers.items.len == 0 and host_io.pendingIo(self) == 0) continue;
         // When libxev operations are in flight, route the wait through the I/O-aware tick (which also
         // fires a due timer). This branch is never taken off the host I/O path (no loop → 0 pending).
         if (host_io.pendingIo(self) > 0) {
