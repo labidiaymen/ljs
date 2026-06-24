@@ -6,6 +6,8 @@
 #include "quickjs.h"
 
 JSValue qjs_undefined(void);
+JSValue qjs_null(void);
+JSValue qjs_int(JSContext *ctx, int v);
 int qjs_is_exception(JSValue v);
 int qjs_is_function(JSContext *ctx, JSValue v);
 JSValue qjs_dup(JSContext *ctx, JSValue v);

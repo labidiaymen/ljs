@@ -1,6 +1,8 @@
 #include "qjs_shim.h"
 
 JSValue qjs_undefined(void) { return JS_UNDEFINED; }
+JSValue qjs_null(void) { return JS_NULL; }
+JSValue qjs_int(JSContext *ctx, int v) { return JS_NewInt32(ctx, v); }
 int qjs_is_exception(JSValue v) { return JS_IsException(v); }
 int qjs_is_function(JSContext *ctx, JSValue v) { return JS_IsFunction(ctx, v); }
 JSValue qjs_dup(JSContext *ctx, JSValue v) { return JS_DupValue(ctx, v); }
