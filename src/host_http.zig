@@ -187,6 +187,48 @@ pub fn build(self: *Interpreter) EvalError!*Object {
     try defineHttpMethod(self, mod, "%clEnd%", "%clEnd%");
     try defineHttpMethod(self, mod, "%clError%", "%clError%");
 
+    // http.METHODS — the supported HTTP method names (express maps these to lower-case route helpers).
+    const methods = try Object.createArray(self.arena, self.arrayProto());
+    const method_names = [_][]const u8{
+        "ACL",        "BIND",   "CHECKOUT", "CONNECT", "COPY",    "DELETE",  "GET",
+        "HEAD",       "LINK",   "LOCK",     "M-SEARCH", "MERGE",  "MKACTIVITY", "MKCALENDAR",
+        "MKCOL",      "MOVE",   "NOTIFY",   "OPTIONS", "PATCH",   "POST",    "PROPFIND",
+        "PROPPATCH",  "PURGE",  "PUT",      "QUERY",   "REBIND",  "REPORT",  "SEARCH",
+        "SOURCE",     "SUBSCRIBE", "TRACE", "UNBIND",  "UNLINK",  "UNLOCK",  "UNSUBSCRIBE",
+    };
+    for (method_names, 0..) |m, i| try methods.arraySet(self.arena, i, .{ .string = m });
+    try mod.defineData("METHODS", .{ .object = methods }, true, false, true);
+
+    // http.STATUS_CODES — code → reason phrase (the common subset).
+    const status = try Object.create(self.arena, self.objectProto());
+    const codes = [_]struct { c: []const u8, r: []const u8 }{
+        .{ .c = "100", .r = "Continue" },               .{ .c = "101", .r = "Switching Protocols" },
+        .{ .c = "200", .r = "OK" },                      .{ .c = "201", .r = "Created" },
+        .{ .c = "202", .r = "Accepted" },                .{ .c = "204", .r = "No Content" },
+        .{ .c = "206", .r = "Partial Content" },         .{ .c = "301", .r = "Moved Permanently" },
+        .{ .c = "302", .r = "Found" },                   .{ .c = "303", .r = "See Other" },
+        .{ .c = "304", .r = "Not Modified" },            .{ .c = "307", .r = "Temporary Redirect" },
+        .{ .c = "308", .r = "Permanent Redirect" },      .{ .c = "400", .r = "Bad Request" },
+        .{ .c = "401", .r = "Unauthorized" },            .{ .c = "403", .r = "Forbidden" },
+        .{ .c = "404", .r = "Not Found" },               .{ .c = "405", .r = "Method Not Allowed" },
+        .{ .c = "406", .r = "Not Acceptable" },          .{ .c = "409", .r = "Conflict" },
+        .{ .c = "410", .r = "Gone" },                    .{ .c = "411", .r = "Length Required" },
+        .{ .c = "413", .r = "Payload Too Large" },       .{ .c = "414", .r = "URI Too Long" },
+        .{ .c = "415", .r = "Unsupported Media Type" },  .{ .c = "418", .r = "I'm a Teapot" },
+        .{ .c = "422", .r = "Unprocessable Entity" },    .{ .c = "429", .r = "Too Many Requests" },
+        .{ .c = "500", .r = "Internal Server Error" },   .{ .c = "501", .r = "Not Implemented" },
+        .{ .c = "502", .r = "Bad Gateway" },             .{ .c = "503", .r = "Service Unavailable" },
+        .{ .c = "504", .r = "Gateway Timeout" },         .{ .c = "505", .r = "HTTP Version Not Supported" },
+    };
+    for (codes) |kv| try status.defineData(kv.c, .{ .string = kv.r }, true, true, true);
+    try mod.defineData("STATUS_CODES", .{ .object = status }, true, false, true);
+
+    // http.globalAgent — a stub Agent object (some libs read .maxSockets / .options).
+    const agent = try Object.create(self.arena, self.objectProto());
+    try agent.defineData("maxSockets", .{ .number = std.math.inf(f64) }, true, true, true);
+    try agent.defineData("options", .{ .object = try Object.create(self.arena, self.objectProto()) }, true, true, true);
+    try mod.defineData("globalAgent", .{ .object = agent }, true, false, true);
+
     return mod;
 }
 
