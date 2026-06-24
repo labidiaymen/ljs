@@ -21,13 +21,20 @@ const FieldInit = struct { name: []const u8, value: *Expr };
 
 const Expr = union(enum) {
     num: i64,
+    str: []const u8,
     var_ref: []const u8,
     neg: *Expr,
     bin: struct { op: u8, l: *Expr, r: *Expr }, // + - * / %
     cmp: struct { op: []const u8, l: *Expr, r: *Expr }, // < > <= >= == !=
     obj: []FieldInit,
     field: struct { obj: *Expr, name: []const u8 },
+    call: struct { name: []const u8, arg: *Expr }, // builtin call, e.g. httpGet(url)
 };
+
+/// Builtins that lower to a Zig std wrapper (need __io/__alloc threaded in).
+fn isBuiltin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "httpGet");
+}
 
 /// Map a typed-JS type name to its Zig type. Accepts TS-ish aliases; unknown names pass through (a
 /// struct type declared with `type`).
@@ -36,12 +43,14 @@ fn mapType(name: []const u8) ?[]const u8 {
     if (eq(u8, name, "int") or eq(u8, name, "i64")) return "i64";
     if (eq(u8, name, "number") or eq(u8, name, "float") or eq(u8, name, "f64")) return "f64";
     if (eq(u8, name, "bool") or eq(u8, name, "boolean")) return "bool";
+    if (eq(u8, name, "string")) return "[]const u8";
     return null;
 }
 
 // ── lexer ────────────────────────────────────────────────────────────────────
 const Tok = union(enum) {
     num: i64,
+    str: []const u8, // string literal content (raw, between quotes)
     op: u8, // + - * / % ( ) { } ; , . : =
     cmp: []const u8, // < > <= >= == !=
     ident: []const u8,
@@ -104,6 +113,17 @@ const Lexer = struct {
             self.i += 1;
             return .{ .cmp = s };
         }
+        if (c == '"') {
+            self.i += 1;
+            const start = self.i;
+            while (self.i < self.src.len and self.src[self.i] != '"') {
+                if (self.src[self.i] == '\\' and self.i + 1 < self.src.len) self.i += 1;
+                self.i += 1;
+            }
+            const s = self.src[start..self.i];
+            if (self.i < self.src.len) self.i += 1; // consume closing quote
+            return .{ .str = s };
+        }
         switch (c) {
             '+', '-', '*', '/', '%', '(', ')', ';', ',', '.', ':', '{', '}' => {
                 self.i += 1;
@@ -137,6 +157,7 @@ const Parser = struct {
     cur_col: u32 = 1, // source column of `cur`
     vars: std.StringHashMapUnmanaged(void) = .empty, // declared variable names (for undefined-var checks)
     last_err: []const u8 = "syntax error", // message for the next diagnostic
+    uses_http: bool = false, // a httpGet builtin was used → emit the std.http wrapper + io main
 
     fn declare(self: *Parser, name: []const u8) CompileError!void {
         self.vars.put(self.arena, name, {}) catch return error.OutOfMemory;
@@ -229,8 +250,21 @@ const Parser = struct {
             try self.advance();
             return self.node(.{ .num = v });
         }
+        if (self.cur == .str) {
+            const s = self.cur.str;
+            try self.advance();
+            return self.node(.{ .str = s });
+        }
         if (self.cur == .ident) {
             const name = self.cur.ident;
+            if (isBuiltin(name)) {
+                try self.advance();
+                try self.expectOp('(');
+                const arg = try self.parseExpr();
+                try self.expectOp(')');
+                if (std.mem.eql(u8, name, "httpGet")) self.uses_http = true;
+                return self.node(.{ .call = .{ .name = name, .arg = arg } });
+            }
             if (!self.vars.contains(name)) return self.undefined_(name);
             try self.advance();
             return self.node(.{ .var_ref = name });
@@ -264,6 +298,22 @@ const Parser = struct {
 fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
     switch (e.*) {
         .num => |v| try w.print(arena, "{d}", .{v}),
+        .str => |s| {
+            try w.append(arena, '"');
+            for (s) |ch| {
+                if (ch == '"' or ch == '\\') try w.append(arena, '\\');
+                try w.append(arena, ch);
+            }
+            try w.append(arena, '"');
+        },
+        .call => |cl| {
+            // builtins lower to a Zig std wrapper taking (__io, __alloc, arg).
+            if (std.mem.eql(u8, cl.name, "httpGet")) {
+                try w.appendSlice(arena, "__httpGet(__io, __alloc, ");
+                try emitExpr(cl.arg, w, arena);
+                try w.append(arena, ')');
+            }
+        },
         .var_ref => |name| try w.appendSlice(arena, name),
         .neg => |inner| {
             try w.appendSlice(arena, "-(");
@@ -459,7 +509,24 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []co
         \\
     );
     try out.appendSlice(arena, decls.items);
-    try out.appendSlice(arena, "pub fn main() void {\n");
+
+    if (p.uses_http) {
+        // A real std.http one-shot GET, wrapped to a tjs-friendly `i64` (status code, or -1 on error).
+        try out.appendSlice(arena,
+            \\fn __httpGet(io: std.Io, alloc: std.mem.Allocator, url: []const u8) i64 {
+            \\    var client: std.http.Client = .{ .allocator = alloc, .io = io };
+            \\    defer client.deinit();
+            \\    client.ca_bundle.rescan(alloc, io, std.Io.Clock.now(.real, io)) catch return -1;
+            \\    const res = client.fetch(.{ .location = .{ .url = url } }) catch return -1;
+            \\    return @intFromEnum(res.status);
+            \\}
+            \\
+        );
+        try out.appendSlice(arena, "pub fn main(__init: std.process.Init) !void {\n");
+        try out.appendSlice(arena, "    const __io = __init.io;\n    const __alloc = __init.arena.allocator();\n");
+    } else {
+        try out.appendSlice(arena, "pub fn main() void {\n");
+    }
     try out.appendSlice(arena, body.items);
     try out.appendSlice(arena, "}\n");
     return out.items;
