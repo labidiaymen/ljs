@@ -683,7 +683,103 @@ pub const Lexer = struct {
     fn lexTemplate(self: *Lexer) LexError!Token {
         self.pos += 1; // opening backtick
         const start = self.pos;
-        var depth: usize = 0;
+        while (self.pos < self.src.len) {
+            const c = self.src[self.pos];
+            if (c == '\\' and self.pos + 1 < self.src.len) {
+                self.pos += 2; // a backslash-escape (`\``, `\${`, …) — never ends the literal
+                continue;
+            }
+            if (c == '$' and self.pos + 1 < self.src.len and self.src[self.pos + 1] == '{') {
+                self.pos += 2; // enter the `${ … }` substitution; skip it as balanced expression text
+                try self.skipTemplateSubst();
+                continue;
+            }
+            if (c == '`') {
+                const inner = self.src[start..self.pos];
+                self.pos += 1; // closing backtick
+                return .{ .kind = .template, .lexeme = inner, .string_value = inner };
+            }
+            self.pos += 1;
+        }
+        return LexError.UnterminatedString;
+    }
+
+    /// Scan a template `${ … }` substitution body (caller left `self.pos` just past `${`); advance past
+    /// the matching `}`. Skips NESTED strings, template literals, and comments as opaque units so their
+    /// braces / backticks don't fool the brace count (e.g. `` `${ `\${x}` }` `` — the nested template's
+    /// `}` must not close the outer substitution). Mutually recursive with `skipNestedTemplate`.
+    fn skipTemplateSubst(self: *Lexer) LexError!void {
+        var depth: usize = 1;
+        var prev: u8 = '('; // previous significant char, to tell a `/` regex from division (seed: regex)
+        while (self.pos < self.src.len) {
+            const c = self.src[self.pos];
+            switch (c) {
+                '`' => {
+                    try self.skipNestedTemplate();
+                    prev = '`';
+                    continue;
+                },
+                '\'', '"' => {
+                    try self.skipNestedString(c);
+                    prev = c;
+                    continue;
+                },
+                '/' => if (self.pos + 1 < self.src.len) {
+                    const n = self.src[self.pos + 1];
+                    if (n == '/') { // line comment
+                        self.pos += 2;
+                        while (self.pos < self.src.len and self.src[self.pos] != '\n') self.pos += 1;
+                        continue;
+                    } else if (n == '*') { // block comment
+                        self.pos += 2;
+                        while (self.pos + 1 < self.src.len and !(self.src[self.pos] == '*' and self.src[self.pos + 1] == '/')) self.pos += 1;
+                        self.pos += 2;
+                        continue;
+                    }
+                    // A `/` is a RegExp iff the previous significant char does not end a value (else
+                    // division). Skip the regex body (its `[…]` class + `\` escapes) so a `"`/`}`/`` ` ``
+                    // inside it isn't mis-scanned (e.g. webpack's `${x.replace(/"/g, '\\"')}`).
+                    const ends_value = (prev >= 'a' and prev <= 'z') or (prev >= 'A' and prev <= 'Z') or
+                        (prev >= '0' and prev <= '9') or prev == '_' or prev == '$' or
+                        prev == ')' or prev == ']' or prev == '}';
+                    if (!ends_value) {
+                        self.pos += 1;
+                        var in_class = false;
+                        while (self.pos < self.src.len) : (self.pos += 1) {
+                            const rc = self.src[self.pos];
+                            if (rc == '\\') {
+                                self.pos += 1;
+                                continue;
+                            }
+                            if (rc == '\n' or rc == '\r') return LexError.UnterminatedString;
+                            if (rc == '[') in_class = true else if (rc == ']') in_class = false else if (rc == '/' and !in_class) break;
+                        }
+                        self.pos += 1; // past closing '/'
+                        while (self.pos < self.src.len and isIdentPart(self.src[self.pos])) self.pos += 1; // flags
+                        prev = '/';
+                        continue;
+                    }
+                },
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    self.pos += 1;
+                    if (depth == 0) return;
+                    prev = '}';
+                    continue;
+                },
+                else => {},
+            }
+            if (c != ' ' and c != '\t' and c != '\n' and c != '\r') prev = c;
+            self.pos += 1;
+        }
+        return LexError.UnterminatedString;
+    }
+
+    /// Skip a nested template literal (`self.pos` at its opening backtick) past its closing backtick,
+    /// recursing through its own `${ … }` substitutions. Mutually recursive with `skipTemplateSubst`.
+    fn skipNestedTemplate(self: *Lexer) LexError!void {
+        self.pos += 1; // opening backtick
         while (self.pos < self.src.len) {
             const c = self.src[self.pos];
             if (c == '\\' and self.pos + 1 < self.src.len) {
@@ -691,20 +787,33 @@ pub const Lexer = struct {
                 continue;
             }
             if (c == '$' and self.pos + 1 < self.src.len and self.src[self.pos + 1] == '{') {
-                depth += 1;
+                self.pos += 2;
+                try self.skipTemplateSubst();
+                continue;
+            }
+            if (c == '`') {
+                self.pos += 1;
+                return;
+            }
+            self.pos += 1;
+        }
+        return LexError.UnterminatedString;
+    }
+
+    /// Skip a nested string literal (`self.pos` at the opening `quote`) past its closing quote.
+    fn skipNestedString(self: *Lexer, quote: u8) LexError!void {
+        self.pos += 1;
+        while (self.pos < self.src.len) {
+            const c = self.src[self.pos];
+            if (c == '\\' and self.pos + 1 < self.src.len) {
                 self.pos += 2;
                 continue;
             }
-            if (c == '}' and depth > 0) {
-                depth -= 1;
+            if (c == quote) {
                 self.pos += 1;
-                continue;
+                return;
             }
-            if (c == '`' and depth == 0) {
-                const inner = self.src[start..self.pos];
-                self.pos += 1; // closing backtick
-                return .{ .kind = .template, .lexeme = inner, .string_value = inner };
-            }
+            if (c == '\n' or c == '\r') return LexError.UnterminatedString; // a string may not span lines
             self.pos += 1;
         }
         return LexError.UnterminatedString;
