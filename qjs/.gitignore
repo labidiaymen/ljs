@@ -1,0 +1,4 @@
+# The quickjs-ng C sources are vendored by fetch.sh (not committed — large, upstream-pinned).
+vendor/quickjs-ng/
+.zig-cache/
+zig-out/
