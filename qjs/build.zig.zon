@@ -1,0 +1,14 @@
+.{
+    .name = .qjs,
+    .version = "0.0.0",
+    .fingerprint = 0xfc6c78dea551187d, // unique to the qjs runtime track
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Same libxev pin as the root ljs package — resolves from the shared zig cache (no re-fetch).
+        .xev = .{
+            .url = "git+https://github.com/mitchellh/libxev.git#9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf",
+            .hash = "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
