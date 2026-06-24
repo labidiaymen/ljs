@@ -1,0 +1,7 @@
+// typed OBJECT — compiles to a flat Zig struct (no hashmap, no prototype)
+type Point = { x: int, y: int };
+
+let p: Point = { x: 8, y: 5 };
+console.log(p.x);
+console.log(p.y);
+console.log(p.x * p.y + 2);

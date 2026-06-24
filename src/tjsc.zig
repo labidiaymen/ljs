@@ -13,11 +13,15 @@ const std = @import("std");
 pub const CompileError = error{ ParseError, OutOfMemory };
 
 // ── AST ──────────────────────────────────────────────────────────────────────
+const FieldInit = struct { name: []const u8, value: *Expr };
+
 const Expr = union(enum) {
     num: i64,
     var_ref: []const u8,
     neg: *Expr,
     bin: struct { op: u8, l: *Expr, r: *Expr },
+    obj: []FieldInit, // object literal { a: e, b: e } → Zig anonymous struct
+    field: struct { obj: *Expr, name: []const u8 }, // obj.field
 };
 
 /// Map a typed-JS type name to its Zig type. Accepts TS-ish aliases.
@@ -65,7 +69,7 @@ const Lexer = struct {
         if (self.i >= self.src.len) return .eof;
         const c = self.src[self.i];
         switch (c) {
-            '+', '-', '*', '/', '(', ')', ';', ',', '.', ':', '=' => {
+            '+', '-', '*', '/', '(', ')', ';', ',', '.', ':', '=', '{', '}' => {
                 self.i += 1;
                 return .{ .op = c };
             },
@@ -140,7 +144,18 @@ const Parser = struct {
             try self.advance();
             return self.node(.{ .neg = try self.parseUnary() });
         }
-        return self.parsePrimary();
+        return self.parsePostfix();
+    }
+    fn parsePostfix(self: *Parser) CompileError!*Expr {
+        var e = try self.parsePrimary();
+        while (self.isOp('.')) {
+            try self.advance();
+            if (self.cur != .ident) return error.ParseError;
+            const name = self.cur.ident;
+            try self.advance();
+            e = try self.node(.{ .field = .{ .obj = e, .name = name } });
+        }
+        return e;
     }
     fn parsePrimary(self: *Parser) CompileError!*Expr {
         if (self.cur == .num) {
@@ -158,6 +173,22 @@ const Parser = struct {
             const e = try self.parseAdd();
             try self.expectOp(')');
             return e;
+        }
+        if (self.isOp('{')) {
+            // object literal: { name: expr, name: expr }
+            try self.advance();
+            var fields: std.ArrayListUnmanaged(FieldInit) = .empty;
+            while (!self.isOp('}')) {
+                if (self.cur != .ident) return error.ParseError;
+                const fname = self.cur.ident;
+                try self.advance();
+                try self.expectOp(':');
+                const v = try self.parseAdd();
+                try fields.append(self.arena, .{ .name = fname, .value = v });
+                if (self.isOp(',')) try self.advance() else break;
+            }
+            try self.expectOp('}');
+            return self.node(.{ .obj = try fields.toOwnedSlice(self.arena) });
         }
         return error.ParseError;
     }
@@ -180,18 +211,55 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try emitExpr(b.r, w, arena);
             try w.append(arena, ')');
         },
+        .obj => |fields| {
+            try w.appendSlice(arena, ".{ ");
+            for (fields, 0..) |f, i| {
+                if (i > 0) try w.appendSlice(arena, ", ");
+                try w.print(arena, ".{s} = ", .{f.name});
+                try emitExpr(f.value, w, arena);
+            }
+            try w.appendSlice(arena, " }");
+        },
+        .field => |fa| {
+            try emitExpr(fa.obj, w, arena);
+            try w.print(arena, ".{s}", .{fa.name});
+        },
     }
 }
 
 /// Compile typed-JS `source` to Zig source text. Cycle 1: a sequence of `print(<int expr>);`.
 pub fn compileToZig(arena: std.mem.Allocator, source: []const u8) CompileError![]const u8 {
     var p = try Parser.init(arena, source);
+    var decls: std.ArrayListUnmanaged(u8) = .empty; // top-level struct type definitions
     var body: std.ArrayListUnmanaged(u8) = .empty;
 
     while (p.cur != .eof) {
         if (p.cur != .ident) return error.ParseError;
         const kw = p.cur.ident;
-        if (std.mem.eql(u8, kw, "let")) {
+        if (std.mem.eql(u8, kw, "type")) {
+            // type <Name> = { field: type, ... } ;   →   const Name = struct { field: ztype, ... };
+            try p.advance();
+            if (p.cur != .ident) return error.ParseError;
+            const tname = p.cur.ident;
+            try p.advance();
+            try p.expectOp('=');
+            try p.expectOp('{');
+            try decls.print(arena, "const {s} = struct {{\n", .{tname});
+            while (!p.isOp('}')) {
+                if (p.cur != .ident) return error.ParseError;
+                const fname = p.cur.ident;
+                try p.advance();
+                try p.expectOp(':');
+                if (p.cur != .ident) return error.ParseError;
+                const fty = mapType(p.cur.ident) orelse p.cur.ident;
+                try p.advance();
+                try decls.print(arena, "    {s}: {s},\n", .{ fname, fty });
+                if (p.isOp(',')) try p.advance() else break;
+            }
+            try p.expectOp('}');
+            if (p.isOp(';')) try p.advance();
+            try decls.appendSlice(arena, "};\n");
+        } else if (std.mem.eql(u8, kw, "let")) {
             // let <name> : <type> = <expr> ;
             try p.advance();
             if (p.cur != .ident) return error.ParseError;
@@ -199,7 +267,7 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8) CompileError![
             try p.advance();
             try p.expectOp(':');
             if (p.cur != .ident) return error.ParseError;
-            const zty = mapType(p.cur.ident) orelse return error.ParseError;
+            const zty = mapType(p.cur.ident) orelse p.cur.ident; // primitive, or a struct type name
             try p.advance();
             try p.expectOp('=');
             const e = try p.parseAdd();
@@ -224,7 +292,9 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8) CompileError![
     }
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    try out.appendSlice(arena, "const std = @import(\"std\");\npub fn main() void {\n");
+    try out.appendSlice(arena, "const std = @import(\"std\");\n");
+    try out.appendSlice(arena, decls.items);
+    try out.appendSlice(arena, "pub fn main() void {\n");
     try out.appendSlice(arena, body.items);
     try out.appendSlice(arena, "}\n");
     return out.items;
