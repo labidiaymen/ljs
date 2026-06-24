@@ -112,6 +112,38 @@ pub fn buildTls(self: *Interpreter) EvalError!*Object {
     return mod;
 }
 
+/// Legacy `constants` module (Node's deprecated top-level `require('constants')`): the fs/os numeric
+/// constants flattened into one object. Values are Node's canonical numbers; graceful-fs / mkdirp /
+/// webpack read O_*/S_*/F_OK/COPYFILE_* etc. (A small, fixed data table — no behavior.)
+pub fn buildConstants(self: *Interpreter) EvalError!*Object {
+    const mod = try Object.create(self.arena, self.objectProto());
+    const kv = [_]struct { k: []const u8, v: f64 }{
+        // file access (fs.constants)
+        .{ .k = "F_OK", .v = 0 },            .{ .k = "R_OK", .v = 4 },             .{ .k = "W_OK", .v = 2 },                   .{ .k = "X_OK", .v = 1 },
+        // open() flags
+        .{ .k = "O_RDONLY", .v = 0 },        .{ .k = "O_WRONLY", .v = 1 },         .{ .k = "O_RDWR", .v = 2 },                 .{ .k = "O_CREAT", .v = 64 },
+        .{ .k = "O_EXCL", .v = 128 },        .{ .k = "O_NOCTTY", .v = 256 },       .{ .k = "O_TRUNC", .v = 512 },              .{ .k = "O_APPEND", .v = 1024 },
+        .{ .k = "O_DIRECTORY", .v = 65536 }, .{ .k = "O_NOATIME", .v = 262144 },   .{ .k = "O_NOFOLLOW", .v = 131072 },        .{ .k = "O_SYNC", .v = 1052672 },
+        .{ .k = "O_DSYNC", .v = 4096 },      .{ .k = "O_SYMLINK", .v = 0 },        .{ .k = "O_DIRECT", .v = 16384 },           .{ .k = "O_NONBLOCK", .v = 2048 },
+        // stat() st_mode bitmasks (S_*)
+        .{ .k = "S_IFMT", .v = 61440 },      .{ .k = "S_IFREG", .v = 32768 },      .{ .k = "S_IFDIR", .v = 16384 },            .{ .k = "S_IFCHR", .v = 8192 },
+        .{ .k = "S_IFBLK", .v = 24576 },     .{ .k = "S_IFIFO", .v = 4096 },       .{ .k = "S_IFLNK", .v = 40960 },            .{ .k = "S_IFSOCK", .v = 49152 },
+        .{ .k = "S_IRWXU", .v = 448 },       .{ .k = "S_IRUSR", .v = 256 },        .{ .k = "S_IWUSR", .v = 128 },              .{ .k = "S_IXUSR", .v = 64 },
+        .{ .k = "S_IRWXG", .v = 56 },        .{ .k = "S_IRGRP", .v = 32 },         .{ .k = "S_IWGRP", .v = 16 },               .{ .k = "S_IXGRP", .v = 8 },
+        .{ .k = "S_IRWXO", .v = 7 },         .{ .k = "S_IROTH", .v = 4 },          .{ .k = "S_IWOTH", .v = 2 },                .{ .k = "S_IXOTH", .v = 1 },
+        // copyFile()
+        .{ .k = "COPYFILE_EXCL", .v = 1 },   .{ .k = "COPYFILE_FICLONE", .v = 2 }, .{ .k = "COPYFILE_FICLONE_FORCE", .v = 4 }, .{ .k = "UV_FS_COPYFILE_EXCL", .v = 1 },
+        // common signals (os.constants.signals subset)
+        .{ .k = "SIGHUP", .v = 1 },          .{ .k = "SIGINT", .v = 2 },           .{ .k = "SIGQUIT", .v = 3 },                .{ .k = "SIGKILL", .v = 9 },
+        .{ .k = "SIGTERM", .v = 15 },        .{ .k = "SIGABRT", .v = 6 },          .{ .k = "SIGSEGV", .v = 11 },               .{ .k = "SIGPIPE", .v = 13 },
+        // a few common errno (os.constants.errno subset)
+        .{ .k = "EACCES", .v = 13 },         .{ .k = "EEXIST", .v = 17 },          .{ .k = "ENOENT", .v = 2 },                 .{ .k = "EISDIR", .v = 21 },
+        .{ .k = "ENOTDIR", .v = 20 },        .{ .k = "EPERM", .v = 1 },            .{ .k = "EMFILE", .v = 24 },                .{ .k = "ENOTEMPTY", .v = 39 },
+    };
+    for (kv) |e| try mod.defineData(e.k, .{ .number = e.v }, true, true, true);
+    return mod;
+}
+
 /// A stub module: each name is an `.https_method` native (returns an empty object / passthrough — see
 /// `method`). Enough for packages that `require` these at load but use them lazily.
 fn buildStub(self: *Interpreter, names: []const []const u8) EvalError!*Object {
