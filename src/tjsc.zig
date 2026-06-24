@@ -49,7 +49,9 @@ const Lexer = struct {
     src: []const u8,
     i: usize = 0,
     line: u32 = 1, // current source line
+    line_start: usize = 0, // byte index where the current line begins (for column math)
     tok_line: u32 = 1, // line where the most-recently-returned token starts
+    tok_col: u32 = 1, // column where that token starts (1-based)
 
     fn isIdentStart(c: u8) bool {
         return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$';
@@ -64,6 +66,7 @@ const Lexer = struct {
             if (c == '\n') {
                 self.line += 1;
                 self.i += 1;
+                self.line_start = self.i;
                 continue;
             }
             if (c == ' ' or c == '\t' or c == '\r') {
@@ -77,6 +80,7 @@ const Lexer = struct {
             break;
         }
         self.tok_line = self.line;
+        self.tok_col = @intCast(self.i - self.line_start + 1);
         if (self.i >= self.src.len) return .eof;
         const c = self.src[self.i];
 
@@ -127,15 +131,17 @@ const Parser = struct {
     lex: Lexer,
     cur: Tok,
     cur_line: u32 = 1, // source line of `cur`
+    cur_col: u32 = 1, // source column of `cur`
 
     fn init(arena: std.mem.Allocator, src: []const u8) CompileError!Parser {
         var lex = Lexer{ .src = src };
         const first = try lex.next();
-        return .{ .arena = arena, .lex = lex, .cur = first, .cur_line = lex.tok_line };
+        return .{ .arena = arena, .lex = lex, .cur = first, .cur_line = lex.tok_line, .cur_col = lex.tok_col };
     }
     fn advance(self: *Parser) CompileError!void {
         self.cur = try self.lex.next();
         self.cur_line = self.lex.tok_line;
+        self.cur_col = self.lex.tok_col;
     }
     fn isOp(self: *Parser, ch: u8) bool {
         return self.cur == .op and self.cur.op == ch;
@@ -294,8 +300,8 @@ fn emitStmt(p: *Parser, out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocat
     const eq = std.mem.eql;
     if (p.cur != .ident) return error.ParseError;
     const kw = p.cur.ident;
-    // Track the source line so a runtime panic can report the .tjs location (Zig has no #line).
-    try out.print(arena, "    __tjs_line = {d};\n", .{p.cur_line});
+    // Track the source line+col so a runtime panic can report the .tjs location (Zig has no #line).
+    try out.print(arena, "    __tjs_line = {d}; __tjs_col = {d};\n", .{ p.cur_line, p.cur_col });
 
     if (eq(u8, kw, "let") or eq(u8, kw, "const") or eq(u8, kw, "var")) {
         const mutable = eq(u8, kw, "var");
@@ -395,11 +401,33 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []co
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.appendSlice(arena, "const std = @import(\"std\");\n");
     try out.print(arena, "const __tjs_file = \"{s}\";\n", .{safe_name});
-    try out.appendSlice(arena, "var __tjs_line: u32 = 0;\n");
-    // Custom panic handler → map the native runtime error back to the .tjs source line.
+    try out.appendSlice(arena, "var __tjs_line: u32 = 0;\nvar __tjs_col: u32 = 0;\n");
+    // Embed the .tjs source as a multiline string (no escaping needed) so the handler can show the line.
+    try out.appendSlice(arena, "const __tjs_src =\n");
+    {
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        while (lines.next()) |l| {
+            const t = std.mem.trimEnd(u8, l, "\r");
+            try out.print(arena, "    \\\\{s}\n", .{t});
+        }
+    }
+    try out.appendSlice(arena, ";\n");
+    // Custom panic handler → map the native runtime error back to the .tjs source: file:line:col +
+    // the offending source line + a caret.
     try out.appendSlice(arena,
         \\fn __tjsPanic(msg: []const u8, _: ?usize) noreturn {
-        \\    std.debug.print("\n{s}:{d}: runtime error: {s}\n", .{ __tjs_file, __tjs_line, msg });
+        \\    std.debug.print("\n{s}:{d}:{d}: runtime error: {s}\n", .{ __tjs_file, __tjs_line, __tjs_col, msg });
+        \\    var __it = std.mem.splitScalar(u8, __tjs_src, '\n');
+        \\    var __n: u32 = 1;
+        \\    while (__it.next()) |__l| : (__n += 1) {
+        \\        if (__n == __tjs_line) {
+        \\            std.debug.print("  {d} | {s}\n    | ", .{ __tjs_line, __l });
+        \\            var __k: u32 = 1;
+        \\            while (__k < __tjs_col) : (__k += 1) std.debug.print(" ", .{});
+        \\            std.debug.print("^\n", .{});
+        \\            break;
+        \\        }
+        \\    }
         \\    std.process.exit(1);
         \\}
         \\pub const panic = std.debug.FullPanic(__tjsPanic);
