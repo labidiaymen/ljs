@@ -13,6 +13,9 @@ const std = @import("std");
 
 pub const CompileError = error{ ParseError, OutOfMemory };
 
+/// A compile-time diagnostic, located in the .tjs source.
+pub const Diag = struct { line: u32 = 0, col: u32 = 0, msg: []const u8 = "syntax error" };
+
 // ── AST ──────────────────────────────────────────────────────────────────────
 const FieldInit = struct { name: []const u8, value: *Expr };
 
@@ -132,6 +135,16 @@ const Parser = struct {
     cur: Tok,
     cur_line: u32 = 1, // source line of `cur`
     cur_col: u32 = 1, // source column of `cur`
+    vars: std.StringHashMapUnmanaged(void) = .empty, // declared variable names (for undefined-var checks)
+    last_err: []const u8 = "syntax error", // message for the next diagnostic
+
+    fn declare(self: *Parser, name: []const u8) CompileError!void {
+        self.vars.put(self.arena, name, {}) catch return error.OutOfMemory;
+    }
+    fn undefined_(self: *Parser, name: []const u8) CompileError {
+        self.last_err = std.fmt.allocPrint(self.arena, "undefined variable '{s}'", .{name}) catch "undefined variable";
+        return error.ParseError;
+    }
 
     fn init(arena: std.mem.Allocator, src: []const u8) CompileError!Parser {
         var lex = Lexer{ .src = src };
@@ -218,6 +231,7 @@ const Parser = struct {
         }
         if (self.cur == .ident) {
             const name = self.cur.ident;
+            if (!self.vars.contains(name)) return self.undefined_(name);
             try self.advance();
             return self.node(.{ .var_ref = name });
         }
@@ -316,6 +330,7 @@ fn emitStmt(p: *Parser, out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocat
         try p.expectOp('=');
         const e = try p.parseExpr();
         try p.expectOp(';');
+        try p.declare(name); // in scope after its initializer (so `let x = x` is undefined)
         try out.print(arena, "    {s} {s}: {s} = ", .{ if (mutable) "var" else "const", name, zty });
         try emitExpr(e, out, arena);
         try out.appendSlice(arena, ";\n");
@@ -346,6 +361,7 @@ fn emitStmt(p: *Parser, out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocat
     } else {
         // assignment: <name> = <expr> ;
         const name = kw;
+        if (!p.vars.contains(name)) return p.undefined_(name);
         try p.advance();
         try p.expectOp('=');
         const e = try p.parseExpr();
@@ -356,13 +372,8 @@ fn emitStmt(p: *Parser, out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocat
     }
 }
 
-/// Compile typed-JS `source` (from `filename`) to Zig source text. `filename` is embedded so a
-/// runtime panic reports the .tjs location.
-pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []const u8) CompileError![]const u8 {
-    var p = try Parser.init(arena, source);
-    var decls: std.ArrayListUnmanaged(u8) = .empty; // top-level struct type definitions
-    var body: std.ArrayListUnmanaged(u8) = .empty;
-
+/// Parse every top-level construct, emitting struct defs into `decls` and statements into `body`.
+fn lower(p: *Parser, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
     while (p.cur != .eof) {
         if (p.isKw("type")) {
             // type <Name> = { field: type, ... } ;   →   const Name = struct { field: ztype, ... };
@@ -388,9 +399,23 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []co
             if (p.isOp(';')) try p.advance();
             try decls.appendSlice(arena, "};\n");
         } else {
-            try emitStmt(&p, &body, arena);
+            try emitStmt(p, body, arena);
         }
     }
+}
+
+/// Compile typed-JS `source` (from `filename`) to Zig source text. On a compile-time error, `diag`
+/// is filled (located in the .tjs source) and `error.ParseError` returned. `filename` is also
+/// embedded so a runtime panic reports the .tjs location.
+pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []const u8, diag: *Diag) CompileError![]const u8 {
+    var p = try Parser.init(arena, source);
+    var decls: std.ArrayListUnmanaged(u8) = .empty; // top-level struct type definitions
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+
+    lower(&p, &decls, &body, arena) catch |e| {
+        diag.* = .{ .line = p.cur_line, .col = p.cur_col, .msg = p.last_err };
+        return e;
+    };
 
     // Sanitize the filename for a Zig string literal (backslashes/quotes break it).
     const safe_name = try arena.dupe(u8, filename);

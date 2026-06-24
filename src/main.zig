@@ -32,6 +32,23 @@ fn looksLikeEsm(source: []const u8) bool {
     return false;
 }
 
+/// Print a tjsc compile-time diagnostic with the offending .tjs line + a caret (Rust/TS-style).
+fn printTjsDiag(err: *std.Io.Writer, source: []const u8, file: []const u8, diag: tjsc.Diag) !void {
+    try err.print("{s}:{d}:{d}: error: {s}\n", .{ file, diag.line, diag.col, diag.msg });
+    var it = std.mem.splitScalar(u8, source, '\n');
+    var n: u32 = 1;
+    while (it.next()) |l| : (n += 1) {
+        if (n == diag.line) {
+            const t = std.mem.trimEnd(u8, l, "\r");
+            try err.print("  {d} | {s}\n    | ", .{ diag.line, t });
+            var k: u32 = 1;
+            while (k < diag.col) : (k += 1) try err.writeByte(' ');
+            try err.writeAll("^\n");
+            break;
+        }
+    }
+}
+
 /// `ljs compile <file>`: lower a typed-JS file to Zig and compile it to a native binary via
 /// `zig build-exe`. POC (spec 142) — not part of the engine.
 fn compileCmd(arena: std.mem.Allocator, io: std.Io, path: []const u8, err: *std.Io.Writer) !void {
@@ -39,8 +56,9 @@ fn compileCmd(arena: std.mem.Allocator, io: std.Io, path: []const u8, err: *std.
         try err.print("error: cannot read file {s}\n", .{path});
         return;
     };
-    const zig_src = tjsc.compileToZig(arena, source, path) catch {
-        try err.print("error: parse error in {s}\n", .{path});
+    var diag: tjsc.Diag = .{};
+    const zig_src = tjsc.compileToZig(arena, source, path, &diag) catch {
+        try printTjsDiag(err, source, path, diag);
         return;
     };
     const base = std.fs.path.stem(path);
