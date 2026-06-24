@@ -494,11 +494,13 @@ pub const Parser = struct {
                 i += 2;
                 const expr_start = i;
                 var depth: usize = 1;
+                // The previous significant (non-space) char, to disambiguate a `/` regex from division.
+                // Seed with '(' so a leading `/` in the interpolation is read as a RegExp.
+                var prev: u8 = '(';
                 while (i < raw.len and depth > 0) {
                     const ch = raw[i];
-                    // Skip string / template literals so braces INSIDE them aren't counted (e.g.
-                    // `${'(\\d{1,'}` in regex-building code — semver et al.). A naive `{`/`}` count
-                    // mismatches on an unbalanced brace inside a string.
+                    // Skip string / template literals so braces/slashes INSIDE them aren't counted (e.g.
+                    // `${'(\\d{1,'}`). A naive scan mismatches on an unbalanced brace inside a string.
                     if (ch == '\'' or ch == '"' or ch == '`') {
                         i += 1;
                         while (i < raw.len) : (i += 1) {
@@ -509,12 +511,50 @@ pub const Parser = struct {
                             if (raw[i] == ch) break;
                         }
                         i += 1; // past the closing quote
+                        prev = ch;
                         continue;
+                    }
+                    // Skip comments and RegExp literals so quotes/braces inside them aren't counted
+                    // (e.g. `${x.replace(/"/g, '\\"')}` in webpack — a `/.../` whose body holds a quote).
+                    if (ch == '/' and i + 1 < raw.len) {
+                        const n = raw[i + 1];
+                        if (n == '/') { // line comment
+                            i += 2;
+                            while (i < raw.len and raw[i] != '\n') i += 1;
+                            continue;
+                        }
+                        if (n == '*') { // block comment
+                            i += 2;
+                            while (i + 1 < raw.len and !(raw[i] == '*' and raw[i + 1] == '/')) i += 1;
+                            i += 2;
+                            continue;
+                        }
+                        // RegExp iff the previous significant char does not end a value (else it's division).
+                        const ends_value = (prev >= 'a' and prev <= 'z') or (prev >= 'A' and prev <= 'Z') or
+                            (prev >= '0' and prev <= '9') or prev == '_' or prev == '$' or
+                            prev == ')' or prev == ']' or prev == '}';
+                        if (!ends_value) {
+                            i += 1;
+                            var in_class = false;
+                            while (i < raw.len) : (i += 1) {
+                                const rc = raw[i];
+                                if (rc == '\\') {
+                                    i += 1; // escaped char (e.g. `\/`) — never ends the body
+                                    continue;
+                                }
+                                if (rc == '[') in_class = true else if (rc == ']') in_class = false else if (rc == '/' and !in_class) break;
+                            }
+                            i += 1; // past the closing '/'
+                            while (i < raw.len and ((raw[i] >= 'a' and raw[i] <= 'z') or (raw[i] >= 'A' and raw[i] <= 'Z'))) i += 1; // flags
+                            prev = '/';
+                            continue;
+                        }
                     }
                     if (ch == '{') depth += 1 else if (ch == '}') {
                         depth -= 1;
                         if (depth == 0) break;
                     }
+                    if (ch != ' ' and ch != '\t' and ch != '\n' and ch != '\r') prev = ch;
                     i += 1;
                 }
                 const node = try self.parseSubstitution(raw[expr_start..i]);

@@ -373,7 +373,19 @@ fn loadModule(self: *Interpreter, abspath: []const u8) EvalError!Completion {
     ) catch return error.OutOfMemory;
     const program = Parser.parseMode(arena, wrapped, false) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return self.throwError("SyntaxError", "module parse error"),
+        else => |pe| {
+            // Pinpoint the failing token (parser sets `last_error_lexeme`) + its line:col in the WRAPPED
+            // source (the wrapper prepends one line, so the file line is `line - 1`).
+            const lx = @import("parser.zig").last_error_lexeme;
+            const base = @intFromPtr(wrapped.ptr);
+            const lp = @intFromPtr(lx.ptr);
+            const detail = if (lx.len != 0 and lp >= base and lp + lx.len <= base + wrapped.len) blk: {
+                const lc = @import("parser.zig").lineColOf(wrapped, lp - base);
+                break :blk std.fmt.allocPrint(arena, "{s} near '{s}' (line {d}:{d})", .{ @errorName(pe), lx, if (lc.line > 0) lc.line - 1 else lc.line, lc.col }) catch @errorName(pe);
+            } else @errorName(pe);
+            const msg = std.fmt.allocPrint(arena, "{s} in {s}", .{ detail, abspath }) catch "module parse error";
+            return self.throwError("SyntaxError", msg);
+        },
     };
     const wrapper_c = try self.run(program, self.globals.?);
     if (wrapper_c.isAbrupt()) return wrapper_c;
