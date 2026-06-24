@@ -636,6 +636,7 @@ pub fn objectToString(it: *Interpreter, this_val: Value) EvalError!Completion {
             if (o.kind == .function) break :blk "Function"; // [[Call]]
             if (o.error_data) break :blk "Error"; // [[ErrorData]]
             if (o.kind == .date) break :blk "Date"; // §20.1.3.6 step 11: [[DateValue]]
+            if (o.regexp != null) break :blk "RegExp"; // §20.1.3.6 step 14: [[RegExpMatcher]]
             if (o.primitive) |p| switch (p) {
                 .boolean => break :blk "Boolean", // [[BooleanData]]
                 .number => break :blk "Number", // [[NumberData]]
