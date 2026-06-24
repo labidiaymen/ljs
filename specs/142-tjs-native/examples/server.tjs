@@ -1,0 +1,2 @@
+// a tjs HTTP server compiled to a native binary
+serve(8090, "Hello from tjs (compiled to native)!");

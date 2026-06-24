@@ -28,12 +28,12 @@ const Expr = union(enum) {
     cmp: struct { op: []const u8, l: *Expr, r: *Expr }, // < > <= >= == !=
     obj: []FieldInit,
     field: struct { obj: *Expr, name: []const u8 },
-    call: struct { name: []const u8, arg: *Expr }, // builtin call, e.g. httpGet(url)
+    call: struct { name: []const u8, args: []*Expr }, // builtin call, e.g. httpGet(url) / serve(port, body)
 };
 
 /// Builtins that lower to a Zig std wrapper (need __io/__alloc threaded in).
 fn isBuiltin(name: []const u8) bool {
-    return std.mem.eql(u8, name, "httpGet");
+    return std.mem.eql(u8, name, "httpGet") or std.mem.eql(u8, name, "serve");
 }
 
 /// Map a typed-JS type name to its Zig type. Accepts TS-ish aliases; unknown names pass through (a
@@ -157,7 +157,9 @@ const Parser = struct {
     cur_col: u32 = 1, // source column of `cur`
     vars: std.StringHashMapUnmanaged(void) = .empty, // declared variable names (for undefined-var checks)
     last_err: []const u8 = "syntax error", // message for the next diagnostic
-    uses_http: bool = false, // a httpGet builtin was used → emit the std.http wrapper + io main
+    uses_io: bool = false, // any io builtin used → emit the std.process.Init main (io + allocator)
+    needs_httpget: bool = false, // emit the __httpGet wrapper
+    needs_serve: bool = false, // emit the __serve wrapper
 
     fn declare(self: *Parser, name: []const u8) CompileError!void {
         self.vars.put(self.arena, name, {}) catch return error.OutOfMemory;
@@ -260,10 +262,16 @@ const Parser = struct {
             if (isBuiltin(name)) {
                 try self.advance();
                 try self.expectOp('(');
-                const arg = try self.parseExpr();
+                var args: std.ArrayListUnmanaged(*Expr) = .empty;
+                while (!self.isOp(')')) {
+                    try args.append(self.arena, try self.parseExpr());
+                    if (self.isOp(',')) try self.advance() else break;
+                }
                 try self.expectOp(')');
-                if (std.mem.eql(u8, name, "httpGet")) self.uses_http = true;
-                return self.node(.{ .call = .{ .name = name, .arg = arg } });
+                self.uses_io = true;
+                if (std.mem.eql(u8, name, "httpGet")) self.needs_httpget = true;
+                if (std.mem.eql(u8, name, "serve")) self.needs_serve = true;
+                return self.node(.{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.arena) } });
             }
             if (!self.vars.contains(name)) return self.undefined_(name);
             try self.advance();
@@ -307,10 +315,16 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try w.append(arena, '"');
         },
         .call => |cl| {
-            // builtins lower to a Zig std wrapper taking (__io, __alloc, arg).
+            // builtins lower to a Zig std wrapper taking (__io, __alloc, args...).
             if (std.mem.eql(u8, cl.name, "httpGet")) {
                 try w.appendSlice(arena, "__httpGet(__io, __alloc, ");
-                try emitExpr(cl.arg, w, arena);
+                if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.name, "serve")) {
+                try w.appendSlice(arena, "__serve(__io, __alloc, ");
+                if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                if (cl.args.len > 1) try emitExpr(cl.args[1], w, arena);
                 try w.append(arena, ')');
             }
         },
@@ -408,6 +422,14 @@ fn emitStmt(p: *Parser, out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocat
         while (!p.isOp('}')) try emitStmt(p, out, arena);
         try p.expectOp('}');
         try out.appendSlice(arena, "    }\n");
+    } else if (isBuiltin(kw)) {
+        // expression statement: a builtin call, e.g. serve(8080, "hi");
+        const e = try p.parseExpr();
+        try p.expectOp(';');
+        // `serve` is noreturn; other builtins return a value that must be discarded.
+        try out.appendSlice(arena, if (std.mem.eql(u8, kw, "serve")) "    " else "    _ = ");
+        try emitExpr(e, out, arena);
+        try out.appendSlice(arena, ";\n");
     } else {
         // assignment: <name> = <expr> ;
         const name = kw;
@@ -510,7 +532,7 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []co
     );
     try out.appendSlice(arena, decls.items);
 
-    if (p.uses_http) {
+    if (p.needs_httpget) {
         // A real std.http one-shot GET, wrapped to a tjs-friendly `i64` (status code, or -1 on error).
         try out.appendSlice(arena,
             \\fn __httpGet(io: std.Io, alloc: std.mem.Allocator, url: []const u8) i64 {
@@ -522,6 +544,30 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []co
             \\}
             \\
         );
+    }
+    if (p.needs_serve) {
+        // A real (blocking) HTTP server on std.Io.net — returns the same body to every request.
+        try out.appendSlice(arena,
+            \\fn __serve(io: std.Io, alloc: std.mem.Allocator, port: i64, body: []const u8) noreturn {
+            \\    _ = alloc;
+            \\    const addr = std.Io.net.IpAddress.parse("0.0.0.0", @intCast(port)) catch std.process.exit(1);
+            \\    var server = addr.listen(io, .{ .reuse_address = true }) catch std.process.exit(1);
+            \\    var hbuf: [256]u8 = undefined;
+            \\    const head = std.fmt.bufPrint(&hbuf, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch std.process.exit(1);
+            \\    while (true) {
+            \\        const stream = server.accept(io) catch continue;
+            \\        var wbuf: [2048]u8 = undefined;
+            \\        var w = stream.writer(io, &wbuf);
+            \\        w.interface.writeAll(head) catch {};
+            \\        w.interface.writeAll(body) catch {};
+            \\        w.interface.flush() catch {};
+            \\        stream.close(io);
+            \\    }
+            \\}
+            \\
+        );
+    }
+    if (p.uses_io) {
         try out.appendSlice(arena, "pub fn main(__init: std.process.Init) !void {\n");
         try out.appendSlice(arena, "    const __io = __init.io;\n    const __alloc = __init.arena.allocator();\n");
     } else {
