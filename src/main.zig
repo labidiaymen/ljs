@@ -4,6 +4,7 @@
 const std = @import("std");
 const Io = std.Io;
 const ljs = @import("ljs");
+const tjsc = @import("tjsc.zig");
 
 /// HOST (spec 100): the OS process id, best-effort per platform (0 if unavailable). The branch is
 /// chosen at comptime (`builtin.os.tag` is comptime-known) so only the matching platform call is
@@ -29,6 +30,49 @@ fn looksLikeEsm(source: []const u8) bool {
         if (std.mem.startsWith(u8, line, "import ") or std.mem.startsWith(u8, line, "import{") or std.mem.startsWith(u8, line, "import*")) return true;
     }
     return false;
+}
+
+/// `ljs compile <file>`: lower a typed-JS file to Zig and compile it to a native binary via
+/// `zig build-exe`. POC (spec 142) — not part of the engine.
+fn compileCmd(arena: std.mem.Allocator, io: std.Io, path: []const u8, err: *std.Io.Writer) !void {
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024)) catch {
+        try err.print("error: cannot read file {s}\n", .{path});
+        return;
+    };
+    const zig_src = tjsc.compileToZig(arena, source) catch {
+        try err.print("error: parse error in {s}\n", .{path});
+        return;
+    };
+    const base = std.fs.path.stem(path);
+    const zig_path = try std.fmt.allocPrint(arena, "{s}.zig", .{base});
+    const exe_name = if (@import("builtin").os.tag == .windows)
+        try std.fmt.allocPrint(arena, "{s}.exe", .{base})
+    else
+        try arena.dupe(u8, base);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zig_path, .data = zig_src });
+
+    const emit = try std.fmt.allocPrint(arena, "-femit-bin={s}", .{exe_name});
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "zig", "build-exe", zig_path, "-O", "ReleaseFast", emit },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit, // zig's own diagnostics pass straight through
+    }) catch |e| {
+        try err.print("error: could not invoke zig ({s}); is zig on PATH?\n", .{@errorName(e)});
+        return;
+    };
+    const term = child.wait(io) catch |e| {
+        try err.print("error: waiting on zig failed ({s})\n", .{@errorName(e)});
+        return;
+    };
+    switch (term) {
+        .exited => |code| if (code == 0)
+            try err.print("compiled {s} -> {s}\n", .{ path, exe_name })
+        else
+            try err.print("zig build-exe failed (exit {d})\n", .{code}),
+        else => try err.print("zig build-exe terminated abnormally\n", .{}),
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -57,6 +101,14 @@ pub fn main(init: std.process.Init) !void {
 
     const cmd = args[1];
     const arg = args[2];
+
+    // `ljs compile <file>` — the Typed-JS → Zig → native compiler (POC, spec 142). Separate from the
+    // engine; lowers a typed-JS subset to Zig and invokes `zig build-exe` to produce a native binary.
+    if (std.mem.eql(u8, cmd, "compile")) {
+        compileCmd(arena, io, arg, err) catch |e| try err.print("compile error: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return;
+    }
 
     const source: []const u8 = if (std.mem.eql(u8, cmd, "eval"))
         arg
