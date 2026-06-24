@@ -3,18 +3,24 @@
 //! code-point semantics; ASCII patterns/inputs behave per spec). Supports: literal chars, `.`, char
 //! classes `[...]` (ranges, negation, `\d\w\s\D\W\S`, escapes), anchors `^ $ \b \B`, quantifiers
 //! `* + ? {n} {n,} {n,m}` (greedy + lazy `?`), groups `( )` (capturing) / `(?: )` / `(?<name> )`,
-//! alternation `|`, and backreferences `\1` / `\k<name>`. Lookaround, Unicode property escapes, and
-//! full u/v-mode strictness are deferred. `compile` throws SyntaxError on malformed syntax.
+//! alternation `|`, backreferences `\1` / `\k<name>`, and Unicode property escapes `\p{…}`/`\P{…}`
+//! (spec 140 — code-point matched via unicode_props.zig). Lookaround + full u/v-mode strictness are
+//! deferred. `compile` throws SyntaxError on malformed syntax.
 const std = @import("std");
 const unicode_id = @import("unicode_id.zig");
+const uprops = @import("unicode_props.zig");
 
 pub const CompileError = error{ SyntaxError, OutOfMemory };
+
+/// §22.2.1 a Unicode property escape `\p{…}` / `\P{…}` referenced from a class. `negate` is set for the
+/// `\P` form (membership inverted). Matched code-point-wise (see the `.class` VM op).
+const UProp = struct { id: uprops.PropId, negate: bool };
 
 /// A compiled instruction for the backtracking VM.
 const Inst = union(enum) {
     char: u8, // match one exact byte (case-folded when ignore_case)
     any, // `.` — any byte except a line terminator (unless dot_all)
-    class: struct { ranges: []const Range, negated: bool }, // [...] / \d\w\s...
+    class: struct { ranges: []const Range, negated: bool, uprops: []const UProp = &.{} }, // [...] / \d\w\s... / \p{…}
     save: usize, // record the current position into capture slot n
     split: struct { a: usize, b: usize }, // try a, then (on backtrack) b
     jmp: usize,
@@ -69,6 +75,7 @@ const Node = struct {
     tag: NodeTag,
     ch: u8 = 0,
     ranges: []Range = &.{},
+    uprops: []const UProp = &.{}, // §22.2.1 `\p{…}` property refs carried by a `.class` node
     negated: bool = false,
     kids: []*Node = &.{}, // concat: sequence; alt: alternatives
     sub: ?*Node = null, // repeat/group child
@@ -328,8 +335,20 @@ const Parser = struct {
             negated = true;
         }
         var ranges: std.ArrayListUnmanaged(Range) = .empty;
+        var ups: std.ArrayListUnmanaged(UProp) = .empty;
         while (self.peek()) |c| {
             if (c == ']') break;
+            // §22.2.1 a `\p{…}`/`\P{…}` ClassEscape inside the class (UnicodeMode) — collect a property
+            // ref rather than a byte. A property may NOT be a range endpoint (`\p{L}-x` is a SyntaxError).
+            if (c == '\\' and self.pos + 1 < self.src.len and self.unicode and
+                (self.src[self.pos + 1] == 'p' or self.src[self.pos + 1] == 'P'))
+            {
+                const neg = self.src[self.pos + 1] == 'P';
+                self.pos += 2; // consume `\` and `p`/`P`
+                try ups.append(self.arena, try self.parsePropEscape(neg));
+                if (self.peek() == '-' and self.pos + 1 < self.src.len and self.src[self.pos + 1] != ']') return CompileError.SyntaxError;
+                continue;
+            }
             // `parseClassAtom` returns the byte for a single-char atom, or null when it appended a
             // CharacterClassEscape (\d\w\s…) directly to `ranges`.
             const lo = try self.parseClassAtom(&ranges);
@@ -361,7 +380,7 @@ const Parser = struct {
         }
         if (self.peek() != ']') return CompileError.SyntaxError;
         self.pos += 1; // ']'
-        return self.mk(.{ .tag = .class, .ranges = ranges.items, .negated = negated });
+        return self.mk(.{ .tag = .class, .ranges = ranges.items, .uprops = ups.items, .negated = negated });
     }
 
     /// Parse one class member. Returns the byte for a single char (for range building), or null when it
@@ -421,10 +440,49 @@ const Parser = struct {
         return v;
     }
 
+    /// §22.2.1 CharacterClassEscape `p{…}` / `P{…}`: parse the `{ Name (= Value)? }` after a `\p`/`\P`
+    /// (`negate` set for `\P`). Property escapes are valid only in UnicodeMode; the caller has consumed
+    /// the `p`/`P`. Resolves the name via `unicode_props.lookup` (a `Name=Value` form uses the Value).
+    fn parsePropEscape(self: *Parser, negate: bool) CompileError!UProp {
+        if (!self.unicode) return CompileError.SyntaxError; // `\p` is a property escape only with `/u`
+        if (self.peek() != '{') return CompileError.SyntaxError;
+        self.pos += 1; // '{'
+        const name_start = self.pos;
+        while (self.peek()) |c| {
+            if (c == '}') break;
+            if (!((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '=')) return CompileError.SyntaxError;
+            self.pos += 1;
+        }
+        if (self.peek() != '}') return CompileError.SyntaxError;
+        const raw = self.src[name_start..self.pos];
+        self.pos += 1; // '}'
+        if (raw.len == 0) return CompileError.SyntaxError;
+        const name = if (std.mem.indexOfScalar(u8, raw, '=')) |eqp| raw[eqp + 1 ..] else raw;
+        const id = uprops.lookup(name) orelse return CompileError.SyntaxError;
+        return .{ .id = id, .negate = negate };
+    }
+
+    /// A standalone `\p{…}`/`\P{…}` atom → a `.class` node carrying one property ref (no byte ranges).
+    fn propEscapeNode(self: *Parser, negate: bool) CompileError!*Node {
+        const up = try self.parsePropEscape(negate);
+        const arr = try self.arena.alloc(UProp, 1);
+        arr[0] = up;
+        return self.mk(.{ .tag = .class, .ranges = &.{}, .uprops = arr, .negated = false });
+    }
+
     fn parseAtomEscape(self: *Parser) CompileError!*Node {
         self.pos += 1; // '\'
         const e = self.peek() orelse return CompileError.SyntaxError;
         switch (e) {
+            'p', 'P' => {
+                if (self.unicode) {
+                    self.pos += 1; // consume 'p'/'P'
+                    return self.propEscapeNode(e == 'P');
+                }
+                // non-UnicodeMode: `\p` is an identity escape (Annex B) → the literal char.
+                const b = try self.singleCharEscape();
+                return self.mk(.{ .tag = .char, .ch = b });
+            },
             'd', 'D', 'w', 'W', 's', 'S' => {
                 self.pos += 1;
                 var ranges: std.ArrayListUnmanaged(Range) = .empty;
@@ -657,7 +715,7 @@ const Compiler = struct {
         switch (n.tag) {
             .char => _ = try self.emit(.{ .char = n.ch }),
             .any => _ = try self.emit(.any),
-            .class => _ = try self.emit(.{ .class = .{ .ranges = n.ranges, .negated = n.negated } }),
+            .class => _ = try self.emit(.{ .class = .{ .ranges = n.ranges, .negated = n.negated, .uprops = n.uprops } }),
             .assert_start => _ = try self.emit(.assert_start),
             .assert_end => _ = try self.emit(.assert_end),
             .word_boundary => _ = try self.emit(.{ .word_boundary = n.negated }),
@@ -880,6 +938,43 @@ fn isLineTerm(b: u8) bool {
     return b == '\n' or b == '\r';
 }
 
+/// Decode the UTF-8 code point at `input[sp]` → its scalar + byte length. An invalid/lone byte decodes
+/// to itself with length 1 (the byte engine's lenient fallback). Used by the property `.class` path.
+fn decodeCpFwd(input: []const u8, sp: usize) struct { cp: u21, len: usize } {
+    const b = input[sp];
+    if (b < 0x80) return .{ .cp = b, .len = 1 };
+    const len = std.unicode.utf8ByteSequenceLength(b) catch return .{ .cp = b, .len = 1 };
+    if (sp + len > input.len) return .{ .cp = b, .len = 1 };
+    const cp = std.unicode.utf8Decode(input[sp .. sp + len]) catch return .{ .cp = b, .len = 1 };
+    return .{ .cp = cp, .len = len };
+}
+
+/// The code point ENDING just before `sp` (back up over UTF-8 continuation bytes to the lead) → its
+/// scalar + start index. For the backward (lookbehind) property `.class` path.
+fn decodeCpBack(input: []const u8, sp: usize) struct { cp: u21, start: usize } {
+    var s = sp - 1;
+    while (s > 0 and (input[s] & 0xC0) == 0x80) s -= 1;
+    const d = decodeCpFwd(input, s);
+    // Only treat it as multi-byte if the decoded span actually reaches `sp` (else it's a lone byte).
+    if (s + d.len == sp) return .{ .cp = d.cp, .start = s };
+    return .{ .cp = input[sp - 1], .start = sp - 1 };
+}
+
+/// §22.2.1 membership for a class that carries Unicode property refs (`\p{…}`), tested by code point.
+/// Byte ranges (`[a-z_…]`) match only for cp < 0x100; each `\p`/`\P` ref adds (cp ∈ prop) / (cp ∉ prop);
+/// then the class-level `[^…]` negation is applied.
+fn classMatchCp(cl: anytype, cp: u21, ignore_case: bool) bool {
+    var matched = false;
+    if (cp < 0x100 and classMatch(cl.ranges, false, @intCast(cp), ignore_case)) matched = true;
+    if (!matched) for (cl.uprops) |up| {
+        if (up.negate != uprops.contains(up.id, cp)) {
+            matched = true;
+            break;
+        }
+    };
+    return cl.negated != matched;
+}
+
 /// A pending backtracking choice point: the lower-priority branch of a `split` to try if the preferred
 /// branch fails. `undo_len` records the capture-undo-log length at the split so the saves array can be
 /// rolled back to its state at that point when this alternative is taken.
@@ -966,12 +1061,30 @@ fn run(ctx: *Ctx, insts: []const Inst, counters: []usize, start: usize, dir: i2)
             },
             .class => |cl| {
                 const have = if (fwd) sp < input.len else sp > 0;
-                const ch: u8 = if (have) (if (fwd) input[sp] else input[sp - 1]) else 0;
-                if (!have or !classMatch(cl.ranges, cl.negated, ch, prog.ignore_case)) {
+                if (!have) {
                     failed = true;
+                } else if (cl.uprops.len != 0) {
+                    // §22.2.1 a `\p{…}`-bearing class matches whole CODE POINTS (decode + advance by the
+                    // utf8 length); property-free classes keep the byte fast path below (no regression).
+                    if (fwd) {
+                        const d = decodeCpFwd(input, sp);
+                        if (!classMatchCp(cl, d.cp, prog.ignore_case)) failed = true else {
+                            sp += d.len;
+                            pc += 1;
+                        }
+                    } else {
+                        const d = decodeCpBack(input, sp);
+                        if (!classMatchCp(cl, d.cp, prog.ignore_case)) failed = true else {
+                            sp = d.start;
+                            pc += 1;
+                        }
+                    }
                 } else {
-                    sp = if (fwd) sp + 1 else sp - 1;
-                    pc += 1;
+                    const ch: u8 = if (fwd) input[sp] else input[sp - 1];
+                    if (!classMatch(cl.ranges, cl.negated, ch, prog.ignore_case)) failed = true else {
+                        sp = if (fwd) sp + 1 else sp - 1;
+                        pc += 1;
+                    }
                 }
             },
             .assert_start => {
