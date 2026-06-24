@@ -46,10 +46,25 @@ const Conn = struct {
     read_c: xev.Completion = .{},
     write_c: xev.Completion = .{},
     close_c: xev.Completion = .{},
-    read_buf: [16 * 1024]u8 = undefined,
+    read_buf: [64 * 1024]u8 = undefined,
     write_buf: [64 * 1024]u8 = undefined,
+    recv_len: usize = 0, // bytes accumulated in read_buf for the in-progress request
     resp_len: usize = 0,
 };
+
+/// Parse a `Content-Length:` header value out of a raw header block (case-insensitive). 0 if absent.
+fn contentLength(headers: []const u8) usize {
+    var it = std.mem.splitSequence(u8, headers, "\r\n");
+    while (it.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " ");
+        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            const val = std.mem.trim(u8, line[colon + 1 ..], " ");
+            return std.fmt.parseInt(usize, val, 10) catch 0;
+        }
+    }
+    return 0;
+}
 
 // Windows IOCP: tie an accepted socket to its listener (SO_UPDATE_ACCEPT_CONTEXT). No-op elsewhere.
 extern "ws2_32" fn setsockopt(s: usize, level: i32, optname: i32, optval: ?[*]const u8, optlen: i32) callconv(.winapi) i32;
@@ -213,11 +228,14 @@ fn onRead(ud: ?*Conn, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, b: xev.Re
         conn.tcp.close(loop, &conn.close_c, Conn, conn, onClose);
         return .disarm;
     }
-    const req = b.slice[0..n];
+    _ = b;
+    conn.recv_len += n;
+    const data = conn.read_buf[0..conn.recv_len];
 
-    // Request line: METHOD SP URL SP HTTP/1.1\r\n ; then the header block up to \r\n\r\n.
-    const line_end = std.mem.indexOf(u8, req, "\r\n") orelse req.len;
-    const line = req[0..line_end];
+    // Need the full header block before we can act.
+    const he = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return readMore(conn, loop);
+    const line_end = std.mem.indexOf(u8, data, "\r\n") orelse he;
+    const line = data[0..line_end];
     var method: []const u8 = "GET";
     var url: []const u8 = "/";
     if (std.mem.indexOfScalar(u8, line, ' ')) |sp1| {
@@ -225,10 +243,13 @@ fn onRead(ud: ?*Conn, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, b: xev.Re
         const rest = line[sp1 + 1 ..];
         if (std.mem.indexOfScalar(u8, rest, ' ')) |sp2| url = rest[0..sp2];
     }
-    var headers: []const u8 = "";
-    if (std.mem.indexOf(u8, req, "\r\n\r\n")) |he| {
-        if (line_end + 2 <= he) headers = req[line_end + 2 .. he];
-    }
+    const headers = if (line_end + 2 <= he) data[line_end + 2 .. he] else "";
+
+    // Wait for the full body (Content-Length) before dispatching, so POST/JSON bodies are complete.
+    const clen = contentLength(headers);
+    const body_start = he + 4;
+    if (conn.recv_len - body_start < clen) return readMore(conn, loop);
+    const body = data[body_start .. body_start + clen];
 
     const id = g_next_id;
     g_next_id +%= 1;
@@ -237,22 +258,34 @@ fn onRead(ud: ?*Conn, loop: *xev.Loop, _: *xev.Completion, _: xev.TCP, b: xev.Re
         conn.tcp.close(loop, &conn.close_c, Conn, conn, onClose);
         return .disarm;
     };
+    conn.recv_len = 0; // request consumed; onWrite re-arms a fresh read for keep-alive
 
-    // Dispatch to JS: __dispatch(id, method, url, rawHeaders). The handler calls __respond (sync or
-    // async); we do NOT re-arm read here — onWrite re-arms after the response goes out (keep-alive).
+    // Dispatch to JS: __dispatch(id, method, url, rawHeaders, body). Handler calls __respond (sync/async).
     const idv = c.qjs_int(g_ctx, @intCast(id));
     const mv = c.JS_NewStringLen(g_ctx, method.ptr, method.len);
     const uv = c.JS_NewStringLen(g_ctx, url.ptr, url.len);
     const hv = c.JS_NewStringLen(g_ctx, headers.ptr, headers.len);
-    var call_args = [_]c.JSValue{ idv, mv, uv, hv };
-    const ret = c.qjs_call(g_ctx, g_dispatch, 4, &call_args);
+    const bv = c.JS_NewStringLen(g_ctx, body.ptr, body.len);
+    var call_args = [_]c.JSValue{ idv, mv, uv, hv, bv };
+    const ret = c.qjs_call(g_ctx, g_dispatch, 5, &call_args);
     reportIfException(ret);
     c.qjs_free(g_ctx, ret);
     c.qjs_free(g_ctx, idv);
     c.qjs_free(g_ctx, mv);
     c.qjs_free(g_ctx, uv);
     c.qjs_free(g_ctx, hv);
+    c.qjs_free(g_ctx, bv);
     drainJobs();
+    return .disarm;
+}
+
+/// Re-arm a read to receive more of an incomplete request (headers or body still arriving).
+fn readMore(conn: *Conn, loop: *xev.Loop) xev.CallbackAction {
+    if (conn.recv_len >= conn.read_buf.len) {
+        conn.tcp.close(loop, &conn.close_c, Conn, conn, onClose); // request too large for the buffer
+        return .disarm;
+    }
+    conn.tcp.read(loop, &conn.read_c, .{ .slice = conn.read_buf[conn.recv_len..] }, Conn, conn, onRead);
     return .disarm;
 }
 

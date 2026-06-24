@@ -246,7 +246,7 @@
     return this;
   };
 
-  function makeReq(method, url_, headersStr) {
+  function makeReq(method, url_, headersStr, body) {
     var req = new Readable();
     req.method = method; req.url = url_; req.originalUrl = url_; req.httpVersion = '1.1'; req.httpVersionMajor = 1; req.httpVersionMinor = 1;
     var headers = {};
@@ -254,11 +254,15 @@
     req.headers = headers; req.rawHeaders = [];
     req.connection = req.socket = { remoteAddress: '127.0.0.1', remotePort: 0, encrypted: false };
     req.complete = true;
-    queueMicrotask(function () { req.emit('end'); });
+    // Deliver the request body as a single 'data' chunk then 'end' (body-parser / express.json read this).
+    queueMicrotask(function () {
+      if (body && body.length) req.emit('data', Buffer.from(body));
+      req.emit('end');
+    });
     return req;
   }
-  G.__dispatch = function (id, method, url_, headersStr) {
-    var req = makeReq(method, url_, headersStr);
+  G.__dispatch = function (id, method, url_, headersStr, body) {
+    var req = makeReq(method, url_, headersStr, body);
     var res = new ServerResponse(id);
     if (_server) _server.emit('request', req, res); else res.end('');
   };
