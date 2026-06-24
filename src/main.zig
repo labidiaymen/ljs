@@ -39,7 +39,7 @@ fn compileCmd(arena: std.mem.Allocator, io: std.Io, path: []const u8, err: *std.
         try err.print("error: cannot read file {s}\n", .{path});
         return;
     };
-    const zig_src = tjsc.compileToZig(arena, source) catch {
+    const zig_src = tjsc.compileToZig(arena, source, path) catch {
         try err.print("error: parse error in {s}\n", .{path});
         return;
     };
@@ -54,7 +54,7 @@ fn compileCmd(arena: std.mem.Allocator, io: std.Io, path: []const u8, err: *std.
 
     const emit = try std.fmt.allocPrint(arena, "-femit-bin={s}", .{exe_name});
     var child = std.process.spawn(io, .{
-        .argv = &.{ "zig", "build-exe", zig_path, "-O", "ReleaseFast", emit },
+        .argv = &.{ "zig", "build-exe", zig_path, "-O", "ReleaseSafe", emit },
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit, // zig's own diagnostics pass straight through

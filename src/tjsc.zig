@@ -48,6 +48,8 @@ const Tok = union(enum) {
 const Lexer = struct {
     src: []const u8,
     i: usize = 0,
+    line: u32 = 1, // current source line
+    tok_line: u32 = 1, // line where the most-recently-returned token starts
 
     fn isIdentStart(c: u8) bool {
         return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$';
@@ -59,7 +61,12 @@ const Lexer = struct {
     fn next(self: *Lexer) CompileError!Tok {
         while (self.i < self.src.len) {
             const c = self.src[self.i];
-            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            if (c == '\n') {
+                self.line += 1;
+                self.i += 1;
+                continue;
+            }
+            if (c == ' ' or c == '\t' or c == '\r') {
                 self.i += 1;
                 continue;
             }
@@ -69,6 +76,7 @@ const Lexer = struct {
             }
             break;
         }
+        self.tok_line = self.line;
         if (self.i >= self.src.len) return .eof;
         const c = self.src[self.i];
 
@@ -118,14 +126,16 @@ const Parser = struct {
     arena: std.mem.Allocator,
     lex: Lexer,
     cur: Tok,
+    cur_line: u32 = 1, // source line of `cur`
 
     fn init(arena: std.mem.Allocator, src: []const u8) CompileError!Parser {
         var lex = Lexer{ .src = src };
         const first = try lex.next();
-        return .{ .arena = arena, .lex = lex, .cur = first };
+        return .{ .arena = arena, .lex = lex, .cur = first, .cur_line = lex.tok_line };
     }
     fn advance(self: *Parser) CompileError!void {
         self.cur = try self.lex.next();
+        self.cur_line = self.lex.tok_line;
     }
     fn isOp(self: *Parser, ch: u8) bool {
         return self.cur == .op and self.cur.op == ch;
@@ -284,6 +294,8 @@ fn emitStmt(p: *Parser, out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocat
     const eq = std.mem.eql;
     if (p.cur != .ident) return error.ParseError;
     const kw = p.cur.ident;
+    // Track the source line so a runtime panic can report the .tjs location (Zig has no #line).
+    try out.print(arena, "    __tjs_line = {d};\n", .{p.cur_line});
 
     if (eq(u8, kw, "let") or eq(u8, kw, "const") or eq(u8, kw, "var")) {
         const mutable = eq(u8, kw, "var");
@@ -338,8 +350,9 @@ fn emitStmt(p: *Parser, out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocat
     }
 }
 
-/// Compile typed-JS `source` to Zig source text.
-pub fn compileToZig(arena: std.mem.Allocator, source: []const u8) CompileError![]const u8 {
+/// Compile typed-JS `source` (from `filename`) to Zig source text. `filename` is embedded so a
+/// runtime panic reports the .tjs location.
+pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []const u8) CompileError![]const u8 {
     var p = try Parser.init(arena, source);
     var decls: std.ArrayListUnmanaged(u8) = .empty; // top-level struct type definitions
     var body: std.ArrayListUnmanaged(u8) = .empty;
@@ -373,8 +386,25 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8) CompileError![
         }
     }
 
+    // Sanitize the filename for a Zig string literal (backslashes/quotes break it).
+    const safe_name = try arena.dupe(u8, filename);
+    for (safe_name) |*ch| if (ch.* == '\\' or ch.* == '"') {
+        ch.* = '/';
+    };
+
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.appendSlice(arena, "const std = @import(\"std\");\n");
+    try out.print(arena, "const __tjs_file = \"{s}\";\n", .{safe_name});
+    try out.appendSlice(arena, "var __tjs_line: u32 = 0;\n");
+    // Custom panic handler → map the native runtime error back to the .tjs source line.
+    try out.appendSlice(arena,
+        \\fn __tjsPanic(msg: []const u8, _: ?usize) noreturn {
+        \\    std.debug.print("\n{s}:{d}: runtime error: {s}\n", .{ __tjs_file, __tjs_line, msg });
+        \\    std.process.exit(1);
+        \\}
+        \\pub const panic = std.debug.FullPanic(__tjsPanic);
+        \\
+    );
     try out.appendSlice(arena, decls.items);
     try out.appendSlice(arena, "pub fn main() void {\n");
     try out.appendSlice(arena, body.items);

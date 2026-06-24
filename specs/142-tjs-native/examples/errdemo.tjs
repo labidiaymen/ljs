@@ -1,0 +1,7 @@
+var x: int = 1;
+var i: int = 0;
+while (i < 100000) {
+  x = x + x;
+  i = i + 1;
+}
+console.log(x);
