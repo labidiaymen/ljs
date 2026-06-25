@@ -14,7 +14,7 @@
 - [x] T004 Make the default build install a compiler-first executable instead
   of the legacy JS runtime.
 - [x] T005 Add `src/lumen.zig` as a compiler-only CLI for `.ts` input.
-- [x] T006 Update `src/tjsc.zig` diagnostics and embedded source labels to
+- [x] T006 Update `src/lumen_compiler.zig` diagnostics and embedded source labels to
   `.ts`.
 - [x] T007 Add valid `.ts` examples under this spec folder.
 - [x] T008 Add invalid dynamic-JS `.ts` examples under this spec folder.
@@ -22,7 +22,9 @@
 ## Phase 3: Compiler Pipeline
 
 - [x] T025 Split diagnostic, AST, type-helper, and lexer code out of
-  `src/tjsc.zig` into focused compiler modules.
+  `src/lumen_compiler.zig` into focused compiler modules.
+- [x] T026 Rename compiler modules and generated helper prefixes from the old
+  track naming to Lumen naming.
 - [ ] T009 Introduce a statement/expression AST separate from immediate Zig
   emission.
 - [ ] T010 Introduce a type representation for `int`, `i32`, `number`, `float`,

@@ -1,9 +1,9 @@
 //! Lumen compiler CLI: TypeScript syntax -> generated Zig -> native binary.
 
 const std = @import("std");
-const tjsc = @import("tjsc.zig");
+const compiler = @import("lumen_compiler.zig");
 
-fn printDiag(err: *std.Io.Writer, source: []const u8, file: []const u8, diag: tjsc.Diag) !void {
+fn printDiag(err: *std.Io.Writer, source: []const u8, file: []const u8, diag: compiler.Diag) !void {
     try err.print("{s}:{d}:{d}: error: {s}\n", .{ file, diag.line, diag.col, diag.msg });
     var it = std.mem.splitScalar(u8, source, '\n');
     var n: u32 = 1;
@@ -30,8 +30,8 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, err: *std
         return 2;
     };
 
-    var diag: tjsc.Diag = .{};
-    const zig_src = tjsc.compileToZig(arena, source, path, &diag) catch {
+    var diag: compiler.Diag = .{};
+    const zig_src = compiler.compileToZig(arena, source, path, &diag) catch {
         try printDiag(err, source, path, diag);
         return 1;
     };

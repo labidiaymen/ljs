@@ -141,7 +141,7 @@ being precise enough for native output.
 ## Assumptions
 
 - Zig remains the native backend for this branch.
-- The existing `src/tjsc.zig` prototype is the starting implementation, but its
-  single-pass shape may change.
+- The existing `src/lumen_compiler.zig` prototype is the starting
+  implementation, but its single-pass shape may change.
 - Existing ljs runtime code can remain in the repo while the active product track
   moves to the compiler.

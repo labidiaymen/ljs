@@ -4,7 +4,7 @@
 const std = @import("std");
 const Io = std.Io;
 const ljs = @import("ljs");
-const tjsc = @import("tjsc.zig");
+const compiler = @import("lumen_compiler.zig");
 
 /// HOST (spec 100): the OS process id, best-effort per platform (0 if unavailable). The branch is
 /// chosen at comptime (`builtin.os.tag` is comptime-known) so only the matching platform call is
@@ -32,8 +32,8 @@ fn looksLikeEsm(source: []const u8) bool {
     return false;
 }
 
-/// Print a tjsc compile-time diagnostic with the offending .tjs line + a caret (Rust/TS-style).
-fn printTjsDiag(err: *std.Io.Writer, source: []const u8, file: []const u8, diag: tjsc.Diag) !void {
+/// Print a compiler compile-time diagnostic with the offending .ts line + a caret (Rust/TS-style).
+fn printLumenDiag(err: *std.Io.Writer, source: []const u8, file: []const u8, diag: compiler.Diag) !void {
     try err.print("{s}:{d}:{d}: error: {s}\n", .{ file, diag.line, diag.col, diag.msg });
     var it = std.mem.splitScalar(u8, source, '\n');
     var n: u32 = 1;
@@ -49,16 +49,16 @@ fn printTjsDiag(err: *std.Io.Writer, source: []const u8, file: []const u8, diag:
     }
 }
 
-/// `ljs compile <file>`: lower a typed-JS file to Zig and compile it to a native binary via
+/// `ljs compile <file>`: lower a Lumen file to Zig and compile it to a native binary via
 /// `zig build-exe`. POC (spec 142) — not part of the engine.
 fn compileCmd(arena: std.mem.Allocator, io: std.Io, path: []const u8, err: *std.Io.Writer) !void {
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024)) catch {
         try err.print("error: cannot read file {s}\n", .{path});
         return;
     };
-    var diag: tjsc.Diag = .{};
-    const zig_src = tjsc.compileToZig(arena, source, path, &diag) catch {
-        try printTjsDiag(err, source, path, diag);
+    var diag: compiler.Diag = .{};
+    const zig_src = compiler.compileToZig(arena, source, path, &diag) catch {
+        try printLumenDiag(err, source, path, diag);
         return;
     };
     const base = std.fs.path.stem(path);
@@ -121,7 +121,7 @@ pub fn main(init: std.process.Init) !void {
     const arg = args[2];
 
     // `ljs compile <file>` — the Typed-JS → Zig → native compiler (POC, spec 142). Separate from the
-    // engine; lowers a typed-JS subset to Zig and invokes `zig build-exe` to produce a native binary.
+    // engine; lowers a Lumen subset to Zig and invokes `zig build-exe` to produce a native binary.
     if (std.mem.eql(u8, cmd, "compile")) {
         compileCmd(arena, io, arg, err) catch |e| try err.print("compile error: {s}\n", .{@errorName(e)});
         try err.flush();

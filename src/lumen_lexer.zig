@@ -1,4 +1,4 @@
-const diag = @import("tjs_diag.zig");
+const diag = @import("lumen_diag.zig");
 
 pub const Tok = union(enum) {
     num: i64,

@@ -12,10 +12,10 @@
 //! comparisons (`< > <= >= == !=`), `while` loops + assignment, typed objects (`type T = {…}` →
 //! struct, object literals, field access), and `console.log`.
 const std = @import("std");
-const ast = @import("tjs_ast.zig");
-const diag_mod = @import("tjs_diag.zig");
-const lexer = @import("tjs_lexer.zig");
-const types = @import("tjs_types.zig");
+const ast = @import("lumen_ast.zig");
+const diag_mod = @import("lumen_diag.zig");
+const lexer = @import("lumen_lexer.zig");
+const types = @import("lumen_types.zig");
 
 pub const CompileError = diag_mod.CompileError;
 pub const Diag = diag_mod.Diag;
@@ -304,7 +304,7 @@ fn emitStmt(p: *Parser, out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocat
     const stmt_line = p.cur_line;
     const stmt_col = p.cur_col;
     // Track the source line+col so a runtime panic can report the .ts location (Zig has no #line).
-    try out.print(arena, "    __tjs_line = {d}; __tjs_col = {d};\n", .{ p.cur_line, p.cur_col });
+    try out.print(arena, "    __lumen_line = {d}; __lumen_col = {d};\n", .{ p.cur_line, p.cur_col });
 
     if (eq(u8, kw, "let") or eq(u8, kw, "const") or eq(u8, kw, "var")) {
         const mutable = eq(u8, kw, "var");
@@ -443,10 +443,10 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []co
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.appendSlice(arena, "const std = @import(\"std\");\n");
-    try out.print(arena, "const __tjs_file = \"{s}\";\n", .{safe_name});
-    try out.appendSlice(arena, "var __tjs_line: u32 = 0;\nvar __tjs_col: u32 = 0;\n");
+    try out.print(arena, "const __lumen_file = \"{s}\";\n", .{safe_name});
+    try out.appendSlice(arena, "var __lumen_line: u32 = 0;\nvar __lumen_col: u32 = 0;\n");
     // Embed the .ts source as a multiline string (no escaping needed) so the handler can show the line.
-    try out.appendSlice(arena, "const __tjs_src =\n");
+    try out.appendSlice(arena, "const __lumen_src =\n");
     {
         var lines = std.mem.splitScalar(u8, source, '\n');
         while (lines.next()) |l| {
@@ -458,28 +458,28 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []co
     // Custom panic handler -> map the native runtime error back to the .ts source: file:line:col +
     // the offending source line + a caret.
     try out.appendSlice(arena,
-        \\fn __tjsPanic(msg: []const u8, _: ?usize) noreturn {
-        \\    std.debug.print("\n{s}:{d}:{d}: runtime error: {s}\n", .{ __tjs_file, __tjs_line, __tjs_col, msg });
-        \\    var __it = std.mem.splitScalar(u8, __tjs_src, '\n');
+        \\fn __lumenPanic(msg: []const u8, _: ?usize) noreturn {
+        \\    std.debug.print("\n{s}:{d}:{d}: runtime error: {s}\n", .{ __lumen_file, __lumen_line, __lumen_col, msg });
+        \\    var __it = std.mem.splitScalar(u8, __lumen_src, '\n');
         \\    var __n: u32 = 1;
         \\    while (__it.next()) |__l| : (__n += 1) {
-        \\        if (__n == __tjs_line) {
-        \\            std.debug.print("  {d} | {s}\n    | ", .{ __tjs_line, __l });
+        \\        if (__n == __lumen_line) {
+        \\            std.debug.print("  {d} | {s}\n    | ", .{ __lumen_line, __l });
         \\            var __k: u32 = 1;
-        \\            while (__k < __tjs_col) : (__k += 1) std.debug.print(" ", .{});
+        \\            while (__k < __lumen_col) : (__k += 1) std.debug.print(" ", .{});
         \\            std.debug.print("^\n", .{});
         \\            break;
         \\        }
         \\    }
         \\    std.process.exit(1);
         \\}
-        \\pub const panic = std.debug.FullPanic(__tjsPanic);
+        \\pub const panic = std.debug.FullPanic(__lumenPanic);
         \\
     );
     try out.appendSlice(arena, decls.items);
 
     if (p.needs_httpget) {
-        // A real std.http one-shot GET, wrapped to a tjs-friendly `i64` (status code, or -1 on error).
+        // A real std.http one-shot GET, wrapped to a Lumen-friendly `i64` (status code, or -1 on error).
         try out.appendSlice(arena,
             \\fn __httpGet(io: std.Io, alloc: std.mem.Allocator, url: []const u8) i64 {
             \\    var client: std.http.Client = .{ .allocator = alloc, .io = io };

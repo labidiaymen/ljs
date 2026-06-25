@@ -7,7 +7,7 @@
 
 Pivot the branch from JavaScript engine conformance to a native compiler product:
 `.ts` source is parsed, statically checked, lowered to generated Zig, and compiled
-to a native executable. The existing `src/tjsc.zig` prototype remains the
+to a native executable. The existing `src/lumen_compiler.zig` prototype remains the
 implementation seed.
 
 ## Technical Context
@@ -49,12 +49,12 @@ JavaScript runtime compatibility.
 
 ```text
 src/
-├── lumen.zig      # compiler CLI, accepts .ts input and builds native binaries
-├── tjsc.zig       # compiler orchestration, parser/lowering/emission seed
-├── tjs_ast.zig    # expression AST nodes
-├── tjs_diag.zig   # compiler error and diagnostic types
-├── tjs_lexer.zig  # source tokenizer
-└── tjs_types.zig  # V1 type aliases and expression type inference
+├── lumen.zig           # compiler CLI, accepts .ts input and builds native binaries
+├── lumen_compiler.zig  # compiler orchestration, parser/lowering/emission seed
+├── lumen_ast.zig       # expression AST nodes
+├── lumen_diag.zig      # compiler error and diagnostic types
+├── lumen_lexer.zig     # source tokenizer
+└── lumen_types.zig     # V1 type aliases and expression type inference
 
 specs/001-typescript-to-zig-native/
 ├── spec.md
@@ -70,7 +70,7 @@ specs/001-typescript-to-zig-native/
 **Structure Decision**: Keep compiler code isolated in its own module path. Do
 not route new compiler semantics through the old interpreter/parser conformance
 path. Keep compiler files small and split by responsibility as the prototype
-grows; do not let `src/tjsc.zig` become a monolith again.
+grows; do not let `src/lumen_compiler.zig` become a monolith again.
 
 ## Milestone Strategy
 

@@ -6,11 +6,11 @@ This branch is now focused on a compiled TypeScript-syntax language:
 TypeScript source (.ts) -> compiler -> generated Zig -> native binary
 ```
 
-The existing `src/tjsc.zig` prototype is the seed. It already proves the useful
-path: typed JS-like source can be lowered to Zig source and then compiled with
-`zig build-exe` into a small native executable. From here, the project should
-evolve away from JavaScript engine conformance and toward the Lumen language
-spec.
+The existing `src/lumen_compiler.zig` prototype is the seed. It already proves
+the useful path: TypeScript-syntax source can be lowered to Zig source and then
+compiled with `zig build-exe` into a small native executable. From here, the
+project should evolve away from JavaScript engine conformance and toward the
+Lumen language spec.
 
 ## Scope
 
@@ -33,8 +33,8 @@ TypeScript-syntax source language, not in Zig.
 
 The current branch contains:
 
-- `src/tjsc.zig`: prototype compiler/lowerer
-- `src/main.zig`: CLI entrypoint with `ljs compile <file>`
+- `src/lumen_compiler.zig`: prototype compiler/lowerer
+- `src/lumen.zig`: compiler CLI entrypoint with `lumen compile <file.ts>`
 - `specs/001-typescript-to-zig-native`: clean Spec Kit track for the new product
 
 The old ljs/Test262 specs were removed from this branch so the active design does
@@ -50,8 +50,9 @@ zig build run -- compile specs/001-typescript-to-zig-native/examples/valid/hello
 ```
 
 The default build now installs the compiler-first `lumen` executable. The
-immediate implementation goal is to align `src/tjsc.zig` with the new spec:
-type-check the V1 subset, lower to generated Zig, and produce a native binary.
+immediate implementation goal is to align `src/lumen_compiler.zig` with the new
+spec: type-check the V1 subset, lower to generated Zig, and produce a native
+binary.
 
 ## Development
 

@@ -3,7 +3,7 @@ For additional context about technologies to be used, project structure, shell
 commands, and other important information, read the current plan:
 `specs/001-typescript-to-zig-native/plan.md`.
 
-Active stack: Zig 0.16.0, Spec Kit, existing `src/tjsc.zig` prototype.
+Active stack: Zig 0.16.0, Spec Kit, existing `src/lumen_compiler.zig` prototype.
 Active product goal: TypeScript syntax -> generated Zig -> native binary.
 <!-- SPECKIT END -->
 
@@ -25,8 +25,8 @@ language, not Zig internals.
 
 ## Current Compiler Seed
 
-- `src/tjsc.zig` is the existing prototype compiler.
-- `src/main.zig` exposes the current `compile` command.
+- `src/lumen_compiler.zig` is the existing prototype compiler.
+- `src/lumen.zig` exposes the current `compile` command.
 - Keep the compiler isolated from the legacy interpreter/runtime path.
 - Evolve toward `parse -> AST -> type check -> emit Zig -> build native`.
 

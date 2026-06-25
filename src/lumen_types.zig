@@ -1,5 +1,5 @@
 const std = @import("std");
-const ast = @import("tjs_ast.zig");
+const ast = @import("lumen_ast.zig");
 
 pub fn inferExprType(e: *const ast.Expr) ?[]const u8 {
     return switch (e.*) {
