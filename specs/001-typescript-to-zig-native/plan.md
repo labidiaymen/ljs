@@ -52,6 +52,7 @@ src/
 ├── lumen.zig           # compiler CLI, accepts .ts input and builds native binaries
 ├── lumen_compiler.zig  # compiler orchestration, parser/lowering/emission seed
 ├── lumen_ast.zig       # expression AST nodes
+├── lumen_check.zig     # static checker and variable symbol table
 ├── lumen_diag.zig      # compiler error and diagnostic types
 ├── lumen_lexer.zig     # source tokenizer
 └── lumen_types.zig     # V1 type aliases and expression type inference

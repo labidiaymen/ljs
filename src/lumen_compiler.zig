@@ -13,9 +13,9 @@
 //! struct, object literals, field access), and `console.log`.
 const std = @import("std");
 const ast = @import("lumen_ast.zig");
+const check = @import("lumen_check.zig");
 const diag_mod = @import("lumen_diag.zig");
 const lexer = @import("lumen_lexer.zig");
-const types = @import("lumen_types.zig");
 
 pub const CompileError = diag_mod.CompileError;
 pub const Diag = diag_mod.Diag;
@@ -23,7 +23,11 @@ pub const Diag = diag_mod.Diag;
 const Expr = ast.Expr;
 const FieldInit = ast.FieldInit;
 const Lexer = lexer.Lexer;
+const Program = ast.Program;
+const Stmt = ast.Stmt;
 const Tok = lexer.Tok;
+
+const SourceLoc = struct { line: u32, col: u32 };
 
 /// Builtins that lower to a Zig std wrapper (need __io/__alloc threaded in).
 fn isBuiltin(name: []const u8) bool {
@@ -115,26 +119,7 @@ const Parser = struct {
     cur: Tok,
     cur_line: u32 = 1, // source line of `cur`
     cur_col: u32 = 1, // source column of `cur`
-    vars: std.StringHashMapUnmanaged([]const u8) = .empty, // declared variable names and normalized types
     last_err: []const u8 = "syntax error", // message for the next diagnostic
-    uses_io: bool = false, // any io builtin used → emit the std.process.Init main (io + allocator)
-    needs_httpget: bool = false, // emit the __httpGet wrapper
-    needs_serve: bool = false, // emit the __serve wrapper
-
-    fn declare(self: *Parser, name: []const u8, zty: []const u8) CompileError!void {
-        self.vars.put(self.arena, name, zty) catch return error.OutOfMemory;
-    }
-    fn undefined_(self: *Parser, name: []const u8) CompileError {
-        self.last_err = std.fmt.allocPrint(self.arena, "undefined variable '{s}'", .{name}) catch "undefined variable";
-        return error.ParseError;
-    }
-    fn exprType(self: *Parser, e: *const Expr) ?[]const u8 {
-        return switch (e.*) {
-            .var_ref => |name| self.vars.get(name),
-            .neg => |inner| self.exprType(inner),
-            else => types.inferExprType(e),
-        };
-    }
 
     fn init(arena: std.mem.Allocator, src: []const u8) CompileError!Parser {
         var lex = Lexer{ .src = src };
@@ -235,12 +220,8 @@ const Parser = struct {
                     if (self.isOp(',')) try self.advance() else break;
                 }
                 try self.expectOp(')');
-                self.uses_io = true;
-                if (std.mem.eql(u8, name, "httpGet")) self.needs_httpget = true;
-                if (std.mem.eql(u8, name, "serve")) self.needs_serve = true;
                 return self.node(.{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.arena) } });
             }
-            if (!self.vars.contains(name)) return self.undefined_(name);
             try self.advance();
             return self.node(.{ .var_ref = name });
         }
@@ -266,6 +247,102 @@ const Parser = struct {
             return self.node(.{ .obj = try fields.toOwnedSlice(self.arena) });
         }
         return error.ParseError;
+    }
+
+    fn parseTypeDecl(self: *Parser, line: u32, col: u32) CompileError!Stmt {
+        try self.advance();
+        if (self.cur != .ident) return error.ParseError;
+        const tname = self.cur.ident;
+        try self.advance();
+        try self.expectOp('=');
+        try self.expectOp('{');
+        var fields: std.ArrayListUnmanaged(ast.TypeField) = .empty;
+        while (!self.isOp('}')) {
+            if (self.cur != .ident) return error.ParseError;
+            const fname = self.cur.ident;
+            try self.advance();
+            try self.expectOp(':');
+            if (self.cur != .ident) return error.ParseError;
+            const fty = self.cur.ident;
+            try self.advance();
+            try fields.append(self.arena, .{ .name = fname, .zty = fty });
+            if (self.isOp(',')) try self.advance() else break;
+        }
+        try self.expectOp('}');
+        if (self.isOp(';')) try self.advance();
+        return .{ .type_decl = .{ .name = tname, .fields = try fields.toOwnedSlice(self.arena), .line = line, .col = col } };
+    }
+
+    fn parseStmt(self: *Parser) CompileError!Stmt {
+        const eq = std.mem.eql;
+        if (self.cur != .ident) return error.ParseError;
+        const kw = self.cur.ident;
+        const line = self.cur_line;
+        const col = self.cur_col;
+
+        if (eq(u8, kw, "type")) return self.parseTypeDecl(line, col);
+
+        if (eq(u8, kw, "let") or eq(u8, kw, "const") or eq(u8, kw, "var")) {
+            const mutable = eq(u8, kw, "var");
+            try self.advance();
+            if (self.cur != .ident) return error.ParseError;
+            const name = self.cur.ident;
+            try self.advance();
+            var annotation: ?[]const u8 = null;
+            if (self.isOp(':')) {
+                try self.advance();
+                if (self.cur != .ident) return error.ParseError;
+                annotation = self.cur.ident;
+                try self.advance();
+            }
+            try self.expectOp('=');
+            const initial_value = try self.parseExpr();
+            try self.expectOp(';');
+            return .{ .var_decl = .{ .mutable = mutable, .name = name, .annotation = annotation, .init = initial_value, .line = line, .col = col } };
+        }
+
+        if (eq(u8, kw, "console")) {
+            try self.advance();
+            try self.expectOp('.');
+            if (!self.isKw("log")) return error.ParseError;
+            try self.advance();
+            try self.expectOp('(');
+            const value = try self.parseExpr();
+            try self.expectOp(')');
+            try self.expectOp(';');
+            return .{ .console_log = .{ .value = value, .line = line, .col = col } };
+        }
+
+        if (eq(u8, kw, "while")) {
+            try self.advance();
+            try self.expectOp('(');
+            const cond = try self.parseExpr();
+            try self.expectOp(')');
+            try self.expectOp('{');
+            var body: std.ArrayListUnmanaged(Stmt) = .empty;
+            while (!self.isOp('}')) try body.append(self.arena, try self.parseStmt());
+            try self.expectOp('}');
+            return .{ .while_stmt = .{ .cond = cond, .body = try body.toOwnedSlice(self.arena), .line = line, .col = col } };
+        }
+
+        if (isBuiltin(kw)) {
+            const value = try self.parseExpr();
+            try self.expectOp(';');
+            return .{ .expr_stmt = .{ .value = value, .line = line, .col = col } };
+        }
+
+        const name = kw;
+        try self.advance();
+        try self.expectOp('=');
+        const value = try self.parseExpr();
+        try self.expectOp(';');
+        return .{ .assign = .{ .name = name, .value = value, .line = line, .col = col } };
+    }
+
+    fn parseProgram(self: *Parser) CompileError!Program {
+        var stmts: std.ArrayListUnmanaged(Stmt) = .empty;
+        while (self.cur != .eof) try stmts.append(self.arena, try self.parseStmt());
+        return .{ .stmts = try stmts.toOwnedSlice(self.arena) };
     }
 };
 
@@ -340,128 +417,57 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
     }
 }
 
-/// Emit one executable statement (recurses for `while` bodies).
-fn emitStmt(p: *Parser, out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
-    const eq = std.mem.eql;
-    if (p.cur != .ident) return error.ParseError;
-    const kw = p.cur.ident;
-    const stmt_line = p.cur_line;
-    const stmt_col = p.cur_col;
-    // Track the source line+col so a runtime panic can report the .ts location (Zig has no #line).
-    try out.print(arena, "    __lumen_line = {d}; __lumen_col = {d};\n", .{ p.cur_line, p.cur_col });
+fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
+    const line_col: SourceLoc = switch (stmt.*) {
+        .type_decl => |decl| .{ .line = decl.line, .col = decl.col },
+        .var_decl => |decl| .{ .line = decl.line, .col = decl.col },
+        .assign => |assignment| .{ .line = assignment.line, .col = assignment.col },
+        .console_log => |log| .{ .line = log.line, .col = log.col },
+        .while_stmt => |loop| .{ .line = loop.line, .col = loop.col },
+        .expr_stmt => |expr_stmt| .{ .line = expr_stmt.line, .col = expr_stmt.col },
+    };
+    try body.print(arena, "    __lumen_line = {d}; __lumen_col = {d};\n", .{ line_col.line, line_col.col });
 
-    if (eq(u8, kw, "let") or eq(u8, kw, "const") or eq(u8, kw, "var")) {
-        const mutable = eq(u8, kw, "var");
-        try p.advance();
-        if (p.cur != .ident) return error.ParseError;
-        const name = p.cur.ident;
-        try p.advance();
-        var zty: ?[]const u8 = null;
-        if (p.isOp(':')) {
-            try p.advance();
-            if (p.cur != .ident) return error.ParseError;
-            zty = types.mapType(p.cur.ident) orelse p.cur.ident;
-            try p.advance();
-        }
-        try p.expectOp('=');
-        const e = try p.parseExpr();
-        try p.expectOp(';');
-        const final_zty = zty orelse p.exprType(e) orelse {
-            p.last_err = "cannot infer variable type";
-            return error.ParseError;
-        };
-        try p.declare(name, final_zty); // in scope after its initializer (so `let x = x` is undefined)
-        try out.print(arena, "    {s} {s}: {s} = ", .{ if (mutable) "var" else "const", name, final_zty });
-        try emitExpr(e, out, arena);
-        try out.appendSlice(arena, ";\n");
-    } else if (eq(u8, kw, "console")) {
-        try p.advance();
-        try p.expectOp('.');
-        if (!p.isKw("log")) return error.ParseError;
-        try p.advance();
-        try p.expectOp('(');
-        const e = try p.parseExpr();
-        try p.expectOp(')');
-        try p.expectOp(';');
-        try out.appendSlice(arena, "    std.debug.print(\"{d}\\n\", .{");
-        try emitExpr(e, out, arena);
-        try out.appendSlice(arena, "});\n");
-    } else if (eq(u8, kw, "while")) {
-        try p.advance();
-        try p.expectOp('(');
-        const cond = try p.parseExpr();
-        try p.expectOp(')');
-        try p.expectOp('{');
-        try out.appendSlice(arena, "    while (");
-        try emitExpr(cond, out, arena);
-        try out.appendSlice(arena, ") {\n");
-        while (!p.isOp('}')) try emitStmt(p, out, arena);
-        try p.expectOp('}');
-        try out.appendSlice(arena, "    }\n");
-    } else if (isBuiltin(kw)) {
-        // expression statement: a builtin call, e.g. serve(8080, "hi");
-        const e = try p.parseExpr();
-        try p.expectOp(';');
-        // `serve` is noreturn; other builtins return a value that must be discarded.
-        try out.appendSlice(arena, if (std.mem.eql(u8, kw, "serve")) "    " else "    _ = ");
-        try emitExpr(e, out, arena);
-        try out.appendSlice(arena, ";\n");
-    } else {
-        // assignment: <name> = <expr> ;
-        const name = kw;
-        const expected_zty = p.vars.get(name) orelse return p.undefined_(name);
-        try p.advance();
-        try p.expectOp('=');
-        const e = try p.parseExpr();
-        try p.expectOp(';');
-        const actual_zty = p.exprType(e) orelse {
-            p.last_err = "cannot infer assignment type";
-            p.cur_line = stmt_line;
-            p.cur_col = stmt_col;
-            return error.ParseError;
-        };
-        if (!types.sameType(expected_zty, actual_zty)) {
-            p.last_err = "E_TYPE_MISMATCH";
-            p.cur_line = stmt_line;
-            p.cur_col = stmt_col;
-            return error.ParseError;
-        }
-        try out.print(arena, "    {s} = ", .{name});
-        try emitExpr(e, out, arena);
-        try out.appendSlice(arena, ";\n");
+    switch (stmt.*) {
+        .type_decl => |decl| {
+            try decls.print(arena, "const {s} = struct {{\n", .{decl.name});
+            for (decl.fields) |field| try decls.print(arena, "    {s}: {s},\n", .{ field.name, field.zty });
+            try decls.appendSlice(arena, "};\n");
+        },
+        .var_decl => |decl| {
+            const final_zty = decl.checked_type orelse return error.ParseError;
+            try body.print(arena, "    {s} {s}: {s} = ", .{ if (decl.mutable) "var" else "const", decl.name, final_zty });
+            try emitExpr(decl.init, body, arena);
+            try body.appendSlice(arena, ";\n");
+        },
+        .assign => |assignment| {
+            try body.print(arena, "    {s} = ", .{assignment.name});
+            try emitExpr(assignment.value, body, arena);
+            try body.appendSlice(arena, ";\n");
+        },
+        .console_log => |log| {
+            try body.appendSlice(arena, "    std.debug.print(\"{d}\\n\", .{");
+            try emitExpr(log.value, body, arena);
+            try body.appendSlice(arena, "});\n");
+        },
+        .while_stmt => |loop| {
+            try body.appendSlice(arena, "    while (");
+            try emitExpr(loop.cond, body, arena);
+            try body.appendSlice(arena, ") {\n");
+            for (loop.body) |*body_stmt| try emitStmt(body_stmt, decls, body, arena);
+            try body.appendSlice(arena, "    }\n");
+        },
+        .expr_stmt => |expr_stmt| {
+            const is_serve = expr_stmt.value.* == .call and std.mem.eql(u8, expr_stmt.value.call.name, "serve");
+            try body.appendSlice(arena, if (is_serve) "    " else "    _ = ");
+            try emitExpr(expr_stmt.value, body, arena);
+            try body.appendSlice(arena, ";\n");
+        },
     }
 }
 
-/// Parse every top-level construct, emitting struct defs into `decls` and statements into `body`.
-fn lower(p: *Parser, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
-    while (p.cur != .eof) {
-        if (p.isKw("type")) {
-            // type <Name> = { field: type, ... } ;   →   const Name = struct { field: ztype, ... };
-            try p.advance();
-            if (p.cur != .ident) return error.ParseError;
-            const tname = p.cur.ident;
-            try p.advance();
-            try p.expectOp('=');
-            try p.expectOp('{');
-            try decls.print(arena, "const {s} = struct {{\n", .{tname});
-            while (!p.isOp('}')) {
-                if (p.cur != .ident) return error.ParseError;
-                const fname = p.cur.ident;
-                try p.advance();
-                try p.expectOp(':');
-                if (p.cur != .ident) return error.ParseError;
-                const fty = types.mapType(p.cur.ident) orelse p.cur.ident;
-                try p.advance();
-                try decls.print(arena, "    {s}: {s},\n", .{ fname, fty });
-                if (p.isOp(',')) try p.advance() else break;
-            }
-            try p.expectOp('}');
-            if (p.isOp(';')) try p.advance();
-            try decls.appendSlice(arena, "};\n");
-        } else {
-            try emitStmt(p, body, arena);
-        }
-    }
+fn emitProgram(program: *const Program, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
+    for (program.stmts) |*stmt| try emitStmt(stmt, decls, body, arena);
 }
 
 /// Compile TypeScript-syntax `source` (from `filename`) to Zig source text. On a compile-time error,
@@ -471,13 +477,17 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []co
     try rejectUnsupportedDynamic(source, diag);
 
     var p = try Parser.init(arena, source);
-    var decls: std.ArrayListUnmanaged(u8) = .empty; // top-level struct type definitions
-    var body: std.ArrayListUnmanaged(u8) = .empty;
-
-    lower(&p, &decls, &body, arena) catch |e| {
+    var program = p.parseProgram() catch |e| {
         diag.* = .{ .line = p.cur_line, .col = p.cur_col, .msg = p.last_err };
         return e;
     };
+
+    try check.checkProgram(arena, &program, diag);
+
+    var decls: std.ArrayListUnmanaged(u8) = .empty; // top-level struct type definitions
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+
+    try emitProgram(&program, &decls, &body, arena);
 
     // Sanitize the filename for a Zig string literal (backslashes/quotes break it).
     const safe_name = try arena.dupe(u8, filename);
@@ -522,7 +532,7 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []co
     );
     try out.appendSlice(arena, decls.items);
 
-    if (p.needs_httpget) {
+    if (program.needs_httpget) {
         // A real std.http one-shot GET, wrapped to a Lumen-friendly `i64` (status code, or -1 on error).
         try out.appendSlice(arena,
             \\fn __httpGet(io: std.Io, alloc: std.mem.Allocator, url: []const u8) i64 {
@@ -535,7 +545,7 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []co
             \\
         );
     }
-    if (p.needs_serve) {
+    if (program.needs_serve) {
         // A real (blocking) HTTP server on std.Io.net — returns the same body to every request.
         try out.appendSlice(arena,
             \\fn __serve(io: std.Io, alloc: std.mem.Allocator, port: i64, body: []const u8) noreturn {
@@ -557,7 +567,7 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []co
             \\
         );
     }
-    if (p.uses_io) {
+    if (program.uses_io) {
         try out.appendSlice(arena, "pub fn main(__init: std.process.Init) !void {\n");
         try out.appendSlice(arena, "    const __io = __init.io;\n    const __alloc = __init.arena.allocator();\n");
     } else {

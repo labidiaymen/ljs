@@ -27,13 +27,14 @@
   track naming to Lumen naming.
 - [x] T027 Document why Lumen uses compiler-specific scanner/IR modules instead
   of the legacy JavaScript lexer/AST as its semantic contract.
-- [ ] T009 Introduce a statement/expression AST separate from immediate Zig
+- [x] T009 Introduce a statement/expression AST separate from immediate Zig
   emission.
 - [ ] T010 Introduce a type representation for `int`, `i32`, `number`, `float`,
   `boolean`, `string`, and `void`.
 - [ ] T011 Add symbol table support for variables and functions.
-- [ ] T012 Add static checker pass before Zig emission.
-- [ ] T013 Keep generated Zig emission as a distinct phase.
+- [x] T028 Add checker-owned variable symbol table support.
+- [x] T012 Add static checker pass before Zig emission.
+- [x] T013 Keep generated Zig emission as a distinct phase.
 
 ## Phase 4: V1 Semantics
 
