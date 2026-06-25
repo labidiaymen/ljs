@@ -49,8 +49,12 @@ JavaScript runtime compatibility.
 
 ```text
 src/
-├── main.zig      # CLI, currently exposes compile command
-└── tjsc.zig      # current compiler prototype, to evolve toward AST/checker/codegen
+├── lumen.zig      # compiler CLI, accepts .ts input and builds native binaries
+├── tjsc.zig       # compiler orchestration, parser/lowering/emission seed
+├── tjs_ast.zig    # expression AST nodes
+├── tjs_diag.zig   # compiler error and diagnostic types
+├── tjs_lexer.zig  # source tokenizer
+└── tjs_types.zig  # V1 type aliases and expression type inference
 
 specs/001-typescript-to-zig-native/
 ├── spec.md
@@ -65,7 +69,8 @@ specs/001-typescript-to-zig-native/
 
 **Structure Decision**: Keep compiler code isolated in its own module path. Do
 not route new compiler semantics through the old interpreter/parser conformance
-path.
+path. Keep compiler files small and split by responsibility as the prototype
+grows; do not let `src/tjsc.zig` become a monolith again.
 
 ## Milestone Strategy
 

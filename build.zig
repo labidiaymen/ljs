@@ -32,6 +32,10 @@ pub fn build(b: *std.Build) void {
     const fmt_targets = [_][]const u8{
         "build.zig",
         "src/lumen.zig",
+        "src/tjs_ast.zig",
+        "src/tjs_diag.zig",
+        "src/tjs_lexer.zig",
+        "src/tjs_types.zig",
         "src/tjsc.zig",
     };
 

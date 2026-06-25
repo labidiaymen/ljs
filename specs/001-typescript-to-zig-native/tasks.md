@@ -21,6 +21,8 @@
 
 ## Phase 3: Compiler Pipeline
 
+- [x] T025 Split diagnostic, AST, type-helper, and lexer code out of
+  `src/tjsc.zig` into focused compiler modules.
 - [ ] T009 Introduce a statement/expression AST separate from immediate Zig
   emission.
 - [ ] T010 Introduce a type representation for `int`, `i32`, `number`, `float`,
