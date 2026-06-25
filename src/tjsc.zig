@@ -7,8 +7,8 @@
 //! and lowering first; optimization, native codegen, and cross-compilation come
 //! from Zig/LLVM.
 //!
-//! Current seed: typed `const`/`let`(immutable) and `var`(mutable) declarations
-//! (`int`/`i64`, `number`/`f64`, `bool`), arithmetic (`+ - * / %`, precedence + parens + unary `-`),
+//! Current seed: inferred and typed `const`/`let`(immutable) and `var`(mutable) declarations
+//! (`int`/`i32`/`i64`, `number`/`f64`, `bool`), arithmetic (`+ - * / %`, precedence + parens + unary `-`),
 //! comparisons (`< > <= >= == !=`), `while` loops + assignment, typed objects (`type T = {…}` →
 //! struct, object literals, field access), and `console.log`.
 const std = @import("std");
@@ -32,6 +32,17 @@ const Expr = union(enum) {
     field: struct { obj: *Expr, name: []const u8 },
     call: struct { name: []const u8, args: []*Expr }, // builtin call, e.g. httpGet(url) / serve(port, body)
 };
+
+fn inferExprType(e: *const Expr) ?[]const u8 {
+    return switch (e.*) {
+        .num => "i32",
+        .str => "[]const u8",
+        .neg => |inner| inferExprType(inner),
+        .bin => "i32",
+        .cmp => "bool",
+        .var_ref, .obj, .field, .call => null,
+    };
+}
 
 /// Builtins that lower to a Zig std wrapper (need __io/__alloc threaded in).
 fn isBuiltin(name: []const u8) bool {
@@ -424,15 +435,22 @@ fn emitStmt(p: *Parser, out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocat
         if (p.cur != .ident) return error.ParseError;
         const name = p.cur.ident;
         try p.advance();
-        try p.expectOp(':');
-        if (p.cur != .ident) return error.ParseError;
-        const zty = mapType(p.cur.ident) orelse p.cur.ident;
-        try p.advance();
+        var zty: ?[]const u8 = null;
+        if (p.isOp(':')) {
+            try p.advance();
+            if (p.cur != .ident) return error.ParseError;
+            zty = mapType(p.cur.ident) orelse p.cur.ident;
+            try p.advance();
+        }
         try p.expectOp('=');
         const e = try p.parseExpr();
         try p.expectOp(';');
+        const final_zty = zty orelse inferExprType(e) orelse {
+            p.last_err = "cannot infer variable type";
+            return error.ParseError;
+        };
         try p.declare(name); // in scope after its initializer (so `let x = x` is undefined)
-        try out.print(arena, "    {s} {s}: {s} = ", .{ if (mutable) "var" else "const", name, zty });
+        try out.print(arena, "    {s} {s}: {s} = ", .{ if (mutable) "var" else "const", name, final_zty });
         try emitExpr(e, out, arena);
         try out.appendSlice(arena, ";\n");
     } else if (eq(u8, kw, "console")) {

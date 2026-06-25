@@ -31,8 +31,8 @@
 
 ## Phase 4: V1 Semantics
 
-- [ ] T014 Accept `let a = 4` with inferred `int`.
-- [ ] T015 Accept explicit `int` and `i32` annotations.
+- [x] T014 Accept `let a = 4` with inferred `int`.
+- [x] T015 Accept explicit `int` and `i32` annotations.
 - [ ] T016 Reject incompatible reassignment with `E_TYPE_MISMATCH`.
 - [x] T017 Reject `eval` with `E_UNSUPPORTED_EVAL`.
 - [x] T018 Reject prototype access/mutation with `E_UNSUPPORTED_PROTOTYPE`.
