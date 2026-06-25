@@ -55,7 +55,7 @@ src/
 ├── lumen_check.zig     # static checker and variable symbol table
 ├── lumen_diag.zig      # compiler error and diagnostic types
 ├── lumen_lexer.zig     # source tokenizer
-└── lumen_types.zig     # V1 type aliases and expression type inference
+└── lumen_types.zig     # V1 type representation, aliases, and Zig emission names
 
 specs/001-typescript-to-zig-native/
 ├── spec.md

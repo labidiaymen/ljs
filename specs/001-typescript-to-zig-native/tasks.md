@@ -29,7 +29,7 @@
   of the legacy JavaScript lexer/AST as its semantic contract.
 - [x] T009 Introduce a statement/expression AST separate from immediate Zig
   emission.
-- [ ] T010 Introduce a type representation for `int`, `i32`, `number`, `float`,
+- [x] T010 Introduce a type representation for `int`, `i32`, `number`, `float`,
   `boolean`, `string`, and `void`.
 - [ ] T011 Add symbol table support for variables and functions.
 - [x] T028 Add checker-owned variable symbol table support.

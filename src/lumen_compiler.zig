@@ -16,6 +16,7 @@ const ast = @import("lumen_ast.zig");
 const check = @import("lumen_check.zig");
 const diag_mod = @import("lumen_diag.zig");
 const lexer = @import("lumen_lexer.zig");
+const types = @import("lumen_types.zig");
 
 pub const CompileError = diag_mod.CompileError;
 pub const Diag = diag_mod.Diag;
@@ -263,9 +264,9 @@ const Parser = struct {
             try self.advance();
             try self.expectOp(':');
             if (self.cur != .ident) return error.ParseError;
-            const fty = self.cur.ident;
+            const annotation = self.cur.ident;
             try self.advance();
-            try fields.append(self.arena, .{ .name = fname, .zty = fty });
+            try fields.append(self.arena, .{ .name = fname, .annotation = annotation });
             if (self.isOp(',')) try self.advance() else break;
         }
         try self.expectOp('}');
@@ -431,12 +432,15 @@ fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.Ar
     switch (stmt.*) {
         .type_decl => |decl| {
             try decls.print(arena, "const {s} = struct {{\n", .{decl.name});
-            for (decl.fields) |field| try decls.print(arena, "    {s}: {s},\n", .{ field.name, field.zty });
+            for (decl.fields) |field| {
+                const field_type = field.checked_type orelse return error.ParseError;
+                try decls.print(arena, "    {s}: {s},\n", .{ field.name, types.zigName(field_type) });
+            }
             try decls.appendSlice(arena, "};\n");
         },
         .var_decl => |decl| {
             const final_zty = decl.checked_type orelse return error.ParseError;
-            try body.print(arena, "    {s} {s}: {s} = ", .{ if (decl.mutable) "var" else "const", decl.name, final_zty });
+            try body.print(arena, "    {s} {s}: {s} = ", .{ if (decl.mutable) "var" else "const", decl.name, types.zigName(final_zty) });
             try emitExpr(decl.init, body, arena);
             try body.appendSlice(arena, ";\n");
         },

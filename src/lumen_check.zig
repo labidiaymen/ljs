@@ -8,7 +8,7 @@ const Diag = diag_mod.Diag;
 
 const Checker = struct {
     arena: std.mem.Allocator,
-    vars: std.StringHashMapUnmanaged([]const u8) = .empty,
+    vars: std.StringHashMapUnmanaged(types.Type) = .empty,
     last_line: u32 = 1,
     last_col: u32 = 1,
     last_err: []const u8 = "syntax error",
@@ -27,8 +27,8 @@ const Checker = struct {
         return error.ParseError;
     }
 
-    fn declare(self: *Checker, name: []const u8, zty: []const u8) CompileError!void {
-        self.vars.put(self.arena, name, zty) catch return error.OutOfMemory;
+    fn declare(self: *Checker, name: []const u8, t: types.Type) CompileError!void {
+        self.vars.put(self.arena, name, t) catch return error.OutOfMemory;
     }
 
     fn checkProgram(self: *Checker, program: *ast.Program) CompileError!void {
@@ -39,25 +39,25 @@ const Checker = struct {
         switch (stmt.*) {
             .type_decl => |*decl| {
                 for (decl.fields) |*field| {
-                    field.zty = types.mapType(field.zty) orelse field.zty;
+                    field.checked_type = types.fromAnnotation(field.annotation);
                 }
             },
             .var_decl => |*decl| {
-                const final_zty = if (decl.annotation) |ann|
-                    types.mapType(ann) orelse ann
+                const final_type = if (decl.annotation) |ann|
+                    types.fromAnnotation(ann)
                 else
                     self.exprType(program, decl.init, decl.line, decl.col) orelse
                         return self.fail(decl.line, decl.col, "cannot infer variable type");
 
-                decl.checked_type = final_zty;
-                try self.declare(decl.name, final_zty);
+                decl.checked_type = final_type;
+                try self.declare(decl.name, final_type);
             },
             .assign => |assignment| {
-                const expected_zty = self.vars.get(assignment.name) orelse
+                const expected_type = self.vars.get(assignment.name) orelse
                     return self.undefined_(assignment.name, assignment.line, assignment.col);
-                const actual_zty = self.exprType(program, assignment.value, assignment.line, assignment.col) orelse
+                const actual_type = self.exprType(program, assignment.value, assignment.line, assignment.col) orelse
                     return self.fail(assignment.line, assignment.col, "cannot infer assignment type");
-                if (!types.sameType(expected_zty, actual_zty)) {
+                if (!types.same(expected_type, actual_type)) {
                     return self.fail(assignment.line, assignment.col, "E_TYPE_MISMATCH");
                 }
             },
@@ -77,7 +77,7 @@ const Checker = struct {
         }
     }
 
-    fn exprType(self: *Checker, program: *ast.Program, e: *const ast.Expr, line: u32, col: u32) ?[]const u8 {
+    fn exprType(self: *Checker, program: *ast.Program, e: *const ast.Expr, line: u32, col: u32) ?types.Type {
         return switch (e.*) {
             .var_ref => |name| self.vars.get(name) orelse {
                 _ = self.undefined_(name, line, col) catch {};
@@ -87,12 +87,12 @@ const Checker = struct {
             .bin => |bin| {
                 _ = self.exprType(program, bin.l, line, col) orelse return null;
                 _ = self.exprType(program, bin.r, line, col) orelse return null;
-                return "i32";
+                return .i32;
             },
             .cmp => |cmp| {
                 _ = self.exprType(program, cmp.l, line, col) orelse return null;
                 _ = self.exprType(program, cmp.r, line, col) orelse return null;
-                return "bool";
+                return .bool;
             },
             .field => |field| self.exprType(program, field.obj, line, col),
             .obj => null,
@@ -101,13 +101,13 @@ const Checker = struct {
                     program.uses_io = true;
                     program.needs_httpget = true;
                     for (call.args) |arg| _ = self.exprType(program, arg, line, col) orelse return null;
-                    return "i64";
+                    return .i64;
                 }
                 if (std.mem.eql(u8, call.name, "serve")) {
                     program.uses_io = true;
                     program.needs_serve = true;
                     for (call.args) |arg| _ = self.exprType(program, arg, line, col) orelse return null;
-                    return "void";
+                    return .void;
                 }
                 return null;
             },

@@ -1,6 +1,8 @@
+const types = @import("lumen_types.zig");
+
 pub const FieldInit = struct { name: []const u8, value: *Expr };
 
-pub const TypeField = struct { name: []const u8, zty: []const u8 };
+pub const TypeField = struct { name: []const u8, annotation: []const u8, checked_type: ?types.Type = null };
 
 pub const TypeDecl = struct {
     name: []const u8,
@@ -13,7 +15,7 @@ pub const VarDecl = struct {
     mutable: bool,
     name: []const u8,
     annotation: ?[]const u8,
-    checked_type: ?[]const u8 = null,
+    checked_type: ?types.Type = null,
     init: *Expr,
     line: u32,
     col: u32,
