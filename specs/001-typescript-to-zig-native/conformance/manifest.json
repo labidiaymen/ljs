@@ -24,6 +24,14 @@
       }
     },
     {
+      "id": "native.valid.named-type",
+      "source": "../examples/valid/named-type.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "7"
+      }
+    },
+    {
       "id": "native.invalid.eval",
       "source": "../examples/invalid/eval.ts",
       "phase": "diagnostics",
@@ -50,6 +58,14 @@
     {
       "id": "native.invalid.type-mismatch",
       "source": "../examples/invalid/type-mismatch.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.named-type-field-mismatch",
+      "source": "../examples/invalid/named-type-field-mismatch.ts",
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_TYPE_MISMATCH"

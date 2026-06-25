@@ -69,6 +69,9 @@ being precise enough for native output.
 2. **Given** `let x: i32 = 4`, **When** checked, **Then** the type is accepted.
 3. **Given** assignment of a string to an integer variable, **When** checked,
    **Then** `E_TYPE_MISMATCH` is reported.
+4. **Given** `type User = { id: int }` and `let user: User = { id: 7 }`,
+   **When** checked, **Then** the object literal is accepted as `User` and
+   `user.id` is typed as `int`.
 
 ### Edge Cases
 
@@ -104,6 +107,9 @@ being precise enough for native output.
   requirement.
 - **FR-013**: Remote packages, package managers, and raw URL/GitHub imports MUST
   be excluded from this V1 compiler slice.
+- **FR-014**: Named object type declarations MUST define closed static shapes.
+  Object literals assigned to those names MUST provide exactly the declared
+  fields with compatible field types.
 
 ### Diagnostics
 
@@ -134,6 +140,8 @@ the Lumen compiler track.
 - **Native binary**: The executable produced by the host Zig compiler.
 - **Static checker**: Compiler phase that assigns and validates fixed source
   types before code generation.
+- **Named object type**: A TypeScript-style `type` declaration whose object
+  fields define a closed native shape for checking and code generation.
 
 ## Success Criteria *(mandatory)*
 
