@@ -1,3 +1,0 @@
-// tjs calling Zig's std.http — compiled to a native binary
-let status: int = httpGet("http://example.com");
-console.log(status);

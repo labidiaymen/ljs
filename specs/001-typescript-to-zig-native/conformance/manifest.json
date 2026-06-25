@@ -1,0 +1,51 @@
+{
+  "feature": "001-typescript-to-zig-native",
+  "cases": [
+    {
+      "id": "native.valid.hello",
+      "source": "../examples/valid/hello.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "7"
+      }
+    },
+    {
+      "id": "native.valid.types",
+      "source": "../examples/valid/types.ts",
+      "phase": "static",
+      "expect": {
+        "inferredTypes": {
+          "a": "int"
+        },
+        "acceptedTypes": [
+          "int",
+          "i32"
+        ]
+      }
+    },
+    {
+      "id": "native.invalid.eval",
+      "source": "../examples/invalid/eval.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_UNSUPPORTED_EVAL"
+      }
+    },
+    {
+      "id": "native.invalid.prototype",
+      "source": "../examples/invalid/prototype.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_UNSUPPORTED_PROTOTYPE"
+      }
+    },
+    {
+      "id": "native.invalid.commonjs",
+      "source": "../examples/invalid/commonjs.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_UNSUPPORTED_COMMONJS"
+      }
+    }
+  ]
+}

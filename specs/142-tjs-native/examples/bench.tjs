@@ -1,7 +1,0 @@
-var acc: int = 0;
-var i: int = 0;
-while (i < 300000000) {
-  acc = (acc + i * 7) % 1000000;
-  i = i + 1;
-}
-console.log(acc);

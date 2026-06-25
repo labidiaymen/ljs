@@ -1,11 +1,13 @@
-//! tjsc — a Typed-JS → Zig → native compiler (proof of concept).
+//! TypeScript-syntax -> Zig -> native compiler seed.
 //!
-//! NOT part of the ECMAScript engine or the Test262 path. A SEPARATE, self-contained front-end that
-//! takes a small statically-typed JS-like language and lowers it to **Zig source**, which `zig
-//! build-exe` then turns into a native binary. Using Zig (LLVM) as the codegen backend means we only
-//! write the front-end + lowering; optimization, native codegen and cross-compilation come free.
+//! NOT part of the ECMAScript engine or the Test262 path. A SEPARATE,
+//! self-contained front-end that takes a small statically-typed TypeScript
+//! syntax subset and lowers it to Zig source, which `zig build-exe` then turns
+//! into a native binary. Using Zig as the backend means we write the front-end
+//! and lowering first; optimization, native codegen, and cross-compilation come
+//! from Zig/LLVM.
 //!
-//! Supported (spec 142): typed `const`/`let`(immutable) and `var`(mutable) declarations
+//! Current seed: typed `const`/`let`(immutable) and `var`(mutable) declarations
 //! (`int`/`i64`, `number`/`f64`, `bool`), arithmetic (`+ - * / %`, precedence + parens + unary `-`),
 //! comparisons (`< > <= >= == !=`), `while` loops + assignment, typed objects (`type T = {…}` →
 //! struct, object literals, field access), and `console.log`.
@@ -13,7 +15,7 @@ const std = @import("std");
 
 pub const CompileError = error{ ParseError, OutOfMemory };
 
-/// A compile-time diagnostic, located in the .tjs source.
+/// A compile-time diagnostic, located in the .ts source.
 pub const Diag = struct { line: u32 = 0, col: u32 = 0, msg: []const u8 = "syntax error" };
 
 // ── AST ──────────────────────────────────────────────────────────────────────
@@ -36,11 +38,12 @@ fn isBuiltin(name: []const u8) bool {
     return std.mem.eql(u8, name, "httpGet") or std.mem.eql(u8, name, "serve");
 }
 
-/// Map a typed-JS type name to its Zig type. Accepts TS-ish aliases; unknown names pass through (a
+/// Map a source type name to its Zig type. Accepts TS-ish aliases; unknown names pass through (a
 /// struct type declared with `type`).
 fn mapType(name: []const u8) ?[]const u8 {
     const eq = std.mem.eql;
-    if (eq(u8, name, "int") or eq(u8, name, "i64")) return "i64";
+    if (eq(u8, name, "int") or eq(u8, name, "i32")) return "i32";
+    if (eq(u8, name, "i64")) return "i64";
     if (eq(u8, name, "number") or eq(u8, name, "float") or eq(u8, name, "f64")) return "f64";
     if (eq(u8, name, "bool") or eq(u8, name, "boolean")) return "bool";
     if (eq(u8, name, "string")) return "[]const u8";
@@ -147,6 +150,40 @@ const Lexer = struct {
         return error.ParseError;
     }
 };
+
+fn setDiag(diag: *Diag, line: u32, col: u32, msg: []const u8) CompileError {
+    diag.* = .{ .line = line, .col = col, .msg = msg };
+    return error.ParseError;
+}
+
+fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
+    const eq = std.mem.eql;
+    var lex = Lexer{ .src = source };
+    var prev_was_dot = false;
+
+    while (true) {
+        const tok = lex.next() catch {
+            return setDiag(diag, lex.tok_line, lex.tok_col, "syntax error");
+        };
+        switch (tok) {
+            .eof => return,
+            .ident => |name| {
+                if (eq(u8, name, "eval")) {
+                    return setDiag(diag, lex.tok_line, lex.tok_col, "E_UNSUPPORTED_EVAL");
+                }
+                if (eq(u8, name, "require")) {
+                    return setDiag(diag, lex.tok_line, lex.tok_col, "E_UNSUPPORTED_COMMONJS");
+                }
+                if (prev_was_dot and eq(u8, name, "prototype")) {
+                    return setDiag(diag, lex.tok_line, lex.tok_col, "E_UNSUPPORTED_PROTOTYPE");
+                }
+                prev_was_dot = false;
+            },
+            .op => |ch| prev_was_dot = ch == '.',
+            else => prev_was_dot = false,
+        }
+    }
+}
 
 // ── parser ───────────────────────────────────────────────────────────────────
 const Parser = struct {
@@ -378,7 +415,7 @@ fn emitStmt(p: *Parser, out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocat
     const eq = std.mem.eql;
     if (p.cur != .ident) return error.ParseError;
     const kw = p.cur.ident;
-    // Track the source line+col so a runtime panic can report the .tjs location (Zig has no #line).
+    // Track the source line+col so a runtime panic can report the .ts location (Zig has no #line).
     try out.print(arena, "    __tjs_line = {d}; __tjs_col = {d};\n", .{ p.cur_line, p.cur_col });
 
     if (eq(u8, kw, "let") or eq(u8, kw, "const") or eq(u8, kw, "var")) {
@@ -476,10 +513,12 @@ fn lower(p: *Parser, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnm
     }
 }
 
-/// Compile typed-JS `source` (from `filename`) to Zig source text. On a compile-time error, `diag`
-/// is filled (located in the .tjs source) and `error.ParseError` returned. `filename` is also
-/// embedded so a runtime panic reports the .tjs location.
+/// Compile TypeScript-syntax `source` (from `filename`) to Zig source text. On a compile-time error,
+/// `diag` is filled (located in the .ts source) and `error.ParseError` returned. `filename` is also
+/// embedded so a runtime panic reports the .ts location.
 pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []const u8, diag: *Diag) CompileError![]const u8 {
+    try rejectUnsupportedDynamic(source, diag);
+
     var p = try Parser.init(arena, source);
     var decls: std.ArrayListUnmanaged(u8) = .empty; // top-level struct type definitions
     var body: std.ArrayListUnmanaged(u8) = .empty;
@@ -499,7 +538,7 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []co
     try out.appendSlice(arena, "const std = @import(\"std\");\n");
     try out.print(arena, "const __tjs_file = \"{s}\";\n", .{safe_name});
     try out.appendSlice(arena, "var __tjs_line: u32 = 0;\nvar __tjs_col: u32 = 0;\n");
-    // Embed the .tjs source as a multiline string (no escaping needed) so the handler can show the line.
+    // Embed the .ts source as a multiline string (no escaping needed) so the handler can show the line.
     try out.appendSlice(arena, "const __tjs_src =\n");
     {
         var lines = std.mem.splitScalar(u8, source, '\n');
@@ -509,7 +548,7 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []co
         }
     }
     try out.appendSlice(arena, ";\n");
-    // Custom panic handler → map the native runtime error back to the .tjs source: file:line:col +
+    // Custom panic handler -> map the native runtime error back to the .ts source: file:line:col +
     // the offending source line + a caret.
     try out.appendSlice(arena,
         \\fn __tjsPanic(msg: []const u8, _: ?usize) noreturn {

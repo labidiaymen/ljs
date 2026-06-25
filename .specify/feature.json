@@ -1,1 +1,3 @@
-{"feature_directory":"specs/004-parser-syntax"}
+{
+  "feature_directory": "specs/001-typescript-to-zig-native"
+}
