@@ -25,6 +25,8 @@
   `src/lumen_compiler.zig` into focused compiler modules.
 - [x] T026 Rename compiler modules and generated helper prefixes from the old
   track naming to Lumen naming.
+- [x] T027 Document why Lumen uses compiler-specific scanner/IR modules instead
+  of the legacy JavaScript lexer/AST as its semantic contract.
 - [ ] T009 Introduce a statement/expression AST separate from immediate Zig
   emission.
 - [ ] T010 Introduce a type representation for `int`, `i32`, `number`, `float`,
@@ -41,7 +43,7 @@
 - [x] T017 Reject `eval` with `E_UNSUPPORTED_EVAL`.
 - [x] T018 Reject prototype access/mutation with `E_UNSUPPORTED_PROTOTYPE`.
 - [x] T019 Reject CommonJS `require` with `E_UNSUPPORTED_COMMONJS`.
-- [ ] T020 Reject dynamic property writes with `E_DYNAMIC_PROPERTY_WRITE`.
+- [x] T020 Reject dynamic property writes with `E_DYNAMIC_PROPERTY_WRITE`.
 
 ## Phase 5: Verification
 

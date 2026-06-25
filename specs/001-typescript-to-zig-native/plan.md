@@ -72,6 +72,15 @@ not route new compiler semantics through the old interpreter/parser conformance
 path. Keep compiler files small and split by responsibility as the prototype
 grows; do not let `src/lumen_compiler.zig` become a monolith again.
 
+**Legacy Lexer/AST Decision**: The repository still contains the old JavaScript
+engine infrastructure in `src/lexer.zig`, `src/ast.zig`, and `src/parser.zig`.
+Those modules model ECMAScript tokens, grammar, runtime object behavior,
+prototypes, dynamic property/index assignment, modules, classes, and other
+semantics that Lumen V1 is deliberately removing. The Lumen compiler therefore
+keeps a separate small source scanner and expression representation for now.
+Reusable implementation ideas may be borrowed later, but the old JavaScript AST
+must not become the semantic contract for the Lumen compiler.
+
 ## Milestone Strategy
 
 1. Keep `.ts` as the source-facing extension.

@@ -116,6 +116,16 @@ being precise enough for native output.
 - **E_TYPE_MISMATCH**: Produced when assigned value type is incompatible with
   the declared or inferred variable type.
 
+### Existing JavaScript Infrastructure
+
+This repository already contains a mature JavaScript lexer, parser, and AST for
+the legacy engine path. Lumen V1 does not use those modules as its language
+contract because they encode JavaScript semantics that are out of scope for this
+compiled language, including prototypes, dynamic object shapes, CommonJS-era
+runtime behavior, and broad ECMAScript grammar. Lumen compiler modules may reuse
+ideas from that code, but accepted source behavior is defined by this spec and
+the Lumen compiler track.
+
 ### Key Entities
 
 - **Source program**: A `.ts` file written in the accepted TypeScript syntax

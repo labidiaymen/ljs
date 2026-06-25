@@ -54,6 +54,22 @@
       "expect": {
         "diagnostic": "E_TYPE_MISMATCH"
       }
+    },
+    {
+      "id": "native.invalid.dynamic-property-write",
+      "source": "../examples/invalid/dynamic-property-write.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_DYNAMIC_PROPERTY_WRITE"
+      }
+    },
+    {
+      "id": "native.invalid.dynamic-property-dot",
+      "source": "../examples/invalid/dynamic-property-dot.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_DYNAMIC_PROPERTY_WRITE"
+      }
     }
   ]
 }

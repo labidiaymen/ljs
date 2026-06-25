@@ -40,6 +40,10 @@ The current branch contains:
 The old ljs/Test262 specs were removed from this branch so the active design does
 not drift back toward ECMAScript conformance.
 
+The repository still contains the legacy JavaScript lexer/parser/AST used by the
+old engine path. Lumen keeps separate compiler modules because V1 intentionally
+removes JavaScript dynamism rather than inheriting it.
+
 ## Quick Start
 
 Requires Zig 0.16.0.

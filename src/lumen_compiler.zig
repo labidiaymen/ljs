@@ -39,6 +39,12 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
     const eq = std.mem.eql;
     var lex = Lexer{ .src = source };
     var prev_was_dot = false;
+    var prev_was_ident = false;
+    var pending_dynamic_write_line: u32 = 0;
+    var pending_dynamic_write_col: u32 = 0;
+    var bracket_depth: u32 = 0;
+    var bracket_candidate_line: u32 = 0;
+    var bracket_candidate_col: u32 = 0;
 
     while (true) {
         const tok = lex.next() catch {
@@ -47,6 +53,10 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
         switch (tok) {
             .eof => return,
             .ident => |name| {
+                if (pending_dynamic_write_line != 0) {
+                    pending_dynamic_write_line = 0;
+                    pending_dynamic_write_col = 0;
+                }
                 if (eq(u8, name, "eval")) {
                     return setDiag(diag, lex.tok_line, lex.tok_col, "E_UNSUPPORTED_EVAL");
                 }
@@ -56,10 +66,44 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
                 if (prev_was_dot and eq(u8, name, "prototype")) {
                     return setDiag(diag, lex.tok_line, lex.tok_col, "E_UNSUPPORTED_PROTOTYPE");
                 }
+                if (prev_was_dot) {
+                    pending_dynamic_write_line = lex.tok_line;
+                    pending_dynamic_write_col = lex.tok_col;
+                }
                 prev_was_dot = false;
+                prev_was_ident = true;
             },
-            .op => |ch| prev_was_dot = ch == '.',
-            else => prev_was_dot = false,
+            .op => |ch| {
+                if (ch == '=' and pending_dynamic_write_line != 0) {
+                    return setDiag(diag, pending_dynamic_write_line, pending_dynamic_write_col, "E_DYNAMIC_PROPERTY_WRITE");
+                }
+                if (ch == '[' and prev_was_ident and bracket_depth == 0) {
+                    bracket_candidate_line = lex.tok_line;
+                    bracket_candidate_col = lex.tok_col;
+                    bracket_depth = 1;
+                } else if (ch == '[' and bracket_depth > 0) {
+                    bracket_depth += 1;
+                } else if (ch == ']' and bracket_depth > 0) {
+                    bracket_depth -= 1;
+                    if (bracket_depth == 0) {
+                        pending_dynamic_write_line = bracket_candidate_line;
+                        pending_dynamic_write_col = bracket_candidate_col;
+                    }
+                } else if (pending_dynamic_write_line != 0 and ch != '=') {
+                    pending_dynamic_write_line = 0;
+                    pending_dynamic_write_col = 0;
+                }
+                prev_was_dot = ch == '.';
+                prev_was_ident = false;
+            },
+            else => {
+                if (pending_dynamic_write_line != 0) {
+                    pending_dynamic_write_line = 0;
+                    pending_dynamic_write_col = 0;
+                }
+                prev_was_dot = false;
+                prev_was_ident = false;
+            },
         }
     }
 }
