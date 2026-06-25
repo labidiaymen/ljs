@@ -46,6 +46,14 @@
       "expect": {
         "diagnostic": "E_UNSUPPORTED_COMMONJS"
       }
+    },
+    {
+      "id": "native.invalid.type-mismatch",
+      "source": "../examples/invalid/type-mismatch.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
     }
   ]
 }

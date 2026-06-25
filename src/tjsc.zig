@@ -44,6 +44,10 @@ fn inferExprType(e: *const Expr) ?[]const u8 {
     };
 }
 
+fn sameType(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
 /// Builtins that lower to a Zig std wrapper (need __io/__alloc threaded in).
 fn isBuiltin(name: []const u8) bool {
     return std.mem.eql(u8, name, "httpGet") or std.mem.eql(u8, name, "serve");
@@ -203,18 +207,25 @@ const Parser = struct {
     cur: Tok,
     cur_line: u32 = 1, // source line of `cur`
     cur_col: u32 = 1, // source column of `cur`
-    vars: std.StringHashMapUnmanaged(void) = .empty, // declared variable names (for undefined-var checks)
+    vars: std.StringHashMapUnmanaged([]const u8) = .empty, // declared variable names and normalized types
     last_err: []const u8 = "syntax error", // message for the next diagnostic
     uses_io: bool = false, // any io builtin used → emit the std.process.Init main (io + allocator)
     needs_httpget: bool = false, // emit the __httpGet wrapper
     needs_serve: bool = false, // emit the __serve wrapper
 
-    fn declare(self: *Parser, name: []const u8) CompileError!void {
-        self.vars.put(self.arena, name, {}) catch return error.OutOfMemory;
+    fn declare(self: *Parser, name: []const u8, zty: []const u8) CompileError!void {
+        self.vars.put(self.arena, name, zty) catch return error.OutOfMemory;
     }
     fn undefined_(self: *Parser, name: []const u8) CompileError {
         self.last_err = std.fmt.allocPrint(self.arena, "undefined variable '{s}'", .{name}) catch "undefined variable";
         return error.ParseError;
+    }
+    fn exprType(self: *Parser, e: *const Expr) ?[]const u8 {
+        return switch (e.*) {
+            .var_ref => |name| self.vars.get(name),
+            .neg => |inner| self.exprType(inner),
+            else => inferExprType(e),
+        };
     }
 
     fn init(arena: std.mem.Allocator, src: []const u8) CompileError!Parser {
@@ -426,6 +437,8 @@ fn emitStmt(p: *Parser, out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocat
     const eq = std.mem.eql;
     if (p.cur != .ident) return error.ParseError;
     const kw = p.cur.ident;
+    const stmt_line = p.cur_line;
+    const stmt_col = p.cur_col;
     // Track the source line+col so a runtime panic can report the .ts location (Zig has no #line).
     try out.print(arena, "    __tjs_line = {d}; __tjs_col = {d};\n", .{ p.cur_line, p.cur_col });
 
@@ -445,11 +458,11 @@ fn emitStmt(p: *Parser, out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocat
         try p.expectOp('=');
         const e = try p.parseExpr();
         try p.expectOp(';');
-        const final_zty = zty orelse inferExprType(e) orelse {
+        const final_zty = zty orelse p.exprType(e) orelse {
             p.last_err = "cannot infer variable type";
             return error.ParseError;
         };
-        try p.declare(name); // in scope after its initializer (so `let x = x` is undefined)
+        try p.declare(name, final_zty); // in scope after its initializer (so `let x = x` is undefined)
         try out.print(arena, "    {s} {s}: {s} = ", .{ if (mutable) "var" else "const", name, final_zty });
         try emitExpr(e, out, arena);
         try out.appendSlice(arena, ";\n");
@@ -488,11 +501,23 @@ fn emitStmt(p: *Parser, out: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocat
     } else {
         // assignment: <name> = <expr> ;
         const name = kw;
-        if (!p.vars.contains(name)) return p.undefined_(name);
+        const expected_zty = p.vars.get(name) orelse return p.undefined_(name);
         try p.advance();
         try p.expectOp('=');
         const e = try p.parseExpr();
         try p.expectOp(';');
+        const actual_zty = p.exprType(e) orelse {
+            p.last_err = "cannot infer assignment type";
+            p.cur_line = stmt_line;
+            p.cur_col = stmt_col;
+            return error.ParseError;
+        };
+        if (!sameType(expected_zty, actual_zty)) {
+            p.last_err = "E_TYPE_MISMATCH";
+            p.cur_line = stmt_line;
+            p.cur_col = stmt_col;
+            return error.ParseError;
+        }
         try out.print(arena, "    {s} = ", .{name});
         try emitExpr(e, out, arena);
         try out.appendSlice(arena, ";\n");

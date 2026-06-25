@@ -33,7 +33,7 @@
 
 - [x] T014 Accept `let a = 4` with inferred `int`.
 - [x] T015 Accept explicit `int` and `i32` annotations.
-- [ ] T016 Reject incompatible reassignment with `E_TYPE_MISMATCH`.
+- [x] T016 Reject incompatible reassignment with `E_TYPE_MISMATCH`.
 - [x] T017 Reject `eval` with `E_UNSUPPORTED_EVAL`.
 - [x] T018 Reject prototype access/mutation with `E_UNSUPPORTED_PROTOTYPE`.
 - [x] T019 Reject CommonJS `require` with `E_UNSUPPORTED_COMMONJS`.
