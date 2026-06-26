@@ -173,6 +173,8 @@ being precise enough for native output.
 - **FR-028**: The compiler MUST support local relative default imports from
   `.ts` files during build, and MUST NOT support remote URLs or package
   resolution for this V1 slice.
+- **FR-029**: Unsupported import forms MUST produce `E_UNSUPPORTED_IMPORT`, and
+  missing local imported files MUST produce `E_IMPORT_NOT_FOUND`.
 
 ### Diagnostics
 
@@ -196,6 +198,10 @@ being precise enough for native output.
   function body.
 - **E_VOID_VALUE**: Produced when source attempts to use a `void` expression as
   a value.
+- **E_UNSUPPORTED_IMPORT**: Produced for remote, bare, named, or otherwise
+  unsupported import forms.
+- **E_IMPORT_NOT_FOUND**: Produced when a local relative imported `.ts` file
+  cannot be read.
 
 ### Existing JavaScript Infrastructure
 

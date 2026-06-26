@@ -22,6 +22,7 @@ fn printDiag(err: *std.Io.Writer, source: []const u8, file: []const u8, diag: co
 fn parseImportSpec(line: []const u8) !?[]const u8 {
     const trimmed = std.mem.trim(u8, line, " \t\r");
     if (!std.mem.startsWith(u8, trimmed, "import ")) return null;
+    if (std.mem.startsWith(u8, trimmed, "import {")) return error.InvalidImport;
     const marker = " from \"";
     const marker_pos = std.mem.indexOf(u8, trimmed, marker) orelse return error.InvalidImport;
     const spec_start = marker_pos + marker.len;
@@ -63,8 +64,8 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, err: *std
 
     const source = readSourceWithImports(arena, io, path) catch |e| {
         switch (e) {
-            error.InvalidImport => try err.print("error: invalid import in {s}; use local relative .ts default imports\n", .{path}),
-            error.ImportReadFailed => try err.print("error: cannot read imported file from {s}\n", .{path}),
+            error.InvalidImport => try err.print("{s}:1:1: error: E_UNSUPPORTED_IMPORT\n", .{path}),
+            error.ImportReadFailed => try err.print("{s}:1:1: error: E_IMPORT_NOT_FOUND\n", .{path}),
             else => try err.print("error: cannot read file {s}\n", .{path}),
         }
         return 2;

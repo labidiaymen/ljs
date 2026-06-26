@@ -168,6 +168,38 @@
       }
     },
     {
+      "id": "native.invalid.import-remote",
+      "source": "../examples/invalid/import-remote.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_UNSUPPORTED_IMPORT"
+      }
+    },
+    {
+      "id": "native.invalid.import-bare",
+      "source": "../examples/invalid/import-bare.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_UNSUPPORTED_IMPORT"
+      }
+    },
+    {
+      "id": "native.invalid.import-named",
+      "source": "../examples/invalid/import-named.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_UNSUPPORTED_IMPORT"
+      }
+    },
+    {
+      "id": "native.invalid.import-missing",
+      "source": "../examples/invalid/import-missing.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_IMPORT_NOT_FOUND"
+      }
+    },
+    {
       "id": "native.invalid.duplicate-binding",
       "source": "../examples/invalid/duplicate-binding.ts",
       "phase": "diagnostics",
