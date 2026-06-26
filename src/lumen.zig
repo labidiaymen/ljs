@@ -13,6 +13,13 @@ const CompileMode = enum {
             .release_fast => "ReleaseFast",
         };
     }
+
+    fn runtimeLocations(self: CompileMode) bool {
+        return switch (self) {
+            .release_safe => true,
+            .release_fast => false,
+        };
+    }
 };
 
 fn printDiag(err: *std.Io.Writer, source: []const u8, file: []const u8, diag: compiler.Diag) !void {
@@ -129,7 +136,9 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
     };
 
     var diag: compiler.Diag = .{};
-    const zig_src = compiler.compileToZig(arena, source, path, &diag) catch {
+    const zig_src = compiler.compileToZigWithOptions(arena, source, path, &diag, .{
+        .runtime_locations = mode.runtimeLocations(),
+    }) catch {
         try printDiag(err, source, path, diag);
         return 1;
     };

@@ -740,25 +740,31 @@ fn printFormat(t: types.Type) []const u8 {
     };
 }
 
-fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
-    return emitStmtWithThrow(stmt, decls, body, arena, null);
+pub const CompileOptions = struct {
+    runtime_locations: bool = true,
+};
+
+fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, options: CompileOptions) CompileError!void {
+    return emitStmtWithThrow(stmt, decls, body, arena, null, options);
 }
 
-fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, throw_target: ?[]const u8) CompileError!void {
-    const line_col: SourceLoc = switch (stmt.*) {
-        .type_decl => |decl| .{ .line = decl.line, .col = decl.col },
-        .function_decl => |decl| .{ .line = decl.line, .col = decl.col },
-        .var_decl => |decl| .{ .line = decl.line, .col = decl.col },
-        .assign => |assignment| .{ .line = assignment.line, .col = assignment.col },
-        .console_log => |log| .{ .line = log.line, .col = log.col },
-        .while_stmt => |loop| .{ .line = loop.line, .col = loop.col },
-        .if_stmt => |branch| .{ .line = branch.line, .col = branch.col },
-        .return_stmt => |ret| .{ .line = ret.line, .col = ret.col },
-        .throw_stmt => |throw_stmt| .{ .line = throw_stmt.line, .col = throw_stmt.col },
-        .try_stmt => |try_stmt| .{ .line = try_stmt.line, .col = try_stmt.col },
-        .expr_stmt => |expr_stmt| .{ .line = expr_stmt.line, .col = expr_stmt.col },
-    };
-    try body.print(arena, "    __lumen_line = {d}; __lumen_col = {d};\n", .{ line_col.line, line_col.col });
+fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, throw_target: ?[]const u8, options: CompileOptions) CompileError!void {
+    if (options.runtime_locations) {
+        const line_col: SourceLoc = switch (stmt.*) {
+            .type_decl => |decl| .{ .line = decl.line, .col = decl.col },
+            .function_decl => |decl| .{ .line = decl.line, .col = decl.col },
+            .var_decl => |decl| .{ .line = decl.line, .col = decl.col },
+            .assign => |assignment| .{ .line = assignment.line, .col = assignment.col },
+            .console_log => |log| .{ .line = log.line, .col = log.col },
+            .while_stmt => |loop| .{ .line = loop.line, .col = loop.col },
+            .if_stmt => |branch| .{ .line = branch.line, .col = branch.col },
+            .return_stmt => |ret| .{ .line = ret.line, .col = ret.col },
+            .throw_stmt => |throw_stmt| .{ .line = throw_stmt.line, .col = throw_stmt.col },
+            .try_stmt => |try_stmt| .{ .line = try_stmt.line, .col = try_stmt.col },
+            .expr_stmt => |expr_stmt| .{ .line = expr_stmt.line, .col = expr_stmt.col },
+        };
+        try body.print(arena, "    __lumen_line = {d}; __lumen_col = {d};\n", .{ line_col.line, line_col.col });
+    }
 
     switch (stmt.*) {
         .type_decl => |decl| {
@@ -778,7 +784,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
                 try decls.print(arena, "{s}: {s}", .{ param.name, types.zigName(param_type) });
             }
             try decls.print(arena, ") {s} {{\n", .{types.zigName(return_type)});
-            for (decl.body) |*body_stmt| try emitStmt(body_stmt, decls, decls, arena);
+            for (decl.body) |*body_stmt| try emitStmt(body_stmt, decls, decls, arena, options);
             try decls.appendSlice(arena, "}\n");
         },
         .var_decl => |decl| {
@@ -802,18 +808,18 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             try body.appendSlice(arena, "    while (");
             try emitExpr(loop.cond, body, arena);
             try body.appendSlice(arena, ") {\n");
-            for (loop.body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target);
+            for (loop.body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target, options);
             try body.appendSlice(arena, "    }\n");
         },
         .if_stmt => |branch| {
             try body.appendSlice(arena, "    if (");
             try emitExpr(branch.cond, body, arena);
             try body.appendSlice(arena, ") {\n");
-            for (branch.then_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target);
+            for (branch.then_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target, options);
             try body.appendSlice(arena, "    }");
             if (branch.else_body) |else_body| {
                 try body.appendSlice(arena, " else {\n");
-                for (else_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target);
+                for (else_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target, options);
                 try body.appendSlice(arena, "    }");
             }
             try body.appendSlice(arena, "\n");
@@ -844,15 +850,15 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             try body.appendSlice(arena, "    {\n");
             for (try_stmt.try_body) |*try_body_stmt| {
                 try body.print(arena, "    if ({s} == null) {{\n", .{slot});
-                try emitStmtWithThrow(try_body_stmt, decls, body, arena, slot);
+                try emitStmtWithThrow(try_body_stmt, decls, body, arena, slot, options);
                 try body.appendSlice(arena, "    }\n");
             }
             try body.appendSlice(arena, "    }\n");
             try body.print(arena, "    if ({s}) |{s}| {{\n", .{ slot, try_stmt.catch_emit_name orelse try_stmt.catch_name });
-            for (try_stmt.catch_body) |*catch_stmt| try emitStmtWithThrow(catch_stmt, decls, body, arena, throw_target);
+            for (try_stmt.catch_body) |*catch_stmt| try emitStmtWithThrow(catch_stmt, decls, body, arena, throw_target, options);
             try body.appendSlice(arena, "    }\n");
             if (try_stmt.finally_body) |finally_body| {
-                for (finally_body) |*finally_stmt| try emitStmtWithThrow(finally_stmt, decls, body, arena, throw_target);
+                for (finally_body) |*finally_stmt| try emitStmtWithThrow(finally_stmt, decls, body, arena, throw_target, options);
             }
         },
         .expr_stmt => |expr_stmt| {
@@ -864,14 +870,18 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
     }
 }
 
-fn emitProgram(program: *const Program, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
-    for (program.stmts) |*stmt| try emitStmt(stmt, decls, body, arena);
+fn emitProgram(program: *const Program, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, options: CompileOptions) CompileError!void {
+    for (program.stmts) |*stmt| try emitStmt(stmt, decls, body, arena, options);
 }
 
 /// Compile TypeScript-syntax `source` (from `filename`) to Zig source text. On a compile-time error,
 /// `diag` is filled (located in the .ts source) and `error.ParseError` returned. `filename` is also
 /// embedded so a runtime panic reports the .ts location.
 pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []const u8, diag: *Diag) CompileError![]const u8 {
+    return compileToZigWithOptions(arena, source, filename, diag, .{});
+}
+
+pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, filename: []const u8, diag: *Diag, options: CompileOptions) CompileError![]const u8 {
     try rejectUnsupportedDynamic(source, diag);
 
     var p = try Parser.init(arena, source);
@@ -885,49 +895,52 @@ pub fn compileToZig(arena: std.mem.Allocator, source: []const u8, filename: []co
     var decls: std.ArrayListUnmanaged(u8) = .empty; // top-level struct type definitions
     var body: std.ArrayListUnmanaged(u8) = .empty;
 
-    try emitProgram(&program, &decls, &body, arena);
-
-    // Sanitize the filename for a Zig string literal (backslashes/quotes break it).
-    const safe_name = try arena.dupe(u8, filename);
-    for (safe_name) |*ch| if (ch.* == '\\' or ch.* == '"') {
-        ch.* = '/';
-    };
+    try emitProgram(&program, &decls, &body, arena, options);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.appendSlice(arena, "const std = @import(\"std\");\n");
-    try out.print(arena, "const __lumen_file = \"{s}\";\n", .{safe_name});
-    try out.appendSlice(arena, "var __lumen_line: u32 = 0;\nvar __lumen_col: u32 = 0;\n");
-    // Embed the .ts source as a multiline string (no escaping needed) so the handler can show the line.
-    try out.appendSlice(arena, "const __lumen_src =\n");
-    {
-        var lines = std.mem.splitScalar(u8, source, '\n');
-        while (lines.next()) |l| {
-            const t = std.mem.trimEnd(u8, l, "\r");
-            try out.print(arena, "    \\\\{s}\n", .{t});
+
+    if (options.runtime_locations) {
+        // Sanitize the filename for a Zig string literal (backslashes/quotes break it).
+        const safe_name = try arena.dupe(u8, filename);
+        for (safe_name) |*ch| if (ch.* == '\\' or ch.* == '"') {
+            ch.* = '/';
+        };
+
+        try out.print(arena, "const __lumen_file = \"{s}\";\n", .{safe_name});
+        try out.appendSlice(arena, "var __lumen_line: u32 = 0;\nvar __lumen_col: u32 = 0;\n");
+        // Embed the .ts source as a multiline string (no escaping needed) so the handler can show the line.
+        try out.appendSlice(arena, "const __lumen_src =\n");
+        {
+            var lines = std.mem.splitScalar(u8, source, '\n');
+            while (lines.next()) |l| {
+                const t = std.mem.trimEnd(u8, l, "\r");
+                try out.print(arena, "    \\\\{s}\n", .{t});
+            }
         }
+        try out.appendSlice(arena, ";\n");
+        // Custom panic handler -> map the native runtime error back to the .ts source: file:line:col +
+        // the offending source line + a caret.
+        try out.appendSlice(arena,
+            \\fn __lumenPanic(msg: []const u8, _: ?usize) noreturn {
+            \\    std.debug.print("\n{s}:{d}:{d}: runtime error: {s}\n", .{ __lumen_file, __lumen_line, __lumen_col, msg });
+            \\    var __it = std.mem.splitScalar(u8, __lumen_src, '\n');
+            \\    var __n: u32 = 1;
+            \\    while (__it.next()) |__l| : (__n += 1) {
+            \\        if (__n == __lumen_line) {
+            \\            std.debug.print("  {d} | {s}\n    | ", .{ __lumen_line, __l });
+            \\            var __k: u32 = 1;
+            \\            while (__k < __lumen_col) : (__k += 1) std.debug.print(" ", .{});
+            \\            std.debug.print("^\n", .{});
+            \\            break;
+            \\        }
+            \\    }
+            \\    std.process.exit(1);
+            \\}
+            \\pub const panic = std.debug.FullPanic(__lumenPanic);
+            \\
+        );
     }
-    try out.appendSlice(arena, ";\n");
-    // Custom panic handler -> map the native runtime error back to the .ts source: file:line:col +
-    // the offending source line + a caret.
-    try out.appendSlice(arena,
-        \\fn __lumenPanic(msg: []const u8, _: ?usize) noreturn {
-        \\    std.debug.print("\n{s}:{d}:{d}: runtime error: {s}\n", .{ __lumen_file, __lumen_line, __lumen_col, msg });
-        \\    var __it = std.mem.splitScalar(u8, __lumen_src, '\n');
-        \\    var __n: u32 = 1;
-        \\    while (__it.next()) |__l| : (__n += 1) {
-        \\        if (__n == __lumen_line) {
-        \\            std.debug.print("  {d} | {s}\n    | ", .{ __lumen_line, __l });
-        \\            var __k: u32 = 1;
-        \\            while (__k < __lumen_col) : (__k += 1) std.debug.print(" ", .{});
-        \\            std.debug.print("^\n", .{});
-        \\            break;
-        \\        }
-        \\    }
-        \\    std.process.exit(1);
-        \\}
-        \\pub const panic = std.debug.FullPanic(__lumenPanic);
-        \\
-    );
     try out.appendSlice(arena, decls.items);
 
     if (program.needs_httpget) {
