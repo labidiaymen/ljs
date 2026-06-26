@@ -31,6 +31,7 @@ pub const Assign = struct {
 
 pub const ConsoleLog = struct {
     value: *Expr,
+    checked_type: ?types.Type = null,
     line: u32,
     col: u32,
 };

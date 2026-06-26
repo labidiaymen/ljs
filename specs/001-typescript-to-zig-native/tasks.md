@@ -44,6 +44,7 @@
 - [x] T029 Check named object type declarations, object literals, and field
   access.
 - [x] T030 Match TypeScript-inspired `let`/`const` binding mutability.
+- [x] T031 Emit `console.log` using the checked argument type.
 - [x] T017 Reject `eval` with `E_UNSUPPORTED_EVAL`.
 - [x] T018 Reject prototype access/mutation with `E_UNSUPPORTED_PROTOTYPE`.
 - [x] T019 Reject CommonJS `require` with `E_UNSUPPORTED_COMMONJS`.

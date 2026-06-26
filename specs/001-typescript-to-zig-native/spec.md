@@ -76,6 +76,9 @@ being precise enough for native output.
    checked, **Then** reassignment is accepted.
 6. **Given** `const total = 1` followed by `total = 2`, **When** checked,
    **Then** `E_CONST_ASSIGNMENT` is reported.
+7. **Given** `console.log` receives a string, boolean, or numeric value,
+   **When** emitted, **Then** the generated native program prints it using the
+   checked source type.
 
 ### Edge Cases
 
@@ -116,6 +119,8 @@ being precise enough for native output.
   fields with compatible field types.
 - **FR-015**: `let` declarations MUST create reassignable bindings and `const`
   declarations MUST create non-reassignable bindings.
+- **FR-016**: `console.log` emission MUST use the checked argument type rather
+  than assuming every argument is an integer.
 
 ### Diagnostics
 

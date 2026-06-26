@@ -87,8 +87,8 @@ const Checker = struct {
                 try self.ensureAssignable(program, expected_type, assignment.value, assignment.line, assignment.col);
                 binding.decl.reassigned = true;
             },
-            .console_log => |log| {
-                _ = self.exprType(program, log.value, log.line, log.col) orelse
+            .console_log => |*log| {
+                log.checked_type = self.exprType(program, log.value, log.line, log.col) orelse
                     return self.fail(log.line, log.col, "cannot infer console.log argument type");
             },
             .while_stmt => |*loop| {

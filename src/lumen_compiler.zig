@@ -418,6 +418,14 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
     }
 }
 
+fn printFormat(t: types.Type) []const u8 {
+    return switch (t) {
+        .string => "{s}",
+        .bool => "{}",
+        else => "{d}",
+    };
+}
+
 fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
     const line_col: SourceLoc = switch (stmt.*) {
         .type_decl => |decl| .{ .line = decl.line, .col = decl.col },
@@ -450,7 +458,8 @@ fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.Ar
             try body.appendSlice(arena, ";\n");
         },
         .console_log => |log| {
-            try body.appendSlice(arena, "    std.debug.print(\"{d}\\n\", .{");
+            const log_type = log.checked_type orelse return error.ParseError;
+            try body.print(arena, "    std.debug.print(\"{s}\\n\", .{{", .{printFormat(log_type)});
             try emitExpr(log.value, body, arena);
             try body.appendSlice(arena, "});\n");
         },

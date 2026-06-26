@@ -40,6 +40,14 @@
       }
     },
     {
+      "id": "native.valid.log-string",
+      "source": "../examples/valid/log-string.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "hello"
+      }
+    },
+    {
       "id": "native.invalid.eval",
       "source": "../examples/invalid/eval.ts",
       "phase": "diagnostics",
