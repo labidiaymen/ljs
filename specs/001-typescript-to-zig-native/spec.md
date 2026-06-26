@@ -129,6 +129,12 @@ being precise enough for native output.
     compiling an entry file, **Then** the imported function is available under
     the local default binding and import cycles or duplicate imports receive
     stable diagnostics.
+28. **Given** V1 stdlib namespace calls, **When** checked, **Then** console,
+    Math, String, and Array helpers validate argument counts and static types
+    before lowering.
+29. **Given** a `class` declaration, **When** checked for V1, **Then** the
+    compiler rejects it with a stable diagnostic until class layout semantics
+    are designed.
 
 ### Edge Cases
 
@@ -220,6 +226,13 @@ being precise enough for native output.
 - **FR-037**: The compiler MUST support the V1 `Math` namespace functions
   `abs`, `max`, and `min`; unsupported stdlib members MUST be rejected with
   `E_UNSUPPORTED_STD`.
+- **FR-037A**: The compiler MUST support `Math.sign`, `Math.clamp`, and
+  `Math.sqrt` with statically checked numeric arguments.
+- **FR-037B**: The compiler MUST support `String.isEmpty`, `String.contains`,
+  `String.startsWith`, and `Array.isEmpty` as namespace stdlib helpers without
+  adding prototype dispatch.
+- **FR-037C**: The compiler MUST support `console.error` as a V1 console API
+  sibling to `console.log`.
 - **FR-038**: The compiler MUST support TypeScript-style `throw`,
   `try`/`catch`, optional `finally`, `Error("message")`, and `err.message` for
   caught errors; thrown values MUST be Error values.
@@ -263,6 +276,8 @@ being precise enough for native output.
 - **E_IMPORT_CYCLE**: Produced when local import expansion detects a cycle.
 - **E_DUPLICATE_IMPORT**: Produced when a source file imports the same
   specifier more than once.
+- **E_UNSUPPORTED_CLASS**: Produced when source uses a class declaration before
+  V1 static class/object layout semantics are designed.
 
 ### Existing JavaScript Infrastructure
 

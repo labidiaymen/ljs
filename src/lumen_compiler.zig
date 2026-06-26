@@ -152,6 +152,9 @@ const Parser = struct {
         p.* = e;
         return p;
     }
+    fn isStdNamespace(name: []const u8) bool {
+        return std.mem.eql(u8, name, "Math") or std.mem.eql(u8, name, "String") or std.mem.eql(u8, name, "Array");
+    }
     fn parseTypeAnnotation(self: *Parser) CompileError![]const u8 {
         if (self.cur != .ident) return error.ParseError;
         const base = self.cur.ident;
@@ -250,7 +253,8 @@ const Parser = struct {
                 const name = self.cur.ident;
                 try self.advance();
                 if (self.isOp('(')) {
-                    if (e.* != .var_ref or !std.mem.eql(u8, e.var_ref.name, "Math")) return error.ParseError;
+                    if (e.* != .var_ref or !isStdNamespace(e.var_ref.name)) return error.ParseError;
+                    const namespace = e.var_ref.name;
                     try self.expectOp('(');
                     var args: std.ArrayListUnmanaged(*Expr) = .empty;
                     while (!self.isOp(')')) {
@@ -258,7 +262,7 @@ const Parser = struct {
                         if (self.isOp(',')) try self.advance() else break;
                     }
                     try self.expectOp(')');
-                    e = try self.node(.{ .static_call = .{ .namespace = "Math", .name = name, .args = try args.toOwnedSlice(self.arena) } });
+                    e = try self.node(.{ .static_call = .{ .namespace = namespace, .name = name, .args = try args.toOwnedSlice(self.arena) } });
                 } else {
                     e = try self.node(.{ .field = .{ .obj = e, .name = name } });
                 }
@@ -405,6 +409,10 @@ const Parser = struct {
 
         if (eq(u8, kw, "type")) return self.parseTypeDecl(line, col);
         if (eq(u8, kw, "function")) return self.parseFunctionDecl(line, col);
+        if (eq(u8, kw, "class")) {
+            self.last_err = "E_UNSUPPORTED_CLASS";
+            return error.ParseError;
+        }
 
         if (eq(u8, kw, "let") or eq(u8, kw, "const") or eq(u8, kw, "var")) {
             const mutable = eq(u8, kw, "let") or eq(u8, kw, "var");
@@ -426,13 +434,18 @@ const Parser = struct {
         if (eq(u8, kw, "console")) {
             try self.advance();
             try self.expectOp('.');
-            if (!self.isKw("log")) return error.ParseError;
+            if (self.cur != .ident) return error.ParseError;
+            const method = self.cur.ident;
+            if (!eq(u8, method, "log") and !eq(u8, method, "error")) {
+                self.last_err = "E_UNSUPPORTED_STD";
+                return error.ParseError;
+            }
             try self.advance();
             try self.expectOp('(');
             const value = try self.parseExpr();
             try self.expectOp(')');
             try self.expectOp(';');
-            return .{ .console_log = .{ .value = value, .line = line, .col = col } };
+            return .{ .console_log = .{ .method = method, .value = value, .line = line, .col = col } };
         }
 
         if (eq(u8, kw, "while")) {
@@ -580,12 +593,57 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                     try emitExpr(cl.args[0], w, arena);
                     try w.appendSlice(arena, ")))");
                 }
+            } else if (std.mem.eql(u8, cl.namespace, "Math") and std.mem.eql(u8, cl.name, "sign")) {
+                try w.appendSlice(arena, "(if (");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, " < 0) -1 else if (");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, " > 0) 1 else 0)");
+            } else if (std.mem.eql(u8, cl.namespace, "Math") and std.mem.eql(u8, cl.name, "sqrt")) {
+                const arg_type = cl.checked_arg_type orelse return error.ParseError;
+                try w.appendSlice(arena, "@sqrt(");
+                if (arg_type == .f64) {
+                    try emitExpr(cl.args[0], w, arena);
+                } else {
+                    try w.appendSlice(arena, "@as(f64, @floatFromInt(");
+                    try emitExpr(cl.args[0], w, arena);
+                    try w.appendSlice(arena, "))");
+                }
+                try w.append(arena, ')');
             } else if (std.mem.eql(u8, cl.namespace, "Math") and (std.mem.eql(u8, cl.name, "max") or std.mem.eql(u8, cl.name, "min"))) {
                 try w.print(arena, "@{s}(", .{cl.name});
                 try emitExpr(cl.args[0], w, arena);
                 try w.appendSlice(arena, ", ");
                 try emitExpr(cl.args[1], w, arena);
                 try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "Math") and std.mem.eql(u8, cl.name, "clamp")) {
+                try w.appendSlice(arena, "@min(@max(");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.appendSlice(arena, "), ");
+                try emitExpr(cl.args[2], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "String") and std.mem.eql(u8, cl.name, "isEmpty")) {
+                try w.append(arena, '(');
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ".len == 0)");
+            } else if (std.mem.eql(u8, cl.namespace, "String") and std.mem.eql(u8, cl.name, "contains")) {
+                try w.appendSlice(arena, "(std.mem.indexOf(u8, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.appendSlice(arena, ") != null)");
+            } else if (std.mem.eql(u8, cl.namespace, "String") and std.mem.eql(u8, cl.name, "startsWith")) {
+                try w.appendSlice(arena, "std.mem.startsWith(u8, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "Array") and std.mem.eql(u8, cl.name, "isEmpty")) {
+                try w.append(arena, '(');
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ".len == 0)");
             } else return error.ParseError;
         },
         .var_ref => |ref| try w.appendSlice(arena, ref.emit_name orelse ref.name),

@@ -48,6 +48,14 @@
       }
     },
     {
+      "id": "native.valid.console-stdlib",
+      "source": "../examples/valid/console-stdlib.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "problem"
+      }
+    },
+    {
       "id": "native.valid.bool-literal",
       "source": "../examples/valid/bool-literal.ts",
       "phase": "compile-run",
@@ -144,6 +152,22 @@
       }
     },
     {
+      "id": "native.valid.math-more",
+      "source": "../examples/valid/math-more.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "-1\n9\n3"
+      }
+    },
+    {
+      "id": "native.valid.string-array-stdlib",
+      "source": "../examples/valid/string-array-stdlib.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "ok"
+      }
+    },
+    {
       "id": "native.valid.exceptions",
       "source": "../examples/valid/exceptions.ts",
       "phase": "compile-run",
@@ -197,6 +221,14 @@
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_UNSUPPORTED_COMMONJS"
+      }
+    },
+    {
+      "id": "native.invalid.class-unsupported",
+      "source": "../examples/invalid/class-unsupported.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_UNSUPPORTED_CLASS"
       }
     },
     {
@@ -349,6 +381,14 @@
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_UNSUPPORTED_STD"
+      }
+    },
+    {
+      "id": "native.invalid.std-type",
+      "source": "../examples/invalid/std-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
       }
     },
     {

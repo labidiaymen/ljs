@@ -48,6 +48,7 @@ pub const Assign = struct {
 };
 
 pub const ConsoleLog = struct {
+    method: []const u8 = "log",
     value: *Expr,
     checked_type: ?types.Type = null,
     line: u32,
@@ -98,6 +99,14 @@ pub const TryStmt = struct {
     col: u32,
 };
 
+pub const StaticCall = struct {
+    namespace: []const u8,
+    name: []const u8,
+    args: []*Expr,
+    checked_type: ?types.Type = null,
+    checked_arg_type: ?types.Type = null,
+};
+
 pub const Stmt = union(enum) {
     type_decl: TypeDecl,
     function_decl: FunctionDecl,
@@ -134,7 +143,7 @@ pub const Expr = union(enum) {
     field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null },
     index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null },
     call: struct { name: []const u8, args: []*Expr }, // builtin call, e.g. httpGet(url) / serve(port, body)
-    static_call: struct { namespace: []const u8, name: []const u8, args: []*Expr, checked_type: ?types.Type = null },
+    static_call: StaticCall,
 };
 
 pub const FieldBuiltin = enum {

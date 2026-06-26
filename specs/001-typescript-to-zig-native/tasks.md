@@ -68,6 +68,10 @@
 - [x] T052 Accept V1 Error, throw, try/catch, and finally.
 - [x] T053 Strengthen local modules with default export rewriting, cycle
   checks, and duplicate import diagnostics.
+- [x] T055 Add `console.error` to the V1 console surface.
+- [x] T056 Extend the V1 Math namespace.
+- [x] T057 Add String and Array namespace helpers without prototypes.
+- [x] T058 Reject class declarations with a stable V1 diagnostic.
 - [x] T017 Reject `eval` with `E_UNSUPPORTED_EVAL`.
 - [x] T018 Reject prototype access/mutation with `E_UNSUPPORTED_PROTOTYPE`.
 - [x] T019 Reject CommonJS `require` with `E_UNSUPPORTED_COMMONJS`.

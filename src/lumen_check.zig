@@ -459,39 +459,7 @@ const Checker = struct {
                 return func.return_type;
             },
             .static_call => |*call| {
-                if (!std.mem.eql(u8, call.namespace, "Math")) {
-                    _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
-                    return null;
-                }
-                if (std.mem.eql(u8, call.name, "abs")) {
-                    if (call.args.len != 1) {
-                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
-                        return null;
-                    }
-                    const arg_type = self.exprType(program, call.args[0], line, col) orelse return null;
-                    if (!types.isNumeric(arg_type)) {
-                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
-                        return null;
-                    }
-                    call.checked_type = arg_type;
-                    return arg_type;
-                }
-                if (std.mem.eql(u8, call.name, "max") or std.mem.eql(u8, call.name, "min")) {
-                    if (call.args.len != 2) {
-                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
-                        return null;
-                    }
-                    const left_type = self.exprType(program, call.args[0], line, col) orelse return null;
-                    const right_type = self.exprType(program, call.args[1], line, col) orelse return null;
-                    if (!types.isNumeric(left_type) or !types.same(left_type, right_type)) {
-                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
-                        return null;
-                    }
-                    call.checked_type = left_type;
-                    return left_type;
-                }
-                _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
-                return null;
+                return self.staticCallType(program, call, line, col);
             },
             else => types.inferExprType(e),
         };
@@ -512,6 +480,114 @@ const Checker = struct {
         }
         _ = self.fail(line, col, "unknown field") catch {};
         return null;
+    }
+
+    fn staticCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
+        if (std.mem.eql(u8, call.namespace, "Math")) return self.mathCallType(program, call, line, col);
+        if (std.mem.eql(u8, call.namespace, "String")) return self.stringCallType(program, call, line, col);
+        if (std.mem.eql(u8, call.namespace, "Array")) return self.arrayCallType(program, call, line, col);
+        _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+        return null;
+    }
+
+    fn mathCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
+        if (std.mem.eql(u8, call.name, "abs") or std.mem.eql(u8, call.name, "sign") or std.mem.eql(u8, call.name, "sqrt")) {
+            if (call.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const arg_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            if (!types.isNumeric(arg_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            call.checked_arg_type = arg_type;
+            call.checked_type = if (std.mem.eql(u8, call.name, "sign")) .i32 else if (std.mem.eql(u8, call.name, "sqrt")) .f64 else arg_type;
+            return call.checked_type;
+        }
+        if (std.mem.eql(u8, call.name, "max") or std.mem.eql(u8, call.name, "min")) {
+            if (call.args.len != 2) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const left_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            const right_type = self.exprType(program, call.args[1], line, col) orelse return null;
+            if (!types.isNumeric(left_type) or !types.same(left_type, right_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            call.checked_arg_type = left_type;
+            call.checked_type = left_type;
+            return left_type;
+        }
+        if (std.mem.eql(u8, call.name, "clamp")) {
+            if (call.args.len != 3) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const value_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            const min_type = self.exprType(program, call.args[1], line, col) orelse return null;
+            const max_type = self.exprType(program, call.args[2], line, col) orelse return null;
+            if (!types.isNumeric(value_type) or !types.same(value_type, min_type) or !types.same(value_type, max_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            call.checked_arg_type = value_type;
+            call.checked_type = value_type;
+            return value_type;
+        }
+        _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+        return null;
+    }
+
+    fn stringCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
+        if (std.mem.eql(u8, call.name, "isEmpty")) {
+            if (call.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const arg_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            if (!types.same(.string, arg_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            call.checked_type = .bool;
+            return .bool;
+        }
+        if (std.mem.eql(u8, call.name, "contains") or std.mem.eql(u8, call.name, "startsWith")) {
+            if (call.args.len != 2) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const left_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            const right_type = self.exprType(program, call.args[1], line, col) orelse return null;
+            if (!types.same(.string, left_type) or !types.same(.string, right_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            call.checked_type = .bool;
+            return .bool;
+        }
+        _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+        return null;
+    }
+
+    fn arrayCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
+        if (!std.mem.eql(u8, call.name, "isEmpty")) {
+            _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+            return null;
+        }
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const arg_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.isArray(arg_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        call.checked_type = .bool;
+        return .bool;
     }
 };
 
