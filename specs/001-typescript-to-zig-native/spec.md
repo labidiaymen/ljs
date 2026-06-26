@@ -111,6 +111,9 @@ being precise enough for native output.
 21. **Given** boolean expressions using `&&`, `||`, and `!`, **When** checked,
     **Then** operands must be boolean and the generated native program preserves
     TypeScript operator precedence.
+22. **Given** a function declaration inside a block or another function body,
+    **When** checked, **Then** the compiler reports that nested function
+    declarations are unsupported in V1.
 
 ### Edge Cases
 
@@ -187,6 +190,9 @@ being precise enough for native output.
   backend slice identity.
 - **FR-033**: Boolean operators `&&`, `||`, and `!` MUST use TypeScript syntax,
   MUST require boolean operands, and MUST lower to native boolean operations.
+- **FR-034**: Function declarations MUST be top-level only in V1; function
+  declarations nested inside blocks or function bodies MUST be rejected with
+  `E_UNSUPPORTED_NESTED_FUNCTION`.
 
 ### Diagnostics
 
@@ -216,6 +222,8 @@ being precise enough for native output.
   cannot be read.
 - **E_MISSING_RETURN**: Produced when a non-`void` function can complete without
   returning a value.
+- **E_UNSUPPORTED_NESTED_FUNCTION**: Produced when a function declaration
+  appears outside the top-level source scope.
 
 ### Existing JavaScript Infrastructure
 

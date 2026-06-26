@@ -280,6 +280,14 @@
       }
     },
     {
+      "id": "native.invalid.nested-function",
+      "source": "../examples/invalid/nested-function.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_UNSUPPORTED_NESTED_FUNCTION"
+      }
+    },
+    {
       "id": "native.invalid.function-missing-return",
       "source": "../examples/invalid/function-missing-return.ts",
       "phase": "diagnostics",

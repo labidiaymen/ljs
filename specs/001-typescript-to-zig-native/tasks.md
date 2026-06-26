@@ -61,6 +61,7 @@
 - [x] T045 Accept bare `return;` only in void functions.
 - [x] T046 Lower string equality and inequality to content comparison.
 - [x] T047 Accept TypeScript boolean operators and require boolean operands.
+- [x] T048 Reject nested function declarations for V1.
 - [x] T017 Reject `eval` with `E_UNSUPPORTED_EVAL`.
 - [x] T018 Reject prototype access/mutation with `E_UNSUPPORTED_PROTOTYPE`.
 - [x] T019 Reject CommonJS `require` with `E_UNSUPPORTED_COMMONJS`.

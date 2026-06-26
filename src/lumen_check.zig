@@ -31,6 +31,7 @@ const Checker = struct {
     funcs: std.StringHashMapUnmanaged(FunctionInfo) = .empty,
     next_binding_id: u32 = 0,
     current_return_type: ?types.Type = null,
+    nested_stmt_depth: u32 = 0,
     last_line: u32 = 1,
     last_col: u32 = 1,
     last_err: []const u8 = "syntax error",
@@ -133,6 +134,8 @@ const Checker = struct {
     fn checkBlock(self: *Checker, program: *ast.Program, body: []ast.Stmt) CompileError!void {
         try self.pushScope();
         defer self.popScope();
+        self.nested_stmt_depth += 1;
+        defer self.nested_stmt_depth -= 1;
         for (body) |*body_stmt| try self.checkStmt(program, body_stmt);
     }
 
@@ -144,6 +147,8 @@ const Checker = struct {
         try self.pushScope();
         defer self.popScope();
         for (decl.params) |param| try self.declareParam(param, decl.line, decl.col);
+        self.nested_stmt_depth += 1;
+        defer self.nested_stmt_depth -= 1;
         for (decl.body) |*body_stmt| try self.checkStmt(program, body_stmt);
 
         const return_type = decl.checked_return_type orelse types.fromAnnotation(decl.return_annotation);
@@ -176,6 +181,7 @@ const Checker = struct {
                 try self.declareType(decl.name, decl.fields, decl.line, decl.col);
             },
             .function_decl => |*decl| {
+                if (self.nested_stmt_depth > 0) return self.fail(decl.line, decl.col, "E_UNSUPPORTED_NESTED_FUNCTION");
                 if (decl.checked_return_type == null) try self.declareFunction(decl);
                 try self.checkFunctionBody(program, decl);
             },
