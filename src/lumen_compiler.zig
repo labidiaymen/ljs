@@ -217,8 +217,8 @@ const Parser = struct {
         }
         if (self.cur == .ident) {
             const name = self.cur.ident;
-            if (isBuiltin(name)) {
-                try self.advance();
+            try self.advance();
+            if (self.isOp('(')) {
                 try self.expectOp('(');
                 var args: std.ArrayListUnmanaged(*Expr) = .empty;
                 while (!self.isOp(')')) {
@@ -228,7 +228,6 @@ const Parser = struct {
                 try self.expectOp(')');
                 return self.node(.{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.arena) } });
             }
-            try self.advance();
             return self.node(.{ .var_ref = .{ .name = name } });
         }
         if (self.isOp('(')) {
@@ -437,6 +436,13 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
                 try w.appendSlice(arena, ", ");
                 if (cl.args.len > 1) try emitExpr(cl.args[1], w, arena);
+                try w.append(arena, ')');
+            } else {
+                try w.print(arena, "{s}(", .{cl.name});
+                for (cl.args, 0..) |arg, i| {
+                    if (i > 0) try w.appendSlice(arena, ", ");
+                    try emitExpr(arg, w, arena);
+                }
                 try w.append(arena, ')');
             }
         },

@@ -10,6 +10,11 @@ const TypeDeclInfo = struct {
     fields: []ast.TypeField,
 };
 
+const FunctionInfo = struct {
+    params: []ast.FunctionParam,
+    return_type: types.Type,
+};
+
 const Binding = struct {
     ty: types.Type,
     mutable: bool,
@@ -23,6 +28,7 @@ const Checker = struct {
     arena: std.mem.Allocator,
     scopes: std.ArrayListUnmanaged(Scope) = .empty,
     type_decls: std.StringHashMapUnmanaged(TypeDeclInfo) = .empty,
+    funcs: std.StringHashMapUnmanaged(FunctionInfo) = .empty,
     next_binding_id: u32 = 0,
     last_line: u32 = 1,
     last_col: u32 = 1,
@@ -98,6 +104,16 @@ const Checker = struct {
         self.type_decls.put(self.arena, name, .{ .fields = fields }) catch return error.OutOfMemory;
     }
 
+    fn declareFunction(self: *Checker, decl: *ast.FunctionDecl) CompileError!void {
+        if (self.funcs.get(decl.name) != null) return self.fail(decl.line, decl.col, "E_DUPLICATE_BINDING");
+        const return_type = types.fromAnnotation(decl.return_annotation);
+        for (decl.params) |*param| {
+            param.checked_type = types.fromAnnotation(param.annotation);
+        }
+        decl.checked_return_type = return_type;
+        self.funcs.put(self.arena, decl.name, .{ .params = decl.params, .return_type = return_type }) catch return error.OutOfMemory;
+    }
+
     fn checkProgram(self: *Checker, program: *ast.Program) CompileError!void {
         try self.pushScope();
         for (program.stmts) |*stmt| try self.checkStmt(program, stmt);
@@ -118,10 +134,7 @@ const Checker = struct {
                 try self.declareType(decl.name, decl.fields, decl.line, decl.col);
             },
             .function_decl => |*decl| {
-                for (decl.params) |*param| {
-                    param.checked_type = types.fromAnnotation(param.annotation);
-                }
-                decl.checked_return_type = types.fromAnnotation(decl.return_annotation);
+                try self.declareFunction(decl);
             },
             .var_decl => |*decl| {
                 const final_type = if (decl.annotation) |ann|
@@ -255,7 +268,23 @@ const Checker = struct {
                     program.needs_serve = true;
                     return .void;
                 }
-                return null;
+                const func = self.funcs.get(call.name) orelse {
+                    _ = self.fail(line, col, "unknown function") catch {};
+                    return null;
+                };
+                if (call.args.len != func.params.len) {
+                    _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                    return null;
+                }
+                for (call.args, func.params) |arg, param| {
+                    const arg_type = self.exprType(program, arg, line, col) orelse return null;
+                    const param_type = param.checked_type orelse types.fromAnnotation(param.annotation);
+                    if (!types.same(param_type, arg_type)) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                }
+                return func.return_type;
             },
             else => types.inferExprType(e),
         };

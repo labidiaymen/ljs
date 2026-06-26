@@ -51,6 +51,7 @@
 - [x] T035 Track lexical binding scopes and reject duplicate bindings.
 - [x] T036 Reject incompatible arithmetic and comparison operands.
 - [x] T037 Parse and emit top-level typed function declarations.
+- [x] T038 Check and emit calls to declared functions.
 - [x] T017 Reject `eval` with `E_UNSUPPORTED_EVAL`.
 - [x] T018 Reject prototype access/mutation with `E_UNSUPPORTED_PROTOTYPE`.
 - [x] T019 Reject CommonJS `require` with `E_UNSUPPORTED_COMMONJS`.

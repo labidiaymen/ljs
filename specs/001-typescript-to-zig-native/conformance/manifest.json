@@ -80,6 +80,14 @@
       }
     },
     {
+      "id": "native.valid.function-call",
+      "source": "../examples/valid/function-call.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "5"
+      }
+    },
+    {
       "id": "native.invalid.eval",
       "source": "../examples/invalid/eval.ts",
       "phase": "diagnostics",
@@ -157,6 +165,22 @@
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.function-arg-type",
+      "source": "../examples/invalid/function-arg-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.function-arg-count",
+      "source": "../examples/invalid/function-arg-count.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_ARG_COUNT"
       }
     },
     {

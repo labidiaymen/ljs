@@ -96,6 +96,8 @@ being precise enough for native output.
 15. **Given** a top-level typed function declaration with typed parameters and
     a declared return type, **When** compiled, **Then** it is emitted into the
     generated native artifact.
+16. **Given** a call to a declared function, **When** checked, **Then** argument
+    count and argument types must match the function signature.
 
 ### Edge Cases
 
@@ -150,6 +152,8 @@ being precise enough for native output.
   operands; equality operators MUST require compatible operand types.
 - **FR-023**: The compiler MUST accept top-level TypeScript-style function
   declarations with typed parameters, an explicit return type, and block bodies.
+- **FR-024**: Function calls MUST check argument count and argument types against
+  the declared function signature.
 
 ### Diagnostics
 
@@ -165,6 +169,8 @@ being precise enough for native output.
   a `const` binding.
 - **E_DUPLICATE_BINDING**: Produced when a declaration repeats a name already
   declared in the same lexical scope.
+- **E_ARG_COUNT**: Produced when a function call provides the wrong number of
+  arguments.
 
 ### Existing JavaScript Infrastructure
 
