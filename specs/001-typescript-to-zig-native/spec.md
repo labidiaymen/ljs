@@ -98,6 +98,8 @@ being precise enough for native output.
     generated native artifact.
 16. **Given** a call to a declared function, **When** checked, **Then** argument
     count and argument types must match the function signature.
+17. **Given** a function return expression, **When** checked, **Then** its type
+    must match the declared return type.
 
 ### Edge Cases
 
@@ -154,6 +156,8 @@ being precise enough for native output.
   declarations with typed parameters, an explicit return type, and block bodies.
 - **FR-024**: Function calls MUST check argument count and argument types against
   the declared function signature.
+- **FR-025**: `return` statements MUST appear inside functions and return values
+  MUST match the declared function return type.
 
 ### Diagnostics
 
@@ -171,6 +175,10 @@ being precise enough for native output.
   declared in the same lexical scope.
 - **E_ARG_COUNT**: Produced when a function call provides the wrong number of
   arguments.
+- **E_RETURN_TYPE**: Produced when a function returns a value incompatible with
+  its declared return type.
+- **E_RETURN_OUTSIDE_FUNCTION**: Produced when `return` appears outside a
+  function body.
 
 ### Existing JavaScript Infrastructure
 

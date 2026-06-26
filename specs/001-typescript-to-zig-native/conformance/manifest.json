@@ -184,6 +184,22 @@
       }
     },
     {
+      "id": "native.invalid.function-return-type",
+      "source": "../examples/invalid/function-return-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_RETURN_TYPE"
+      }
+    },
+    {
+      "id": "native.invalid.return-outside-function",
+      "source": "../examples/invalid/return-outside-function.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_RETURN_OUTSIDE_FUNCTION"
+      }
+    },
+    {
       "id": "native.invalid.named-type-field-mismatch",
       "source": "../examples/invalid/named-type-field-mismatch.ts",
       "phase": "diagnostics",

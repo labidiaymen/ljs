@@ -18,7 +18,7 @@ const FunctionInfo = struct {
 const Binding = struct {
     ty: types.Type,
     mutable: bool,
-    decl: *ast.VarDecl,
+    decl: ?*ast.VarDecl = null,
     emit_name: []const u8,
 };
 
@@ -30,6 +30,7 @@ const Checker = struct {
     type_decls: std.StringHashMapUnmanaged(TypeDeclInfo) = .empty,
     funcs: std.StringHashMapUnmanaged(FunctionInfo) = .empty,
     next_binding_id: u32 = 0,
+    current_return_type: ?types.Type = null,
     last_line: u32 = 1,
     last_col: u32 = 1,
     last_err: []const u8 = "syntax error",
@@ -99,6 +100,13 @@ const Checker = struct {
         scope.put(self.arena, name, .{ .ty = ty, .mutable = decl.mutable, .decl = decl, .emit_name = emit_name }) catch return error.OutOfMemory;
     }
 
+    fn declareParam(self: *Checker, param: ast.FunctionParam, line: u32, col: u32) CompileError!void {
+        const scope = self.currentScope();
+        if (scope.get(param.name) != null) return self.fail(line, col, "E_DUPLICATE_BINDING");
+        const param_type = param.checked_type orelse types.fromAnnotation(param.annotation);
+        scope.put(self.arena, param.name, .{ .ty = param_type, .mutable = true, .emit_name = param.name }) catch return error.OutOfMemory;
+    }
+
     fn declareType(self: *Checker, name: []const u8, fields: []ast.TypeField, line: u32, col: u32) CompileError!void {
         if (self.type_decls.get(name) != null) return self.fail(line, col, "E_DUPLICATE_BINDING");
         self.type_decls.put(self.arena, name, .{ .fields = fields }) catch return error.OutOfMemory;
@@ -125,6 +133,17 @@ const Checker = struct {
         for (body) |*body_stmt| try self.checkStmt(program, body_stmt);
     }
 
+    fn checkFunctionBody(self: *Checker, program: *ast.Program, decl: *ast.FunctionDecl) CompileError!void {
+        const previous_return_type = self.current_return_type;
+        self.current_return_type = decl.checked_return_type;
+        defer self.current_return_type = previous_return_type;
+
+        try self.pushScope();
+        defer self.popScope();
+        for (decl.params) |param| try self.declareParam(param, decl.line, decl.col);
+        for (decl.body) |*body_stmt| try self.checkStmt(program, body_stmt);
+    }
+
     fn checkStmt(self: *Checker, program: *ast.Program, stmt: *ast.Stmt) CompileError!void {
         switch (stmt.*) {
             .type_decl => |*decl| {
@@ -135,6 +154,7 @@ const Checker = struct {
             },
             .function_decl => |*decl| {
                 try self.declareFunction(decl);
+                try self.checkFunctionBody(program, decl);
             },
             .var_decl => |*decl| {
                 const final_type = if (decl.annotation) |ann|
@@ -163,7 +183,7 @@ const Checker = struct {
                     else => return self.inferenceFail(assignment.line, assignment.col, "cannot infer assignment type"),
                 }
                 try self.ensureAssignable(program, expected_type, assignment.value, assignment.line, assignment.col);
-                found_binding.decl.reassigned = true;
+                if (found_binding.decl) |decl| decl.reassigned = true;
                 assignment.emit_name = found_binding.emit_name;
             },
             .console_log => |*log| {
@@ -190,8 +210,12 @@ const Checker = struct {
                     return self.inferenceFail(expr_stmt.line, expr_stmt.col, "cannot infer expression type");
             },
             .return_stmt => |*ret| {
-                ret.checked_type = self.exprType(program, ret.value, ret.line, ret.col) orelse
+                const expected_return = self.current_return_type orelse
+                    return self.fail(ret.line, ret.col, "E_RETURN_OUTSIDE_FUNCTION");
+                const actual_return = self.exprType(program, ret.value, ret.line, ret.col) orelse
                     return self.inferenceFail(ret.line, ret.col, "cannot infer return type");
+                if (!types.same(expected_return, actual_return)) return self.fail(ret.line, ret.col, "E_RETURN_TYPE");
+                ret.checked_type = actual_return;
             },
         }
     }
