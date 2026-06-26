@@ -56,6 +56,14 @@
       }
     },
     {
+      "id": "native.valid.if-else",
+      "source": "../examples/valid/if-else.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "yes"
+      }
+    },
+    {
       "id": "native.invalid.eval",
       "source": "../examples/invalid/eval.ts",
       "phase": "diagnostics",
@@ -93,6 +101,14 @@
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_CONST_ASSIGNMENT"
+      }
+    },
+    {
+      "id": "native.invalid.if-condition-type",
+      "source": "../examples/invalid/if-condition-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
       }
     },
     {

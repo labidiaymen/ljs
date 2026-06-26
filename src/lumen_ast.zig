@@ -43,6 +43,14 @@ pub const WhileStmt = struct {
     col: u32,
 };
 
+pub const IfStmt = struct {
+    cond: *Expr,
+    then_body: []Stmt,
+    else_body: ?[]Stmt = null,
+    line: u32,
+    col: u32,
+};
+
 pub const ExprStmt = struct {
     value: *Expr,
     line: u32,
@@ -55,6 +63,7 @@ pub const Stmt = union(enum) {
     assign: Assign,
     console_log: ConsoleLog,
     while_stmt: WhileStmt,
+    if_stmt: IfStmt,
     expr_stmt: ExprStmt,
 };
 

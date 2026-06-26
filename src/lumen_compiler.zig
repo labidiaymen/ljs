@@ -279,6 +279,14 @@ const Parser = struct {
         return .{ .type_decl = .{ .name = tname, .fields = try fields.toOwnedSlice(self.arena), .line = line, .col = col } };
     }
 
+    fn parseBlock(self: *Parser) CompileError![]Stmt {
+        try self.expectOp('{');
+        var body: std.ArrayListUnmanaged(Stmt) = .empty;
+        while (!self.isOp('}')) try body.append(self.arena, try self.parseStmt());
+        try self.expectOp('}');
+        return body.toOwnedSlice(self.arena);
+    }
+
     fn parseStmt(self: *Parser) CompileError!Stmt {
         const eq = std.mem.eql;
         if (self.cur != .ident) return error.ParseError;
@@ -324,11 +332,22 @@ const Parser = struct {
             try self.expectOp('(');
             const cond = try self.parseExpr();
             try self.expectOp(')');
-            try self.expectOp('{');
-            var body: std.ArrayListUnmanaged(Stmt) = .empty;
-            while (!self.isOp('}')) try body.append(self.arena, try self.parseStmt());
-            try self.expectOp('}');
-            return .{ .while_stmt = .{ .cond = cond, .body = try body.toOwnedSlice(self.arena), .line = line, .col = col } };
+            const body = try self.parseBlock();
+            return .{ .while_stmt = .{ .cond = cond, .body = body, .line = line, .col = col } };
+        }
+
+        if (eq(u8, kw, "if")) {
+            try self.advance();
+            try self.expectOp('(');
+            const cond = try self.parseExpr();
+            try self.expectOp(')');
+            const then_body = try self.parseBlock();
+            var else_body: ?[]Stmt = null;
+            if (self.isKw("else")) {
+                try self.advance();
+                else_body = try self.parseBlock();
+            }
+            return .{ .if_stmt = .{ .cond = cond, .then_body = then_body, .else_body = else_body, .line = line, .col = col } };
         }
 
         if (isBuiltin(kw)) {
@@ -439,6 +458,7 @@ fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.Ar
         .assign => |assignment| .{ .line = assignment.line, .col = assignment.col },
         .console_log => |log| .{ .line = log.line, .col = log.col },
         .while_stmt => |loop| .{ .line = loop.line, .col = loop.col },
+        .if_stmt => |branch| .{ .line = branch.line, .col = branch.col },
         .expr_stmt => |expr_stmt| .{ .line = expr_stmt.line, .col = expr_stmt.col },
     };
     try body.print(arena, "    __lumen_line = {d}; __lumen_col = {d};\n", .{ line_col.line, line_col.col });
@@ -475,6 +495,19 @@ fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.Ar
             try body.appendSlice(arena, ") {\n");
             for (loop.body) |*body_stmt| try emitStmt(body_stmt, decls, body, arena);
             try body.appendSlice(arena, "    }\n");
+        },
+        .if_stmt => |branch| {
+            try body.appendSlice(arena, "    if (");
+            try emitExpr(branch.cond, body, arena);
+            try body.appendSlice(arena, ") {\n");
+            for (branch.then_body) |*body_stmt| try emitStmt(body_stmt, decls, body, arena);
+            try body.appendSlice(arena, "    }");
+            if (branch.else_body) |else_body| {
+                try body.appendSlice(arena, " else {\n");
+                for (else_body) |*body_stmt| try emitStmt(body_stmt, decls, body, arena);
+                try body.appendSlice(arena, "    }");
+            }
+            try body.appendSlice(arena, "\n");
         },
         .expr_stmt => |expr_stmt| {
             const is_serve = expr_stmt.value.* == .call and std.mem.eql(u8, expr_stmt.value.call.name, "serve");

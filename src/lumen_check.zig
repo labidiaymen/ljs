@@ -96,6 +96,15 @@ const Checker = struct {
                     return self.fail(loop.line, loop.col, "cannot infer while condition type");
                 for (loop.body) |*body_stmt| try self.checkStmt(program, body_stmt);
             },
+            .if_stmt => |*branch| {
+                const cond_type = self.exprType(program, branch.cond, branch.line, branch.col) orelse
+                    return self.fail(branch.line, branch.col, "cannot infer if condition type");
+                if (!types.same(.bool, cond_type)) return self.fail(branch.line, branch.col, "E_TYPE_MISMATCH");
+                for (branch.then_body) |*body_stmt| try self.checkStmt(program, body_stmt);
+                if (branch.else_body) |else_body| {
+                    for (else_body) |*body_stmt| try self.checkStmt(program, body_stmt);
+                }
+            },
             .expr_stmt => |expr_stmt| {
                 _ = self.exprType(program, expr_stmt.value, expr_stmt.line, expr_stmt.col) orelse
                     return self.fail(expr_stmt.line, expr_stmt.col, "cannot infer expression type");

@@ -81,6 +81,10 @@ being precise enough for native output.
    checked source type.
 8. **Given** `true` or `false` appears in an expression, **When** parsed,
    **Then** it is treated as a boolean literal rather than a variable name.
+9. **Given** an `if` statement with a boolean condition, **When** compiled,
+   **Then** the native program executes the matching block.
+10. **Given** an `if` statement with a non-boolean condition, **When** checked,
+    **Then** `E_TYPE_MISMATCH` is reported.
 
 ### Edge Cases
 
@@ -124,6 +128,8 @@ being precise enough for native output.
 - **FR-016**: `console.log` emission MUST use the checked argument type rather
   than assuming every argument is an integer.
 - **FR-017**: The compiler MUST accept `true` and `false` as boolean literals.
+- **FR-018**: The compiler MUST accept TypeScript-style `if`/`else` block
+  statements and require their conditions to be boolean.
 
 ### Diagnostics
 
