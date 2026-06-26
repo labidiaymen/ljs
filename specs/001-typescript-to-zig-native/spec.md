@@ -85,6 +85,8 @@ being precise enough for native output.
    **Then** the native program executes the matching block.
 10. **Given** an `if` statement with a non-boolean condition, **When** checked,
     **Then** `E_TYPE_MISMATCH` is reported.
+11. **Given** a `while` statement with a non-boolean condition, **When**
+    checked, **Then** `E_TYPE_MISMATCH` is reported.
 
 ### Edge Cases
 
@@ -130,6 +132,7 @@ being precise enough for native output.
 - **FR-017**: The compiler MUST accept `true` and `false` as boolean literals.
 - **FR-018**: The compiler MUST accept TypeScript-style `if`/`else` block
   statements and require their conditions to be boolean.
+- **FR-019**: The compiler MUST require `while` conditions to be boolean.
 
 ### Diagnostics
 

@@ -92,8 +92,9 @@ const Checker = struct {
                     return self.fail(log.line, log.col, "cannot infer console.log argument type");
             },
             .while_stmt => |*loop| {
-                _ = self.exprType(program, loop.cond, loop.line, loop.col) orelse
+                const cond_type = self.exprType(program, loop.cond, loop.line, loop.col) orelse
                     return self.fail(loop.line, loop.col, "cannot infer while condition type");
+                if (!types.same(.bool, cond_type)) return self.fail(loop.line, loop.col, "E_TYPE_MISMATCH");
                 for (loop.body) |*body_stmt| try self.checkStmt(program, body_stmt);
             },
             .if_stmt => |*branch| {

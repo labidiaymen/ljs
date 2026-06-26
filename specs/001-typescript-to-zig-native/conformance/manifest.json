@@ -112,6 +112,14 @@
       }
     },
     {
+      "id": "native.invalid.while-condition-type",
+      "source": "../examples/invalid/while-condition-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
       "id": "native.invalid.named-type-field-mismatch",
       "source": "../examples/invalid/named-type-field-mismatch.ts",
       "phase": "diagnostics",
