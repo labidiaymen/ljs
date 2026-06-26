@@ -16,6 +16,7 @@ pub const VarDecl = struct {
     name: []const u8,
     annotation: ?[]const u8,
     checked_type: ?types.Type = null,
+    reassigned: bool = false,
     init: *Expr,
     line: u32,
     col: u32,

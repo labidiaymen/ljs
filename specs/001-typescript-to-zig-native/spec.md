@@ -72,6 +72,10 @@ being precise enough for native output.
 4. **Given** `type User = { id: int }` and `let user: User = { id: 7 }`,
    **When** checked, **Then** the object literal is accepted as `User` and
    `user.id` is typed as `int`.
+5. **Given** `let total = 1` followed by `total = total + 2`, **When**
+   checked, **Then** reassignment is accepted.
+6. **Given** `const total = 1` followed by `total = 2`, **When** checked,
+   **Then** `E_CONST_ASSIGNMENT` is reported.
 
 ### Edge Cases
 
@@ -110,6 +114,8 @@ being precise enough for native output.
 - **FR-014**: Named object type declarations MUST define closed static shapes.
   Object literals assigned to those names MUST provide exactly the declared
   fields with compatible field types.
+- **FR-015**: `let` declarations MUST create reassignable bindings and `const`
+  declarations MUST create non-reassignable bindings.
 
 ### Diagnostics
 
@@ -121,6 +127,8 @@ being precise enough for native output.
   declared by the target object type.
 - **E_TYPE_MISMATCH**: Produced when assigned value type is incompatible with
   the declared or inferred variable type.
+- **E_CONST_ASSIGNMENT**: Produced when source attempts to assign a new value to
+  a `const` binding.
 
 ### Existing JavaScript Infrastructure
 

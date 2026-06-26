@@ -10,9 +10,15 @@ const TypeDeclInfo = struct {
     fields: []ast.TypeField,
 };
 
+const Binding = struct {
+    ty: types.Type,
+    mutable: bool,
+    decl: *ast.VarDecl,
+};
+
 const Checker = struct {
     arena: std.mem.Allocator,
-    vars: std.StringHashMapUnmanaged(types.Type) = .empty,
+    vars: std.StringHashMapUnmanaged(Binding) = .empty,
     type_decls: std.StringHashMapUnmanaged(TypeDeclInfo) = .empty,
     last_line: u32 = 1,
     last_col: u32 = 1,
@@ -32,8 +38,8 @@ const Checker = struct {
         return error.ParseError;
     }
 
-    fn declare(self: *Checker, name: []const u8, t: types.Type) CompileError!void {
-        self.vars.put(self.arena, name, t) catch return error.OutOfMemory;
+    fn declare(self: *Checker, name: []const u8, binding: Binding) CompileError!void {
+        self.vars.put(self.arena, name, binding) catch return error.OutOfMemory;
     }
 
     fn declareType(self: *Checker, name: []const u8, fields: []ast.TypeField) CompileError!void {
@@ -61,11 +67,15 @@ const Checker = struct {
 
                 try self.ensureAssignable(program, final_type, decl.init, decl.line, decl.col);
                 decl.checked_type = final_type;
-                try self.declare(decl.name, final_type);
+                try self.declare(decl.name, .{ .ty = final_type, .mutable = decl.mutable, .decl = decl });
             },
             .assign => |assignment| {
-                const expected_type = self.vars.get(assignment.name) orelse
+                const binding = self.vars.getPtr(assignment.name) orelse
                     return self.undefined_(assignment.name, assignment.line, assignment.col);
+                if (!binding.mutable) {
+                    return self.fail(assignment.line, assignment.col, "E_CONST_ASSIGNMENT");
+                }
+                const expected_type = binding.ty;
                 if (self.exprType(program, assignment.value, assignment.line, assignment.col)) |actual_type| {
                     if (!types.same(expected_type, actual_type)) {
                         return self.fail(assignment.line, assignment.col, "E_TYPE_MISMATCH");
@@ -75,6 +85,7 @@ const Checker = struct {
                     else => return self.fail(assignment.line, assignment.col, "cannot infer assignment type"),
                 }
                 try self.ensureAssignable(program, expected_type, assignment.value, assignment.line, assignment.col);
+                binding.decl.reassigned = true;
             },
             .console_log => |log| {
                 _ = self.exprType(program, log.value, log.line, log.col) orelse
@@ -112,9 +123,12 @@ const Checker = struct {
 
     fn exprType(self: *Checker, program: *ast.Program, e: *const ast.Expr, line: u32, col: u32) ?types.Type {
         return switch (e.*) {
-            .var_ref => |name| self.vars.get(name) orelse {
-                _ = self.undefined_(name, line, col) catch {};
-                return null;
+            .var_ref => |name| blk: {
+                const binding = self.vars.get(name) orelse {
+                    _ = self.undefined_(name, line, col) catch {};
+                    return null;
+                };
+                break :blk binding.ty;
             },
             .neg => |inner| self.exprType(program, inner, line, col),
             .bin => |bin| {

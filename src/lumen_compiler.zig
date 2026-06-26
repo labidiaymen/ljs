@@ -7,7 +7,7 @@
 //! and lowering first; optimization, native codegen, and cross-compilation come
 //! from Zig/LLVM.
 //!
-//! Current seed: inferred and typed `const`/`let`(immutable) and `var`(mutable) declarations
+//! Current seed: inferred and typed `let`(mutable), `const`(immutable), and `var` declarations
 //! (`int`/`i32`/`i64`, `number`/`f64`, `bool`), arithmetic (`+ - * / %`, precedence + parens + unary `-`),
 //! comparisons (`< > <= >= == !=`), `while` loops + assignment, typed objects (`type T = {…}` →
 //! struct, object literals, field access), and `console.log`.
@@ -284,7 +284,7 @@ const Parser = struct {
         if (eq(u8, kw, "type")) return self.parseTypeDecl(line, col);
 
         if (eq(u8, kw, "let") or eq(u8, kw, "const") or eq(u8, kw, "var")) {
-            const mutable = eq(u8, kw, "var");
+            const mutable = eq(u8, kw, "let") or eq(u8, kw, "var");
             try self.advance();
             if (self.cur != .ident) return error.ParseError;
             const name = self.cur.ident;
@@ -440,7 +440,7 @@ fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.Ar
         },
         .var_decl => |decl| {
             const final_zty = decl.checked_type orelse return error.ParseError;
-            try body.print(arena, "    {s} {s}: {s} = ", .{ if (decl.mutable) "var" else "const", decl.name, types.zigName(final_zty) });
+            try body.print(arena, "    {s} {s}: {s} = ", .{ if (decl.mutable and decl.reassigned) "var" else "const", decl.name, types.zigName(final_zty) });
             try emitExpr(decl.init, body, arena);
             try body.appendSlice(arena, ";\n");
         },
