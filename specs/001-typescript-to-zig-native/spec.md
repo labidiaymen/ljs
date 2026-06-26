@@ -87,6 +87,10 @@ being precise enough for native output.
     **Then** `E_TYPE_MISMATCH` is reported.
 11. **Given** a `while` statement with a non-boolean condition, **When**
     checked, **Then** `E_TYPE_MISMATCH` is reported.
+12. **Given** two declarations with the same name in the same lexical scope,
+    **When** checked, **Then** `E_DUPLICATE_BINDING` is reported.
+13. **Given** a block declares a name that exists in an outer scope, **When**
+    checked, **Then** the inner declaration shadows only within that block.
 
 ### Edge Cases
 
@@ -133,6 +137,9 @@ being precise enough for native output.
 - **FR-018**: The compiler MUST accept TypeScript-style `if`/`else` block
   statements and require their conditions to be boolean.
 - **FR-019**: The compiler MUST require `while` conditions to be boolean.
+- **FR-020**: `let`, `const`, and `var` declarations MUST be tracked in
+  lexical scopes, reject duplicate declarations in the same scope, and allow
+  shadowing in nested block scopes.
 
 ### Diagnostics
 
@@ -146,6 +153,8 @@ being precise enough for native output.
   the declared or inferred variable type.
 - **E_CONST_ASSIGNMENT**: Produced when source attempts to assign a new value to
   a `const` binding.
+- **E_DUPLICATE_BINDING**: Produced when a declaration repeats a name already
+  declared in the same lexical scope.
 
 ### Existing JavaScript Infrastructure
 

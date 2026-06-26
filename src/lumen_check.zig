@@ -14,12 +14,16 @@ const Binding = struct {
     ty: types.Type,
     mutable: bool,
     decl: *ast.VarDecl,
+    emit_name: []const u8,
 };
+
+const Scope = std.StringHashMapUnmanaged(Binding);
 
 const Checker = struct {
     arena: std.mem.Allocator,
-    vars: std.StringHashMapUnmanaged(Binding) = .empty,
+    scopes: std.ArrayListUnmanaged(Scope) = .empty,
     type_decls: std.StringHashMapUnmanaged(TypeDeclInfo) = .empty,
+    next_binding_id: u32 = 0,
     last_line: u32 = 1,
     last_col: u32 = 1,
     last_err: []const u8 = "syntax error",
@@ -38,16 +42,64 @@ const Checker = struct {
         return error.ParseError;
     }
 
-    fn declare(self: *Checker, name: []const u8, binding: Binding) CompileError!void {
-        self.vars.put(self.arena, name, binding) catch return error.OutOfMemory;
+    fn currentScope(self: *Checker) *Scope {
+        return &self.scopes.items[self.scopes.items.len - 1];
     }
 
-    fn declareType(self: *Checker, name: []const u8, fields: []ast.TypeField) CompileError!void {
+    fn pushScope(self: *Checker) CompileError!void {
+        self.scopes.append(self.arena, .empty) catch return error.OutOfMemory;
+    }
+
+    fn popScope(self: *Checker) void {
+        self.scopes.items.len -= 1;
+    }
+
+    fn binding(self: *Checker, name: []const u8) ?Binding {
+        var i = self.scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.scopes.items[i].get(name)) |found| return found;
+        }
+        return null;
+    }
+
+    fn bindingPtr(self: *Checker, name: []const u8) ?*Binding {
+        var i = self.scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.scopes.items[i].getPtr(name)) |found| return found;
+        }
+        return null;
+    }
+
+    fn freshEmitName(self: *Checker, name: []const u8) CompileError![]const u8 {
+        const id = self.next_binding_id;
+        self.next_binding_id += 1;
+        return std.fmt.allocPrint(self.arena, "__lumen_{d}_{s}", .{ id, name }) catch error.OutOfMemory;
+    }
+
+    fn declare(self: *Checker, name: []const u8, decl: *ast.VarDecl, ty: types.Type, line: u32, col: u32) CompileError!void {
+        const scope = self.currentScope();
+        if (scope.get(name) != null) return self.fail(line, col, "E_DUPLICATE_BINDING");
+        const emit_name = try self.freshEmitName(name);
+        decl.emit_name = emit_name;
+        scope.put(self.arena, name, .{ .ty = ty, .mutable = decl.mutable, .decl = decl, .emit_name = emit_name }) catch return error.OutOfMemory;
+    }
+
+    fn declareType(self: *Checker, name: []const u8, fields: []ast.TypeField, line: u32, col: u32) CompileError!void {
+        if (self.type_decls.get(name) != null) return self.fail(line, col, "E_DUPLICATE_BINDING");
         self.type_decls.put(self.arena, name, .{ .fields = fields }) catch return error.OutOfMemory;
     }
 
     fn checkProgram(self: *Checker, program: *ast.Program) CompileError!void {
+        try self.pushScope();
         for (program.stmts) |*stmt| try self.checkStmt(program, stmt);
+    }
+
+    fn checkBlock(self: *Checker, program: *ast.Program, body: []ast.Stmt) CompileError!void {
+        try self.pushScope();
+        defer self.popScope();
+        for (body) |*body_stmt| try self.checkStmt(program, body_stmt);
     }
 
     fn checkStmt(self: *Checker, program: *ast.Program, stmt: *ast.Stmt) CompileError!void {
@@ -56,7 +108,7 @@ const Checker = struct {
                 for (decl.fields) |*field| {
                     field.checked_type = types.fromAnnotation(field.annotation);
                 }
-                try self.declareType(decl.name, decl.fields);
+                try self.declareType(decl.name, decl.fields, decl.line, decl.col);
             },
             .var_decl => |*decl| {
                 const final_type = if (decl.annotation) |ann|
@@ -67,15 +119,15 @@ const Checker = struct {
 
                 try self.ensureAssignable(program, final_type, decl.init, decl.line, decl.col);
                 decl.checked_type = final_type;
-                try self.declare(decl.name, .{ .ty = final_type, .mutable = decl.mutable, .decl = decl });
+                try self.declare(decl.name, decl, final_type, decl.line, decl.col);
             },
-            .assign => |assignment| {
-                const binding = self.vars.getPtr(assignment.name) orelse
+            .assign => |*assignment| {
+                const found_binding = self.bindingPtr(assignment.name) orelse
                     return self.undefined_(assignment.name, assignment.line, assignment.col);
-                if (!binding.mutable) {
+                if (!found_binding.mutable) {
                     return self.fail(assignment.line, assignment.col, "E_CONST_ASSIGNMENT");
                 }
-                const expected_type = binding.ty;
+                const expected_type = found_binding.ty;
                 if (self.exprType(program, assignment.value, assignment.line, assignment.col)) |actual_type| {
                     if (!types.same(expected_type, actual_type)) {
                         return self.fail(assignment.line, assignment.col, "E_TYPE_MISMATCH");
@@ -85,7 +137,8 @@ const Checker = struct {
                     else => return self.fail(assignment.line, assignment.col, "cannot infer assignment type"),
                 }
                 try self.ensureAssignable(program, expected_type, assignment.value, assignment.line, assignment.col);
-                binding.decl.reassigned = true;
+                found_binding.decl.reassigned = true;
+                assignment.emit_name = found_binding.emit_name;
             },
             .console_log => |*log| {
                 log.checked_type = self.exprType(program, log.value, log.line, log.col) orelse
@@ -95,15 +148,15 @@ const Checker = struct {
                 const cond_type = self.exprType(program, loop.cond, loop.line, loop.col) orelse
                     return self.fail(loop.line, loop.col, "cannot infer while condition type");
                 if (!types.same(.bool, cond_type)) return self.fail(loop.line, loop.col, "E_TYPE_MISMATCH");
-                for (loop.body) |*body_stmt| try self.checkStmt(program, body_stmt);
+                try self.checkBlock(program, loop.body);
             },
             .if_stmt => |*branch| {
                 const cond_type = self.exprType(program, branch.cond, branch.line, branch.col) orelse
                     return self.fail(branch.line, branch.col, "cannot infer if condition type");
                 if (!types.same(.bool, cond_type)) return self.fail(branch.line, branch.col, "E_TYPE_MISMATCH");
-                for (branch.then_body) |*body_stmt| try self.checkStmt(program, body_stmt);
+                try self.checkBlock(program, branch.then_body);
                 if (branch.else_body) |else_body| {
-                    for (else_body) |*body_stmt| try self.checkStmt(program, body_stmt);
+                    try self.checkBlock(program, else_body);
                 }
             },
             .expr_stmt => |expr_stmt| {
@@ -113,7 +166,7 @@ const Checker = struct {
         }
     }
 
-    fn ensureAssignable(self: *Checker, program: *ast.Program, expected: types.Type, value: *const ast.Expr, line: u32, col: u32) CompileError!void {
+    fn ensureAssignable(self: *Checker, program: *ast.Program, expected: types.Type, value: *ast.Expr, line: u32, col: u32) CompileError!void {
         switch (expected) {
             .named => |type_name| {
                 const decl = self.type_decls.get(type_name) orelse return self.fail(line, col, "unknown type name");
@@ -131,14 +184,15 @@ const Checker = struct {
         }
     }
 
-    fn exprType(self: *Checker, program: *ast.Program, e: *const ast.Expr, line: u32, col: u32) ?types.Type {
+    fn exprType(self: *Checker, program: *ast.Program, e: *ast.Expr, line: u32, col: u32) ?types.Type {
         return switch (e.*) {
-            .var_ref => |name| blk: {
-                const binding = self.vars.get(name) orelse {
-                    _ = self.undefined_(name, line, col) catch {};
+            .var_ref => |*ref| blk: {
+                const found_binding = self.binding(ref.name) orelse {
+                    _ = self.undefined_(ref.name, line, col) catch {};
                     return null;
                 };
-                break :blk binding.ty;
+                ref.emit_name = found_binding.emit_name;
+                break :blk found_binding.ty;
             },
             .neg => |inner| self.exprType(program, inner, line, col),
             .bin => |bin| {

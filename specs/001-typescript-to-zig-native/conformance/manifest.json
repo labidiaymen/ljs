@@ -64,6 +64,14 @@
       }
     },
     {
+      "id": "native.valid.block-shadow",
+      "source": "../examples/valid/block-shadow.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "2\n1"
+      }
+    },
+    {
       "id": "native.invalid.eval",
       "source": "../examples/invalid/eval.ts",
       "phase": "diagnostics",
@@ -117,6 +125,14 @@
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.duplicate-binding",
+      "source": "../examples/invalid/duplicate-binding.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_DUPLICATE_BINDING"
       }
     },
     {

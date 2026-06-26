@@ -229,7 +229,7 @@ const Parser = struct {
                 return self.node(.{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.arena) } });
             }
             try self.advance();
-            return self.node(.{ .var_ref = name });
+            return self.node(.{ .var_ref = .{ .name = name } });
         }
         if (self.isOp('(')) {
             try self.advance();
@@ -398,7 +398,7 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try w.append(arena, ')');
             }
         },
-        .var_ref => |name| try w.appendSlice(arena, name),
+        .var_ref => |ref| try w.appendSlice(arena, ref.emit_name orelse ref.name),
         .neg => |inner| {
             try w.appendSlice(arena, "-(");
             try emitExpr(inner, w, arena);
@@ -474,12 +474,12 @@ fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.Ar
         },
         .var_decl => |decl| {
             const final_zty = decl.checked_type orelse return error.ParseError;
-            try body.print(arena, "    {s} {s}: {s} = ", .{ if (decl.mutable and decl.reassigned) "var" else "const", decl.name, types.zigName(final_zty) });
+            try body.print(arena, "    {s} {s}: {s} = ", .{ if (decl.mutable and decl.reassigned) "var" else "const", decl.emit_name orelse decl.name, types.zigName(final_zty) });
             try emitExpr(decl.init, body, arena);
             try body.appendSlice(arena, ";\n");
         },
         .assign => |assignment| {
-            try body.print(arena, "    {s} = ", .{assignment.name});
+            try body.print(arena, "    {s} = ", .{assignment.emit_name orelse assignment.name});
             try emitExpr(assignment.value, body, arena);
             try body.appendSlice(arena, ";\n");
         },

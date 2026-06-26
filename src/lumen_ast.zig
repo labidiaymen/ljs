@@ -14,6 +14,7 @@ pub const TypeDecl = struct {
 pub const VarDecl = struct {
     mutable: bool,
     name: []const u8,
+    emit_name: ?[]const u8 = null,
     annotation: ?[]const u8,
     checked_type: ?types.Type = null,
     reassigned: bool = false,
@@ -24,6 +25,7 @@ pub const VarDecl = struct {
 
 pub const Assign = struct {
     name: []const u8,
+    emit_name: ?[]const u8 = null,
     value: *Expr,
     line: u32,
     col: u32,
@@ -78,7 +80,7 @@ pub const Expr = union(enum) {
     num: i64,
     bool: bool,
     str: []const u8,
-    var_ref: []const u8,
+    var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null },
     neg: *Expr,
     bin: struct { op: u8, l: *Expr, r: *Expr }, // + - * / %
     cmp: struct { op: []const u8, l: *Expr, r: *Expr }, // < > <= >= == !=
