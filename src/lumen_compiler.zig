@@ -205,6 +205,11 @@ const Parser = struct {
             try self.advance();
             return self.node(.{ .num = v });
         }
+        if (self.isKw("true") or self.isKw("false")) {
+            const v = self.isKw("true");
+            try self.advance();
+            return self.node(.{ .bool = v });
+        }
         if (self.cur == .str) {
             const s = self.cur.str;
             try self.advance();
@@ -351,6 +356,7 @@ const Parser = struct {
 fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
     switch (e.*) {
         .num => |v| try w.print(arena, "{d}", .{v}),
+        .bool => |v| try w.appendSlice(arena, if (v) "true" else "false"),
         .str => |s| {
             try w.append(arena, '"');
             for (s) |ch| {

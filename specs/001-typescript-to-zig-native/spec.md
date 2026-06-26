@@ -79,6 +79,8 @@ being precise enough for native output.
 7. **Given** `console.log` receives a string, boolean, or numeric value,
    **When** emitted, **Then** the generated native program prints it using the
    checked source type.
+8. **Given** `true` or `false` appears in an expression, **When** parsed,
+   **Then** it is treated as a boolean literal rather than a variable name.
 
 ### Edge Cases
 
@@ -121,6 +123,7 @@ being precise enough for native output.
   declarations MUST create non-reassignable bindings.
 - **FR-016**: `console.log` emission MUST use the checked argument type rather
   than assuming every argument is an integer.
+- **FR-017**: The compiler MUST accept `true` and `false` as boolean literals.
 
 ### Diagnostics
 

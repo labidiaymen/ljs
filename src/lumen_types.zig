@@ -14,6 +14,7 @@ pub const Type = union(enum) {
 pub fn inferExprType(e: *const ast.Expr) ?Type {
     return switch (e.*) {
         .num => .i32,
+        .bool => .bool,
         .str => .string,
         .neg => |inner| inferExprType(inner),
         .bin => .i32,

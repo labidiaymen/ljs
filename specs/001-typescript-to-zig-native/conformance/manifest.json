@@ -48,6 +48,14 @@
       }
     },
     {
+      "id": "native.valid.bool-literal",
+      "source": "../examples/valid/bool-literal.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "true"
+      }
+    },
+    {
       "id": "native.invalid.eval",
       "source": "../examples/invalid/eval.ts",
       "phase": "diagnostics",
