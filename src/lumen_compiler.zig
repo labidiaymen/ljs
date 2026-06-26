@@ -279,6 +279,40 @@ const Parser = struct {
         return .{ .type_decl = .{ .name = tname, .fields = try fields.toOwnedSlice(self.arena), .line = line, .col = col } };
     }
 
+    fn parseFunctionDecl(self: *Parser, line: u32, col: u32) CompileError!Stmt {
+        try self.advance();
+        if (self.cur != .ident) return error.ParseError;
+        const name = self.cur.ident;
+        try self.advance();
+        try self.expectOp('(');
+        var params: std.ArrayListUnmanaged(ast.FunctionParam) = .empty;
+        while (!self.isOp(')')) {
+            if (self.cur != .ident) return error.ParseError;
+            const param_name = self.cur.ident;
+            try self.advance();
+            try self.expectOp(':');
+            if (self.cur != .ident) return error.ParseError;
+            const annotation = self.cur.ident;
+            try self.advance();
+            try params.append(self.arena, .{ .name = param_name, .annotation = annotation });
+            if (self.isOp(',')) try self.advance() else break;
+        }
+        try self.expectOp(')');
+        try self.expectOp(':');
+        if (self.cur != .ident) return error.ParseError;
+        const return_annotation = self.cur.ident;
+        try self.advance();
+        const body = try self.parseBlock();
+        return .{ .function_decl = .{
+            .name = name,
+            .params = try params.toOwnedSlice(self.arena),
+            .return_annotation = return_annotation,
+            .body = body,
+            .line = line,
+            .col = col,
+        } };
+    }
+
     fn parseBlock(self: *Parser) CompileError![]Stmt {
         try self.expectOp('{');
         var body: std.ArrayListUnmanaged(Stmt) = .empty;
@@ -295,6 +329,7 @@ const Parser = struct {
         const col = self.cur_col;
 
         if (eq(u8, kw, "type")) return self.parseTypeDecl(line, col);
+        if (eq(u8, kw, "function")) return self.parseFunctionDecl(line, col);
 
         if (eq(u8, kw, "let") or eq(u8, kw, "const") or eq(u8, kw, "var")) {
             const mutable = eq(u8, kw, "let") or eq(u8, kw, "var");
@@ -348,6 +383,13 @@ const Parser = struct {
                 else_body = try self.parseBlock();
             }
             return .{ .if_stmt = .{ .cond = cond, .then_body = then_body, .else_body = else_body, .line = line, .col = col } };
+        }
+
+        if (eq(u8, kw, "return")) {
+            try self.advance();
+            const value = try self.parseExpr();
+            try self.expectOp(';');
+            return .{ .return_stmt = .{ .value = value, .line = line, .col = col } };
         }
 
         if (isBuiltin(kw)) {
@@ -454,11 +496,13 @@ fn printFormat(t: types.Type) []const u8 {
 fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
     const line_col: SourceLoc = switch (stmt.*) {
         .type_decl => |decl| .{ .line = decl.line, .col = decl.col },
+        .function_decl => |decl| .{ .line = decl.line, .col = decl.col },
         .var_decl => |decl| .{ .line = decl.line, .col = decl.col },
         .assign => |assignment| .{ .line = assignment.line, .col = assignment.col },
         .console_log => |log| .{ .line = log.line, .col = log.col },
         .while_stmt => |loop| .{ .line = loop.line, .col = loop.col },
         .if_stmt => |branch| .{ .line = branch.line, .col = branch.col },
+        .return_stmt => |ret| .{ .line = ret.line, .col = ret.col },
         .expr_stmt => |expr_stmt| .{ .line = expr_stmt.line, .col = expr_stmt.col },
     };
     try body.print(arena, "    __lumen_line = {d}; __lumen_col = {d};\n", .{ line_col.line, line_col.col });
@@ -471,6 +515,18 @@ fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.Ar
                 try decls.print(arena, "    {s}: {s},\n", .{ field.name, types.zigName(field_type) });
             }
             try decls.appendSlice(arena, "};\n");
+        },
+        .function_decl => |decl| {
+            const return_type = decl.checked_return_type orelse types.fromAnnotation(decl.return_annotation);
+            try decls.print(arena, "fn {s}(", .{decl.name});
+            for (decl.params, 0..) |param, i| {
+                if (i > 0) try decls.appendSlice(arena, ", ");
+                const param_type = param.checked_type orelse types.fromAnnotation(param.annotation);
+                try decls.print(arena, "{s}: {s}", .{ param.name, types.zigName(param_type) });
+            }
+            try decls.print(arena, ") {s} {{\n", .{types.zigName(return_type)});
+            for (decl.body) |*body_stmt| try emitStmt(body_stmt, decls, decls, arena);
+            try decls.appendSlice(arena, "}\n");
         },
         .var_decl => |decl| {
             const final_zty = decl.checked_type orelse return error.ParseError;
@@ -508,6 +564,11 @@ fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.Ar
                 try body.appendSlice(arena, "    }");
             }
             try body.appendSlice(arena, "\n");
+        },
+        .return_stmt => |ret| {
+            try body.appendSlice(arena, "    return ");
+            try emitExpr(ret.value, body, arena);
+            try body.appendSlice(arena, ";\n");
         },
         .expr_stmt => |expr_stmt| {
             const is_serve = expr_stmt.value.* == .call and std.mem.eql(u8, expr_stmt.value.call.name, "serve");

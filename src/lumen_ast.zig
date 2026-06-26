@@ -11,6 +11,22 @@ pub const TypeDecl = struct {
     col: u32,
 };
 
+pub const FunctionParam = struct {
+    name: []const u8,
+    annotation: []const u8,
+    checked_type: ?types.Type = null,
+};
+
+pub const FunctionDecl = struct {
+    name: []const u8,
+    params: []FunctionParam,
+    return_annotation: []const u8,
+    checked_return_type: ?types.Type = null,
+    body: []Stmt,
+    line: u32,
+    col: u32,
+};
+
 pub const VarDecl = struct {
     mutable: bool,
     name: []const u8,
@@ -59,13 +75,22 @@ pub const ExprStmt = struct {
     col: u32,
 };
 
+pub const ReturnStmt = struct {
+    value: *Expr,
+    checked_type: ?types.Type = null,
+    line: u32,
+    col: u32,
+};
+
 pub const Stmt = union(enum) {
     type_decl: TypeDecl,
+    function_decl: FunctionDecl,
     var_decl: VarDecl,
     assign: Assign,
     console_log: ConsoleLog,
     while_stmt: WhileStmt,
     if_stmt: IfStmt,
+    return_stmt: ReturnStmt,
     expr_stmt: ExprStmt,
 };
 

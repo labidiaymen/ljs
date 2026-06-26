@@ -117,6 +117,12 @@ const Checker = struct {
                 }
                 try self.declareType(decl.name, decl.fields, decl.line, decl.col);
             },
+            .function_decl => |*decl| {
+                for (decl.params) |*param| {
+                    param.checked_type = types.fromAnnotation(param.annotation);
+                }
+                decl.checked_return_type = types.fromAnnotation(decl.return_annotation);
+            },
             .var_decl => |*decl| {
                 const final_type = if (decl.annotation) |ann|
                     types.fromAnnotation(ann)
@@ -169,6 +175,10 @@ const Checker = struct {
             .expr_stmt => |expr_stmt| {
                 _ = self.exprType(program, expr_stmt.value, expr_stmt.line, expr_stmt.col) orelse
                     return self.inferenceFail(expr_stmt.line, expr_stmt.col, "cannot infer expression type");
+            },
+            .return_stmt => |*ret| {
+                ret.checked_type = self.exprType(program, ret.value, ret.line, ret.col) orelse
+                    return self.inferenceFail(ret.line, ret.col, "cannot infer return type");
             },
         }
     }

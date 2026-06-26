@@ -93,6 +93,9 @@ being precise enough for native output.
     checked, **Then** the inner declaration shadows only within that block.
 14. **Given** arithmetic or ordered comparison operands with incompatible
     types, **When** checked, **Then** `E_TYPE_MISMATCH` is reported.
+15. **Given** a top-level typed function declaration with typed parameters and
+    a declared return type, **When** compiled, **Then** it is emitted into the
+    generated native artifact.
 
 ### Edge Cases
 
@@ -145,6 +148,8 @@ being precise enough for native output.
 - **FR-021**: Arithmetic operators MUST require compatible numeric operands.
 - **FR-022**: Ordered comparison operators MUST require compatible numeric
   operands; equality operators MUST require compatible operand types.
+- **FR-023**: The compiler MUST accept top-level TypeScript-style function
+  declarations with typed parameters, an explicit return type, and block bodies.
 
 ### Diagnostics
 

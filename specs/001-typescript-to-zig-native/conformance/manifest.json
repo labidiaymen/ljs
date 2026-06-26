@@ -72,6 +72,14 @@
       }
     },
     {
+      "id": "native.valid.function-decl",
+      "source": "../examples/valid/function-decl.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "1"
+      }
+    },
+    {
       "id": "native.invalid.eval",
       "source": "../examples/invalid/eval.ts",
       "phase": "diagnostics",
