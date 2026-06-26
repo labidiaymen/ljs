@@ -238,7 +238,14 @@ const Checker = struct {
             .return_stmt => |*ret| {
                 const expected_return = self.current_return_type orelse
                     return self.fail(ret.line, ret.col, "E_RETURN_OUTSIDE_FUNCTION");
-                const actual_return = self.exprType(program, ret.value, ret.line, ret.col) orelse
+                const value = ret.value orelse {
+                    if (expected_return == .void) {
+                        ret.checked_type = .void;
+                        return;
+                    }
+                    return self.fail(ret.line, ret.col, "E_RETURN_TYPE");
+                };
+                const actual_return = self.exprType(program, value, ret.line, ret.col) orelse
                     return self.inferenceFail(ret.line, ret.col, "cannot infer return type");
                 if (!types.same(expected_return, actual_return)) return self.fail(ret.line, ret.col, "E_RETURN_TYPE");
                 ret.checked_type = actual_return;

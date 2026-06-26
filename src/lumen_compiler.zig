@@ -386,7 +386,7 @@ const Parser = struct {
 
         if (eq(u8, kw, "return")) {
             try self.advance();
-            const value = try self.parseExpr();
+            const value = if (self.isOp(';')) null else try self.parseExpr();
             try self.expectOp(';');
             return .{ .return_stmt = .{ .value = value, .line = line, .col = col } };
         }
@@ -584,9 +584,13 @@ fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.Ar
             try body.appendSlice(arena, "\n");
         },
         .return_stmt => |ret| {
-            try body.appendSlice(arena, "    return ");
-            try emitExpr(ret.value, body, arena);
-            try body.appendSlice(arena, ";\n");
+            if (ret.value) |value| {
+                try body.appendSlice(arena, "    return ");
+                try emitExpr(value, body, arena);
+                try body.appendSlice(arena, ";\n");
+            } else {
+                try body.appendSlice(arena, "    return;\n");
+            }
         },
         .expr_stmt => |expr_stmt| {
             const is_serve = expr_stmt.value.* == .call and std.mem.eql(u8, expr_stmt.value.call.name, "serve");

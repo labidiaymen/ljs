@@ -76,7 +76,7 @@ pub const ExprStmt = struct {
 };
 
 pub const ReturnStmt = struct {
-    value: *Expr,
+    value: ?*Expr = null,
     checked_type: ?types.Type = null,
     line: u32,
     col: u32,

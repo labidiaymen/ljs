@@ -178,6 +178,8 @@ being precise enough for native output.
 - **FR-030**: Non-`void` functions MUST return on all simple checked paths;
   direct `return` and `if`/`else` branches where both sides return count as
   returning.
+- **FR-031**: Bare `return;` MUST be accepted only in `void` functions and MUST
+  be rejected in non-`void` functions.
 
 ### Diagnostics
 
