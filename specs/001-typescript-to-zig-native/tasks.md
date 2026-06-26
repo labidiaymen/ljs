@@ -31,7 +31,7 @@
   emission.
 - [x] T010 Introduce a type representation for `int`, `i32`, `number`, `float`,
   `boolean`, `string`, and `void`.
-- [ ] T011 Add symbol table support for variables and functions.
+- [x] T011 Add symbol table support for variables and functions.
 - [x] T028 Add checker-owned variable symbol table support.
 - [x] T012 Add static checker pass before Zig emission.
 - [x] T013 Keep generated Zig emission as a distinct phase.

@@ -163,6 +163,8 @@ being precise enough for native output.
 - **FR-020**: `let`, `const`, and `var` declarations MUST be tracked in
   lexical scopes, reject duplicate declarations in the same scope, and allow
   shadowing in nested block scopes.
+- **FR-020A**: Variable bindings and top-level function signatures MUST be
+  stored in checker-owned symbol tables before Zig emission.
 - **FR-021**: Arithmetic operators MUST require compatible numeric operands.
 - **FR-022**: Ordered comparison operators MUST require compatible numeric
   operands; equality operators MUST require compatible operand types.
