@@ -124,6 +124,9 @@ const Checker = struct {
 
     fn checkProgram(self: *Checker, program: *ast.Program) CompileError!void {
         try self.pushScope();
+        for (program.stmts) |*stmt| {
+            if (stmt.* == .function_decl) try self.declareFunction(&stmt.function_decl);
+        }
         for (program.stmts) |*stmt| try self.checkStmt(program, stmt);
     }
 
@@ -153,7 +156,7 @@ const Checker = struct {
                 try self.declareType(decl.name, decl.fields, decl.line, decl.col);
             },
             .function_decl => |*decl| {
-                try self.declareFunction(decl);
+                if (decl.checked_return_type == null) try self.declareFunction(decl);
                 try self.checkFunctionBody(program, decl);
             },
             .var_decl => |*decl| {

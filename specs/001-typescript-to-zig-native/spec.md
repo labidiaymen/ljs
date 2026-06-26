@@ -103,6 +103,8 @@ being precise enough for native output.
 18. **Given** a `void` function call used as a statement, **When** checked,
     **Then** it is accepted; **Given** the same call is used as a value,
     **Then** `E_VOID_VALUE` is reported.
+19. **Given** a top-level function call appears before its declaration, **When**
+    checked, **Then** it resolves against the later function declaration.
 
 ### Edge Cases
 
@@ -163,6 +165,8 @@ being precise enough for native output.
   MUST match the declared function return type.
 - **FR-026**: `void` function calls MUST be allowed as statements but rejected
   when used as values.
+- **FR-027**: Top-level function declarations MUST be available throughout the
+  source file, including before their declaration point.
 
 ### Diagnostics
 
