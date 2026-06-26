@@ -144,6 +144,14 @@
       }
     },
     {
+      "id": "native.valid.exceptions",
+      "source": "../examples/valid/exceptions.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "boom\ndone"
+      }
+    },
+    {
       "id": "native.valid.function-hoist",
       "source": "../examples/valid/function-hoist.ts",
       "phase": "compile-run",
@@ -317,6 +325,14 @@
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_UNSUPPORTED_STD"
+      }
+    },
+    {
+      "id": "native.invalid.throw-type",
+      "source": "../examples/invalid/throw-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_THROW_TYPE"
       }
     },
     {

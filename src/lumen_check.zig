@@ -108,6 +108,14 @@ const Checker = struct {
         scope.put(self.arena, param.name, .{ .ty = param_type, .mutable = true, .emit_name = param.name }) catch return error.OutOfMemory;
     }
 
+    fn declareCatch(self: *Checker, stmt: *ast.TryStmt) CompileError!void {
+        const scope = self.currentScope();
+        if (scope.get(stmt.catch_name) != null) return self.fail(stmt.line, stmt.col, "E_DUPLICATE_BINDING");
+        const emit_name = try self.freshEmitName(stmt.catch_name);
+        stmt.catch_emit_name = emit_name;
+        scope.put(self.arena, stmt.catch_name, .{ .ty = .error_obj, .mutable = false, .emit_name = emit_name }) catch return error.OutOfMemory;
+    }
+
     fn declareType(self: *Checker, name: []const u8, fields: []ast.TypeField, line: u32, col: u32) CompileError!void {
         if (self.type_decls.get(name) != null) return self.fail(line, col, "E_DUPLICATE_BINDING");
         self.type_decls.put(self.arena, name, .{ .fields = fields }) catch return error.OutOfMemory;
@@ -168,6 +176,7 @@ const Checker = struct {
         return switch (stmt) {
             .return_stmt => true,
             .if_stmt => |branch| branch.else_body != null and blockReturns(branch.then_body) and blockReturns(branch.else_body.?),
+            .throw_stmt => true,
             else => false,
         };
     }
@@ -255,6 +264,23 @@ const Checker = struct {
                     return self.inferenceFail(ret.line, ret.col, "cannot infer return type");
                 if (!types.same(expected_return, actual_return)) return self.fail(ret.line, ret.col, "E_RETURN_TYPE");
                 ret.checked_type = actual_return;
+            },
+            .throw_stmt => |throw_stmt| {
+                const thrown_type = self.exprType(program, throw_stmt.value, throw_stmt.line, throw_stmt.col) orelse
+                    return self.inferenceFail(throw_stmt.line, throw_stmt.col, "cannot infer throw type");
+                if (!types.same(.error_obj, thrown_type)) return self.fail(throw_stmt.line, throw_stmt.col, "E_THROW_TYPE");
+            },
+            .try_stmt => |*try_stmt| {
+                try self.checkBlock(program, try_stmt.try_body);
+                try self.pushScope();
+                defer self.popScope();
+                try self.declareCatch(try_stmt);
+                self.nested_stmt_depth += 1;
+                defer self.nested_stmt_depth -= 1;
+                for (try_stmt.catch_body) |*catch_stmt| try self.checkStmt(program, catch_stmt);
+                if (try_stmt.finally_body) |finally_body| {
+                    try self.checkBlock(program, finally_body);
+                }
             },
         }
     }
@@ -365,6 +391,10 @@ const Checker = struct {
                     field.builtin = .length;
                     return .i64;
                 }
+                if (obj_type == .error_obj and std.mem.eql(u8, field.name, "message")) {
+                    field.builtin = .error_message;
+                    return .string;
+                }
                 return switch (obj_type) {
                     .named => |type_name| self.fieldType(type_name, field.name, line, col),
                     else => null,
@@ -386,6 +416,18 @@ const Checker = struct {
             },
             .obj => null,
             .call => |call| {
+                if (std.mem.eql(u8, call.name, "Error")) {
+                    if (call.args.len != 1) {
+                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    const message_type = self.exprType(program, call.args[0], line, col) orelse return null;
+                    if (!types.same(.string, message_type)) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                    return .error_obj;
+                }
                 if (std.mem.eql(u8, call.name, "httpGet")) {
                     for (call.args) |arg| _ = self.exprType(program, arg, line, col) orelse return null;
                     program.uses_io = true;

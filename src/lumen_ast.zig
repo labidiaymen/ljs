@@ -82,6 +82,22 @@ pub const ReturnStmt = struct {
     col: u32,
 };
 
+pub const ThrowStmt = struct {
+    value: *Expr,
+    line: u32,
+    col: u32,
+};
+
+pub const TryStmt = struct {
+    try_body: []Stmt,
+    catch_name: []const u8,
+    catch_emit_name: ?[]const u8 = null,
+    catch_body: []Stmt,
+    finally_body: ?[]Stmt = null,
+    line: u32,
+    col: u32,
+};
+
 pub const Stmt = union(enum) {
     type_decl: TypeDecl,
     function_decl: FunctionDecl,
@@ -91,6 +107,8 @@ pub const Stmt = union(enum) {
     while_stmt: WhileStmt,
     if_stmt: IfStmt,
     return_stmt: ReturnStmt,
+    throw_stmt: ThrowStmt,
+    try_stmt: TryStmt,
     expr_stmt: ExprStmt,
 };
 
@@ -121,4 +139,5 @@ pub const Expr = union(enum) {
 
 pub const FieldBuiltin = enum {
     length,
+    error_message,
 };

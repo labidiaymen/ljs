@@ -122,6 +122,9 @@ being precise enough for native output.
 25. **Given** calls to supported `Math` APIs, **When** checked, **Then**
     numeric argument types and arity are validated before lowering to native
     operations.
+26. **Given** `try`/`catch`/`throw` source using `Error("message")`, **When**
+    compiled, **Then** thrown error messages can be observed as `err.message`
+    inside the catch block and `finally` runs after catch handling.
 
 ### Edge Cases
 
@@ -213,6 +216,9 @@ being precise enough for native output.
 - **FR-037**: The compiler MUST support the V1 `Math` namespace functions
   `abs`, `max`, and `min`; unsupported stdlib members MUST be rejected with
   `E_UNSUPPORTED_STD`.
+- **FR-038**: The compiler MUST support TypeScript-style `throw`,
+  `try`/`catch`, optional `finally`, `Error("message")`, and `err.message` for
+  caught errors; thrown values MUST be Error values.
 
 ### Diagnostics
 
@@ -246,6 +252,7 @@ being precise enough for native output.
   appears outside the top-level source scope.
 - **E_UNSUPPORTED_STD**: Produced when source calls a stdlib namespace member
   that is not part of the V1 supported surface.
+- **E_THROW_TYPE**: Produced when source throws a non-Error value.
 
 ### Existing JavaScript Infrastructure
 

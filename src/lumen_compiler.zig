@@ -465,6 +465,32 @@ const Parser = struct {
             return .{ .return_stmt = .{ .value = value, .line = line, .col = col } };
         }
 
+        if (eq(u8, kw, "throw")) {
+            try self.advance();
+            const value = try self.parseExpr();
+            try self.expectOp(';');
+            return .{ .throw_stmt = .{ .value = value, .line = line, .col = col } };
+        }
+
+        if (eq(u8, kw, "try")) {
+            try self.advance();
+            const try_body = try self.parseBlock();
+            if (!self.isKw("catch")) return error.ParseError;
+            try self.advance();
+            try self.expectOp('(');
+            if (self.cur != .ident) return error.ParseError;
+            const catch_name = self.cur.ident;
+            try self.advance();
+            try self.expectOp(')');
+            const catch_body = try self.parseBlock();
+            var finally_body: ?[]Stmt = null;
+            if (self.isKw("finally")) {
+                try self.advance();
+                finally_body = try self.parseBlock();
+            }
+            return .{ .try_stmt = .{ .try_body = try_body, .catch_name = catch_name, .catch_body = catch_body, .finally_body = finally_body, .line = line, .col = col } };
+        }
+
         if (isBuiltin(kw)) {
             const value = try self.parseExpr();
             try self.expectOp(';');
@@ -521,7 +547,9 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
         },
         .call => |cl| {
             // builtins lower to a Zig std wrapper taking (__io, __alloc, args...).
-            if (std.mem.eql(u8, cl.name, "httpGet")) {
+            if (std.mem.eql(u8, cl.name, "Error")) {
+                if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
+            } else if (std.mem.eql(u8, cl.name, "httpGet")) {
                 try w.appendSlice(arena, "__httpGet(__io, __alloc, ");
                 if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
                 try w.append(arena, ')');
@@ -630,6 +658,8 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try w.appendSlice(arena, "@as(i64, @intCast(");
                 try emitExpr(fa.obj, w, arena);
                 try w.appendSlice(arena, ".len))");
+            } else if (fa.builtin == .error_message) {
+                try emitExpr(fa.obj, w, arena);
             } else {
                 try emitExpr(fa.obj, w, arena);
                 try w.print(arena, ".{s}", .{fa.name});
@@ -653,6 +683,10 @@ fn printFormat(t: types.Type) []const u8 {
 }
 
 fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
+    return emitStmtWithThrow(stmt, decls, body, arena, null);
+}
+
+fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, throw_target: ?[]const u8) CompileError!void {
     const line_col: SourceLoc = switch (stmt.*) {
         .type_decl => |decl| .{ .line = decl.line, .col = decl.col },
         .function_decl => |decl| .{ .line = decl.line, .col = decl.col },
@@ -662,6 +696,8 @@ fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.Ar
         .while_stmt => |loop| .{ .line = loop.line, .col = loop.col },
         .if_stmt => |branch| .{ .line = branch.line, .col = branch.col },
         .return_stmt => |ret| .{ .line = ret.line, .col = ret.col },
+        .throw_stmt => |throw_stmt| .{ .line = throw_stmt.line, .col = throw_stmt.col },
+        .try_stmt => |try_stmt| .{ .line = try_stmt.line, .col = try_stmt.col },
         .expr_stmt => |expr_stmt| .{ .line = expr_stmt.line, .col = expr_stmt.col },
     };
     try body.print(arena, "    __lumen_line = {d}; __lumen_col = {d};\n", .{ line_col.line, line_col.col });
@@ -708,18 +744,18 @@ fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.Ar
             try body.appendSlice(arena, "    while (");
             try emitExpr(loop.cond, body, arena);
             try body.appendSlice(arena, ") {\n");
-            for (loop.body) |*body_stmt| try emitStmt(body_stmt, decls, body, arena);
+            for (loop.body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target);
             try body.appendSlice(arena, "    }\n");
         },
         .if_stmt => |branch| {
             try body.appendSlice(arena, "    if (");
             try emitExpr(branch.cond, body, arena);
             try body.appendSlice(arena, ") {\n");
-            for (branch.then_body) |*body_stmt| try emitStmt(body_stmt, decls, body, arena);
+            for (branch.then_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target);
             try body.appendSlice(arena, "    }");
             if (branch.else_body) |else_body| {
                 try body.appendSlice(arena, " else {\n");
-                for (else_body) |*body_stmt| try emitStmt(body_stmt, decls, body, arena);
+                for (else_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target);
                 try body.appendSlice(arena, "    }");
             }
             try body.appendSlice(arena, "\n");
@@ -731,6 +767,34 @@ fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.Ar
                 try body.appendSlice(arena, ";\n");
             } else {
                 try body.appendSlice(arena, "    return;\n");
+            }
+        },
+        .throw_stmt => |throw_stmt| {
+            if (throw_target) |target| {
+                try body.print(arena, "    {s} = ", .{target});
+                try emitExpr(throw_stmt.value, body, arena);
+                try body.appendSlice(arena, ";\n");
+            } else {
+                try body.appendSlice(arena, "    @panic(");
+                try emitExpr(throw_stmt.value, body, arena);
+                try body.appendSlice(arena, ");\n");
+            }
+        },
+        .try_stmt => |try_stmt| {
+            const slot = try std.fmt.allocPrint(arena, "__lumen_throw_{d}_{d}", .{ try_stmt.line, try_stmt.col });
+            try body.print(arena, "    var {s}: ?[]const u8 = null;\n", .{slot});
+            try body.appendSlice(arena, "    {\n");
+            for (try_stmt.try_body) |*try_body_stmt| {
+                try body.print(arena, "    if ({s} == null) {{\n", .{slot});
+                try emitStmtWithThrow(try_body_stmt, decls, body, arena, slot);
+                try body.appendSlice(arena, "    }\n");
+            }
+            try body.appendSlice(arena, "    }\n");
+            try body.print(arena, "    if ({s}) |{s}| {{\n", .{ slot, try_stmt.catch_emit_name orelse try_stmt.catch_name });
+            for (try_stmt.catch_body) |*catch_stmt| try emitStmtWithThrow(catch_stmt, decls, body, arena, throw_target);
+            try body.appendSlice(arena, "    }\n");
+            if (try_stmt.finally_body) |finally_body| {
+                for (finally_body) |*finally_stmt| try emitStmtWithThrow(finally_stmt, decls, body, arena, throw_target);
             }
         },
         .expr_stmt => |expr_stmt| {

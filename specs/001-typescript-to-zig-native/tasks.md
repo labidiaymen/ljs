@@ -65,6 +65,7 @@
 - [x] T049 Accept primitive typed arrays, indexing, and length.
 - [x] T050 Accept string length and string concatenation.
 - [x] T051 Accept V1 Math namespace functions.
+- [x] T052 Accept V1 Error, throw, try/catch, and finally.
 - [x] T017 Reject `eval` with `E_UNSUPPORTED_EVAL`.
 - [x] T018 Reject prototype access/mutation with `E_UNSUPPORTED_PROTOTYPE`.
 - [x] T019 Reject CommonJS `require` with `E_UNSUPPORTED_COMMONJS`.
