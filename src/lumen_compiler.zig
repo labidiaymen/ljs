@@ -249,7 +249,19 @@ const Parser = struct {
                 if (self.cur != .ident) return error.ParseError;
                 const name = self.cur.ident;
                 try self.advance();
-                e = try self.node(.{ .field = .{ .obj = e, .name = name } });
+                if (self.isOp('(')) {
+                    if (e.* != .var_ref or !std.mem.eql(u8, e.var_ref.name, "Math")) return error.ParseError;
+                    try self.expectOp('(');
+                    var args: std.ArrayListUnmanaged(*Expr) = .empty;
+                    while (!self.isOp(')')) {
+                        try args.append(self.arena, try self.parseExpr());
+                        if (self.isOp(',')) try self.advance() else break;
+                    }
+                    try self.expectOp(')');
+                    e = try self.node(.{ .static_call = .{ .namespace = "Math", .name = name, .args = try args.toOwnedSlice(self.arena) } });
+                } else {
+                    e = try self.node(.{ .field = .{ .obj = e, .name = name } });
+                }
             } else {
                 try self.advance();
                 const index_value = try self.parseExpr();
@@ -527,6 +539,26 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 }
                 try w.append(arena, ')');
             }
+        },
+        .static_call => |cl| {
+            const checked_type = cl.checked_type orelse return error.ParseError;
+            if (std.mem.eql(u8, cl.namespace, "Math") and std.mem.eql(u8, cl.name, "abs")) {
+                if (checked_type == .f64) {
+                    try w.appendSlice(arena, "@abs(");
+                    try emitExpr(cl.args[0], w, arena);
+                    try w.append(arena, ')');
+                } else {
+                    try w.print(arena, "@as({s}, @intCast(@abs(", .{types.zigName(checked_type)});
+                    try emitExpr(cl.args[0], w, arena);
+                    try w.appendSlice(arena, ")))");
+                }
+            } else if (std.mem.eql(u8, cl.namespace, "Math") and (std.mem.eql(u8, cl.name, "max") or std.mem.eql(u8, cl.name, "min"))) {
+                try w.print(arena, "@{s}(", .{cl.name});
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.append(arena, ')');
+            } else return error.ParseError;
         },
         .var_ref => |ref| try w.appendSlice(arena, ref.emit_name orelse ref.name),
         .neg => |inner| {

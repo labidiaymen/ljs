@@ -119,6 +119,9 @@ being precise enough for native output.
     element type, integer indexing is allowed, and `.length` returns an integer.
 24. **Given** string values, **When** using `.length` or `string + string`,
     **Then** `.length` returns an integer and `+` concatenates string contents.
+25. **Given** calls to supported `Math` APIs, **When** checked, **Then**
+    numeric argument types and arity are validated before lowering to native
+    operations.
 
 ### Edge Cases
 
@@ -207,6 +210,9 @@ being precise enough for native output.
 - **FR-036**: String values MUST support `.length` and `string + string`
   concatenation; mixed string/non-string `+` MUST be rejected with
   `E_TYPE_MISMATCH`.
+- **FR-037**: The compiler MUST support the V1 `Math` namespace functions
+  `abs`, `max`, and `min`; unsupported stdlib members MUST be rejected with
+  `E_UNSUPPORTED_STD`.
 
 ### Diagnostics
 
@@ -238,6 +244,8 @@ being precise enough for native output.
   returning a value.
 - **E_UNSUPPORTED_NESTED_FUNCTION**: Produced when a function declaration
   appears outside the top-level source scope.
+- **E_UNSUPPORTED_STD**: Produced when source calls a stdlib namespace member
+  that is not part of the V1 supported surface.
 
 ### Existing JavaScript Infrastructure
 

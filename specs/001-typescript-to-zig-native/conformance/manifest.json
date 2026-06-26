@@ -136,6 +136,14 @@
       }
     },
     {
+      "id": "native.valid.math-stdlib",
+      "source": "../examples/valid/math-stdlib.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "7"
+      }
+    },
+    {
       "id": "native.valid.function-hoist",
       "source": "../examples/valid/function-hoist.ts",
       "phase": "compile-run",
@@ -293,6 +301,22 @@
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.math-type",
+      "source": "../examples/invalid/math-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.math-unsupported",
+      "source": "../examples/invalid/math-unsupported.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_UNSUPPORTED_STD"
       }
     },
     {

@@ -416,6 +416,41 @@ const Checker = struct {
                 }
                 return func.return_type;
             },
+            .static_call => |*call| {
+                if (!std.mem.eql(u8, call.namespace, "Math")) {
+                    _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+                    return null;
+                }
+                if (std.mem.eql(u8, call.name, "abs")) {
+                    if (call.args.len != 1) {
+                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    const arg_type = self.exprType(program, call.args[0], line, col) orelse return null;
+                    if (!types.isNumeric(arg_type)) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                    call.checked_type = arg_type;
+                    return arg_type;
+                }
+                if (std.mem.eql(u8, call.name, "max") or std.mem.eql(u8, call.name, "min")) {
+                    if (call.args.len != 2) {
+                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    const left_type = self.exprType(program, call.args[0], line, col) orelse return null;
+                    const right_type = self.exprType(program, call.args[1], line, col) orelse return null;
+                    if (!types.isNumeric(left_type) or !types.same(left_type, right_type)) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                    call.checked_type = left_type;
+                    return left_type;
+                }
+                _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+                return null;
+            },
             else => types.inferExprType(e),
         };
     }

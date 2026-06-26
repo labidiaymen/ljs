@@ -116,6 +116,7 @@ pub const Expr = union(enum) {
     field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null },
     index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null },
     call: struct { name: []const u8, args: []*Expr }, // builtin call, e.g. httpGet(url) / serve(port, body)
+    static_call: struct { namespace: []const u8, name: []const u8, args: []*Expr, checked_type: ?types.Type = null },
 };
 
 pub const FieldBuiltin = enum {
