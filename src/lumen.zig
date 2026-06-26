@@ -19,14 +19,54 @@ fn printDiag(err: *std.Io.Writer, source: []const u8, file: []const u8, diag: co
     }
 }
 
+fn parseImportSpec(line: []const u8) !?[]const u8 {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (!std.mem.startsWith(u8, trimmed, "import ")) return null;
+    const marker = " from \"";
+    const marker_pos = std.mem.indexOf(u8, trimmed, marker) orelse return error.InvalidImport;
+    const spec_start = marker_pos + marker.len;
+    const spec_end = std.mem.indexOfScalarPos(u8, trimmed, spec_start, '"') orelse return error.InvalidImport;
+    const spec = trimmed[spec_start..spec_end];
+    if (!(std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../"))) return error.InvalidImport;
+    if (!std.mem.endsWith(u8, spec, ".ts")) return error.InvalidImport;
+    return spec;
+}
+
+fn appendExpandedSource(arena: std.mem.Allocator, io: std.Io, path: []const u8, out: *std.ArrayListUnmanaged(u8), depth: u8) !void {
+    if (depth > 16) return error.InvalidImport;
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024)) catch return error.ImportReadFailed;
+    const dir = std.fs.path.dirname(path) orelse ".";
+
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        if (try parseImportSpec(line)) |spec| {
+            const imported_path = try std.fs.path.join(arena, &.{ dir, spec });
+            try appendExpandedSource(arena, io, imported_path, out, depth + 1);
+            continue;
+        }
+        try out.appendSlice(arena, line);
+        try out.append(arena, '\n');
+    }
+}
+
+fn readSourceWithImports(arena: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try appendExpandedSource(arena, io, path, &out, 0);
+    return out.items;
+}
+
 fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, err: *std.Io.Writer) !u8 {
     if (!std.mem.endsWith(u8, path, ".ts")) {
         try err.print("error: expected a .ts source file, got {s}\n", .{path});
         return 2;
     }
 
-    const source = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024)) catch {
-        try err.print("error: cannot read file {s}\n", .{path});
+    const source = readSourceWithImports(arena, io, path) catch |e| {
+        switch (e) {
+            error.InvalidImport => try err.print("error: invalid import in {s}; use local relative .ts default imports\n", .{path}),
+            error.ImportReadFailed => try err.print("error: cannot read imported file from {s}\n", .{path}),
+            else => try err.print("error: cannot read file {s}\n", .{path}),
+        }
         return 2;
     };
 

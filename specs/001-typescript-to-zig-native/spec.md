@@ -105,6 +105,9 @@ being precise enough for native output.
     **Then** `E_VOID_VALUE` is reported.
 19. **Given** a top-level function call appears before its declaration, **When**
     checked, **Then** it resolves against the later function declaration.
+20. **Given** `import add from "./math.ts"`, **When** compiling the entry file,
+    **Then** the compiler loads the local relative `.ts` file at build time and
+    makes its declarations available to the entry program.
 
 ### Edge Cases
 
@@ -167,6 +170,9 @@ being precise enough for native output.
   when used as values.
 - **FR-027**: Top-level function declarations MUST be available throughout the
   source file, including before their declaration point.
+- **FR-028**: The compiler MUST support local relative default imports from
+  `.ts` files during build, and MUST NOT support remote URLs or package
+  resolution for this V1 slice.
 
 ### Diagnostics
 

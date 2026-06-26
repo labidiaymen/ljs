@@ -55,6 +55,7 @@
 - [x] T039 Check function return statements against declared return types.
 - [x] T040 Allow `void` function statement calls and reject void values.
 - [x] T041 Predeclare top-level function signatures for hoisted calls.
+- [x] T042 Resolve local relative default imports during build.
 - [x] T017 Reject `eval` with `E_UNSUPPORTED_EVAL`.
 - [x] T018 Reject prototype access/mutation with `E_UNSUPPORTED_PROTOTYPE`.
 - [x] T019 Reject CommonJS `require` with `E_UNSUPPORTED_COMMONJS`.

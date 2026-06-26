@@ -104,6 +104,14 @@
       }
     },
     {
+      "id": "native.valid.import-main",
+      "source": "../examples/valid/import-main.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "17"
+      }
+    },
+    {
       "id": "native.invalid.eval",
       "source": "../examples/invalid/eval.ts",
       "phase": "diagnostics",
