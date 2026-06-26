@@ -14,6 +14,15 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    const conformance_runner = b.addExecutable(.{
+        .name = "lumen-conformance",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/lumen_conformance.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
@@ -38,6 +47,7 @@ pub fn build(b: *std.Build) void {
         "src/lumen_lexer.zig",
         "src/lumen_types.zig",
         "src/lumen_compiler.zig",
+        "tools/lumen_conformance.zig",
     };
 
     const fmt = b.addSystemCommand(&[_][]const u8{ "zig", "fmt" });
@@ -52,4 +62,12 @@ pub fn build(b: *std.Build) void {
 
     const lint_step = b.step("lint", "Run compiler lint checks");
     lint_step.dependOn(&fmt_check.step);
+
+    const conformance_cmd = b.addRunArtifact(conformance_runner);
+    conformance_cmd.step.dependOn(b.getInstallStep());
+    conformance_cmd.addArg("specs/001-typescript-to-zig-native/conformance/manifest.json");
+    conformance_cmd.addArg("zig-out/bin/lumen");
+
+    const conformance_step = b.step("conformance", "Run Lumen manifest conformance cases");
+    conformance_step.dependOn(&conformance_cmd.step);
 }

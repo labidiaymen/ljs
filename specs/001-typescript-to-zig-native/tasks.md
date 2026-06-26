@@ -79,3 +79,5 @@
 - [x] T022 Verify `zig build`.
 - [x] T023 Verify a valid `.ts` example compiles and its binary runs.
 - [x] T024 Verify invalid examples fail before generated Zig is emitted.
+- [x] T054 Add a manifest-driven conformance runner and `zig build
+  conformance` step.

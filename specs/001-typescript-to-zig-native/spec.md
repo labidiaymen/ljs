@@ -297,6 +297,8 @@ the Lumen compiler track.
   behavior.
 - **SC-004**: Project docs describe the branch as TypeScript-to-Zig-to-binary,
   not as a Test262 conformance effort.
+- **SC-005**: `zig build conformance` runs the V1 manifest, compiles/runs valid
+  cases, compares expected output, and checks invalid diagnostics.
 
 ## Assumptions
 

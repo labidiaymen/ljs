@@ -51,12 +51,18 @@ Requires Zig 0.16.0.
 ```sh
 zig build
 zig build run -- compile specs/001-typescript-to-zig-native/examples/valid/hello.ts
+zig build conformance
 ```
 
 The default build now installs the compiler-first `lumen` executable. The
 immediate implementation goal is to align `src/lumen_compiler.zig` with the new
 spec: type-check the V1 subset, lower to generated Zig, and produce a native
 binary.
+
+`zig build conformance` runs the manifest-driven V1 conformance suite from
+`specs/001-typescript-to-zig-native/conformance/manifest.json`, compiling valid
+cases, running native binaries, comparing output, and checking invalid
+diagnostics.
 
 ## Development
 
