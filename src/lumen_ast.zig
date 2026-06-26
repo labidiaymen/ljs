@@ -109,7 +109,7 @@ pub const Expr = union(enum) {
     var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null },
     neg: *Expr,
     not: *Expr,
-    bin: struct { op: u8, l: *Expr, r: *Expr }, // + - * / %
+    bin: struct { op: u8, l: *Expr, r: *Expr, checked_type: ?types.Type = null }, // + - * / %
     bool_bin: struct { op: []const u8, l: *Expr, r: *Expr }, // && ||
     cmp: struct { op: []const u8, l: *Expr, r: *Expr, checked_operand_type: ?types.Type = null }, // < > <= >= == !=
     obj: []FieldInit,

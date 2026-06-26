@@ -128,6 +128,14 @@
       }
     },
     {
+      "id": "native.valid.string-basics",
+      "source": "../examples/valid/string-basics.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "hello world\n11"
+      }
+    },
+    {
       "id": "native.valid.function-hoist",
       "source": "../examples/valid/function-hoist.ts",
       "phase": "compile-run",
@@ -274,6 +282,14 @@
     {
       "id": "native.invalid.array-index-type",
       "source": "../examples/invalid/array-index-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.string-concat-type",
+      "source": "../examples/invalid/string-concat-type.ts",
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_TYPE_MISMATCH"

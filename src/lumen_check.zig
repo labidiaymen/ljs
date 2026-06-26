@@ -304,13 +304,18 @@ const Checker = struct {
                 }
                 return .bool;
             },
-            .bin => |bin| {
+            .bin => |*bin| {
                 const left_type = self.exprType(program, bin.l, line, col) orelse return null;
                 const right_type = self.exprType(program, bin.r, line, col) orelse return null;
+                if (bin.op == '+' and types.same(.string, left_type) and types.same(.string, right_type)) {
+                    bin.checked_type = .string;
+                    return .string;
+                }
                 if (!types.isNumeric(left_type) or !types.same(left_type, right_type)) {
                     _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                     return null;
                 }
+                bin.checked_type = left_type;
                 return left_type;
             },
             .bool_bin => |bin| {

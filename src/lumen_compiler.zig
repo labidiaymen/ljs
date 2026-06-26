@@ -540,7 +540,13 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try w.append(arena, ')');
         },
         .bin => |b| {
-            if (b.op == '%') {
+            if (b.op == '+' and b.checked_type != null and b.checked_type.? == .string) {
+                try w.appendSlice(arena, "(std.mem.concat(std.heap.page_allocator, u8, &.{ ");
+                try emitExpr(b.l, w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(b.r, w, arena);
+                try w.appendSlice(arena, " }) catch std.process.exit(1))");
+            } else if (b.op == '%') {
                 // Zig's `%` rejects signed operands → use @rem (operands are non-negative here).
                 try w.appendSlice(arena, "@rem(");
                 try emitExpr(b.l, w, arena);

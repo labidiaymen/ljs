@@ -63,6 +63,7 @@
 - [x] T047 Accept TypeScript boolean operators and require boolean operands.
 - [x] T048 Reject nested function declarations for V1.
 - [x] T049 Accept primitive typed arrays, indexing, and length.
+- [x] T050 Accept string length and string concatenation.
 - [x] T017 Reject `eval` with `E_UNSUPPORTED_EVAL`.
 - [x] T018 Reject prototype access/mutation with `E_UNSUPPORTED_PROTOTYPE`.
 - [x] T019 Reject CommonJS `require` with `E_UNSUPPORTED_COMMONJS`.

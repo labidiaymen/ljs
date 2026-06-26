@@ -117,6 +117,8 @@ being precise enough for native output.
 23. **Given** a typed array declaration such as `let nums: int[] = [1, 2]`,
     **When** checked and emitted, **Then** elements must match the declared
     element type, integer indexing is allowed, and `.length` returns an integer.
+24. **Given** string values, **When** using `.length` or `string + string`,
+    **Then** `.length` returns an integer and `+` concatenates string contents.
 
 ### Edge Cases
 
@@ -202,6 +204,9 @@ being precise enough for native output.
   for primitive V1 element types, array literals, integer indexing, and
   `.length`; array literals MUST contain values compatible with their element
   type.
+- **FR-036**: String values MUST support `.length` and `string + string`
+  concatenation; mixed string/non-string `+` MUST be rejected with
+  `E_TYPE_MISMATCH`.
 
 ### Diagnostics
 
