@@ -180,6 +180,8 @@ being precise enough for native output.
   returning.
 - **FR-031**: Bare `return;` MUST be accepted only in `void` functions and MUST
   be rejected in non-`void` functions.
+- **FR-032**: String equality and inequality MUST compare string contents, not
+  backend slice identity.
 
 ### Diagnostics
 

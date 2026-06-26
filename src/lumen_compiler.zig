@@ -481,11 +481,20 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             }
         },
         .cmp => |b| {
-            try w.append(arena, '(');
-            try emitExpr(b.l, w, arena);
-            try w.print(arena, " {s} ", .{b.op});
-            try emitExpr(b.r, w, arena);
-            try w.append(arena, ')');
+            if (b.checked_operand_type != null and b.checked_operand_type.? == .string and (std.mem.eql(u8, b.op, "==") or std.mem.eql(u8, b.op, "!="))) {
+                if (std.mem.eql(u8, b.op, "!=")) try w.append(arena, '!');
+                try w.appendSlice(arena, "std.mem.eql(u8, ");
+                try emitExpr(b.l, w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(b.r, w, arena);
+                try w.append(arena, ')');
+            } else {
+                try w.append(arena, '(');
+                try emitExpr(b.l, w, arena);
+                try w.print(arena, " {s} ", .{b.op});
+                try emitExpr(b.r, w, arena);
+                try w.append(arena, ')');
+            }
         },
         .obj => |fields| {
             try w.appendSlice(arena, ".{ ");

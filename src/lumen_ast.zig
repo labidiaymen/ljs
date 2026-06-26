@@ -108,7 +108,7 @@ pub const Expr = union(enum) {
     var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null },
     neg: *Expr,
     bin: struct { op: u8, l: *Expr, r: *Expr }, // + - * / %
-    cmp: struct { op: []const u8, l: *Expr, r: *Expr }, // < > <= >= == !=
+    cmp: struct { op: []const u8, l: *Expr, r: *Expr, checked_operand_type: ?types.Type = null }, // < > <= >= == !=
     obj: []FieldInit,
     field: struct { obj: *Expr, name: []const u8 },
     call: struct { name: []const u8, args: []*Expr }, // builtin call, e.g. httpGet(url) / serve(port, body)

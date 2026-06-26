@@ -291,7 +291,7 @@ const Checker = struct {
                 }
                 return left_type;
             },
-            .cmp => |cmp| {
+            .cmp => |*cmp| {
                 const left_type = self.exprType(program, cmp.l, line, col) orelse return null;
                 const right_type = self.exprType(program, cmp.r, line, col) orelse return null;
                 if (!types.same(left_type, right_type)) {
@@ -302,6 +302,7 @@ const Checker = struct {
                     _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                     return null;
                 }
+                cmp.checked_operand_type = left_type;
                 return .bool;
             },
             .field => |field| {
