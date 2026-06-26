@@ -108,6 +108,9 @@ being precise enough for native output.
 20. **Given** `import add from "./math.ts"`, **When** compiling the entry file,
     **Then** the compiler loads the local relative `.ts` file at build time and
     makes its declarations available to the entry program.
+21. **Given** boolean expressions using `&&`, `||`, and `!`, **When** checked,
+    **Then** operands must be boolean and the generated native program preserves
+    TypeScript operator precedence.
 
 ### Edge Cases
 
@@ -182,6 +185,8 @@ being precise enough for native output.
   be rejected in non-`void` functions.
 - **FR-032**: String equality and inequality MUST compare string contents, not
   backend slice identity.
+- **FR-033**: Boolean operators `&&`, `||`, and `!` MUST use TypeScript syntax,
+  MUST require boolean operands, and MUST lower to native boolean operations.
 
 ### Diagnostics
 

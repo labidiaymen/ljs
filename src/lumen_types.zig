@@ -17,7 +17,9 @@ pub fn inferExprType(e: *const ast.Expr) ?Type {
         .bool => .bool,
         .str => .string,
         .neg => |inner| inferExprType(inner),
+        .not => .bool,
         .bin => .i32,
+        .bool_bin => .bool,
         .cmp => .bool,
         .var_ref, .obj, .field, .call => null,
     };

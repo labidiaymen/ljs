@@ -282,6 +282,14 @@ const Checker = struct {
                 break :blk found_binding.ty;
             },
             .neg => |inner| self.exprType(program, inner, line, col),
+            .not => |inner| {
+                const inner_type = self.exprType(program, inner, line, col) orelse return null;
+                if (!types.same(.bool, inner_type)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+                return .bool;
+            },
             .bin => |bin| {
                 const left_type = self.exprType(program, bin.l, line, col) orelse return null;
                 const right_type = self.exprType(program, bin.r, line, col) orelse return null;
@@ -290,6 +298,15 @@ const Checker = struct {
                     return null;
                 }
                 return left_type;
+            },
+            .bool_bin => |bin| {
+                const left_type = self.exprType(program, bin.l, line, col) orelse return null;
+                const right_type = self.exprType(program, bin.r, line, col) orelse return null;
+                if (!types.same(.bool, left_type) or !types.same(.bool, right_type)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+                return .bool;
             },
             .cmp => |*cmp| {
                 const left_type = self.exprType(program, cmp.l, line, col) orelse return null;

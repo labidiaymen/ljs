@@ -149,11 +149,44 @@ const Parser = struct {
     }
 
     fn parseExpr(self: *Parser) CompileError!*Expr {
-        return self.parseCmp();
+        return self.parseOr();
+    }
+    fn isCmp(self: *Parser, op: []const u8) bool {
+        return self.cur == .cmp and std.mem.eql(u8, self.cur.cmp, op);
+    }
+    fn isComparison(self: *Parser) bool {
+        if (self.cur != .cmp) return false;
+        const op = self.cur.cmp;
+        return std.mem.eql(u8, op, "<") or
+            std.mem.eql(u8, op, ">") or
+            std.mem.eql(u8, op, "<=") or
+            std.mem.eql(u8, op, ">=") or
+            std.mem.eql(u8, op, "==") or
+            std.mem.eql(u8, op, "!=");
+    }
+    fn parseOr(self: *Parser) CompileError!*Expr {
+        var left = try self.parseAnd();
+        while (self.isCmp("||")) {
+            const op = self.cur.cmp;
+            try self.advance();
+            const right = try self.parseAnd();
+            left = try self.node(.{ .bool_bin = .{ .op = op, .l = left, .r = right } });
+        }
+        return left;
+    }
+    fn parseAnd(self: *Parser) CompileError!*Expr {
+        var left = try self.parseCmp();
+        while (self.isCmp("&&")) {
+            const op = self.cur.cmp;
+            try self.advance();
+            const right = try self.parseCmp();
+            left = try self.node(.{ .bool_bin = .{ .op = op, .l = left, .r = right } });
+        }
+        return left;
     }
     fn parseCmp(self: *Parser) CompileError!*Expr {
         var left = try self.parseAdd();
-        if (self.cur == .cmp) {
+        if (self.isComparison()) {
             const op = self.cur.cmp;
             try self.advance();
             const right = try self.parseAdd();
@@ -185,6 +218,10 @@ const Parser = struct {
         if (self.isOp('-')) {
             try self.advance();
             return self.node(.{ .neg = try self.parseUnary() });
+        }
+        if (self.isOp('!')) {
+            try self.advance();
+            return self.node(.{ .not = try self.parseUnary() });
         }
         return self.parsePostfix();
     }
@@ -464,6 +501,11 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try emitExpr(inner, w, arena);
             try w.append(arena, ')');
         },
+        .not => |inner| {
+            try w.appendSlice(arena, "!(");
+            try emitExpr(inner, w, arena);
+            try w.append(arena, ')');
+        },
         .bin => |b| {
             if (b.op == '%') {
                 // Zig's `%` rejects signed operands → use @rem (operands are non-negative here).
@@ -479,6 +521,13 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try emitExpr(b.r, w, arena);
                 try w.append(arena, ')');
             }
+        },
+        .bool_bin => |b| {
+            try w.append(arena, '(');
+            try emitExpr(b.l, w, arena);
+            try w.print(arena, " {s} ", .{if (std.mem.eql(u8, b.op, "&&")) "and" else "or"});
+            try emitExpr(b.r, w, arena);
+            try w.append(arena, ')');
         },
         .cmp => |b| {
             if (b.checked_operand_type != null and b.checked_operand_type.? == .string and (std.mem.eql(u8, b.op, "==") or std.mem.eql(u8, b.op, "!="))) {

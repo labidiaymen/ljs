@@ -3,8 +3,8 @@ const diag = @import("lumen_diag.zig");
 pub const Tok = union(enum) {
     num: i64,
     str: []const u8, // string literal content (raw, between quotes)
-    op: u8, // + - * / % ( ) { } ; , . : =
-    cmp: []const u8, // < > <= >= == !=
+    op: u8, // + - * / % ! ( ) { } ; , . : =
+    cmp: []const u8, // < > <= >= == != && ||
     ident: []const u8,
     eof,
 };
@@ -48,13 +48,22 @@ pub const Lexer = struct {
         if (self.i >= self.src.len) return .eof;
         const c = self.src[self.i];
 
+        if (c == '&' or c == '|') {
+            if (self.i + 1 >= self.src.len or self.src[self.i + 1] != c) return error.ParseError;
+            const s = self.src[self.i .. self.i + 2];
+            self.i += 2;
+            return .{ .cmp = s };
+        }
         if (c == '<' or c == '>' or c == '=' or c == '!') {
             const two = self.i + 1 < self.src.len and self.src[self.i + 1] == '=';
             if (c == '=' and !two) {
                 self.i += 1;
                 return .{ .op = '=' };
             }
-            if (c == '!' and !two) return error.ParseError;
+            if (c == '!' and !two) {
+                self.i += 1;
+                return .{ .op = '!' };
+            }
             if (two) {
                 const s = self.src[self.i .. self.i + 2];
                 self.i += 2;
