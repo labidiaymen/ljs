@@ -125,6 +125,10 @@ being precise enough for native output.
 26. **Given** `try`/`catch`/`throw` source using `Error("message")`, **When**
     compiled, **Then** thrown error messages can be observed as `err.message`
     inside the catch block and `finally` runs after catch handling.
+27. **Given** local default imports and `export default function`, **When**
+    compiling an entry file, **Then** the imported function is available under
+    the local default binding and import cycles or duplicate imports receive
+    stable diagnostics.
 
 ### Edge Cases
 
@@ -219,6 +223,9 @@ being precise enough for native output.
 - **FR-038**: The compiler MUST support TypeScript-style `throw`,
   `try`/`catch`, optional `finally`, `Error("message")`, and `err.message` for
   caught errors; thrown values MUST be Error values.
+- **FR-039**: Local default imports MUST support imported `export default
+  function` declarations, MUST detect import cycles, and MUST reject duplicate
+  import specifiers in the same source file.
 
 ### Diagnostics
 
@@ -253,6 +260,9 @@ being precise enough for native output.
 - **E_UNSUPPORTED_STD**: Produced when source calls a stdlib namespace member
   that is not part of the V1 supported surface.
 - **E_THROW_TYPE**: Produced when source throws a non-Error value.
+- **E_IMPORT_CYCLE**: Produced when local import expansion detects a cycle.
+- **E_DUPLICATE_IMPORT**: Produced when a source file imports the same
+  specifier more than once.
 
 ### Existing JavaScript Infrastructure
 

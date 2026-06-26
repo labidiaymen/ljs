@@ -168,6 +168,14 @@
       }
     },
     {
+      "id": "native.valid.export-default-main",
+      "source": "../examples/valid/export-default-main.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "12"
+      }
+    },
+    {
       "id": "native.invalid.eval",
       "source": "../examples/invalid/eval.ts",
       "phase": "diagnostics",
@@ -253,6 +261,22 @@
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_IMPORT_NOT_FOUND"
+      }
+    },
+    {
+      "id": "native.invalid.import-duplicate",
+      "source": "../examples/invalid/import-duplicate.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_DUPLICATE_IMPORT"
+      }
+    },
+    {
+      "id": "native.invalid.import-cycle-a",
+      "source": "../examples/invalid/import-cycle-a.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_IMPORT_CYCLE"
       }
     },
     {
