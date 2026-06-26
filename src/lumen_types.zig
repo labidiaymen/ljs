@@ -38,6 +38,13 @@ pub fn same(a: Type, b: Type) bool {
     };
 }
 
+pub fn isNumeric(t: Type) bool {
+    return switch (t) {
+        .i32, .i64, .f64 => true,
+        else => false,
+    };
+}
+
 /// Parse a source type annotation. Unknown names are preserved as named types.
 pub fn fromAnnotation(name: []const u8) Type {
     const eq = std.mem.eql;

@@ -136,6 +136,22 @@
       }
     },
     {
+      "id": "native.invalid.arithmetic-type",
+      "source": "../examples/invalid/arithmetic-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.comparison-type",
+      "source": "../examples/invalid/comparison-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
       "id": "native.invalid.named-type-field-mismatch",
       "source": "../examples/invalid/named-type-field-mismatch.ts",
       "phase": "diagnostics",

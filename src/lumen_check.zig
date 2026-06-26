@@ -35,6 +35,13 @@ const Checker = struct {
         return error.ParseError;
     }
 
+    fn inferenceFail(self: *Checker, line: u32, col: u32, msg: []const u8) CompileError {
+        if (self.last_line == line and self.last_col == col and !std.mem.eql(u8, self.last_err, "syntax error")) {
+            return error.ParseError;
+        }
+        return self.fail(line, col, msg);
+    }
+
     fn undefined_(self: *Checker, name: []const u8, line: u32, col: u32) CompileError {
         self.last_err = std.fmt.allocPrint(self.arena, "undefined variable '{s}'", .{name}) catch "undefined variable";
         self.last_line = line;
@@ -115,7 +122,7 @@ const Checker = struct {
                     types.fromAnnotation(ann)
                 else
                     self.exprType(program, decl.init, decl.line, decl.col) orelse
-                        return self.fail(decl.line, decl.col, "cannot infer variable type");
+                        return self.inferenceFail(decl.line, decl.col, "cannot infer variable type");
 
                 try self.ensureAssignable(program, final_type, decl.init, decl.line, decl.col);
                 decl.checked_type = final_type;
@@ -134,7 +141,7 @@ const Checker = struct {
                     }
                 } else switch (expected_type) {
                     .named => {},
-                    else => return self.fail(assignment.line, assignment.col, "cannot infer assignment type"),
+                    else => return self.inferenceFail(assignment.line, assignment.col, "cannot infer assignment type"),
                 }
                 try self.ensureAssignable(program, expected_type, assignment.value, assignment.line, assignment.col);
                 found_binding.decl.reassigned = true;
@@ -142,17 +149,17 @@ const Checker = struct {
             },
             .console_log => |*log| {
                 log.checked_type = self.exprType(program, log.value, log.line, log.col) orelse
-                    return self.fail(log.line, log.col, "cannot infer console.log argument type");
+                    return self.inferenceFail(log.line, log.col, "cannot infer console.log argument type");
             },
             .while_stmt => |*loop| {
                 const cond_type = self.exprType(program, loop.cond, loop.line, loop.col) orelse
-                    return self.fail(loop.line, loop.col, "cannot infer while condition type");
+                    return self.inferenceFail(loop.line, loop.col, "cannot infer while condition type");
                 if (!types.same(.bool, cond_type)) return self.fail(loop.line, loop.col, "E_TYPE_MISMATCH");
                 try self.checkBlock(program, loop.body);
             },
             .if_stmt => |*branch| {
                 const cond_type = self.exprType(program, branch.cond, branch.line, branch.col) orelse
-                    return self.fail(branch.line, branch.col, "cannot infer if condition type");
+                    return self.inferenceFail(branch.line, branch.col, "cannot infer if condition type");
                 if (!types.same(.bool, cond_type)) return self.fail(branch.line, branch.col, "E_TYPE_MISMATCH");
                 try self.checkBlock(program, branch.then_body);
                 if (branch.else_body) |else_body| {
@@ -161,7 +168,7 @@ const Checker = struct {
             },
             .expr_stmt => |expr_stmt| {
                 _ = self.exprType(program, expr_stmt.value, expr_stmt.line, expr_stmt.col) orelse
-                    return self.fail(expr_stmt.line, expr_stmt.col, "cannot infer expression type");
+                    return self.inferenceFail(expr_stmt.line, expr_stmt.col, "cannot infer expression type");
             },
         }
     }
@@ -196,13 +203,25 @@ const Checker = struct {
             },
             .neg => |inner| self.exprType(program, inner, line, col),
             .bin => |bin| {
-                _ = self.exprType(program, bin.l, line, col) orelse return null;
-                _ = self.exprType(program, bin.r, line, col) orelse return null;
-                return .i32;
+                const left_type = self.exprType(program, bin.l, line, col) orelse return null;
+                const right_type = self.exprType(program, bin.r, line, col) orelse return null;
+                if (!types.isNumeric(left_type) or !types.same(left_type, right_type)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+                return left_type;
             },
             .cmp => |cmp| {
-                _ = self.exprType(program, cmp.l, line, col) orelse return null;
-                _ = self.exprType(program, cmp.r, line, col) orelse return null;
+                const left_type = self.exprType(program, cmp.l, line, col) orelse return null;
+                const right_type = self.exprType(program, cmp.r, line, col) orelse return null;
+                if (!types.same(left_type, right_type)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+                if (!std.mem.eql(u8, cmp.op, "==") and !std.mem.eql(u8, cmp.op, "!=") and !types.isNumeric(left_type)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
                 return .bool;
             },
             .field => |field| {

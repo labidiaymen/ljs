@@ -91,6 +91,8 @@ being precise enough for native output.
     **When** checked, **Then** `E_DUPLICATE_BINDING` is reported.
 13. **Given** a block declares a name that exists in an outer scope, **When**
     checked, **Then** the inner declaration shadows only within that block.
+14. **Given** arithmetic or ordered comparison operands with incompatible
+    types, **When** checked, **Then** `E_TYPE_MISMATCH` is reported.
 
 ### Edge Cases
 
@@ -140,6 +142,9 @@ being precise enough for native output.
 - **FR-020**: `let`, `const`, and `var` declarations MUST be tracked in
   lexical scopes, reject duplicate declarations in the same scope, and allow
   shadowing in nested block scopes.
+- **FR-021**: Arithmetic operators MUST require compatible numeric operands.
+- **FR-022**: Ordered comparison operators MUST require compatible numeric
+  operands; equality operators MUST require compatible operand types.
 
 ### Diagnostics
 

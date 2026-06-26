@@ -49,6 +49,7 @@
 - [x] T033 Accept `if`/`else` block statements with boolean conditions.
 - [x] T034 Require boolean `while` conditions.
 - [x] T035 Track lexical binding scopes and reject duplicate bindings.
+- [x] T036 Reject incompatible arithmetic and comparison operands.
 - [x] T017 Reject `eval` with `E_UNSUPPORTED_EVAL`.
 - [x] T018 Reject prototype access/mutation with `E_UNSUPPORTED_PROTOTYPE`.
 - [x] T019 Reject CommonJS `require` with `E_UNSUPPORTED_COMMONJS`.
