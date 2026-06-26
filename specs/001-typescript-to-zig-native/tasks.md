@@ -53,6 +53,7 @@
 - [x] T037 Parse and emit top-level typed function declarations.
 - [x] T038 Check and emit calls to declared functions.
 - [x] T039 Check function return statements against declared return types.
+- [x] T040 Allow `void` function statement calls and reject void values.
 - [x] T017 Reject `eval` with `E_UNSUPPORTED_EVAL`.
 - [x] T018 Reject prototype access/mutation with `E_UNSUPPORTED_PROTOTYPE`.
 - [x] T019 Reject CommonJS `require` with `E_UNSUPPORTED_COMMONJS`.

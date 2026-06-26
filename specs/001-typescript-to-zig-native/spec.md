@@ -100,6 +100,9 @@ being precise enough for native output.
     count and argument types must match the function signature.
 17. **Given** a function return expression, **When** checked, **Then** its type
     must match the declared return type.
+18. **Given** a `void` function call used as a statement, **When** checked,
+    **Then** it is accepted; **Given** the same call is used as a value,
+    **Then** `E_VOID_VALUE` is reported.
 
 ### Edge Cases
 
@@ -158,6 +161,8 @@ being precise enough for native output.
   the declared function signature.
 - **FR-025**: `return` statements MUST appear inside functions and return values
   MUST match the declared function return type.
+- **FR-026**: `void` function calls MUST be allowed as statements but rejected
+  when used as values.
 
 ### Diagnostics
 
@@ -179,6 +184,8 @@ being precise enough for native output.
   its declared return type.
 - **E_RETURN_OUTSIDE_FUNCTION**: Produced when `return` appears outside a
   function body.
+- **E_VOID_VALUE**: Produced when source attempts to use a `void` expression as
+  a value.
 
 ### Existing JavaScript Infrastructure
 

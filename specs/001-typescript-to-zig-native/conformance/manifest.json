@@ -88,6 +88,14 @@
       }
     },
     {
+      "id": "native.valid.void-function",
+      "source": "../examples/valid/void-function.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "ready"
+      }
+    },
+    {
       "id": "native.invalid.eval",
       "source": "../examples/invalid/eval.ts",
       "phase": "diagnostics",
@@ -197,6 +205,14 @@
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_RETURN_OUTSIDE_FUNCTION"
+      }
+    },
+    {
+      "id": "native.invalid.void-value",
+      "source": "../examples/invalid/void-value.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_VOID_VALUE"
       }
     },
     {

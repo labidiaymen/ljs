@@ -399,6 +399,18 @@ const Parser = struct {
 
         const name = kw;
         try self.advance();
+        if (self.isOp('(')) {
+            try self.expectOp('(');
+            var args: std.ArrayListUnmanaged(*Expr) = .empty;
+            while (!self.isOp(')')) {
+                try args.append(self.arena, try self.parseExpr());
+                if (self.isOp(',')) try self.advance() else break;
+            }
+            try self.expectOp(')');
+            try self.expectOp(';');
+            const value = try self.node(.{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.arena) } });
+            return .{ .expr_stmt = .{ .value = value, .line = line, .col = col } };
+        }
         try self.expectOp('=');
         const value = try self.parseExpr();
         try self.expectOp(';');

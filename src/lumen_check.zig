@@ -162,6 +162,7 @@ const Checker = struct {
                 else
                     self.exprType(program, decl.init, decl.line, decl.col) orelse
                         return self.inferenceFail(decl.line, decl.col, "cannot infer variable type");
+                if (final_type == .void) return self.fail(decl.line, decl.col, "E_VOID_VALUE");
 
                 try self.ensureAssignable(program, final_type, decl.init, decl.line, decl.col);
                 decl.checked_type = final_type;
@@ -187,8 +188,10 @@ const Checker = struct {
                 assignment.emit_name = found_binding.emit_name;
             },
             .console_log => |*log| {
-                log.checked_type = self.exprType(program, log.value, log.line, log.col) orelse
+                const log_type = self.exprType(program, log.value, log.line, log.col) orelse
                     return self.inferenceFail(log.line, log.col, "cannot infer console.log argument type");
+                if (log_type == .void) return self.fail(log.line, log.col, "E_VOID_VALUE");
+                log.checked_type = log_type;
             },
             .while_stmt => |*loop| {
                 const cond_type = self.exprType(program, loop.cond, loop.line, loop.col) orelse
