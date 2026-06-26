@@ -248,6 +248,14 @@
       }
     },
     {
+      "id": "native.invalid.function-missing-return",
+      "source": "../examples/invalid/function-missing-return.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_MISSING_RETURN"
+      }
+    },
+    {
       "id": "native.invalid.return-outside-function",
       "source": "../examples/invalid/return-outside-function.ts",
       "phase": "diagnostics",

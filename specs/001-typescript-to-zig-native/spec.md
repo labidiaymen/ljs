@@ -175,6 +175,9 @@ being precise enough for native output.
   resolution for this V1 slice.
 - **FR-029**: Unsupported import forms MUST produce `E_UNSUPPORTED_IMPORT`, and
   missing local imported files MUST produce `E_IMPORT_NOT_FOUND`.
+- **FR-030**: Non-`void` functions MUST return on all simple checked paths;
+  direct `return` and `if`/`else` branches where both sides return count as
+  returning.
 
 ### Diagnostics
 
@@ -202,6 +205,8 @@ being precise enough for native output.
   unsupported import forms.
 - **E_IMPORT_NOT_FOUND**: Produced when a local relative imported `.ts` file
   cannot be read.
+- **E_MISSING_RETURN**: Produced when a non-`void` function can complete without
+  returning a value.
 
 ### Existing JavaScript Infrastructure
 

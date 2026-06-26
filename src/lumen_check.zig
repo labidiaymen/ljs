@@ -145,6 +145,26 @@ const Checker = struct {
         defer self.popScope();
         for (decl.params) |param| try self.declareParam(param, decl.line, decl.col);
         for (decl.body) |*body_stmt| try self.checkStmt(program, body_stmt);
+
+        const return_type = decl.checked_return_type orelse types.fromAnnotation(decl.return_annotation);
+        if (return_type != .void and !blockReturns(decl.body)) {
+            return self.fail(decl.line, decl.col, "E_MISSING_RETURN");
+        }
+    }
+
+    fn blockReturns(body: []ast.Stmt) bool {
+        for (body) |stmt| {
+            if (stmtReturns(stmt)) return true;
+        }
+        return false;
+    }
+
+    fn stmtReturns(stmt: ast.Stmt) bool {
+        return switch (stmt) {
+            .return_stmt => true,
+            .if_stmt => |branch| branch.else_body != null and blockReturns(branch.then_body) and blockReturns(branch.else_body.?),
+            else => false,
+        };
     }
 
     fn checkStmt(self: *Checker, program: *ast.Program, stmt: *ast.Stmt) CompileError!void {
