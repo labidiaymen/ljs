@@ -64,6 +64,12 @@ binary.
 cases, running native binaries, comparing output, and checking invalid
 diagnostics.
 
+For a larger robustness and performance comparison against Node.js, run:
+
+```sh
+node benchmarks/robustness/run.js
+```
+
 ## Development
 
 Spec Kit remains the workflow, but the active specs now describe the native

@@ -594,7 +594,7 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                     try w.appendSlice(arena, ")))");
                 }
             } else if (std.mem.eql(u8, cl.namespace, "Math") and std.mem.eql(u8, cl.name, "sign")) {
-                try w.appendSlice(arena, "(if (");
+                try w.appendSlice(arena, "@as(i32, if (");
                 try emitExpr(cl.args[0], w, arena);
                 try w.appendSlice(arena, " < 0) -1 else if (");
                 try emitExpr(cl.args[0], w, arena);
