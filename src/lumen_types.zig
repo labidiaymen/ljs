@@ -8,6 +8,11 @@ pub const Type = union(enum) {
     bool,
     string,
     void,
+    i32_array,
+    i64_array,
+    f64_array,
+    bool_array,
+    string_array,
     named: []const u8,
 };
 
@@ -21,7 +26,7 @@ pub fn inferExprType(e: *const ast.Expr) ?Type {
         .bin => .i32,
         .bool_bin => .bool,
         .cmp => .bool,
-        .var_ref, .obj, .field, .call => null,
+        .array, .var_ref, .obj, .field, .index, .call => null,
     };
 }
 
@@ -33,6 +38,11 @@ pub fn same(a: Type, b: Type) bool {
         .bool => b == .bool,
         .string => b == .string,
         .void => b == .void,
+        .i32_array => b == .i32_array,
+        .i64_array => b == .i64_array,
+        .f64_array => b == .f64_array,
+        .bool_array => b == .bool_array,
+        .string_array => b == .string_array,
         .named => |a_name| switch (b) {
             .named => |b_name| std.mem.eql(u8, a_name, b_name),
             else => false,
@@ -47,9 +57,43 @@ pub fn isNumeric(t: Type) bool {
     };
 }
 
+pub fn isArray(t: Type) bool {
+    return switch (t) {
+        .i32_array, .i64_array, .f64_array, .bool_array, .string_array => true,
+        else => false,
+    };
+}
+
+pub fn arrayElem(t: Type) ?Type {
+    return switch (t) {
+        .i32_array => .i32,
+        .i64_array => .i64,
+        .f64_array => .f64,
+        .bool_array => .bool,
+        .string_array => .string,
+        else => null,
+    };
+}
+
+pub fn arrayOf(t: Type) ?Type {
+    return switch (t) {
+        .i32 => .i32_array,
+        .i64 => .i64_array,
+        .f64 => .f64_array,
+        .bool => .bool_array,
+        .string => .string_array,
+        else => null,
+    };
+}
+
 /// Parse a source type annotation. Unknown names are preserved as named types.
 pub fn fromAnnotation(name: []const u8) Type {
     const eq = std.mem.eql;
+    if (std.mem.endsWith(u8, name, "[]")) {
+        const base = name[0 .. name.len - 2];
+        const elem = fromAnnotation(base);
+        return arrayOf(elem) orelse .{ .named = name };
+    }
     if (eq(u8, name, "int") or eq(u8, name, "i32")) return .i32;
     if (eq(u8, name, "i64")) return .i64;
     if (eq(u8, name, "number") or eq(u8, name, "float") or eq(u8, name, "f64")) return .f64;
@@ -67,6 +111,11 @@ pub fn zigName(t: Type) []const u8 {
         .bool => "bool",
         .string => "[]const u8",
         .void => "void",
+        .i32_array => "[]const i32",
+        .i64_array => "[]const i64",
+        .f64_array => "[]const f64",
+        .bool_array => "[]const bool",
+        .string_array => "[]const []const u8",
         .named => |name| name,
     };
 }

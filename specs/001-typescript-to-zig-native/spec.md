@@ -114,6 +114,9 @@ being precise enough for native output.
 22. **Given** a function declaration inside a block or another function body,
     **When** checked, **Then** the compiler reports that nested function
     declarations are unsupported in V1.
+23. **Given** a typed array declaration such as `let nums: int[] = [1, 2]`,
+    **When** checked and emitted, **Then** elements must match the declared
+    element type, integer indexing is allowed, and `.length` returns an integer.
 
 ### Edge Cases
 
@@ -195,6 +198,10 @@ being precise enough for native output.
 - **FR-034**: Function declarations MUST be top-level only in V1; function
   declarations nested inside blocks or function bodies MUST be rejected with
   `E_UNSUPPORTED_NESTED_FUNCTION`.
+- **FR-035**: The compiler MUST accept TypeScript-style array type annotations
+  for primitive V1 element types, array literals, integer indexing, and
+  `.length`; array literals MUST contain values compatible with their element
+  type.
 
 ### Diagnostics
 

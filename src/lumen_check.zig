@@ -273,6 +273,14 @@ const Checker = struct {
                     if (!types.same(expected_field_type, actual_field_type)) return self.fail(line, col, "E_TYPE_MISMATCH");
                 }
             },
+            .i32_array, .i64_array, .f64_array, .bool_array, .string_array => {
+                if (value.* != .array) return self.fail(line, col, "E_TYPE_MISMATCH");
+                const elem_type = types.arrayElem(expected) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
+                for (value.array) |item| {
+                    const item_type = self.exprType(program, item, line, col) orelse return self.fail(line, col, "cannot infer array element type");
+                    if (!types.same(elem_type, item_type)) return self.fail(line, col, "E_TYPE_MISMATCH");
+                }
+            },
             else => {},
         }
     }
@@ -328,12 +336,48 @@ const Checker = struct {
                 cmp.checked_operand_type = left_type;
                 return .bool;
             },
-            .field => |field| {
+            .array => |items| {
+                if (items.len == 0) {
+                    _ = self.fail(line, col, "cannot infer array type") catch {};
+                    return null;
+                }
+                const first_type = self.exprType(program, items[0], line, col) orelse return null;
+                for (items[1..]) |item| {
+                    const item_type = self.exprType(program, item, line, col) orelse return null;
+                    if (!types.same(first_type, item_type)) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                }
+                return types.arrayOf(first_type) orelse {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                };
+            },
+            .field => |*field| {
                 const obj_type = self.exprType(program, field.obj, line, col) orelse return null;
+                if ((obj_type == .string or types.isArray(obj_type)) and std.mem.eql(u8, field.name, "length")) {
+                    field.builtin = .length;
+                    return .i64;
+                }
                 return switch (obj_type) {
                     .named => |type_name| self.fieldType(type_name, field.name, line, col),
                     else => null,
                 };
+            },
+            .index => |*index| {
+                const obj_type = self.exprType(program, index.obj, line, col) orelse return null;
+                const index_type = self.exprType(program, index.value, line, col) orelse return null;
+                if (!types.same(.i32, index_type) and !types.same(.i64, index_type)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+                const elem_type = types.arrayElem(obj_type) orelse {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                };
+                index.checked_element_type = elem_type;
+                return elem_type;
             },
             .obj => null,
             .call => |call| {

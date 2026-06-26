@@ -105,6 +105,7 @@ pub const Expr = union(enum) {
     num: i64,
     bool: bool,
     str: []const u8,
+    array: []*Expr,
     var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null },
     neg: *Expr,
     not: *Expr,
@@ -112,6 +113,11 @@ pub const Expr = union(enum) {
     bool_bin: struct { op: []const u8, l: *Expr, r: *Expr }, // && ||
     cmp: struct { op: []const u8, l: *Expr, r: *Expr, checked_operand_type: ?types.Type = null }, // < > <= >= == !=
     obj: []FieldInit,
-    field: struct { obj: *Expr, name: []const u8 },
+    field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null },
+    index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null },
     call: struct { name: []const u8, args: []*Expr }, // builtin call, e.g. httpGet(url) / serve(port, body)
+};
+
+pub const FieldBuiltin = enum {
+    length,
 };

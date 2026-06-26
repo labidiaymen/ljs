@@ -50,6 +50,7 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
     var bracket_depth: u32 = 0;
     var bracket_candidate_line: u32 = 0;
     var bracket_candidate_col: u32 = 0;
+    var bracket_has_content = false;
 
     while (true) {
         const tok = lex.next() catch {
@@ -58,6 +59,7 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
         switch (tok) {
             .eof => return,
             .ident => |name| {
+                if (bracket_depth > 0) bracket_has_content = true;
                 if (pending_dynamic_write_line != 0) {
                     pending_dynamic_write_line = 0;
                     pending_dynamic_write_col = 0;
@@ -79,6 +81,7 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
                 prev_was_ident = true;
             },
             .op => |ch| {
+                if (bracket_depth > 0 and ch != '[' and ch != ']') bracket_has_content = true;
                 if (ch == '=' and pending_dynamic_write_line != 0) {
                     return setDiag(diag, pending_dynamic_write_line, pending_dynamic_write_col, "E_DYNAMIC_PROPERTY_WRITE");
                 }
@@ -86,11 +89,12 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
                     bracket_candidate_line = lex.tok_line;
                     bracket_candidate_col = lex.tok_col;
                     bracket_depth = 1;
+                    bracket_has_content = false;
                 } else if (ch == '[' and bracket_depth > 0) {
                     bracket_depth += 1;
                 } else if (ch == ']' and bracket_depth > 0) {
                     bracket_depth -= 1;
-                    if (bracket_depth == 0) {
+                    if (bracket_depth == 0 and bracket_has_content) {
                         pending_dynamic_write_line = bracket_candidate_line;
                         pending_dynamic_write_col = bracket_candidate_col;
                     }
@@ -102,6 +106,7 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
                 prev_was_ident = false;
             },
             else => {
+                if (bracket_depth > 0) bracket_has_content = true;
                 if (pending_dynamic_write_line != 0) {
                     pending_dynamic_write_line = 0;
                     pending_dynamic_write_col = 0;
@@ -146,6 +151,17 @@ const Parser = struct {
         const p = try self.arena.create(Expr);
         p.* = e;
         return p;
+    }
+    fn parseTypeAnnotation(self: *Parser) CompileError![]const u8 {
+        if (self.cur != .ident) return error.ParseError;
+        const base = self.cur.ident;
+        try self.advance();
+        if (self.isOp('[')) {
+            try self.advance();
+            try self.expectOp(']');
+            return std.fmt.allocPrint(self.arena, "{s}[]", .{base}) catch error.OutOfMemory;
+        }
+        return base;
     }
 
     fn parseExpr(self: *Parser) CompileError!*Expr {
@@ -227,12 +243,19 @@ const Parser = struct {
     }
     fn parsePostfix(self: *Parser) CompileError!*Expr {
         var e = try self.parsePrimary();
-        while (self.isOp('.')) {
-            try self.advance();
-            if (self.cur != .ident) return error.ParseError;
-            const name = self.cur.ident;
-            try self.advance();
-            e = try self.node(.{ .field = .{ .obj = e, .name = name } });
+        while (self.isOp('.') or self.isOp('[')) {
+            if (self.isOp('.')) {
+                try self.advance();
+                if (self.cur != .ident) return error.ParseError;
+                const name = self.cur.ident;
+                try self.advance();
+                e = try self.node(.{ .field = .{ .obj = e, .name = name } });
+            } else {
+                try self.advance();
+                const index_value = try self.parseExpr();
+                try self.expectOp(']');
+                e = try self.node(.{ .index = .{ .obj = e, .value = index_value } });
+            }
         }
         return e;
     }
@@ -273,6 +296,16 @@ const Parser = struct {
             try self.expectOp(')');
             return e;
         }
+        if (self.isOp('[')) {
+            try self.advance();
+            var items: std.ArrayListUnmanaged(*Expr) = .empty;
+            while (!self.isOp(']')) {
+                try items.append(self.arena, try self.parseExpr());
+                if (self.isOp(',')) try self.advance() else break;
+            }
+            try self.expectOp(']');
+            return self.node(.{ .array = try items.toOwnedSlice(self.arena) });
+        }
         if (self.isOp('{')) {
             try self.advance();
             var fields: std.ArrayListUnmanaged(FieldInit) = .empty;
@@ -304,9 +337,7 @@ const Parser = struct {
             const fname = self.cur.ident;
             try self.advance();
             try self.expectOp(':');
-            if (self.cur != .ident) return error.ParseError;
-            const annotation = self.cur.ident;
-            try self.advance();
+            const annotation = try self.parseTypeAnnotation();
             try fields.append(self.arena, .{ .name = fname, .annotation = annotation });
             if (self.isOp(',')) try self.advance() else break;
         }
@@ -327,17 +358,13 @@ const Parser = struct {
             const param_name = self.cur.ident;
             try self.advance();
             try self.expectOp(':');
-            if (self.cur != .ident) return error.ParseError;
-            const annotation = self.cur.ident;
-            try self.advance();
+            const annotation = try self.parseTypeAnnotation();
             try params.append(self.arena, .{ .name = param_name, .annotation = annotation });
             if (self.isOp(',')) try self.advance() else break;
         }
         try self.expectOp(')');
         try self.expectOp(':');
-        if (self.cur != .ident) return error.ParseError;
-        const return_annotation = self.cur.ident;
-        try self.advance();
+        const return_annotation = try self.parseTypeAnnotation();
         const body = try self.parseBlock();
         return .{ .function_decl = .{
             .name = name,
@@ -376,9 +403,7 @@ const Parser = struct {
             var annotation: ?[]const u8 = null;
             if (self.isOp(':')) {
                 try self.advance();
-                if (self.cur != .ident) return error.ParseError;
-                annotation = self.cur.ident;
-                try self.advance();
+                annotation = try self.parseTypeAnnotation();
             }
             try self.expectOp('=');
             const initial_value = try self.parseExpr();
@@ -474,6 +499,14 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             }
             try w.append(arena, '"');
         },
+        .array => |items| {
+            try w.appendSlice(arena, "&.{ ");
+            for (items, 0..) |item, i| {
+                if (i > 0) try w.appendSlice(arena, ", ");
+                try emitExpr(item, w, arena);
+            }
+            try w.appendSlice(arena, " }");
+        },
         .call => |cl| {
             // builtins lower to a Zig std wrapper taking (__io, __alloc, args...).
             if (std.mem.eql(u8, cl.name, "httpGet")) {
@@ -555,8 +588,20 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try w.appendSlice(arena, " }");
         },
         .field => |fa| {
-            try emitExpr(fa.obj, w, arena);
-            try w.print(arena, ".{s}", .{fa.name});
+            if (fa.builtin == .length) {
+                try w.appendSlice(arena, "@as(i64, @intCast(");
+                try emitExpr(fa.obj, w, arena);
+                try w.appendSlice(arena, ".len))");
+            } else {
+                try emitExpr(fa.obj, w, arena);
+                try w.print(arena, ".{s}", .{fa.name});
+            }
+        },
+        .index => |idx| {
+            try emitExpr(idx.obj, w, arena);
+            try w.appendSlice(arena, "[@as(usize, @intCast(");
+            try emitExpr(idx.value, w, arena);
+            try w.appendSlice(arena, "))]");
         },
     }
 }
