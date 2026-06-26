@@ -21,5 +21,6 @@ Optionally pass the number of timing rounds:
 node benchmarks/robustness/run.js 30
 ```
 
-The runner builds `lumen`, compiles the Lumen source once, verifies that native
-and Node outputs match, then reports average process execution time for each.
+The runner builds `lumen`, compiles the Lumen source once with
+`--release-fast`, verifies that native and Node outputs match, then reports
+average process execution time for each.

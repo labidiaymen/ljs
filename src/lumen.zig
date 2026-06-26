@@ -3,6 +3,18 @@
 const std = @import("std");
 const compiler = @import("lumen_compiler.zig");
 
+const CompileMode = enum {
+    release_safe,
+    release_fast,
+
+    fn zigName(self: CompileMode) []const u8 {
+        return switch (self) {
+            .release_safe => "ReleaseSafe",
+            .release_fast => "ReleaseFast",
+        };
+    }
+};
+
 fn printDiag(err: *std.Io.Writer, source: []const u8, file: []const u8, diag: compiler.Diag) !void {
     try err.print("{s}:{d}:{d}: error: {s}\n", .{ file, diag.line, diag.col, diag.msg });
     var it = std.mem.splitScalar(u8, source, '\n');
@@ -99,7 +111,7 @@ fn readSourceWithImports(arena: std.mem.Allocator, io: std.Io, path: []const u8)
     return out.items;
 }
 
-fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, err: *std.Io.Writer) !u8 {
+fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: CompileMode, err: *std.Io.Writer) !u8 {
     if (!std.mem.endsWith(u8, path, ".ts")) {
         try err.print("error: expected a .ts source file, got {s}\n", .{path});
         return 2;
@@ -133,7 +145,7 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, err: *std
 
     const emit = try std.fmt.allocPrint(arena, "-femit-bin={s}", .{exe_name});
     var child = std.process.spawn(io, .{
-        .argv = &.{ "zig", "build-exe", zig_path, "-O", "ReleaseSafe", emit },
+        .argv = &.{ "zig", "build-exe", zig_path, "-O", mode.zigName(), emit },
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -173,19 +185,36 @@ pub fn main(init: std.process.Init) !void {
     const err = &err_fw.interface;
 
     if (args.len < 2) {
-        try err.writeAll("usage: lumen compile <file.ts>\n");
+        try err.writeAll("usage: lumen compile [--release-fast] <file.ts>\n");
         try err.flush();
         std.process.exit(2);
     }
 
     const code = if (std.mem.eql(u8, args[1], "compile")) blk: {
         if (args.len < 3) {
-            try err.writeAll("usage: lumen compile <file.ts>\n");
+            try err.writeAll("usage: lumen compile [--release-fast] <file.ts>\n");
             break :blk 2;
         }
-        break :blk try compileFile(arena, io, args[2], err);
+        var mode: CompileMode = .release_safe;
+        var source_arg: ?[]const u8 = null;
+        for (args[2..]) |arg| {
+            if (std.mem.eql(u8, arg, "--release-fast")) {
+                mode = .release_fast;
+            } else if (std.mem.eql(u8, arg, "--release-safe")) {
+                mode = .release_safe;
+            } else if (source_arg == null) {
+                source_arg = arg;
+            } else {
+                try err.writeAll("usage: lumen compile [--release-fast] <file.ts>\n");
+                break :blk 2;
+            }
+        }
+        break :blk try compileFile(arena, io, source_arg orelse {
+            try err.writeAll("usage: lumen compile [--release-fast] <file.ts>\n");
+            break :blk 2;
+        }, mode, err);
     } else blk: {
-        break :blk try compileFile(arena, io, args[1], err);
+        break :blk try compileFile(arena, io, args[1], .release_safe, err);
     };
 
     try err.flush();

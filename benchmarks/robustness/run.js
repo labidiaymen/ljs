@@ -65,9 +65,9 @@ function cleanup() {
 
 cleanup();
 must("zig", ["build"]);
-must("zig-out/bin/lumen", ["compile", lumenSource]);
+must("zig-out/bin/lumen", ["compile", "--release-fast", lumenSource]);
 
-const nativeResult = timed("lumen-native", `./${binary}`, []);
+const nativeResult = timed("lumen-native-releasefast", `./${binary}`, []);
 const nodeResult = timed("node", "node", [nodeSource]);
 
 if (nativeResult.output !== nodeResult.output) {
