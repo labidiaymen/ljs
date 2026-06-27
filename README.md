@@ -64,6 +64,4 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ## Development
 
-The project uses Spec Kit; specs live under `specs/`. The repository also
-contains a legacy JavaScript engine (`src/*.zig`) that the Lumen compiler does
-not use.
+The project uses Spec Kit; specs live under `specs/`.
