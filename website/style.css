@@ -6,7 +6,7 @@
   --border: #e2e6ea;
   --fg: #1b1f24;
   --muted: #59636e;
-  --accent: #2563eb;
+  --accent: #ea580c;
   --accent-fg: #ffffff;
   /* Code blocks stay dark in both themes (tuned syntax colors). */
   --code-bg: #0c0f14;
@@ -25,8 +25,8 @@
     --border: #262c36;
     --fg: #e6edf3;
     --muted: #9aa7b4;
-    --accent: #4d8dff;
-    --accent-fg: #0c1322;
+    --accent: #fb923c;
+    --accent-fg: #1a1205;
   }
 }
 
