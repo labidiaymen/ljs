@@ -19,7 +19,11 @@ uses TypeScript syntax, but with compiled static semantics:
 
 - `.ts` source files
 - fixed static types with local inference
-- `int` and `i32` accepted for 32-bit integers
+- `number`/`float`/`f64` for floating-point, `int`/`i32` for 32-bit integers
+- numeric literals: decimal, float (`3.14`, `1.5e2`), and `0x`/`0o`/`0b` with
+  `_` separators
+- `//` line and `/* ... */` block comments
+- `===`/`!==` accepted (equivalent to `==`/`!=` under static typing)
 - no prototypes, `eval`, CommonJS, package.json resolution, or dynamic object
   mutation
 - native binary output through generated Zig

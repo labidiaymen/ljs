@@ -1,0 +1,61 @@
+{
+  "feature": "002-numeric-literals-lexer",
+  "cases": [
+    {
+      "id": "lex.valid.float-literal",
+      "source": "../examples/valid/float-literal.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "3.14\n0.5\n150"
+      }
+    },
+    {
+      "id": "lex.invalid.float-to-int",
+      "source": "../examples/invalid/float-to-int.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "lex.valid.int-bases",
+      "source": "../examples/valid/int-bases.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "255\n15\n10\n1000000\n65535"
+      }
+    },
+    {
+      "id": "lex.invalid.malformed-number",
+      "source": "../examples/invalid/malformed-number.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_INVALID_NUMBER"
+      }
+    },
+    {
+      "id": "lex.valid.block-comment",
+      "source": "../examples/valid/block-comment.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "5"
+      }
+    },
+    {
+      "id": "lex.invalid.unterminated-comment",
+      "source": "../examples/invalid/unterminated-comment.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_UNTERMINATED_COMMENT"
+      }
+    },
+    {
+      "id": "lex.valid.strict-equality",
+      "source": "../examples/valid/strict-equality.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "eq\nne"
+      }
+    }
+  ]
+}

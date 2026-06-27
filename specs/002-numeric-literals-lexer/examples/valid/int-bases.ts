@@ -1,0 +1,10 @@
+let mask = 0xFF;
+let perms = 0o17;
+let flags = 0b1010;
+let big = 1_000_000;
+let hexsep = 0xFF_FF;
+console.log(mask);
+console.log(perms);
+console.log(flags);
+console.log(big);
+console.log(hexsep);

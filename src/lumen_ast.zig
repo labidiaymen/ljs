@@ -176,6 +176,7 @@ pub const Program = struct {
 
 pub const Expr = union(enum) {
     num: i64,
+    float: f64,
     bool: bool,
     str: []const u8,
     array: []*Expr,

@@ -68,6 +68,12 @@ pub fn build(b: *std.Build) void {
     conformance_cmd.addArg("specs/001-typescript-to-zig-native/conformance/manifest.json");
     conformance_cmd.addArg("zig-out/bin/lumen");
 
+    const conformance_cmd_002 = b.addRunArtifact(conformance_runner);
+    conformance_cmd_002.step.dependOn(b.getInstallStep());
+    conformance_cmd_002.addArg("specs/002-numeric-literals-lexer/conformance/manifest.json");
+    conformance_cmd_002.addArg("zig-out/bin/lumen");
+
     const conformance_step = b.step("conformance", "Run Lumen manifest conformance cases");
     conformance_step.dependOn(&conformance_cmd.step);
+    conformance_step.dependOn(&conformance_cmd_002.step);
 }
