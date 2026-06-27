@@ -1,0 +1,111 @@
+name: release
+
+# Build self-contained Lumen archives for every platform and attach them to the
+# GitHub Release. Cross-compiled entirely from one Linux runner — Zig is a
+# first-class cross-compiler, so a single job produces all targets.
+#
+# Trigger: push a tag like `v0.1.0`.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64-linux
+            zig_target: x86_64-linux
+            zig_dist: zig-x86_64-linux-0.16.0
+            dist_ext: tar.xz
+            archive: tar.gz
+            exe: lumen
+          - name: aarch64-linux
+            zig_target: aarch64-linux
+            zig_dist: zig-aarch64-linux-0.16.0
+            dist_ext: tar.xz
+            archive: tar.gz
+            exe: lumen
+          - name: x86_64-macos
+            zig_target: x86_64-macos
+            zig_dist: zig-x86_64-macos-0.16.0
+            dist_ext: tar.xz
+            archive: tar.gz
+            exe: lumen
+          - name: aarch64-macos
+            zig_target: aarch64-macos
+            zig_dist: zig-aarch64-macos-0.16.0
+            dist_ext: tar.xz
+            archive: tar.gz
+            exe: lumen
+          - name: x86_64-windows
+            zig_target: x86_64-windows
+            zig_dist: zig-x86_64-windows-0.16.0
+            dist_ext: zip
+            archive: zip
+            exe: lumen.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build-time Zig (to compile the lumen compiler itself).
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Cross-compile lumen for ${{ matrix.name }}
+        run: |
+          zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
+
+      - name: Download the Zig toolchain to bundle (${{ matrix.name }})
+        run: |
+          url="https://ziglang.org/download/${ZIG_VERSION}/${{ matrix.zig_dist }}.${{ matrix.dist_ext }}"
+          echo "Fetching $url"
+          curl -fSL "$url" -o zigdist.${{ matrix.dist_ext }}
+          mkdir -p zigdist
+          if [ "${{ matrix.dist_ext }}" = "zip" ]; then
+            unzip -q zigdist.zip -d zigdist
+          else
+            tar -xf zigdist.tar.xz -C zigdist
+          fi
+          # The archive unpacks to a single top dir; flatten it to `zig/`.
+          mv "zigdist/${{ matrix.zig_dist }}" zig
+
+      - name: Stage the release archive
+        run: |
+          out="lumen-${{ matrix.name }}"
+          mkdir -p "$out"
+          cp "zig-out/bin/${{ matrix.exe }}" "$out/"
+          mv zig "$out/zig"
+          cp README.md "$out/README.md" 2>/dev/null || true
+          cat > "$out/LUMEN.txt" <<'EOF'
+          Lumen — a compiled TypeScript-syntax language.
+          This archive is self-contained; the native backend is bundled under ./zig.
+          Use the install script, or run ./lumen directly with ./zig on PATH.
+          EOF
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: tar -czf "lumen-${{ matrix.name }}.tar.gz" "lumen-${{ matrix.name }}"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        run: zip -qr "lumen-${{ matrix.name }}.zip" "lumen-${{ matrix.name }}"
+
+      - name: Upload to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            lumen-${{ matrix.name }}.tar.gz
+            lumen-${{ matrix.name }}.zip
+          fail_on_unmatched_files: false

@@ -134,15 +134,18 @@ console.log(rectangle_area(6, 7));   // 42</code></pre>
 
 <section class="wrap" id="quickstart">
   <h2>Quickstart</h2>
-  <p class="sub">Install the <code>lumen</code> compiler, then build and run a program.</p>
+  <p class="sub">Install the self-contained <code>lumen</code> compiler — nothing else required.</p>
+  <h3>Install (macOS / Linux)</h3>
+<pre><code class="lumen">curl -fsSL https://raw.githubusercontent.com/labidiaymen/ljs/main/install.sh | sh</code></pre>
+  <p class="sub">Windows: download the <code>.zip</code> from the
+  <a href="https://github.com/labidiaymen/ljs/releases">releases page</a>.</p>
   <h3>Compile and run a program</h3>
 <pre><code class="lumen">lumen compile hello.ts
 ./hello</code></pre>
   <h3>Run tests</h3>
 <pre><code class="lumen">lumen test math.test.ts</code></pre>
   <p class="note">The native code Lumen generates is an implementation detail — you think
-  in the TypeScript-syntax source language. Building the compiler from source
-  requires the toolchain documented in the repository.</p>
+  in the TypeScript-syntax source language.</p>
 </section>
 
 <footer><div class="wrap">

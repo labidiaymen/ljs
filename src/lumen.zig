@@ -182,6 +182,9 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
     defer std.Io.Dir.cwd().deleteFile(io, gen_path) catch {};
 
     const emit = try std.fmt.allocPrint(arena, "-femit-bin={s}", .{exe_name});
+    // The native backend is invoked as `zig` from PATH. Release archives bundle
+    // a private toolchain that the `lumen` launcher injects into PATH, so a
+    // downloaded build is self-contained without exposing zig in the user's shell.
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     switch (action) {
         .build_exe => try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-O", mode.zigName(), emit }),

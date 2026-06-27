@@ -45,6 +45,29 @@ uses TypeScript syntax, but with compiled static semantics:
 The generated Zig is an implementation artifact. Users should think in the
 TypeScript-syntax source language, not in Zig.
 
+## Install (prebuilt)
+
+End users install a self-contained release (the native backend is bundled; no
+separate toolchain required):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/labidiaymen/ljs/main/install.sh | sh
+```
+
+Windows: download the `.zip` from the [releases page](https://github.com/labidiaymen/ljs/releases).
+
+## Releasing
+
+Tag and push; CI cross-compiles every platform from one runner, bundles a Zig
+toolchain into each archive, and uploads them to the GitHub Release:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+See `.github/workflows/release.yml`. Note: verify the bundled-Zig download URLs
+in that file match the current Zig release naming before tagging.
+
 ## Current Implementation Seed
 
 The current branch contains:
