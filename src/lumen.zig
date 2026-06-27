@@ -54,7 +54,10 @@ fn parseImportSpec(line: []const u8) !?ImportSpec {
     const spec_start = marker_pos + marker.len;
     const spec_end = std.mem.indexOfScalarPos(u8, trimmed, spec_start, '"') orelse return error.InvalidImport;
     const spec = trimmed[spec_start..spec_end];
-    if (!(std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../"))) return error.InvalidImport;
+    const is_local = std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../");
+    const is_url = std.mem.startsWith(u8, spec, "https://");
+    // Local relative or https URL only; reject http://, bare, and others.
+    if (!is_local and !is_url) return error.InvalidImport;
     if (!std.mem.endsWith(u8, spec, ".ts")) return error.InvalidImport;
     return .{ .binding = binding, .spec = spec };
 }
@@ -71,6 +74,60 @@ fn appendExportDefaultFunction(arena: std.mem.Allocator, out: *std.ArrayListUnma
     return true;
 }
 
+/// Resolves a relative specifier (`./x.ts`, `../y/z.ts`) against a remote
+/// module's base directory URL (the URL up to its last `/`). `..` pops a path
+/// segment but never past the host.
+fn joinUrl(arena: std.mem.Allocator, base_dir: []const u8, rel: []const u8) ![]const u8 {
+    const scheme = "https://";
+    var dir = base_dir;
+    var r = rel;
+    while (true) {
+        if (std.mem.startsWith(u8, r, "./")) {
+            r = r[2..];
+        } else if (std.mem.startsWith(u8, r, "../")) {
+            r = r[3..];
+            const slash = std.mem.lastIndexOfScalar(u8, dir, '/') orelse return error.InvalidImport;
+            if (slash < scheme.len) return error.InvalidImport;
+            dir = dir[0..slash];
+        } else break;
+    }
+    return std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, r });
+}
+
+/// Net `{`/`}` balance on a line, skipping string literals and line comments so
+/// braces inside `"…{…"` or after `//` don't throw off block tracking.
+fn braceDelta(line: []const u8) i32 {
+    var depth: i32 = 0;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        switch (c) {
+            '"', '\'', '`' => {
+                i += 1;
+                while (i < line.len and line[i] != c) : (i += 1) {
+                    if (line[i] == '\\') i += 1;
+                }
+            },
+            '/' => if (i + 1 < line.len and line[i + 1] == '/') return depth,
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            else => {},
+        }
+    }
+    return depth;
+}
+
+/// Fetches a module's source over HTTPS at build time.
+fn fetchUrl(arena: std.mem.Allocator, io: std.Io, url: []const u8) ![]const u8 {
+    var client: std.http.Client = .{ .allocator = arena, .io = io };
+    defer client.deinit();
+    client.ca_bundle.rescan(arena, io, std.Io.Clock.now(.real, io)) catch return error.FetchFailed;
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const res = client.fetch(.{ .location = .{ .url = url }, .response_writer = &aw.writer }) catch return error.FetchFailed;
+    if (@intFromEnum(res.status) != 200) return error.FetchFailed;
+    return aw.toArrayList().items;
+}
+
 fn appendExpandedSource(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -82,32 +139,61 @@ fn appendExpandedSource(
     depth: u8,
 ) !void {
     if (depth > 16) return error.InvalidImport;
-    const resolved_path = try std.fs.path.resolve(arena, &.{path});
-    if (visiting.get(resolved_path) != null) return error.ImportCycle;
-    if (emitted.get(resolved_path) != null) return;
-    try visiting.put(arena, resolved_path, {});
-    defer _ = visiting.remove(resolved_path);
+    const is_url = std.mem.startsWith(u8, path, "https://");
+    // Cycle/dedup key: the URL itself for remote modules, the resolved path otherwise.
+    const key = if (is_url) path else try std.fs.path.resolve(arena, &.{path});
+    if (visiting.get(key) != null) return error.ImportCycle;
+    if (emitted.get(key) != null) return;
+    try visiting.put(arena, key, {});
+    defer _ = visiting.remove(key);
 
-    const source = std.Io.Dir.cwd().readFileAlloc(io, resolved_path, arena, .limited(16 * 1024 * 1024)) catch return error.ImportReadFailed;
-    const dir = std.fs.path.dirname(resolved_path) orelse ".";
+    const source = if (is_url)
+        fetchUrl(arena, io, path) catch return error.ImportReadFailed
+    else
+        std.Io.Dir.cwd().readFileAlloc(io, key, arena, .limited(16 * 1024 * 1024)) catch return error.ImportReadFailed;
+    // Base directory for resolving relative child imports: for a URL it is the
+    // URL up to its last `/`; for a local file it is the file's directory.
+    const dir = if (is_url) blk: {
+        const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return error.InvalidImport;
+        break :blk path[0..slash];
+    } else (std.fs.path.dirname(key) orelse ".");
 
     var local_imports: std.StringHashMapUnmanaged(void) = .empty;
+    // Tests belong to the module under test, not to importers: strip `test "…"`
+    // blocks from imported modules (depth > 0) so they don't leak into the build.
+    var test_skip: i32 = 0;
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |line| {
+        if (test_skip > 0) {
+            test_skip += braceDelta(line);
+            continue;
+        }
         if (try parseImportSpec(line)) |import_spec| {
             if (local_imports.get(import_spec.spec) != null) return error.DuplicateImport;
             try local_imports.put(arena, import_spec.spec, {});
-            const imported_path = try std.fs.path.join(arena, &.{ dir, import_spec.spec });
+            const child_is_url = std.mem.startsWith(u8, import_spec.spec, "https://");
+            // Resolve relative imports against the base dir — a URL base for a
+            // remote module (recursive remote packages), a local path otherwise.
+            const imported_path = if (child_is_url)
+                import_spec.spec
+            else if (is_url)
+                try joinUrl(arena, dir, import_spec.spec)
+            else
+                try std.fs.path.join(arena, &.{ dir, import_spec.spec });
             try appendExpandedSource(arena, io, imported_path, out, visiting, emitted, import_spec.binding, depth + 1);
             continue;
         }
         const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (depth > 0 and std.mem.startsWith(u8, trimmed, "test \"")) {
+            test_skip = braceDelta(line);
+            continue;
+        }
         if (try appendExportDefaultFunction(arena, out, trimmed, default_name)) continue;
         if (std.mem.startsWith(u8, trimmed, "export ")) return error.InvalidImport;
         try out.appendSlice(arena, line);
         try out.append(arena, '\n');
     }
-    try emitted.put(arena, resolved_path, {});
+    try emitted.put(arena, key, {});
 }
 
 fn readSourceWithImports(arena: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {

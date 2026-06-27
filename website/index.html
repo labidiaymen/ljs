@@ -71,6 +71,7 @@ console.log(`distance² = ${distanceSq(origin, p)}`);  // distance² = 25</code>
     <div class="card"><h3>defer</h3><p>Scope&#8209;exit cleanup, last&#8209;in&#8209;first&#8209;out.</p></div>
     <div class="card"><h3>Built-in tests</h3><p><code>test "…" { expect(…); }</code> run with <code>lumen test</code>.</p></div>
     <div class="card"><h3>C FFI</h3><p><code>extern function</code> + <code>// @link</code> call native C libraries — and C++ via an <code>extern "C"</code> shim.</p></div>
+    <div class="card"><h3>URL imports</h3><p>Import a default export from a relative file or an <code>https://</code> URL — a package is just a URL.</p></div>
     <div class="card"><h3>Native output</h3><p>Compiles to a small, fast, dependency&#8209;free native binary.</p></div>
   </div>
 </section>
@@ -133,6 +134,16 @@ extern function rectangle_area(w: int, h: int): int;
 console.log(rectangle_area(6, 7));   // 42</code></pre>
   <p class="note">V1 FFI passes scalar arguments (<code>int</code>, <code>i64</code>, <code>number</code>, <code>bool</code>).
   This links local/system libraries — it is not a package manager.</p>
+</section>
+
+<section class="wrap" id="imports">
+  <h2>Import from a URL</h2>
+  <p class="sub">A package is just a URL. The <code>.ts</code> is fetched over HTTPS and inlined at compile time — no package manager, no install step.</p>
+<pre><code class="lumen">import greet from "https://raw.githubusercontent.com/lumen-lang-org/std-contrib/main/packages/hello/hello.ts";
+
+console.log(greet("world"));   // Hello, world!</code></pre>
+  <p class="sub">A remote module can import its own siblings with relative paths, fetched recursively. The same URL is fetched once per build, and import cycles are reported.</p>
+  <p class="note">Only <code>https://</code> is allowed. Remote code runs at build time, so import from sources you trust.</p>
 </section>
 
 <section class="wrap" id="quickstart">

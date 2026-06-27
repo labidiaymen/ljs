@@ -464,8 +464,16 @@
       }
     },
     {
-      "id": "native.invalid.import-remote",
-      "source": "../examples/invalid/import-remote.ts",
+      "id": "native.invalid.import-remote-insecure",
+      "source": "../examples/invalid/import-remote-insecure.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_UNSUPPORTED_IMPORT"
+      }
+    },
+    {
+      "id": "native.invalid.import-remote-noext",
+      "source": "../examples/invalid/import-remote-noext.ts",
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_UNSUPPORTED_IMPORT"

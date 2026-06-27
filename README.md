@@ -23,6 +23,7 @@ Compiled static semantics — not a JavaScript runtime:
 - classes: fields, constructor, `this`, methods
 - `defer`; built-in `test` blocks with `expect`
 - C FFI via `extern function` + library linking
+- imports from a relative path or an `https://` URL (a package is just a URL)
 - no prototypes, `eval`, CommonJS, or dynamic object mutation
 
 ## Install
@@ -39,6 +40,22 @@ Windows: download the `.zip` from the [releases page](https://github.com/lumen-l
 lumen compile app.ts      # build a native binary
 lumen test app.test.ts    # run test blocks
 ```
+
+## Imports
+
+Import a default export from a relative file or straight from a URL:
+
+```ts
+import helpers from "./helpers.ts";
+import greet from "https://raw.githubusercontent.com/lumen-lang-org/std-contrib/main/packages/hello/hello.ts";
+
+console.log(greet("world"));
+```
+
+URL modules are fetched over HTTPS and inlined at compile time -- no package
+manager, no install step. A remote module can import its own siblings with
+relative paths, fetched recursively. `https://` only; remote code runs at build
+time, so import from sources you trust. See [`examples/url-imports`](examples/url-imports).
 
 ## Build from source
 

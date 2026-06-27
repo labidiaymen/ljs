@@ -129,6 +129,15 @@ console.log(sqrt(hypotSq));   // 5
 console.log(pow(2.0, 10.0));  // 1024</code></pre>
   </div>
 
+  <div class="example">
+    <h3>url-imports.ts <span class="meta">import from a URL · fetched and inlined at compile time</span></h3>
+<pre><code class="lumen">// The .ts is fetched over HTTPS at compile time and inlined into the build --
+// no package manager, no install step. A package is just a URL.
+import greet from "https://raw.githubusercontent.com/lumen-lang-org/std-contrib/main/packages/hello/hello.ts";
+
+console.log(greet("world"));   // Hello, world!</code></pre>
+  </div>
+
 </section>
 
 <footer><div class="wrap">
