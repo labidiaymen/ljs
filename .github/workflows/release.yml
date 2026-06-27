@@ -19,9 +19,9 @@ env:
 
 jobs:
   release:
-    # Self-hosted runner. One machine cross-compiles every target (Zig).
-    # Requires on the runner: bash, curl, tar (with xz), unzip, zip.
-    runs-on: self-hosted
+    # Self-hosted runner (label `diff`). One machine cross-compiles every target
+    # (Zig). Requires on the runner: zig 0.16.0, curl, tar (with xz), unzip, zip.
+    runs-on: [self-hosted, diff]
     strategy:
       fail-fast: false
       matrix:
