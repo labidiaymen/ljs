@@ -103,23 +103,6 @@ pre {
 code { font: 13.5px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 p code, li code, td code { background: var(--panel); border: 1px solid var(--border); padding: 1px 6px; border-radius: 5px; font-size: 12.5px; }
 
-/* Terminal-style blocks (commands + output) */
-pre.term { background: #05070b; border-color: #1c2530; }
-pre.term code { color: #cdd9e5; white-space: pre; }
-
-/* Numbered getting-started steps */
-.steps { list-style: none; counter-reset: step; padding: 0; margin: 0 0 8px; }
-.steps > li { counter-increment: step; position: relative; padding-left: 54px; margin-bottom: 30px; }
-.steps > li::before {
-  content: counter(step);
-  position: absolute; left: 0; top: 2px;
-  width: 34px; height: 34px; border-radius: 50%;
-  background: var(--accent-soft); color: var(--accent); border: 1px solid var(--border);
-  display: grid; place-items: center; font-weight: 700; font-size: 15px;
-}
-.steps > li h3 { margin: 4px 0 12px; }
-.steps > li p { margin: 0 0 12px; }
-
 .tok-kw { color: #ff9ecb; }
 .tok-type { color: #7cd4ff; }
 .tok-str { color: #b9e88a; }
