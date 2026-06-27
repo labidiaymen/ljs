@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Examples — Lumen</title>
+<meta name="description" content="Lumen example programs: records, enums, closures, null-safety, defer, and tests.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav><div class="wrap">
+  <a class="brand" href="index.html" style="color:var(--fg)">Lumen<span class="dot">.</span></a>
+  <span class="links">
+    <a href="index.html#features">Features</a>
+    <a href="examples.html">Examples</a>
+    <a href="stdlib.html">Stdlib</a>
+    <a href="index.html#quickstart">Quickstart</a>
+  </span>
+</div></nav>
+
+<section class="wrap">
+  <h2>Examples</h2>
+  <p class="sub">Runnable programs from the <code>examples/showcase/</code> folder. Compile with
+  <code>lumen compile &lt;file&gt;.ts</code>, or run tests with <code>lumen test</code>.</p>
+
+  <div class="example">
+    <h3>inventory.ts <span class="meta">enums · interfaces · record arrays · for…of · template literals</span></h3>
+<pre><code class="lumen">enum Category { Food, Tool, Book }
+
+interface Item {
+  name: string;
+  price: int;
+  category: Category;
+}
+
+function describe(item: Item): string {
+  return `${item.name}: $${item.price}`;
+}
+
+let items: Item[] = [
+  { name: "apple", price: 2, category: Category.Food },
+  { name: "hammer", price: 15, category: Category.Tool },
+  { name: "novel", price: 9, category: Category.Book },
+];
+
+let total = 0;
+for (const item of items) {
+  console.log(describe(item));
+  total += item.price;
+}
+console.log(`total: $${total}`);</code></pre>
+  </div>
+
+  <div class="example">
+    <h3>higher-order.ts <span class="meta">function values · arrow functions · ternary</span></h3>
+<pre><code class="lumen">function applyTwice(f: (n: int) => int, v: int): int {
+  return f(f(v));
+}
+
+function triple(x: int): int {
+  return x * 3;
+}
+
+console.log(applyTwice(triple, 2));               // 18
+console.log(applyTwice((x: int) => x + 10, 5));   // 25
+
+let clamp: (n: int) => int = (x: int) => x > 100 ? 100 : x;
+console.log(clamp(250));   // 100
+console.log(clamp(42));    // 42</code></pre>
+  </div>
+
+  <div class="example">
+    <h3>config.ts <span class="meta">optional fields · ?? · null-narrowing · defer</span></h3>
+<pre><code class="lumen">interface Settings {
+  host: string;
+  port?: int;
+}
+
+function connect(s: Settings): void {
+  defer console.log("connection closed");
+  let port = s.port ?? 8080;
+  console.log(`connecting to ${s.host}:${port}`);
+}
+
+function label(name: string | null): string {
+  if (name != null) {
+    return name;
+  }
+  return "anonymous";
+}
+
+connect({ host: "localhost" });                  // :8080  + closed
+connect({ host: "api.example.com", port: 443 }); // :443   + closed
+console.log(label("ada"));                        // ada
+console.log(label(null));                         // anonymous</code></pre>
+  </div>
+
+  <div class="example">
+    <h3>math.test.ts <span class="meta">test blocks · expect — run with <code>lumen test</code></span></h3>
+<pre><code class="lumen">function gcd(a: int, b: int): int {
+  let x = a;
+  let y = b;
+  while (y != 0) {
+    let t = y;
+    y = x % y;
+    x = t;
+  }
+  return x;
+}
+
+test "gcd computes greatest common divisor" {
+  expect(gcd(12, 8) == 4);
+  expect(gcd(17, 5) == 1);
+}</code></pre>
+  </div>
+
+</section>
+
+<footer><div class="wrap">
+  <a href="index.html">← Back to home</a> · <a href="stdlib.html">Standard library</a>
+</div></footer>
+
+<script src="highlight.js"></script>
+</body>
+</html>

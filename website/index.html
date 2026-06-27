@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lumen — TypeScript syntax, native speed</title>
+<meta name="description" content="Lumen is a statically compiled language with TypeScript syntax that lowers to Zig and builds a native binary.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav><div class="wrap">
+  <span class="brand">Lumen<span class="dot">.</span></span>
+  <span class="links">
+    <a href="#features">Features</a>
+    <a href="examples.html">Examples</a>
+    <a href="stdlib.html">Stdlib</a>
+    <a href="#quickstart">Quickstart</a>
+  </span>
+</div></nav>
+
+<header class="hero">
+  <h1>TypeScript syntax.<br><span class="glow">Native speed.</span></h1>
+  <p class="tag">Lumen is a statically&#8209;typed, compiled language. You write TypeScript&#8209;style
+  source; it type&#8209;checks, lowers to Zig, and builds a small native binary.</p>
+  <div class="pipeline">
+    <span>.ts source</span><span class="arrow">→</span>
+    <span>type check</span><span class="arrow">→</span>
+    <span>generated Zig</span><span class="arrow">→</span>
+    <span>native binary</span>
+  </div>
+  <div>
+    <a class="btn primary" href="#quickstart">Get started</a>
+    <a class="btn ghost" href="examples.html">See examples</a>
+  </div>
+</header>
+
+<section class="wrap" id="hello">
+  <h2>Hello, Lumen</h2>
+  <p class="sub">Familiar syntax, fixed static types, no runtime — just a native executable.</p>
+<pre><code class="lumen">interface Point {
+  x: int;
+  y: int;
+}
+
+function distanceSq(a: Point, b: Point): int {
+  let dx = a.x - b.x;
+  let dy = a.y - b.y;
+  return dx * dx + dy * dy;
+}
+
+let origin: Point = { x: 0, y: 0 };
+let p: Point = { x: 3, y: 4 };
+console.log(`distance² = ${distanceSq(origin, p)}`);  // distance² = 25</code></pre>
+</section>
+
+<section class="wrap" id="features">
+  <h2>What's in the language</h2>
+  <p class="sub">A predictable static subset of TypeScript — no prototypes, no <code>eval</code>, no dynamic shapes.</p>
+  <div class="grid">
+    <div class="card"><h3>Static types</h3><p>Local inference, <code>int</code>/<code>i64</code>/<code>number</code>/<code>bool</code>/<code>string</code>, float &amp; hex/binary literals.</p></div>
+    <div class="card"><h3>Records &amp; interfaces</h3><p>Closed object shapes, nested records, arrays of records, <code>enum</code>s.</p></div>
+    <div class="card"><h3>Full control flow</h3><p><code>if</code>/<code>else if</code>, <code>while</code>, <code>do</code>, C&#8209;style <code>for</code>, <code>for…of</code>, <code>switch</code>, ternary.</p></div>
+    <div class="card"><h3>Null safety</h3><p><code>T | null</code>, optional <code>?</code> fields, <code>??</code>, <code>?.</code>, and <code>if (x != null)</code> narrowing.</p></div>
+    <div class="card"><h3>First-class functions</h3><p>Function types, arrow functions, and capturing closures.</p></div>
+    <div class="card"><h3>Template literals</h3><p><code>`hi ${name}`</code> with string &amp; numeric interpolation.</p></div>
+    <div class="card"><h3>defer</h3><p>Zig&#8209;style scope&#8209;exit cleanup, last&#8209;in&#8209;first&#8209;out.</p></div>
+    <div class="card"><h3>Built-in tests</h3><p><code>test "…" { expect(…); }</code> run with <code>lumen test</code> on Zig's test runner.</p></div>
+    <div class="card"><h3>Native output</h3><p>Compiles through Zig to a small, fast, dependency&#8209;free binary.</p></div>
+  </div>
+</section>
+
+<section class="wrap" id="closures">
+  <h2>Closures that compile</h2>
+  <p class="sub">Capture locals by value — lowered to a heap environment, no GC.</p>
+<pre><code class="lumen">function makeAdder(n: int): (x: int) => int {
+  return (x: int) => x + n;
+}
+
+let add10 = makeAdder(10);
+console.log(add10(5));   // 15
+
+let factor = 3;
+let nums: int[] = [1, 2, 3];
+for (const v of nums) {
+  console.log((v: int) => v * factor);  // closes over `factor`
+}</code></pre>
+</section>
+
+<section class="wrap" id="quickstart">
+  <h2>Quickstart</h2>
+  <p class="sub">Requires <a href="https://ziglang.org/download/">Zig 0.16</a> on your PATH.</p>
+  <h3>Build the compiler</h3>
+<pre><code class="lumen">zig build</code></pre>
+  <h3>Compile and run a program</h3>
+<pre><code class="lumen">./zig-out/bin/lumen compile hello.ts
+./hello</code></pre>
+  <h3>Run tests</h3>
+<pre><code class="lumen">./zig-out/bin/lumen test math.test.ts</code></pre>
+  <p class="note">The generated Zig is an implementation detail — you think in the TypeScript-syntax
+  source language, not in Zig.</p>
+</section>
+
+<footer><div class="wrap">
+  Lumen — a compiled TypeScript-syntax language. Built with Zig.<br>
+  <a href="examples.html">Examples</a> · <a href="stdlib.html">Standard library</a>
+</div></footer>
+
+<script src="highlight.js"></script>
+</body>
+</html>

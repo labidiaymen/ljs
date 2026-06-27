@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Standard library — Lumen</title>
+<meta name="description" content="The Lumen V1 standard library: console, Math, String, Array, errors, files, and process args.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav><div class="wrap">
+  <a class="brand" href="index.html" style="color:var(--fg)">Lumen<span class="dot">.</span></a>
+  <span class="links">
+    <a href="index.html#features">Features</a>
+    <a href="examples.html">Examples</a>
+    <a href="stdlib.html">Stdlib</a>
+    <a href="index.html#quickstart">Quickstart</a>
+  </span>
+</div></nav>
+
+<section class="wrap">
+  <h2>Standard library</h2>
+  <p class="sub">A small, explicit, Node-flavored surface. Every member is statically typed and
+  arity-checked before it lowers to native code.</p>
+
+  <h3>console</h3>
+  <table>
+    <tr><th>API</th><th>Type</th><th>Notes</th></tr>
+    <tr><td><code>console.log(x)</code></td><td>any → void</td><td>Prints the value using its checked type.</td></tr>
+    <tr><td><code>console.error(x)</code></td><td>any → void</td><td>Prints to standard error.</td></tr>
+  </table>
+
+  <h3>Math</h3>
+  <table>
+    <tr><th>API</th><th>Type</th></tr>
+    <tr><td><code>Math.abs(n)</code></td><td>number → number</td></tr>
+    <tr><td><code>Math.max(a, b)</code> / <code>Math.min(a, b)</code></td><td>(number, number) → number</td></tr>
+    <tr><td><code>Math.sign(n)</code></td><td>number → int</td></tr>
+    <tr><td><code>Math.clamp(n, lo, hi)</code></td><td>(number, number, number) → number</td></tr>
+    <tr><td><code>Math.sqrt(n)</code></td><td>number → number</td></tr>
+  </table>
+
+  <h3>String</h3>
+  <table>
+    <tr><th>API</th><th>Type</th></tr>
+    <tr><td><code>s.length</code></td><td>int</td></tr>
+    <tr><td><code>s + t</code></td><td>string concatenation</td></tr>
+    <tr><td><code>String.isEmpty(s)</code></td><td>string → bool</td></tr>
+    <tr><td><code>String.contains(s, sub)</code></td><td>(string, string) → bool</td></tr>
+    <tr><td><code>String.startsWith(s, prefix)</code></td><td>(string, string) → bool</td></tr>
+  </table>
+
+  <h3>Array</h3>
+  <table>
+    <tr><th>API</th><th>Type</th></tr>
+    <tr><td><code>a[i]</code></td><td>element access (integer index)</td></tr>
+    <tr><td><code>a.length</code></td><td>int</td></tr>
+    <tr><td><code>Array.isEmpty(a)</code></td><td>T[] → bool</td></tr>
+  </table>
+
+  <h3>Errors</h3>
+  <table>
+    <tr><th>API</th><th>Notes</th></tr>
+    <tr><td><code>Error("message")</code></td><td>Constructs an error value.</td></tr>
+    <tr><td><code>throw e</code></td><td>Throws an Error value.</td></tr>
+    <tr><td><code>try { … } catch (e) { … } finally { … }</code></td><td><code>e.message</code> is the thrown message.</td></tr>
+  </table>
+
+  <h3>Files &amp; process</h3>
+  <table>
+    <tr><th>API</th><th>Type</th><th>Notes</th></tr>
+    <tr><td><code>fs.readFileSync(path, encoding?)</code></td><td>(string, string?) → string</td><td>UTF-8 text; empty string if unreadable.</td></tr>
+    <tr><td><code>argsCount()</code></td><td>→ int</td><td>Number of native arguments.</td></tr>
+    <tr><td><code>arg(i)</code></td><td>int → string</td><td>Argument at index, or "" if absent.</td></tr>
+  </table>
+
+  <p class="note">V1 is intentionally small and not full Node compatibility. The surface grows in
+  explicit, conformance-backed slices rather than inheriting an entire runtime.</p>
+</section>
+
+<footer><div class="wrap">
+  <a href="index.html">← Back to home</a> · <a href="examples.html">Examples</a>
+</div></footer>
+
+<script src="highlight.js"></script>
+</body>
+</html>
