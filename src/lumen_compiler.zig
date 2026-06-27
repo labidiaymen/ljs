@@ -45,6 +45,8 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
     var lex = Lexer{ .src = source };
     var prev_was_dot = false;
     var prev_was_ident = false;
+    var last_ident_this = false; // the most recent ident was `this`
+    var dot_obj_this = false; // the object before the current `.` was `this`
     var pending_dynamic_write_line: u32 = 0;
     var pending_dynamic_write_col: u32 = 0;
     var bracket_depth: u32 = 0;
@@ -73,11 +75,14 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
                 if (prev_was_dot and eq(u8, name, "prototype")) {
                     return setDiag(diag, lex.tok_line, lex.tok_col, "E_UNSUPPORTED_PROTOTYPE");
                 }
-                if (prev_was_dot) {
+                // Writes through `this` are declared class fields, not dynamic
+                // property writes, so don't flag them.
+                if (prev_was_dot and !dot_obj_this) {
                     pending_dynamic_write_line = lex.tok_line;
                     pending_dynamic_write_col = lex.tok_col;
                 }
                 prev_was_dot = false;
+                last_ident_this = eq(u8, name, "this");
                 // A declaration keyword before `[` is array destructuring, not an
                 // indexed dynamic write, so it must not start a write candidate.
                 prev_was_ident = !(eq(u8, name, "let") or eq(u8, name, "const") or eq(u8, name, "var"));
@@ -104,7 +109,9 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
                     pending_dynamic_write_line = 0;
                     pending_dynamic_write_col = 0;
                 }
+                if (ch == '.') dot_obj_this = last_ident_this;
                 prev_was_dot = ch == '.';
+                last_ident_this = false;
                 prev_was_ident = false;
             },
             else => {
@@ -410,7 +417,10 @@ const Parser = struct {
         return self.parsePostfix();
     }
     fn parsePostfix(self: *Parser) CompileError!*Expr {
-        var e = try self.parsePrimary();
+        return self.parsePostfixFrom(try self.parsePrimary());
+    }
+    fn parsePostfixFrom(self: *Parser, base: *Expr) CompileError!*Expr {
+        var e = base;
         while (self.isOp('.') or self.isOp('[') or self.isOp2("?.")) {
             if (self.isOp2("?.")) {
                 try self.advance();
@@ -424,8 +434,6 @@ const Parser = struct {
                 const name = self.cur.ident;
                 try self.advance();
                 if (self.isOp('(')) {
-                    if (e.* != .var_ref or !isStdNamespace(e.var_ref.name)) return error.ParseError;
-                    const namespace = e.var_ref.name;
                     try self.expectOp('(');
                     var args: std.ArrayListUnmanaged(*Expr) = .empty;
                     while (!self.isOp(')')) {
@@ -433,7 +441,12 @@ const Parser = struct {
                         if (self.isOp(',')) try self.advance() else break;
                     }
                     try self.expectOp(')');
-                    e = try self.node(.{ .static_call = .{ .namespace = namespace, .name = name, .args = try args.toOwnedSlice(self.arena) } });
+                    if (e.* == .var_ref and isStdNamespace(e.var_ref.name)) {
+                        e = try self.node(.{ .static_call = .{ .namespace = e.var_ref.name, .name = name, .args = try args.toOwnedSlice(self.arena) } });
+                    } else {
+                        // instance method call: obj.method(args)
+                        e = try self.node(.{ .method_call = .{ .obj = e, .name = name, .args = try args.toOwnedSlice(self.arena) } });
+                    }
                 } else {
                     e = try self.node(.{ .field = .{ .obj = e, .name = name } });
                 }
@@ -516,6 +529,24 @@ const Parser = struct {
         if (self.isKw("null") or self.isKw("undefined")) {
             try self.advance();
             return self.node(.null_lit);
+        }
+        if (self.isKw("this")) {
+            try self.advance();
+            return self.node(.this_expr);
+        }
+        if (self.isKw("new")) {
+            try self.advance();
+            if (self.cur != .ident) return error.ParseError;
+            const class_name = self.cur.ident;
+            try self.advance();
+            try self.expectOp('(');
+            var args: std.ArrayListUnmanaged(*Expr) = .empty;
+            while (!self.isOp(')')) {
+                try args.append(self.arena, try self.parseExpr());
+                if (self.isOp(',')) try self.advance() else break;
+            }
+            try self.expectOp(')');
+            return self.node(.{ .new_expr = .{ .class_name = class_name, .args = try args.toOwnedSlice(self.arena) } });
         }
         if (self.cur == .template) {
             const raw = self.cur.template;
@@ -789,6 +820,71 @@ const Parser = struct {
         } };
     }
 
+    fn parseParamList(self: *Parser) CompileError![]ast.FunctionParam {
+        try self.expectOp('(');
+        var params: std.ArrayListUnmanaged(ast.FunctionParam) = .empty;
+        while (!self.isOp(')')) {
+            if (self.cur != .ident) return error.ParseError;
+            const param_name = self.cur.ident;
+            try self.advance();
+            const annotation = try self.parseOptionalMember();
+            try params.append(self.arena, .{ .name = param_name, .annotation = annotation });
+            if (self.isOp(',')) try self.advance() else break;
+        }
+        try self.expectOp(')');
+        return params.toOwnedSlice(self.arena);
+    }
+
+    /// `class Name { field: T; constructor(p: T) { ... } method(p: T): R { ... } }`
+    fn parseClassDecl(self: *Parser, line: u32, col: u32) CompileError!Stmt {
+        try self.advance(); // 'class'
+        if (self.cur != .ident) return error.ParseError;
+        const name = self.cur.ident;
+        try self.advance();
+        try self.expectOp('{');
+        var fields: std.ArrayListUnmanaged(ast.TypeField) = .empty;
+        var methods: std.ArrayListUnmanaged(ast.FunctionDecl) = .empty;
+        var has_ctor = false;
+        var ctor_params: []ast.FunctionParam = &.{};
+        var ctor_body: []Stmt = &.{};
+        while (!self.isOp('}')) {
+            if (self.cur != .ident) return error.ParseError;
+            const member = self.cur.ident;
+            const m_line = self.cur_line;
+            const m_col = self.cur_col;
+            try self.advance();
+            if (std.mem.eql(u8, member, "constructor")) {
+                ctor_params = try self.parseParamList();
+                ctor_body = try self.parseBlock();
+                has_ctor = true;
+            } else if (self.isOp('(')) {
+                // method
+                const params = try self.parseParamList();
+                try self.expectOp(':');
+                const return_annotation = try self.parseTypeAnnotation();
+                const body = try self.parseBlock();
+                try methods.append(self.arena, .{ .name = member, .params = params, .return_annotation = return_annotation, .body = body, .line = m_line, .col = m_col });
+            } else {
+                // field: name: T ;
+                const annotation = try self.parseOptionalMember();
+                try fields.append(self.arena, .{ .name = member, .annotation = annotation });
+                if (self.isOp(';') or self.isOp(',')) try self.advance();
+            }
+        }
+        try self.expectOp('}');
+        if (self.isOp(';')) try self.advance();
+        return .{ .class_decl = .{
+            .name = name,
+            .fields = try fields.toOwnedSlice(self.arena),
+            .has_ctor = has_ctor,
+            .ctor_params = ctor_params,
+            .ctor_body = ctor_body,
+            .methods = try methods.toOwnedSlice(self.arena),
+            .line = line,
+            .col = col,
+        } };
+    }
+
     fn parseBlock(self: *Parser) CompileError![]Stmt {
         try self.expectOp('{');
         var body: std.ArrayListUnmanaged(Stmt) = .empty;
@@ -851,9 +947,38 @@ const Parser = struct {
         if (eq(u8, kw, "extern")) return self.parseExternDecl(line, col);
         if (eq(u8, kw, "function")) return self.parseFunctionDecl(line, col);
         if (eq(u8, kw, "switch")) return self.parseSwitch(line, col);
-        if (eq(u8, kw, "class")) {
-            self.last_err = "E_UNSUPPORTED_CLASS";
-            return error.ParseError;
+        if (eq(u8, kw, "class")) return self.parseClassDecl(line, col);
+
+        // `this.field = value;` (member assignment) or `this.method(args);`
+        if (eq(u8, kw, "this")) {
+            try self.advance(); // 'this'
+            try self.expectOp('.');
+            if (self.cur != .ident) return error.ParseError;
+            const member = self.cur.ident;
+            try self.advance();
+            if (self.isOp('(')) {
+                try self.expectOp('(');
+                var args: std.ArrayListUnmanaged(*Expr) = .empty;
+                while (!self.isOp(')')) {
+                    try args.append(self.arena, try self.parseExpr());
+                    if (self.isOp(',')) try self.advance() else break;
+                }
+                try self.expectOp(')');
+                try self.expectOp(';');
+                const this_e = try self.node(.this_expr);
+                const mc = try self.node(.{ .method_call = .{ .obj = this_e, .name = member, .args = try args.toOwnedSlice(self.arena) } });
+                return .{ .expr_stmt = .{ .value = mc, .line = line, .col = col } };
+            }
+            var op: []const u8 = "=";
+            if (self.isOp('=')) {
+                try self.advance();
+            } else if (self.cur == .op2 and (eq(u8, self.cur.op2, "+=") or eq(u8, self.cur.op2, "-=") or eq(u8, self.cur.op2, "*=") or eq(u8, self.cur.op2, "/=") or eq(u8, self.cur.op2, "%="))) {
+                op = self.cur.op2;
+                try self.advance();
+            } else return error.ParseError;
+            const value = try self.parseExpr();
+            try self.expectOp(';');
+            return .{ .member_assign = .{ .field = member, .op = op, .value = value, .line = line, .col = col } };
         }
 
         if (eq(u8, kw, "let") or eq(u8, kw, "const") or eq(u8, kw, "var")) {
@@ -1100,9 +1225,24 @@ const Parser = struct {
                 if (self.isOp(',')) try self.advance() else break;
             }
             try self.expectOp(')');
+            // A method call on a returned object, e.g. `make().go();`, continues
+            // as a postfix expression statement.
+            if (self.isOp('.') or self.isOp('[') or self.isOp2("?.")) {
+                const call_e = try self.node(.{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.arena) } });
+                const e = try self.parsePostfixFrom(call_e);
+                try self.expectOp(';');
+                return .{ .expr_stmt = .{ .value = e, .line = line, .col = col } };
+            }
             try self.expectOp(';');
             const value = try self.node(.{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.arena) } });
             return .{ .expr_stmt = .{ .value = value, .line = line, .col = col } };
+        }
+        // Member-expression statement: `obj.method(args);`, `obj.field...`.
+        if (self.isOp('.') or self.isOp('[') or self.isOp2("?.")) {
+            const base = try self.node(.{ .var_ref = .{ .name = name } });
+            const e = try self.parsePostfixFrom(base);
+            try self.expectOp(';');
+            return .{ .expr_stmt = .{ .value = e, .line = line, .col = col } };
         }
         return .{ .assign = try self.parseAssignmentTail(name, line, col, true) };
     }
@@ -1377,6 +1517,24 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try emitExpr(c.r, w, arena);
             try w.append(arena, ')');
         },
+        .this_expr => try w.appendSlice(arena, "self"),
+        .new_expr => |ne| {
+            try w.print(arena, "{s}.__init(", .{ne.class_name});
+            for (ne.args, 0..) |arg, i| {
+                if (i > 0) try w.appendSlice(arena, ", ");
+                try emitExpr(arg, w, arena);
+            }
+            try w.append(arena, ')');
+        },
+        .method_call => |mc| {
+            try emitExpr(mc.obj, w, arena);
+            try w.print(arena, ".{s}(", .{mc.name});
+            for (mc.args, 0..) |arg, i| {
+                if (i > 0) try w.appendSlice(arena, ", ");
+                try emitExpr(arg, w, arena);
+            }
+            try w.append(arena, ')');
+        },
         .arrow => |arrow| {
             const ret = arrow.checked_return_type orelse return error.ParseError;
             // Build the fat-pointer struct name for this signature.
@@ -1576,6 +1734,8 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             .type_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .enum_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .extern_decl => |decl| .{ .line = decl.line, .col = decl.col },
+            .class_decl => |decl| .{ .line = decl.line, .col = decl.col },
+            .member_assign => |ma| .{ .line = ma.line, .col = ma.col },
             .test_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .function_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .var_decl => |decl| .{ .line = decl.line, .col = decl.col },
@@ -1618,6 +1778,55 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
                 try decls.print(arena, "{s}: {s}", .{ param.name, try types.zigName(arena, param.checked_type orelse return error.ParseError) });
             }
             try decls.print(arena, ") {s};\n", .{try types.zigName(arena, decl.checked_return_type orelse return error.ParseError)});
+        },
+        .class_decl => |c| {
+            // A class lowers to a struct with heap-allocated instances (*Name),
+            // an `__init` constructor, and methods taking `self: *Name`.
+            try decls.print(arena, "const {s} = struct {{\n", .{c.name});
+            for (c.fields) |field| {
+                try decls.print(arena, "    {s}: {s},\n", .{ field.name, try types.zigName(arena, field.checked_type orelse return error.ParseError) });
+            }
+            // constructor
+            try decls.print(arena, "    fn __init(", .{});
+            for (c.ctor_params, 0..) |param, i| {
+                if (i > 0) try decls.appendSlice(arena, ", ");
+                try decls.print(arena, "{s}: {s}", .{ param.name, try types.zigName(arena, param.checked_type orelse return error.ParseError) });
+            }
+            try decls.print(arena, ") *{s} {{\n", .{c.name});
+            try decls.print(arena, "    const self = std.heap.page_allocator.create({s}) catch unreachable;\n", .{c.name});
+            for (c.ctor_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, decls, arena, throw_target, switch_break_target, options);
+            try decls.appendSlice(arena, "    return self;\n    }\n");
+            // methods
+            for (c.methods) |m| {
+                try decls.print(arena, "    fn {s}(self: *{s}", .{ m.name, c.name });
+                for (m.params) |param| {
+                    try decls.print(arena, ", {s}: {s}", .{ param.name, try types.zigName(arena, param.checked_type orelse return error.ParseError) });
+                }
+                try decls.print(arena, ") {s} {{\n", .{try types.zigName(arena, m.checked_return_type orelse return error.ParseError)});
+                for (m.body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, decls, arena, throw_target, switch_break_target, options);
+                try decls.appendSlice(arena, "    }\n");
+            }
+            try decls.appendSlice(arena, "};\n");
+        },
+        .member_assign => |ma| {
+            // this.field <op>= value  ->  self.field = (self.field op value);
+            try body.print(arena, "    self.{s} = ", .{ma.field});
+            if (std.mem.eql(u8, ma.op, "=")) {
+                try emitExpr(ma.value, body, arena);
+            } else if (ma.op[0] == '/') {
+                try body.print(arena, "@divTrunc(self.{s}, ", .{ma.field});
+                try emitExpr(ma.value, body, arena);
+                try body.append(arena, ')');
+            } else if (ma.op[0] == '%') {
+                try body.print(arena, "@rem(self.{s}, ", .{ma.field});
+                try emitExpr(ma.value, body, arena);
+                try body.append(arena, ')');
+            } else {
+                try body.print(arena, "(self.{s} {c} ", .{ ma.field, ma.op[0] });
+                try emitExpr(ma.value, body, arena);
+                try body.append(arena, ')');
+            }
+            try body.appendSlice(arena, ";\n");
         },
         .test_decl => |t| {
             // Emit a Zig `test "name" { ... }` block into the top-level decls.

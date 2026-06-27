@@ -63,6 +63,7 @@ console.log(`distance² = ${distanceSq(origin, p)}`);  // distance² = 25</code>
     <div class="card"><h3>Full control flow</h3><p><code>if</code>/<code>else if</code>, <code>while</code>, <code>do</code>, C&#8209;style <code>for</code>, <code>for…of</code>, <code>switch</code>, ternary.</p></div>
     <div class="card"><h3>Null safety</h3><p><code>T | null</code>, optional <code>?</code> fields, <code>??</code>, <code>?.</code>, and <code>if (x != null)</code> narrowing.</p></div>
     <div class="card"><h3>First-class functions</h3><p>Function types, arrow functions, and capturing closures.</p></div>
+    <div class="card"><h3>Classes</h3><p>Fields, constructor, <code>this</code>, and methods — instances lower to heap structs.</p></div>
     <div class="card"><h3>Template literals</h3><p><code>`hi ${name}`</code> with string &amp; numeric interpolation.</p></div>
     <div class="card"><h3>defer</h3><p>Zig&#8209;style scope&#8209;exit cleanup, last&#8209;in&#8209;first&#8209;out.</p></div>
     <div class="card"><h3>Built-in tests</h3><p><code>test "…" { expect(…); }</code> run with <code>lumen test</code> on Zig's test runner.</p></div>
@@ -86,6 +87,27 @@ let nums: int[] = [1, 2, 3];
 for (const v of nums) {
   console.log((v: int) => v * factor);  // closes over `factor`
 }</code></pre>
+</section>
+
+<section class="wrap" id="classes">
+  <h2>Classes</h2>
+  <p class="sub">Fields, a constructor, <code>this</code>, and methods — instances are heap structs.</p>
+<pre><code class="lumen">class Counter {
+  count: int;
+  constructor(start: int) {
+    this.count = start;
+  }
+  increment(): void {
+    this.count += 1;
+  }
+  get(): int {
+    return this.count;
+  }
+}
+
+let c = new Counter(5);
+c.increment();
+console.log(c.get());   // 6</code></pre>
 </section>
 
 <section class="wrap" id="ffi">

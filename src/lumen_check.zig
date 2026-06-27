@@ -22,6 +22,13 @@ const EnumInfo = struct {
     members: []ast.EnumMember,
 };
 
+const ClassInfo = struct {
+    fields: []ast.TypeField,
+    methods: []ast.FunctionDecl,
+    ctor_params: []ast.FunctionParam,
+    has_ctor: bool,
+};
+
 const Binding = struct {
     ty: types.Type,
     mutable: bool,
@@ -36,7 +43,9 @@ const Checker = struct {
     scopes: std.ArrayListUnmanaged(Scope) = .empty,
     type_decls: std.StringHashMapUnmanaged(TypeDeclInfo) = .empty,
     enums: std.StringHashMapUnmanaged(EnumInfo) = .empty,
+    classes: std.StringHashMapUnmanaged(ClassInfo) = .empty,
     funcs: std.StringHashMapUnmanaged(FunctionInfo) = .empty,
+    current_class: ?[]const u8 = null,
     next_binding_id: u32 = 0,
     current_return_type: ?types.Type = null,
     nested_stmt_depth: u32 = 0,
@@ -221,6 +230,9 @@ const Checker = struct {
         if (self.enums.get(annotation)) |einfo| {
             return .{ .enum_type = .{ .name = annotation, .is_string = einfo.is_string } };
         }
+        if (self.classes.get(annotation) != null) {
+            return .{ .class_type = annotation };
+        }
         if (self.type_decls.get(annotation)) |decl| {
             if (decl.string_literals != null) return .{ .string_literal_union = annotation };
             if (decl.int_literals != null) return .{ .int_literal_union = annotation };
@@ -250,6 +262,18 @@ const Checker = struct {
                 self.enums.put(self.arena, e.name, .{ .is_string = e.is_string, .members = e.members }) catch return error.OutOfMemory;
             }
         }
+        // Register class names (pass A) so cross-references resolve, then fill
+        // field/method/constructor types (pass B).
+        for (program.stmts) |*stmt| {
+            if (stmt.* == .class_decl) {
+                const c = &stmt.class_decl;
+                if (self.classes.get(c.name) != null) return self.fail(c.line, c.col, "E_DUPLICATE_BINDING");
+                self.classes.put(self.arena, c.name, .{ .fields = c.fields, .methods = c.methods, .ctor_params = c.ctor_params, .has_ctor = c.has_ctor }) catch return error.OutOfMemory;
+            }
+        }
+        for (program.stmts) |*stmt| {
+            if (stmt.* == .class_decl) try self.fillClassTypes(&stmt.class_decl);
+        }
         for (program.stmts) |*stmt| {
             if (stmt.* == .extern_decl) try self.declareExtern(&stmt.extern_decl);
         }
@@ -257,6 +281,27 @@ const Checker = struct {
             if (stmt.* == .function_decl) try self.declareFunction(&stmt.function_decl);
         }
         for (program.stmts) |*stmt| try self.checkStmt(program, stmt);
+    }
+
+    fn fillClassTypes(self: *Checker, c: *ast.ClassDecl) CompileError!void {
+        for (c.fields) |*field| {
+            field.checked_type = try self.typeFromAnnotation(field.annotation, c.line, c.col);
+        }
+        for (c.ctor_params) |*param| {
+            param.checked_type = try self.typeFromAnnotation(param.annotation, c.line, c.col);
+        }
+        for (c.methods) |*m| {
+            for (m.params) |*param| param.checked_type = try self.typeFromAnnotation(param.annotation, m.line, m.col);
+            m.checked_return_type = try self.typeFromAnnotation(m.return_annotation, m.line, m.col);
+        }
+    }
+
+    fn classField(self: *Checker, class_name: []const u8, field: []const u8) ?types.Type {
+        const info = self.classes.get(class_name) orelse return null;
+        for (info.fields) |f| {
+            if (std.mem.eql(u8, f.name, field)) return f.checked_type;
+        }
+        return null;
     }
 
     fn declareExtern(self: *Checker, decl: *ast.ExternDecl) CompileError!void {
@@ -297,6 +342,21 @@ const Checker = struct {
         }
     }
 
+    fn checkClass(self: *Checker, program: *ast.Program, c: *ast.ClassDecl) CompileError!void {
+        const prev = self.current_class;
+        self.current_class = c.name;
+        defer self.current_class = prev;
+        if (c.has_ctor) {
+            try self.pushScope();
+            defer self.popScope();
+            for (c.ctor_params) |param| try self.declareParam(param, c.line, c.col);
+            self.nested_stmt_depth += 1;
+            defer self.nested_stmt_depth -= 1;
+            for (c.ctor_body) |*body_stmt| try self.checkStmt(program, body_stmt);
+        }
+        for (c.methods) |*m| try self.checkFunctionBody(program, m);
+    }
+
     fn blockReturns(body: []ast.Stmt) bool {
         for (body) |stmt| {
             if (stmtReturns(stmt)) return true;
@@ -322,6 +382,20 @@ const Checker = struct {
             },
             .enum_decl => {}, // registered during the hoisting pre-pass
             .extern_decl => {}, // registered during the hoisting pre-pass
+            .class_decl => |*c| try self.checkClass(program, c),
+            .member_assign => |*ma| {
+                const cls = self.current_class orelse return self.fail(ma.line, ma.col, "E_RETURN_OUTSIDE_FUNCTION");
+                const field_type = self.classField(cls, ma.field) orelse return self.fail(ma.line, ma.col, "E_TYPE_MISMATCH");
+                if (std.mem.eql(u8, ma.op, "=")) {
+                    try self.ensureAssignable(program, field_type, ma.value, ma.line, ma.col);
+                } else {
+                    const value_type = self.exprType(program, ma.value, ma.line, ma.col) orelse
+                        return self.inferenceFail(ma.line, ma.col, "cannot infer assignment type");
+                    if (!types.isNumeric(field_type) or !types.same(field_type, value_type)) {
+                        return self.fail(ma.line, ma.col, "E_TYPE_MISMATCH");
+                    }
+                }
+            },
             .test_decl => |*t| {
                 self.test_depth += 1;
                 defer self.test_depth -= 1;
@@ -900,8 +974,69 @@ const Checker = struct {
                 }
                 return switch (obj_type) {
                     .named => |type_name| self.fieldType(type_name, field.name, line, col),
+                    .class_type => |class_name| self.classField(class_name, field.name) orelse {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    },
                     else => null,
                 };
+            },
+            .this_expr => blk: {
+                const cls = self.current_class orelse {
+                    _ = self.fail(line, col, "E_RETURN_OUTSIDE_FUNCTION") catch {};
+                    return null;
+                };
+                break :blk .{ .class_type = cls };
+            },
+            .new_expr => |*ne| {
+                const info = self.classes.get(ne.class_name) orelse {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                };
+                if (info.has_ctor) {
+                    if (ne.args.len != info.ctor_params.len) {
+                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    for (ne.args, info.ctor_params) |arg, p| {
+                        const pt = p.checked_type orelse return null;
+                        self.ensureAssignable(program, pt, arg, line, col) catch {
+                            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                            return null;
+                        };
+                    }
+                } else if (ne.args.len != 0) {
+                    _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                    return null;
+                }
+                return .{ .class_type = ne.class_name };
+            },
+            .method_call => |*mc| {
+                const obj_type = self.exprType(program, mc.obj, line, col) orelse return null;
+                if (obj_type != .class_type) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+                const cls = obj_type.class_type;
+                const info = self.classes.get(cls) orelse return null;
+                for (info.methods) |m| {
+                    if (std.mem.eql(u8, m.name, mc.name)) {
+                        if (mc.args.len != m.params.len) {
+                            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                            return null;
+                        }
+                        for (mc.args, m.params) |arg, p| {
+                            self.ensureAssignable(program, p.checked_type orelse return null, arg, line, col) catch {
+                                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                                return null;
+                            };
+                        }
+                        mc.class_name = cls;
+                        return m.checked_return_type orelse return null;
+                    }
+                }
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
             },
             .index => |*index| {
                 const obj_type = self.exprType(program, index.obj, line, col) orelse return null;

@@ -1,0 +1,17 @@
+{
+  "feature": "010-classes",
+  "cases": [
+    {
+      "id": "class.valid.classes",
+      "source": "../examples/valid/classes.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "16\n7\n3" }
+    },
+    {
+      "id": "class.invalid.ctor-arg-type",
+      "source": "../examples/invalid/ctor-arg-type.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    }
+  ]
+}

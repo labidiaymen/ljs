@@ -352,14 +352,6 @@
       }
     },
     {
-      "id": "native.invalid.class-unsupported",
-      "source": "../examples/invalid/class-unsupported.ts",
-      "phase": "diagnostics",
-      "expect": {
-        "diagnostic": "E_UNSUPPORTED_CLASS"
-      }
-    },
-    {
       "id": "native.invalid.type-mismatch",
       "source": "../examples/invalid/type-mismatch.ts",
       "phase": "diagnostics",

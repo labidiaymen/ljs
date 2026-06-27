@@ -46,6 +46,26 @@ pub const ExternDecl = struct {
     col: u32,
 };
 
+pub const ClassDecl = struct {
+    name: []const u8,
+    fields: []TypeField,
+    has_ctor: bool = false,
+    ctor_params: []FunctionParam = &.{},
+    ctor_body: []Stmt = &.{},
+    methods: []FunctionDecl = &.{},
+    line: u32,
+    col: u32,
+};
+
+/// `this.field = value` (field write inside a method/constructor).
+pub const MemberAssign = struct {
+    field: []const u8,
+    op: []const u8 = "=",
+    value: *Expr,
+    line: u32,
+    col: u32,
+};
+
 pub const FunctionDecl = struct {
     name: []const u8,
     params: []FunctionParam,
@@ -219,9 +239,11 @@ pub const Stmt = union(enum) {
     enum_decl: EnumDecl,
     test_decl: TestDecl,
     extern_decl: ExternDecl,
+    class_decl: ClassDecl,
     function_decl: FunctionDecl,
     var_decl: VarDecl,
     destructure_decl: DestructureDecl,
+    member_assign: MemberAssign,
     assign: Assign,
     console_log: ConsoleLog,
     while_stmt: WhileStmt,
@@ -265,6 +287,9 @@ pub const Expr = union(enum) {
     ternary: struct { cond: *Expr, then_expr: *Expr, else_expr: *Expr },
     coalesce: struct { l: *Expr, r: *Expr }, // a ?? b
     arrow: *ArrowExpr, // (x: T) => expr
+    this_expr, // `this` inside a method/constructor
+    new_expr: struct { class_name: []const u8, args: []*Expr }, // new C(args)
+    method_call: struct { obj: *Expr, name: []const u8, args: []*Expr, class_name: ?[]const u8 = null }, // obj.m(args)
     template: []TemplatePart, // `text ${expr} ...`
     obj: []FieldInit,
     field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null, enum_value: ?EnumValue = null, optional_chain: bool = false, chain_field_type: ?types.Type = null },

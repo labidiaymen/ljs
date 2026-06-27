@@ -22,6 +22,7 @@ pub const Type = union(enum) {
     optional: *const Type, // T | null / T | undefined  ->  Zig ?T
     none, // the bare null/undefined literal, assignable to any optional
     func_type: *const FuncSig, // (A, B) => R  ->  Zig *const fn(A, B) R
+    class_type: []const u8, // a class instance  ->  Zig *Name (heap pointer)
 };
 
 pub const EnumType = struct { name: []const u8, is_string: bool };
@@ -56,6 +57,7 @@ fn mangle(arena: std.mem.Allocator, t: Type) error{OutOfMemory}![]const u8 {
         .named_array => |n| try std.fmt.allocPrint(arena, "ar_{s}", .{n}),
         .enum_type => |e| try std.fmt.allocPrint(arena, "enum_{s}", .{e.name}),
         .optional => |inner| try std.fmt.allocPrint(arena, "opt_{s}", .{try mangle(arena, inner.*)}),
+        .class_type => |n| try std.fmt.allocPrint(arena, "cls_{s}", .{n}),
         .func_type => |sig| blk: {
             var buf: std.ArrayListUnmanaged(u8) = .empty;
             try buf.appendSlice(arena, "fn");
@@ -120,7 +122,7 @@ pub fn inferExprType(e: *const ast.Expr) ?Type {
             return if (same(then_type, else_type)) then_type else null;
         },
         .template => .string,
-        .array, .var_ref, .obj, .field, .index, .call, .static_call, .coalesce, .arrow => null,
+        .array, .var_ref, .obj, .field, .index, .call, .static_call, .coalesce, .arrow, .this_expr, .new_expr, .method_call => null,
     };
 }
 
@@ -163,6 +165,10 @@ pub fn same(a: Type, b: Type) bool {
             else => false,
         },
         .none => b == .none,
+        .class_type => |a_name| switch (b) {
+            .class_type => |b_name| std.mem.eql(u8, a_name, b_name),
+            else => false,
+        },
         .func_type => |a_sig| switch (b) {
             .func_type => |b_sig| blk: {
                 if (a_sig.params.len != b_sig.params.len) break :blk false;
@@ -280,5 +286,6 @@ pub fn zigName(arena: std.mem.Allocator, t: Type) ![]const u8 {
         .optional => |inner| try std.fmt.allocPrint(arena, "?{s}", .{try zigName(arena, inner.*)}),
         .none => "?u8", // defensive; a bare null is only valid in an optional context
         .func_type => |sig| try funcStructName(arena, sig.*),
+        .class_type => |name| try std.fmt.allocPrint(arena, "*{s}", .{name}),
     };
 }
