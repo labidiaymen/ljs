@@ -1,55 +1,33 @@
-# Lumen Native Compiler
+# Lumen
 
 Website & docs: **https://ljs-9ky.pages.dev**
 
-This branch is now focused on a compiled TypeScript-syntax language:
+A statically typed, compiled language with TypeScript syntax. Source is
+type-checked and compiled straight to a small native binary.
 
-```text
-TypeScript source (.ts) -> compiler -> generated Zig -> native binary
-```
+## Language
 
-The existing `src/lumen_compiler.zig` prototype is the seed. It already proves
-the useful path: TypeScript-syntax source can be lowered to Zig source and then
-compiled with `zig build-exe` into a small native executable. From here, the
-project should evolve away from JavaScript engine conformance and toward the
-Lumen language spec.
+Compiled static semantics — not a JavaScript runtime:
 
-## Scope
+- `.ts` source, fixed static types with local inference
+- `number`/`float`/`f64` floats, `int`/`i32`/`i64` integers; decimal, float,
+  `0x`/`0o`/`0b` literals with `_` separators
+- `//` and `/* … */` comments; `===`/`!==`
+- `if`/`else if`, `while`, `do`, `for`, `for…of`, `switch`, ternary
+- `enum`, `interface`, records, typed arrays
+- bitwise `& | ^ ~ << >>` and exponent `**`
+- nullable types (`T | null`), optional `?` fields/params, `??`, `?.`,
+  `if (x != null)` narrowing
+- numeric literal unions, array/object destructuring, template literals
+- first-class functions, arrow functions, capturing closures
+- classes: fields, constructor, `this`, methods
+- `defer`; built-in `test` blocks with `expect`
+- C FFI via `extern function` + library linking
+- no prototypes, `eval`, CommonJS, or dynamic object mutation
 
-V1 is not a JavaScript runtime and not a Test262 project. The source language
-uses TypeScript syntax, but with compiled static semantics:
+## Install
 
-- `.ts` source files
-- fixed static types with local inference
-- `number`/`float`/`f64` for floating-point, `int`/`i32` for 32-bit integers
-- numeric literals: decimal, float (`3.14`, `1.5e2`), and `0x`/`0o`/`0b` with
-  `_` separators
-- `//` line and `/* ... */` block comments
-- `===`/`!==` accepted (equivalent to `==`/`!=` under static typing)
-- `for...of` over arrays and strings
-- `enum` (numeric and string), `interface` (object-type synonym)
-- bitwise `& | ^ ~ << >>` and exponent `**` operators (integers)
-- nullable types (`T | null`, `T | undefined`), optional `?` fields/params,
-  `??` nullish coalescing, `?.` optional chaining, `if (x != null)` narrowing
-- numeric literal unions (`type Code = 200 | 404`), array/object destructuring
-  (`let [a, b] = …`, `let { x, y } = …`), template literals (`` `hi ${name}` ``)
-- first-class functions: function types `(x: int) => int`, named functions as
-  values, arrow functions (`(x: int) => x*2`)
-- `defer` (Zig-style scope-exit, LIFO)
-- `test "name" { ... }` blocks with `expect(...)`, run via `lumen test <file.ts>`
-  (lowered to Zig's native test runner)
-- no prototypes, `eval`, CommonJS, package.json resolution, or dynamic object
-  mutation
-- native binary output through generated Zig
-- a small standard library exposed through explicit, per-API wrappers
-
-The generated Zig is an implementation artifact. Users should think in the
-TypeScript-syntax source language, not in Zig.
-
-## Install (prebuilt)
-
-End users install a self-contained release (the native backend is bundled; no
-separate toolchain required):
+Self-contained release, no other toolchain required:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/labidiaymen/ljs/main/install.sh | sh
@@ -57,62 +35,35 @@ curl -fsSL https://raw.githubusercontent.com/labidiaymen/ljs/main/install.sh | s
 
 Windows: download the `.zip` from the [releases page](https://github.com/labidiaymen/ljs/releases).
 
+```sh
+lumen compile app.ts      # build a native binary
+lumen test app.test.ts    # run test blocks
+```
+
+## Build from source
+
+Requires the Zig 0.16 toolchain.
+
+```sh
+zig build
+zig build conformance
+```
+
+`zig build conformance` runs the manifest-driven suite under
+`specs/*/conformance/`: it compiles the valid examples, runs the binaries,
+compares output, and checks the expected diagnostics for the invalid ones.
+
 ## Releasing
 
-Tag and push; CI cross-compiles every platform from one runner, bundles a Zig
-toolchain into each archive, and uploads them to the GitHub Release:
+Push a tag; CI cross-compiles every platform from one runner and uploads
+self-contained archives to the GitHub Release (`.github/workflows/release.yml`):
 
 ```sh
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-See `.github/workflows/release.yml`. Note: verify the bundled-Zig download URLs
-in that file match the current Zig release naming before tagging.
-
-## Current Implementation Seed
-
-The current branch contains:
-
-- `src/lumen_compiler.zig`: prototype compiler/lowerer
-- `src/lumen.zig`: compiler CLI entrypoint with `lumen compile <file.ts>`
-- `specs/001-typescript-to-zig-native`: clean Spec Kit track for the new product
-
-The old ljs/Test262 specs were removed from this branch so the active design does
-not drift back toward ECMAScript conformance.
-
-The repository still contains the legacy JavaScript lexer/parser/AST used by the
-old engine path. Lumen keeps separate compiler modules because V1 intentionally
-removes JavaScript dynamism rather than inheriting it.
-
-## Quick Start
-
-Requires Zig 0.16.0.
-
-```sh
-zig build
-zig build run -- compile specs/001-typescript-to-zig-native/examples/valid/hello.ts
-zig build conformance
-```
-
-The default build now installs the compiler-first `lumen` executable. The
-immediate implementation goal is to align `src/lumen_compiler.zig` with the new
-spec: type-check the V1 subset, lower to generated Zig, and produce a native
-binary.
-
-`zig build conformance` runs the manifest-driven V1 conformance suite from
-`specs/001-typescript-to-zig-native/conformance/manifest.json`, compiling valid
-cases, running native binaries, comparing output, and checking invalid
-diagnostics.
-
 ## Development
 
-Spec Kit remains the workflow, but the active specs now describe the native
-compiler product rather than the legacy JavaScript engine.
-
-Start with:
-
-```text
-specs/001-typescript-to-zig-native/spec.md
-specs/001-typescript-to-zig-native/plan.md
-specs/001-typescript-to-zig-native/tasks.md
-```
+The project uses Spec Kit; specs live under `specs/`. The repository also
+contains a legacy JavaScript engine (`src/*.zig`) that the Lumen compiler does
+not use.
