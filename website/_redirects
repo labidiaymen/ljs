@@ -12,3 +12,6 @@
 # Generic passthrough to any lumen-lang-org repo at main:
 #   https://lumen-lang.org/gh/<repo>/<path>.ts
 /gh/:repo/*  https://raw.githubusercontent.com/lumen-lang-org/:repo/main/:splat  302
+
+# Install script: curl -fsSL https://lumen-lang.org/install.sh | sh
+/install.sh  https://raw.githubusercontent.com/lumen-lang-org/lumen/main/install.sh  302

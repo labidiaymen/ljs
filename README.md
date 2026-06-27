@@ -31,7 +31,7 @@ Compiled static semantics — not a JavaScript runtime:
 Self-contained release, no other toolchain required:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/lumen-lang-org/lumen/main/install.sh | sh
+curl -fsSL https://lumen-lang.org/install.sh | sh
 ```
 
 Windows: download the `.zip` from the [releases page](https://github.com/lumen-lang-org/lumen/releases).
