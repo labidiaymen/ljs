@@ -44,6 +44,25 @@ nav .wrap { display: flex; align-items: center; height: 62px; }
 nav .links { margin-left: auto; display: flex; gap: 26px; }
 nav .links a { color: var(--muted); font-size: 14.5px; font-weight: 500; }
 nav .links a:hover { color: var(--fg); text-decoration: none; }
+.nav-burger { display: none; }
+
+@media (max-width: 720px) {
+  nav .wrap { position: relative; }
+  .nav-burger {
+    display: block; margin-left: auto; width: 26px; height: 16px; cursor: pointer;
+    background:
+      linear-gradient(var(--fg), var(--fg)) left top / 100% 2px no-repeat,
+      linear-gradient(var(--fg), var(--fg)) left center / 100% 2px no-repeat,
+      linear-gradient(var(--fg), var(--fg)) left bottom / 100% 2px no-repeat;
+  }
+  nav .links {
+    display: none; position: absolute; top: 62px; left: 0; right: 0;
+    margin: 0; flex-direction: column; gap: 0;
+    background: var(--bg-soft); border-bottom: 1px solid var(--border); padding: 6px 0;
+  }
+  nav .links a { padding: 12px 24px; font-size: 16px; }
+  .nav-toggle:checked ~ .links { display: flex; }
+}
 
 /* Hero */
 .hero {
