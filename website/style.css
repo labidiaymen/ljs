@@ -1,5 +1,9 @@
 /* Light theme (default) */
 :root {
+  /* Tell the browser the page supports both schemes so it commits to the OS
+     setting on first paint -- without this, dark loads show UA-default (blue)
+     link colors until a theme toggle forces a recalc. */
+  color-scheme: light dark;
   --bg: #ffffff;
   --bg-soft: #f7f8fa;
   --panel: #f4f6f8;
