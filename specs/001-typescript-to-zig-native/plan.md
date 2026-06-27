@@ -124,6 +124,8 @@ Expression syntax accepts TypeScript ternary conditionals with boolean
 conditions and same-type arms.
 Switch syntax accepts typed `case` labels plus optional `default`, lowered to
 isolated native branches without implicit fallthrough for V1.
+String literal union aliases erase to native strings while the checker enforces
+allowed literal values across assignment, functions, and switch cases.
 Destructuring, comma expressions, and value-producing update expressions remain
 separate future syntax slices.
 

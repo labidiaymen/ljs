@@ -134,3 +134,5 @@
   optional default, switch-local `break;`, and conformance fixtures.
 - [x] T079 Add TypeScript-style `do...while` loops with boolean condition
   checking and `continue` condition preservation.
+- [x] T080 Add named string literal union aliases with assignment, function,
+  equality, and switch conformance.

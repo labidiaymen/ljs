@@ -14,6 +14,7 @@ pub const Type = union(enum) {
     f64_array,
     bool_array,
     string_array,
+    string_literal_union: []const u8,
     named: []const u8,
     named_array: []const u8,
 };
@@ -51,6 +52,10 @@ pub fn same(a: Type, b: Type) bool {
         .f64_array => b == .f64_array,
         .bool_array => b == .bool_array,
         .string_array => b == .string_array,
+        .string_literal_union => |a_name| switch (b) {
+            .string_literal_union => |b_name| std.mem.eql(u8, a_name, b_name),
+            else => false,
+        },
         .named => |a_name| switch (b) {
             .named => |b_name| std.mem.eql(u8, a_name, b_name),
             else => false,
@@ -69,6 +74,13 @@ pub fn isNumeric(t: Type) bool {
     };
 }
 
+pub fn isStringLike(t: Type) bool {
+    return switch (t) {
+        .string, .string_literal_union => true,
+        else => false,
+    };
+}
+
 pub fn isArray(t: Type) bool {
     return switch (t) {
         .i32_array, .i64_array, .f64_array, .bool_array, .string_array, .named_array => true,
@@ -83,6 +95,7 @@ pub fn arrayElem(t: Type) ?Type {
         .f64_array => .f64,
         .bool_array => .bool,
         .string_array => .string,
+        .string_literal_union => .string,
         .named_array => |name| .{ .named = name },
         else => null,
     };
@@ -131,6 +144,7 @@ pub fn zigName(arena: std.mem.Allocator, t: Type) ![]const u8 {
         .f64_array => "[]const f64",
         .bool_array => "[]const bool",
         .string_array => "[]const []const u8",
+        .string_literal_union => "[]const u8",
         .named => |name| name,
         .named_array => |name| try std.fmt.allocPrint(arena, "[]const {s}", .{name}),
     };

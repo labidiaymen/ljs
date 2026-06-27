@@ -320,6 +320,14 @@
       }
     },
     {
+      "id": "native.valid.string-literal-union",
+      "source": "../examples/valid/string-literal-union.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "debug\nrelease"
+      }
+    },
+    {
       "id": "native.invalid.eval",
       "source": "../examples/invalid/eval.ts",
       "phase": "diagnostics",
@@ -450,6 +458,14 @@
     {
       "id": "native.invalid.switch-case-type",
       "source": "../examples/invalid/switch-case-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.string-literal-union-value",
+      "source": "../examples/invalid/string-literal-union-value.ts",
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_TYPE_MISMATCH"

@@ -215,6 +215,10 @@ being precise enough for native output.
   switch cases. Case expressions MUST have the same static type as the switch
   expression. V1 switch cases MUST be isolated branches and MUST NOT implicitly
   fall through.
+- **FR-019F**: The compiler MUST accept named string literal union aliases such
+  as `type Mode = "dev" | "prod";`. Values assigned to those aliases, passed as
+  function arguments, returned from functions, or used as switch cases MUST be
+  one of the declared string literals.
 - **FR-020**: `let`, `const`, and `var` declarations MUST be tracked in
   lexical scopes, reject duplicate declarations in the same scope, and allow
   shadowing in nested block scopes.

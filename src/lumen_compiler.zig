@@ -393,6 +393,19 @@ const Parser = struct {
         const tname = self.cur.ident;
         try self.advance();
         try self.expectOp('=');
+        if (self.cur == .str) {
+            var literals: std.ArrayListUnmanaged([]const u8) = .empty;
+            while (true) {
+                if (self.cur != .str) return error.ParseError;
+                try literals.append(self.arena, self.cur.str);
+                try self.advance();
+                if (self.isOp(';')) break;
+                if (self.cur != .cmp or !std.mem.eql(u8, self.cur.cmp, "|")) return error.ParseError;
+                try self.advance();
+            }
+            try self.expectOp(';');
+            return .{ .type_decl = .{ .name = tname, .string_literals = try literals.toOwnedSlice(self.arena), .line = line, .col = col } };
+        }
         try self.expectOp('{');
         var fields: std.ArrayListUnmanaged(ast.TypeField) = .empty;
         while (!self.isOp('}')) {
@@ -923,7 +936,7 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
 
 fn printFormat(t: types.Type) []const u8 {
     return switch (t) {
-        .string => "{s}",
+        .string, .string_literal_union => "{s}",
         .bool => "{}",
         else => "{d}",
     };
@@ -958,7 +971,7 @@ fn emitAssignExpr(assignment: ast.Assign, body: *std.ArrayListUnmanaged(u8), are
 }
 
 fn emitSwitchCaseMatch(switch_type: types.Type, switch_value: *const Expr, case_value: *const Expr, body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
-    if (switch_type == .string) {
+    if (types.isStringLike(switch_type)) {
         try body.appendSlice(arena, "std.mem.eql(u8, ");
         try emitExpr(switch_value, body, arena);
         try body.appendSlice(arena, ", ");
@@ -998,6 +1011,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
 
     switch (stmt.*) {
         .type_decl => |decl| {
+            if (decl.string_literals != null) return;
             try decls.print(arena, "const {s} = struct {{\n", .{decl.name});
             for (decl.fields) |field| {
                 const field_type = field.checked_type orelse return error.ParseError;

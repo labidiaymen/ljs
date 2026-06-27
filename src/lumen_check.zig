@@ -8,6 +8,7 @@ const Diag = diag_mod.Diag;
 
 const TypeDeclInfo = struct {
     fields: []ast.TypeField,
+    string_literals: ?[][]const u8 = null,
 };
 
 const FunctionInfo = struct {
@@ -106,7 +107,7 @@ const Checker = struct {
     fn declareParam(self: *Checker, param: ast.FunctionParam, line: u32, col: u32) CompileError!void {
         const scope = self.currentScope();
         if (scope.get(param.name) != null) return self.fail(line, col, "E_DUPLICATE_BINDING");
-        const param_type = param.checked_type orelse types.fromAnnotation(param.annotation);
+        const param_type = param.checked_type orelse try self.typeFromAnnotation(param.annotation, line, col);
         scope.put(self.arena, param.name, .{ .ty = param_type, .mutable = true, .emit_name = param.name }) catch return error.OutOfMemory;
     }
 
@@ -118,16 +119,25 @@ const Checker = struct {
         scope.put(self.arena, stmt.catch_name, .{ .ty = .error_obj, .mutable = false, .emit_name = emit_name }) catch return error.OutOfMemory;
     }
 
-    fn declareType(self: *Checker, name: []const u8, fields: []ast.TypeField, line: u32, col: u32) CompileError!void {
+    fn declareType(self: *Checker, name: []const u8, fields: []ast.TypeField, string_literals: ?[][]const u8, line: u32, col: u32) CompileError!void {
         if (self.type_decls.get(name) != null) return self.fail(line, col, "E_DUPLICATE_BINDING");
-        self.type_decls.put(self.arena, name, .{ .fields = fields }) catch return error.OutOfMemory;
+        self.type_decls.put(self.arena, name, .{ .fields = fields, .string_literals = string_literals }) catch return error.OutOfMemory;
+    }
+
+    fn typeFromAnnotation(self: *Checker, annotation: []const u8, line: u32, col: u32) CompileError!types.Type {
+        if (self.type_decls.get(annotation)) |decl| {
+            if (decl.string_literals != null) return .{ .string_literal_union = annotation };
+        }
+        _ = line;
+        _ = col;
+        return types.fromAnnotation(annotation);
     }
 
     fn declareFunction(self: *Checker, decl: *ast.FunctionDecl) CompileError!void {
         if (self.funcs.get(decl.name) != null) return self.fail(decl.line, decl.col, "E_DUPLICATE_BINDING");
-        const return_type = types.fromAnnotation(decl.return_annotation);
+        const return_type = try self.typeFromAnnotation(decl.return_annotation, decl.line, decl.col);
         for (decl.params) |*param| {
-            param.checked_type = types.fromAnnotation(param.annotation);
+            param.checked_type = try self.typeFromAnnotation(param.annotation, decl.line, decl.col);
         }
         decl.checked_return_type = return_type;
         self.funcs.put(self.arena, decl.name, .{ .params = decl.params, .return_type = return_type }) catch return error.OutOfMemory;
@@ -135,6 +145,9 @@ const Checker = struct {
 
     fn checkProgram(self: *Checker, program: *ast.Program) CompileError!void {
         try self.pushScope();
+        for (program.stmts) |*stmt| {
+            if (stmt.* == .type_decl) try self.declareType(stmt.type_decl.name, stmt.type_decl.fields, stmt.type_decl.string_literals, stmt.type_decl.line, stmt.type_decl.col);
+        }
         for (program.stmts) |*stmt| {
             if (stmt.* == .function_decl) try self.declareFunction(&stmt.function_decl);
         }
@@ -161,7 +174,7 @@ const Checker = struct {
         defer self.nested_stmt_depth -= 1;
         for (decl.body) |*body_stmt| try self.checkStmt(program, body_stmt);
 
-        const return_type = decl.checked_return_type orelse types.fromAnnotation(decl.return_annotation);
+        const return_type = decl.checked_return_type orelse try self.typeFromAnnotation(decl.return_annotation, decl.line, decl.col);
         if (return_type != .void and !blockReturns(decl.body)) {
             return self.fail(decl.line, decl.col, "E_MISSING_RETURN");
         }
@@ -187,9 +200,8 @@ const Checker = struct {
         switch (stmt.*) {
             .type_decl => |*decl| {
                 for (decl.fields) |*field| {
-                    field.checked_type = types.fromAnnotation(field.annotation);
+                    field.checked_type = try self.typeFromAnnotation(field.annotation, decl.line, decl.col);
                 }
-                try self.declareType(decl.name, decl.fields, decl.line, decl.col);
             },
             .function_decl => |*decl| {
                 if (self.nested_stmt_depth > 0) return self.fail(decl.line, decl.col, "E_UNSUPPORTED_NESTED_FUNCTION");
@@ -198,7 +210,7 @@ const Checker = struct {
             },
             .var_decl => |*decl| {
                 const final_type = if (decl.annotation) |ann|
-                    types.fromAnnotation(ann)
+                    try self.typeFromAnnotation(ann, decl.line, decl.col)
                 else
                     self.exprType(program, decl.init, decl.line, decl.col) orelse
                         return self.inferenceFail(decl.line, decl.col, "cannot infer variable type");
@@ -216,13 +228,13 @@ const Checker = struct {
                 }
                 const expected_type = found_binding.ty;
                 if (std.mem.eql(u8, assignment.op, "=")) {
-                    if (self.exprType(program, assignment.value, assignment.line, assignment.col)) |actual_type| {
-                        if (!types.same(expected_type, actual_type)) {
-                            return self.fail(assignment.line, assignment.col, "E_TYPE_MISMATCH");
-                        }
-                    } else switch (expected_type) {
-                        .named, .named_array => {},
-                        else => return self.inferenceFail(assignment.line, assignment.col, "cannot infer assignment type"),
+                    switch (expected_type) {
+                        .named, .named_array, .string_literal_union => {},
+                        else => if (self.exprType(program, assignment.value, assignment.line, assignment.col)) |actual_type| {
+                            if (!types.same(expected_type, actual_type)) {
+                                return self.fail(assignment.line, assignment.col, "E_TYPE_MISMATCH");
+                            }
+                        } else return self.inferenceFail(assignment.line, assignment.col, "cannot infer assignment type"),
                     }
                     try self.ensureAssignable(program, expected_type, assignment.value, assignment.line, assignment.col);
                 } else {
@@ -289,9 +301,14 @@ const Checker = struct {
                 self.switch_depth += 1;
                 defer self.switch_depth -= 1;
                 for (switch_stmt.cases) |*case| {
-                    const case_type = self.exprType(program, case.value, case.line, case.col) orelse
-                        return self.inferenceFail(case.line, case.col, "cannot infer switch case type");
-                    if (!types.same(switch_type, case_type)) return self.fail(case.line, case.col, "E_TYPE_MISMATCH");
+                    switch (switch_type) {
+                        .string_literal_union => try self.ensureAssignable(program, switch_type, case.value, case.line, case.col),
+                        else => {
+                            const case_type = self.exprType(program, case.value, case.line, case.col) orelse
+                                return self.inferenceFail(case.line, case.col, "cannot infer switch case type");
+                            if (!types.same(switch_type, case_type)) return self.fail(case.line, case.col, "E_TYPE_MISMATCH");
+                        },
+                    }
                     try self.checkBlock(program, case.body);
                 }
                 if (switch_stmt.default_body) |default_body| try self.checkBlock(program, default_body);
@@ -341,6 +358,18 @@ const Checker = struct {
 
     fn ensureAssignable(self: *Checker, program: *ast.Program, expected: types.Type, value: *ast.Expr, line: u32, col: u32) CompileError!void {
         switch (expected) {
+            .string_literal_union => |type_name| {
+                const decl = self.type_decls.get(type_name) orelse return self.fail(line, col, "unknown type name");
+                const literals = decl.string_literals orelse return self.fail(line, col, "E_TYPE_MISMATCH");
+                if (value.* == .str) {
+                    for (literals) |literal| {
+                        if (std.mem.eql(u8, literal, value.str)) return;
+                    }
+                    return self.fail(line, col, "E_TYPE_MISMATCH");
+                }
+                const actual_type = self.exprType(program, value, line, col) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
+                if (!types.same(expected, actual_type)) return self.fail(line, col, "E_TYPE_MISMATCH");
+            },
             .named => |type_name| {
                 if (value.* != .obj) {
                     const actual_type = self.exprType(program, value, line, col) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
@@ -348,6 +377,7 @@ const Checker = struct {
                     return;
                 }
                 const decl = self.type_decls.get(type_name) orelse return self.fail(line, col, "unknown type name");
+                if (decl.string_literals != null) return self.fail(line, col, "E_TYPE_MISMATCH");
                 const fields = value.obj;
                 if (fields.len != decl.fields.len) return self.fail(line, col, "E_TYPE_MISMATCH");
                 for (decl.fields) |expected_field| {
@@ -419,6 +449,10 @@ const Checker = struct {
             .cmp => |*cmp| {
                 const left_type = self.exprType(program, cmp.l, line, col) orelse return null;
                 const right_type = self.exprType(program, cmp.r, line, col) orelse return null;
+                if ((std.mem.eql(u8, cmp.op, "==") or std.mem.eql(u8, cmp.op, "!=")) and types.isStringLike(left_type) and types.isStringLike(right_type)) {
+                    cmp.checked_operand_type = .string;
+                    return .bool;
+                }
                 if (!types.same(left_type, right_type)) {
                     _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                     return null;
@@ -464,7 +498,7 @@ const Checker = struct {
             },
             .field => |*field| {
                 const obj_type = self.exprType(program, field.obj, line, col) orelse return null;
-                if ((obj_type == .string or types.isArray(obj_type)) and std.mem.eql(u8, field.name, "length")) {
+                if ((types.isStringLike(obj_type) or types.isArray(obj_type)) and std.mem.eql(u8, field.name, "length")) {
                     field.builtin = .length;
                     return .i64;
                 }
@@ -549,7 +583,10 @@ const Checker = struct {
                     return null;
                 }
                 for (call.args, func.params) |arg, param| {
-                    const param_type = param.checked_type orelse types.fromAnnotation(param.annotation);
+                    const param_type = param.checked_type orelse {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    };
                     self.ensureAssignable(program, param_type, arg, line, col) catch {
                         _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                         return null;

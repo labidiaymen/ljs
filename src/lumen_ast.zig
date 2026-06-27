@@ -6,7 +6,8 @@ pub const TypeField = struct { name: []const u8, annotation: []const u8, checked
 
 pub const TypeDecl = struct {
     name: []const u8,
-    fields: []TypeField,
+    fields: []TypeField = &.{},
+    string_literals: ?[][]const u8 = null,
     line: u32,
     col: u32,
 };

@@ -49,7 +49,17 @@ pub const Lexer = struct {
         if (self.i >= self.src.len) return .eof;
         const c = self.src[self.i];
 
-        if (c == '&' or c == '|') {
+        if (c == '|') {
+            if (self.i + 1 < self.src.len and self.src[self.i + 1] == c) {
+                const s = self.src[self.i .. self.i + 2];
+                self.i += 2;
+                return .{ .cmp = s };
+            }
+            const s = self.src[self.i .. self.i + 1];
+            self.i += 1;
+            return .{ .cmp = s };
+        }
+        if (c == '&') {
             if (self.i + 1 >= self.src.len or self.src[self.i + 1] != c) return error.ParseError;
             const s = self.src[self.i .. self.i + 2];
             self.i += 2;
