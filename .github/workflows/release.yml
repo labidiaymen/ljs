@@ -19,7 +19,9 @@ env:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # Self-hosted runner. One machine cross-compiles every target (Zig).
+    # Requires on the runner: bash, curl, tar (with xz), unzip, zip.
+    runs-on: self-hosted
     strategy:
       fail-fast: false
       matrix:
@@ -58,10 +60,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Build-time Zig (to compile the lumen compiler itself).
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
+      # Build-time Zig comes from the self-hosted runner's PATH (expected 0.16.0).
+      - name: Show Zig version
+        run: zig version
 
       - name: Cross-compile lumen for ${{ matrix.name }}
         run: |
