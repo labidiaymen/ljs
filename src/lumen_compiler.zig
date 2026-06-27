@@ -161,7 +161,7 @@ const Parser = struct {
     fn isStdNamespace(name: []const u8) bool {
         return std.mem.eql(u8, name, "Math") or std.mem.eql(u8, name, "String") or std.mem.eql(u8, name, "Array") or std.mem.eql(u8, name, "fs");
     }
-    fn parseTypeAnnotation(self: *Parser) CompileError![]const u8 {
+    fn parseTypeMember(self: *Parser) CompileError![]const u8 {
         if (self.cur != .ident) return error.ParseError;
         const base = self.cur.ident;
         try self.advance();
@@ -173,17 +173,49 @@ const Parser = struct {
         return base;
     }
 
+    /// Parses a type annotation. `T | null` / `T | undefined` (in either order)
+    /// produce the canonical optional spelling `T?`; other `|` unions are
+    /// deferred to a later milestone.
+    fn parseTypeAnnotation(self: *Parser) CompileError![]const u8 {
+        const eq = std.mem.eql;
+        var base = try self.parseTypeMember();
+        var optional = false;
+        while (self.isCmp("|")) {
+            try self.advance();
+            const member = try self.parseTypeMember();
+            if (eq(u8, member, "null") or eq(u8, member, "undefined")) {
+                optional = true;
+            } else if (eq(u8, base, "null") or eq(u8, base, "undefined")) {
+                base = member;
+                optional = true;
+            } else {
+                return error.ParseError; // general unions: feature 005
+            }
+        }
+        if (optional) return std.fmt.allocPrint(self.arena, "{s}?", .{base}) catch error.OutOfMemory;
+        return base;
+    }
+
     fn parseExpr(self: *Parser) CompileError!*Expr {
         return self.parseTernary();
     }
     fn parseTernary(self: *Parser) CompileError!*Expr {
-        const cond = try self.parseOr();
+        const cond = try self.parseCoalesce();
         if (!self.isOp('?')) return cond;
         try self.advance();
         const then_expr = try self.parseExpr();
         try self.expectOp(':');
         const else_expr = try self.parseExpr();
         return self.node(.{ .ternary = .{ .cond = cond, .then_expr = then_expr, .else_expr = else_expr } });
+    }
+    fn parseCoalesce(self: *Parser) CompileError!*Expr {
+        var left = try self.parseOr();
+        while (self.isOp2("??")) {
+            try self.advance();
+            const right = try self.parseOr();
+            left = try self.node(.{ .coalesce = .{ .l = left, .r = right } });
+        }
+        return left;
     }
     fn isCmp(self: *Parser, op: []const u8) bool {
         return self.cur == .cmp and std.mem.eql(u8, self.cur.cmp, op);
@@ -311,8 +343,14 @@ const Parser = struct {
     }
     fn parsePostfix(self: *Parser) CompileError!*Expr {
         var e = try self.parsePrimary();
-        while (self.isOp('.') or self.isOp('[')) {
-            if (self.isOp('.')) {
+        while (self.isOp('.') or self.isOp('[') or self.isOp2("?.")) {
+            if (self.isOp2("?.")) {
+                try self.advance();
+                if (self.cur != .ident) return error.ParseError;
+                const name = self.cur.ident;
+                try self.advance();
+                e = try self.node(.{ .field = .{ .obj = e, .name = name, .optional_chain = true } });
+            } else if (self.isOp('.')) {
                 try self.advance();
                 if (self.cur != .ident) return error.ParseError;
                 const name = self.cur.ident;
@@ -355,6 +393,10 @@ const Parser = struct {
             const v = self.isKw("true");
             try self.advance();
             return self.node(.{ .bool = v });
+        }
+        if (self.isKw("null") or self.isKw("undefined")) {
+            try self.advance();
+            return self.node(.null_lit);
         }
         if (self.cur == .str) {
             const s = self.cur.str;
@@ -467,14 +509,29 @@ const Parser = struct {
             if (self.cur != .ident) return error.ParseError;
             const fname = self.cur.ident;
             try self.advance();
-            try self.expectOp(':');
-            const annotation = try self.parseTypeAnnotation();
+            const annotation = try self.parseOptionalMember();
             try fields.append(self.arena, .{ .name = fname, .annotation = annotation });
             if (self.isOp(',')) try self.advance() else break;
         }
         try self.expectOp('}');
         if (self.isOp(';')) try self.advance();
         return .{ .type_decl = .{ .name = tname, .fields = try fields.toOwnedSlice(self.arena), .line = line, .col = col } };
+    }
+
+    /// Parses `[?] : Type` after a field/param name, returning the annotation with
+    /// an optional `?` suffix when the member is marked optional.
+    fn parseOptionalMember(self: *Parser) CompileError![]const u8 {
+        var opt = false;
+        if (self.isOp('?')) {
+            try self.advance();
+            opt = true;
+        }
+        try self.expectOp(':');
+        const annotation = try self.parseTypeAnnotation();
+        if (opt and !std.mem.endsWith(u8, annotation, "?")) {
+            return std.fmt.allocPrint(self.arena, "{s}?", .{annotation}) catch error.OutOfMemory;
+        }
+        return annotation;
     }
 
     /// `interface Name { field: T; field2: U }` — a synonym for an object `type`.
@@ -490,8 +547,7 @@ const Parser = struct {
             if (self.cur != .ident) return error.ParseError;
             const fname = self.cur.ident;
             try self.advance();
-            try self.expectOp(':');
-            const annotation = try self.parseTypeAnnotation();
+            const annotation = try self.parseOptionalMember();
             try fields.append(self.arena, .{ .name = fname, .annotation = annotation });
             if (self.isOp(',') or self.isOp(';')) try self.advance();
         }
@@ -549,8 +605,7 @@ const Parser = struct {
             if (self.cur != .ident) return error.ParseError;
             const param_name = self.cur.ident;
             try self.advance();
-            try self.expectOp(':');
-            const annotation = try self.parseTypeAnnotation();
+            const annotation = try self.parseOptionalMember();
             try params.append(self.arena, .{ .name = param_name, .annotation = annotation });
             if (self.isOp(',')) try self.advance() else break;
         }
@@ -846,6 +901,7 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
     switch (e.*) {
         .num => |v| try w.print(arena, "{d}", .{v}),
         .float => |v| try w.print(arena, "{d}", .{v}),
+        .null_lit => try w.appendSlice(arena, "null"),
         .bool => |v| try w.appendSlice(arena, if (v) "true" else "false"),
         .str => |s| {
             try w.append(arena, '"');
@@ -963,7 +1019,10 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try w.append(arena, ')');
             } else return error.ParseError;
         },
-        .var_ref => |ref| try w.appendSlice(arena, ref.emit_name orelse ref.name),
+        .var_ref => |ref| {
+            try w.appendSlice(arena, ref.emit_name orelse ref.name);
+            if (ref.unwrap) try w.appendSlice(arena, ".?"); // narrowed optional access
+        },
         .neg => |inner| {
             try w.appendSlice(arena, "-(");
             try emitExpr(inner, w, arena);
@@ -1064,6 +1123,13 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try emitExpr(ternary.else_expr, w, arena);
             try w.append(arena, ')');
         },
+        .coalesce => |c| {
+            try w.append(arena, '(');
+            try emitExpr(c.l, w, arena);
+            try w.appendSlice(arena, " orelse ");
+            try emitExpr(c.r, w, arena);
+            try w.append(arena, ')');
+        },
         .obj => |fields| {
             try w.appendSlice(arena, ".{ ");
             for (fields, 0..) |f, i| {
@@ -1074,7 +1140,14 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try w.appendSlice(arena, " }");
         },
         .field => |fa| {
-            if (fa.enum_value) |ev| {
+            if (fa.optional_chain) {
+                // a?.field  ->  (if (a) |__oc| @as(?T, __oc.field) else null)
+                // The @as keeps both branches of the same optional type.
+                const ft = try types.zigName(arena, fa.chain_field_type orelse .none);
+                try w.appendSlice(arena, "(if (");
+                try emitExpr(fa.obj, w, arena);
+                try w.print(arena, ") |__oc| @as(?{s}, __oc.{s}) else null)", .{ ft, fa.name });
+            } else if (fa.enum_value) |ev| {
                 switch (ev) {
                     .int => |n| try w.print(arena, "{d}", .{n}),
                     .str => |s| {
@@ -1111,6 +1184,11 @@ fn printFormat(t: types.Type) []const u8 {
         .string, .string_literal_union => "{s}",
         .bool => "{}",
         .enum_type => |e| if (e.is_string) "{s}" else "{d}",
+        .optional => |inner| switch (inner.*) {
+            .string, .string_literal_union => "{?s}",
+            .bool => "{?}",
+            else => "{?d}",
+        },
         else => "{d}",
     };
 }

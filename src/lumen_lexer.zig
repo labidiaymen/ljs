@@ -114,6 +114,12 @@ pub const Lexer = struct {
             self.i += 2;
             return .{ .op2 = s };
         }
+        // `??` nullish coalescing and `?.` optional chaining.
+        if (c == '?' and self.i + 1 < self.src.len and (self.src[self.i + 1] == '?' or self.src[self.i + 1] == '.')) {
+            const s = self.src[self.i .. self.i + 2];
+            self.i += 2;
+            return .{ .op2 = s };
+        }
         if (c == '<' or c == '>' or c == '=' or c == '!') {
             const two = self.i + 1 < self.src.len and self.src[self.i + 1] == '=';
             if (c == '=' and !two) {

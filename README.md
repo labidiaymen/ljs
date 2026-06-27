@@ -27,6 +27,8 @@ uses TypeScript syntax, but with compiled static semantics:
 - `for...of` over arrays and strings
 - `enum` (numeric and string), `interface` (object-type synonym)
 - bitwise `& | ^ ~ << >>` and exponent `**` operators (integers)
+- nullable types (`T | null`, `T | undefined`), optional `?` fields/params,
+  `??` nullish coalescing, `?.` optional chaining, `if (x != null)` narrowing
 - no prototypes, `eval`, CommonJS, package.json resolution, or dynamic object
   mutation
 - native binary output through generated Zig

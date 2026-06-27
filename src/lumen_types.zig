@@ -18,6 +18,8 @@ pub const Type = union(enum) {
     named: []const u8,
     named_array: []const u8,
     enum_type: EnumType,
+    optional: *const Type, // T | null / T | undefined  ->  Zig ?T
+    none, // the bare null/undefined literal, assignable to any optional
 };
 
 pub const EnumType = struct { name: []const u8, is_string: bool };
@@ -26,6 +28,7 @@ pub fn inferExprType(e: *const ast.Expr) ?Type {
     return switch (e.*) {
         .num => .i32,
         .float => .f64,
+        .null_lit => .none,
         .bool => .bool,
         .str => .string,
         .neg => |inner| inferExprType(inner),
@@ -39,7 +42,7 @@ pub fn inferExprType(e: *const ast.Expr) ?Type {
             const else_type = inferExprType(ternary.else_expr) orelse return null;
             return if (same(then_type, else_type)) then_type else null;
         },
-        .array, .var_ref, .obj, .field, .index, .call, .static_call => null,
+        .array, .var_ref, .obj, .field, .index, .call, .static_call, .coalesce => null,
     };
 }
 
@@ -73,6 +76,23 @@ pub fn same(a: Type, b: Type) bool {
             .enum_type => |b_enum| std.mem.eql(u8, a_enum.name, b_enum.name),
             else => false,
         },
+        .optional => |a_inner| switch (b) {
+            .optional => |b_inner| same(a_inner.*, b_inner.*),
+            else => false,
+        },
+        .none => b == .none,
+    };
+}
+
+pub fn isOptional(t: Type) bool {
+    return t == .optional;
+}
+
+/// The non-optional element type, or the type itself if not optional.
+pub fn unwrapOptional(t: Type) Type {
+    return switch (t) {
+        .optional => |inner| inner.*,
+        else => t,
     };
 }
 
@@ -164,5 +184,7 @@ pub fn zigName(arena: std.mem.Allocator, t: Type) ![]const u8 {
         .named => |name| name,
         .named_array => |name| try std.fmt.allocPrint(arena, "[]const {s}", .{name}),
         .enum_type => |e| if (e.is_string) "[]const u8" else "i32",
+        .optional => |inner| try std.fmt.allocPrint(arena, "?{s}", .{try zigName(arena, inner.*)}),
+        .none => "?u8", // defensive; a bare null is only valid in an optional context
     };
 }

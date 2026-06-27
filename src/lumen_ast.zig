@@ -209,8 +209,9 @@ pub const Expr = union(enum) {
     float: f64,
     bool: bool,
     str: []const u8,
+    null_lit, // null / undefined
     array: []*Expr,
-    var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null },
+    var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null, unwrap: bool = false },
     neg: *Expr,
     not: *Expr,
     bnot: *Expr, // bitwise ~
@@ -218,8 +219,9 @@ pub const Expr = union(enum) {
     bool_bin: struct { op: []const u8, l: *Expr, r: *Expr }, // && ||
     cmp: struct { op: []const u8, l: *Expr, r: *Expr, checked_operand_type: ?types.Type = null }, // < > <= >= == !=
     ternary: struct { cond: *Expr, then_expr: *Expr, else_expr: *Expr },
+    coalesce: struct { l: *Expr, r: *Expr }, // a ?? b
     obj: []FieldInit,
-    field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null, enum_value: ?EnumValue = null },
+    field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null, enum_value: ?EnumValue = null, optional_chain: bool = false, chain_field_type: ?types.Type = null },
     index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null },
     call: struct { name: []const u8, args: []*Expr }, // builtin call, e.g. httpGet(url) / serve(port, body)
     static_call: StaticCall,

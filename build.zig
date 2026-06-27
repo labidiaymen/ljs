@@ -78,8 +78,14 @@ pub fn build(b: *std.Build) void {
     conformance_cmd_003.addArg("specs/003-iteration-enums-ops/conformance/manifest.json");
     conformance_cmd_003.addArg("zig-out/bin/lumen");
 
+    const conformance_cmd_004 = b.addRunArtifact(conformance_runner);
+    conformance_cmd_004.step.dependOn(b.getInstallStep());
+    conformance_cmd_004.addArg("specs/004-nullability/conformance/manifest.json");
+    conformance_cmd_004.addArg("zig-out/bin/lumen");
+
     const conformance_step = b.step("conformance", "Run Lumen manifest conformance cases");
     conformance_step.dependOn(&conformance_cmd.step);
     conformance_step.dependOn(&conformance_cmd_002.step);
     conformance_step.dependOn(&conformance_cmd_003.step);
+    conformance_step.dependOn(&conformance_cmd_004.step);
 }

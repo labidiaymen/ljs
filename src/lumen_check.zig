@@ -41,6 +41,7 @@ const Checker = struct {
     nested_stmt_depth: u32 = 0,
     loop_depth: u32 = 0,
     switch_depth: u32 = 0,
+    narrowed: std.ArrayListUnmanaged([]const u8) = .empty,
     last_line: u32 = 1,
     last_col: u32 = 1,
     last_err: []const u8 = "syntax error",
@@ -68,6 +69,29 @@ const Checker = struct {
 
     fn currentScope(self: *Checker) *Scope {
         return &self.scopes.items[self.scopes.items.len - 1];
+    }
+
+    fn isNarrowed(self: *Checker, name: []const u8) bool {
+        for (self.narrowed.items) |n| {
+            if (std.mem.eql(u8, n, name)) return true;
+        }
+        return false;
+    }
+
+    /// If `cond` is `x != null` / `x !== null` (or undefined) returns the binding
+    /// narrowed in the then-branch; `x == null` returns it for the else-branch.
+    /// `in_then` says which branch the non-optional narrowing applies to.
+    fn narrowTarget(cond: *ast.Expr) ?struct { name: []const u8, in_then: bool } {
+        if (cond.* != .cmp) return null;
+        const c = cond.cmp;
+        const is_ne = std.mem.eql(u8, c.op, "!=");
+        const is_eq = std.mem.eql(u8, c.op, "==");
+        if (!is_ne and !is_eq) return null;
+        var name: ?[]const u8 = null;
+        if (c.l.* == .var_ref and c.r.* == .null_lit) name = c.l.var_ref.name;
+        if (c.r.* == .var_ref and c.l.* == .null_lit) name = c.r.var_ref.name;
+        const n = name orelse return null;
+        return .{ .name = n, .in_then = is_ne };
     }
 
     fn pushScope(self: *Checker) CompileError!void {
@@ -131,14 +155,18 @@ const Checker = struct {
     }
 
     fn typeFromAnnotation(self: *Checker, annotation: []const u8, line: u32, col: u32) CompileError!types.Type {
+        if (std.mem.endsWith(u8, annotation, "?")) {
+            const inner = try self.typeFromAnnotation(annotation[0 .. annotation.len - 1], line, col);
+            const p = self.arena.create(types.Type) catch return error.OutOfMemory;
+            p.* = inner;
+            return .{ .optional = p };
+        }
         if (self.enums.get(annotation)) |einfo| {
             return .{ .enum_type = .{ .name = annotation, .is_string = einfo.is_string } };
         }
         if (self.type_decls.get(annotation)) |decl| {
             if (decl.string_literals != null) return .{ .string_literal_union = annotation };
         }
-        _ = line;
-        _ = col;
         return types.fromAnnotation(annotation);
     }
 
@@ -233,6 +261,7 @@ const Checker = struct {
                     self.exprType(program, decl.init, decl.line, decl.col) orelse
                         return self.inferenceFail(decl.line, decl.col, "cannot infer variable type");
                 if (final_type == .void) return self.fail(decl.line, decl.col, "E_VOID_VALUE");
+                if (final_type == .none) return self.inferenceFail(decl.line, decl.col, "cannot infer type of null; annotate as T | null");
 
                 try self.ensureAssignable(program, final_type, decl.init, decl.line, decl.col);
                 decl.checked_type = final_type;
@@ -247,7 +276,7 @@ const Checker = struct {
                 const expected_type = found_binding.ty;
                 if (std.mem.eql(u8, assignment.op, "=")) {
                     switch (expected_type) {
-                        .named, .named_array, .string_literal_union => {},
+                        .named, .named_array, .string_literal_union, .optional => {},
                         else => if (self.exprType(program, assignment.value, assignment.line, assignment.col)) |actual_type| {
                             if (!types.same(expected_type, actual_type)) {
                                 return self.fail(assignment.line, assignment.col, "E_TYPE_MISMATCH");
@@ -328,8 +357,21 @@ const Checker = struct {
                 const cond_type = self.exprType(program, branch.cond, branch.line, branch.col) orelse
                     return self.inferenceFail(branch.line, branch.col, "cannot infer if condition type");
                 if (!types.same(.bool, cond_type)) return self.fail(branch.line, branch.col, "E_TYPE_MISMATCH");
-                try self.checkBlock(program, branch.then_body);
+                const narrow = narrowTarget(branch.cond);
+                {
+                    const active = narrow != null and narrow.?.in_then;
+                    if (active) self.narrowed.append(self.arena, narrow.?.name) catch return error.OutOfMemory;
+                    defer if (active) {
+                        self.narrowed.items.len -= 1;
+                    };
+                    try self.checkBlock(program, branch.then_body);
+                }
                 if (branch.else_body) |else_body| {
+                    const active = narrow != null and !narrow.?.in_then;
+                    if (active) self.narrowed.append(self.arena, narrow.?.name) catch return error.OutOfMemory;
+                    defer if (active) {
+                        self.narrowed.items.len -= 1;
+                    };
                     try self.checkBlock(program, else_body);
                 }
             },
@@ -417,13 +459,41 @@ const Checker = struct {
                 }
                 const decl = self.type_decls.get(type_name) orelse return self.fail(line, col, "unknown type name");
                 if (decl.string_literals != null) return self.fail(line, col, "E_TYPE_MISMATCH");
-                const fields = value.obj;
-                if (fields.len != decl.fields.len) return self.fail(line, col, "E_TYPE_MISMATCH");
-                for (decl.fields) |expected_field| {
-                    const expected_field_type = expected_field.checked_type orelse return self.fail(line, col, "unknown field type");
-                    const value_field = findField(fields, expected_field.name) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
-                    try self.ensureAssignable(program, expected_field_type, value_field.value, line, col);
+                const provided = value.obj;
+                // Reject fields not declared on the target type.
+                for (provided) |pf| {
+                    var known = false;
+                    for (decl.fields) |df| {
+                        if (std.mem.eql(u8, df.name, pf.name)) known = true;
+                    }
+                    if (!known) return self.fail(line, col, "E_TYPE_MISMATCH");
                 }
+                // Build the literal in declared order, filling omitted optional
+                // fields with the absent value so emission has every field.
+                const ordered = self.arena.alloc(ast.FieldInit, decl.fields.len) catch return error.OutOfMemory;
+                for (decl.fields, 0..) |expected_field, i| {
+                    const expected_field_type = expected_field.checked_type orelse return self.fail(line, col, "unknown field type");
+                    if (findField(provided, expected_field.name)) |value_field| {
+                        try self.ensureAssignable(program, expected_field_type, value_field.value, line, col);
+                        ordered[i] = value_field;
+                    } else if (expected_field_type == .optional) {
+                        const absent = self.arena.create(ast.Expr) catch return error.OutOfMemory;
+                        absent.* = .null_lit;
+                        ordered[i] = .{ .name = expected_field.name, .value = absent };
+                    } else {
+                        return self.fail(line, col, "E_TYPE_MISMATCH");
+                    }
+                }
+                value.* = .{ .obj = ordered };
+            },
+            .optional => |inner| {
+                if (value.* == .null_lit) return; // absent is always assignable
+                if (self.exprType(program, value, line, col)) |actual| {
+                    if (types.same(expected, actual)) return; // optional <- same optional
+                    if (actual == .none) return;
+                }
+                // otherwise the value must be assignable to the non-optional type
+                return self.ensureAssignable(program, inner.*, value, line, col);
             },
             .i32_array, .i64_array, .f64_array, .bool_array, .string_array, .named_array => {
                 if (value.* != .array) {
@@ -451,6 +521,11 @@ const Checker = struct {
                     return null;
                 };
                 ref.emit_name = found_binding.emit_name;
+                if (found_binding.ty == .optional and self.isNarrowed(ref.name)) {
+                    ref.unwrap = true;
+                    break :blk found_binding.ty.optional.*;
+                }
+                ref.unwrap = false;
                 break :blk found_binding.ty;
             },
             .neg => |inner| self.exprType(program, inner, line, col),
@@ -509,6 +584,14 @@ const Checker = struct {
                     cmp.checked_operand_type = .string;
                     return .bool;
                 }
+                // Comparing an optional value against null/undefined (the
+                // narrowing condition `x != null`) is allowed and yields bool.
+                if ((std.mem.eql(u8, cmp.op, "==") or std.mem.eql(u8, cmp.op, "!=")) and
+                    (left_type == .optional or left_type == .none) and
+                    (right_type == .optional or right_type == .none))
+                {
+                    return .bool;
+                }
                 // String-backed enum equality uses content comparison.
                 if ((std.mem.eql(u8, cmp.op, "==") or std.mem.eql(u8, cmp.op, "!=")) and
                     left_type == .enum_type and right_type == .enum_type and
@@ -541,6 +624,16 @@ const Checker = struct {
                     return null;
                 }
                 return then_type;
+            },
+            .coalesce => |*c| {
+                const left_type = self.exprType(program, c.l, line, col) orelse return null;
+                if (left_type != .optional) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+                const inner = left_type.optional.*;
+                self.ensureAssignable(program, inner, c.r, line, col) catch return null;
+                return inner;
             },
             .array => |items| {
                 if (items.len == 0) {
@@ -576,6 +669,24 @@ const Checker = struct {
                     }
                 }
                 const obj_type = self.exprType(program, field.obj, line, col) orelse return null;
+                if (field.optional_chain) {
+                    if (obj_type != .optional) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                    const inner = obj_type.optional.*;
+                    const field_type = switch (inner) {
+                        .named => |type_name| self.fieldType(type_name, field.name, line, col) orelse return null,
+                        else => {
+                            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                            return null;
+                        },
+                    };
+                    field.chain_field_type = field_type;
+                    const p = self.arena.create(types.Type) catch return null;
+                    p.* = field_type;
+                    return .{ .optional = p };
+                }
                 if ((types.isStringLike(obj_type) or types.isArray(obj_type)) and std.mem.eql(u8, field.name, "length")) {
                     field.builtin = .length;
                     return .i64;

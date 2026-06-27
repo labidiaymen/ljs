@@ -1,0 +1,35 @@
+{
+  "feature": "004-nullability",
+  "cases": [
+    {
+      "id": "null.valid.nullable",
+      "source": "../examples/valid/nullable.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "ada\n7" }
+    },
+    {
+      "id": "null.invalid.absent-to-nonoptional",
+      "source": "../examples/invalid/absent-to-nonoptional.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "null.valid.optional-coalesce",
+      "source": "../examples/valid/optional-coalesce.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "localhost\n8080\n443" }
+    },
+    {
+      "id": "null.valid.narrowing-chain",
+      "source": "../examples/valid/narrowing-chain.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "hi\nnone\ndefault\nhere" }
+    },
+    {
+      "id": "null.invalid.use-without-narrow",
+      "source": "../examples/invalid/use-without-narrow.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_RETURN_TYPE" }
+    }
+  ]
+}
