@@ -139,7 +139,7 @@ console.log(rectangle_area(6, 7));   // 42</code></pre>
 <section class="wrap" id="imports">
   <h2>Import from a URL</h2>
   <p class="sub">A package is just a URL. The <code>.ts</code> is fetched over HTTPS and inlined at compile time — no package manager, no install step.</p>
-<pre><code class="lumen">import greet from "https://raw.githubusercontent.com/lumen-lang-org/std-contrib/main/packages/hello/hello.ts";
+<pre><code class="lumen">import greet from "https://lumen-lang.org/package/std-contrib/hello/hello.ts";
 
 console.log(greet("world"));   // Hello, world!</code></pre>
   <p class="sub">A remote module can import its own siblings with relative paths, fetched recursively. The same URL is fetched once per build, and import cycles are reported.</p>

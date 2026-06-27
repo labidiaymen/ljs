@@ -14,6 +14,11 @@ lumen compile recursive.ts && ./recursive
 # Hey Lumen!!!
 ```
 
+Both examples import through `lumen-lang.org`, which redirects to the package's
+own repository ([std-contrib](https://github.com/lumen-lang-org/std-contrib)).
+The raw GitHub URL works too:
+`https://raw.githubusercontent.com/lumen-lang-org/std-contrib/main/packages/hello/hello.ts`.
+
 ## How it works
 
 - An import specifier may be a relative path (`./util.ts`) or an `https://` URL
