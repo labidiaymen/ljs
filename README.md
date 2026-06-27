@@ -41,8 +41,7 @@ uses TypeScript syntax, but with compiled static semantics:
 - no prototypes, `eval`, CommonJS, package.json resolution, or dynamic object
   mutation
 - native binary output through generated Zig
-- Node-like standard-library surface by explicit wrapper APIs, not full Node
-  compatibility
+- a small standard library exposed through explicit, per-API wrappers
 
 The generated Zig is an implementation artifact. Users should think in the
 TypeScript-syntax source language, not in Zig.
@@ -104,12 +103,6 @@ binary.
 `specs/001-typescript-to-zig-native/conformance/manifest.json`, compiling valid
 cases, running native binaries, comparing output, and checking invalid
 diagnostics.
-
-For a larger robustness and performance comparison against Node.js, run:
-
-```sh
-node benchmarks/robustness/run.js
-```
 
 ## Development
 

@@ -44,8 +44,8 @@ language, not Zig internals.
 - Remove JavaScript dynamism: no prototypes, no `eval`, no CommonJS, no dynamic
   object shape mutation.
 - No package manager or remote packages in V1.
-- Standard-library APIs should be familiar and Node-like where specified, but
-  not full Node compatibility.
+- Standard-library APIs should use familiar, conventional names where specified,
+  exposed as explicit per-API wrappers rather than a full runtime.
 
 ## Work Loop
 
