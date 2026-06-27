@@ -251,9 +251,24 @@ const Checker = struct {
             }
         }
         for (program.stmts) |*stmt| {
+            if (stmt.* == .extern_decl) try self.declareExtern(&stmt.extern_decl);
+        }
+        for (program.stmts) |*stmt| {
             if (stmt.* == .function_decl) try self.declareFunction(&stmt.function_decl);
         }
         for (program.stmts) |*stmt| try self.checkStmt(program, stmt);
+    }
+
+    fn declareExtern(self: *Checker, decl: *ast.ExternDecl) CompileError!void {
+        if (self.funcs.get(decl.name) != null) return self.fail(decl.line, decl.col, "E_DUPLICATE_BINDING");
+        const ret = try self.typeFromAnnotation(decl.return_annotation, decl.line, decl.col);
+        if (!isCSafe(ret) and ret != .void) return self.fail(decl.line, decl.col, "E_FFI_TYPE");
+        decl.checked_return_type = ret;
+        for (decl.params) |*param| {
+            param.checked_type = try self.typeFromAnnotation(param.annotation, decl.line, decl.col);
+            if (!isCSafe(param.checked_type.?)) return self.fail(decl.line, decl.col, "E_FFI_TYPE");
+        }
+        self.funcs.put(self.arena, decl.name, .{ .params = decl.params, .return_type = ret }) catch return error.OutOfMemory;
     }
 
     fn checkBlock(self: *Checker, program: *ast.Program, body: []ast.Stmt) CompileError!void {
@@ -306,6 +321,7 @@ const Checker = struct {
                 }
             },
             .enum_decl => {}, // registered during the hoisting pre-pass
+            .extern_decl => {}, // registered during the hoisting pre-pass
             .test_decl => |*t| {
                 self.test_depth += 1;
                 defer self.test_depth -= 1;
@@ -1165,6 +1181,14 @@ const Checker = struct {
         return .bool;
     }
 };
+
+/// C-ABI-safe scalar types allowed in extern function signatures.
+fn isCSafe(t: types.Type) bool {
+    return switch (t) {
+        .i32, .i64, .f64, .bool => true,
+        else => false,
+    };
+}
 
 fn findField(fields: []ast.FieldInit, name: []const u8) ?ast.FieldInit {
     for (fields) |field| {

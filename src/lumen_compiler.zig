@@ -674,6 +674,32 @@ const Parser = struct {
         return annotation;
     }
 
+    /// `extern function name(p: T, ...): R;` — an external C-ABI function.
+    fn parseExternDecl(self: *Parser, line: u32, col: u32) CompileError!Stmt {
+        try self.advance(); // 'extern'
+        if (!self.isKw("function")) return error.ParseError;
+        try self.advance(); // 'function'
+        if (self.cur != .ident) return error.ParseError;
+        const name = self.cur.ident;
+        try self.advance();
+        try self.expectOp('(');
+        var params: std.ArrayListUnmanaged(ast.FunctionParam) = .empty;
+        while (!self.isOp(')')) {
+            if (self.cur != .ident) return error.ParseError;
+            const pname = self.cur.ident;
+            try self.advance();
+            try self.expectOp(':');
+            const annotation = try self.parseTypeAnnotation();
+            try params.append(self.arena, .{ .name = pname, .annotation = annotation });
+            if (self.isOp(',')) try self.advance() else break;
+        }
+        try self.expectOp(')');
+        try self.expectOp(':');
+        const return_annotation = try self.parseTypeAnnotation();
+        try self.expectOp(';');
+        return .{ .extern_decl = .{ .name = name, .params = try params.toOwnedSlice(self.arena), .return_annotation = return_annotation, .line = line, .col = col } };
+    }
+
     /// `interface Name { field: T; field2: U }` — a synonym for an object `type`.
     /// Accepts `;` or `,` (or newline) between members.
     fn parseInterfaceDecl(self: *Parser, line: u32, col: u32) CompileError!Stmt {
@@ -822,6 +848,7 @@ const Parser = struct {
         if (eq(u8, kw, "type")) return self.parseTypeDecl(line, col);
         if (eq(u8, kw, "interface")) return self.parseInterfaceDecl(line, col);
         if (eq(u8, kw, "enum")) return self.parseEnumDecl(line, col);
+        if (eq(u8, kw, "extern")) return self.parseExternDecl(line, col);
         if (eq(u8, kw, "function")) return self.parseFunctionDecl(line, col);
         if (eq(u8, kw, "switch")) return self.parseSwitch(line, col);
         if (eq(u8, kw, "class")) {
@@ -1548,6 +1575,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
         const line_col: SourceLoc = switch (stmt.*) {
             .type_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .enum_decl => |decl| .{ .line = decl.line, .col = decl.col },
+            .extern_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .test_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .function_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .var_decl => |decl| .{ .line = decl.line, .col = decl.col },
@@ -1582,6 +1610,15 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             try decls.appendSlice(arena, "};\n");
         },
         .enum_decl => {}, // members are inlined as constants at each use site
+        .extern_decl => |decl| {
+            // extern fn name(p0: T, ...) Ret;  -- resolved at link time.
+            try decls.print(arena, "extern fn {s}(", .{decl.name});
+            for (decl.params, 0..) |param, i| {
+                if (i > 0) try decls.appendSlice(arena, ", ");
+                try decls.print(arena, "{s}: {s}", .{ param.name, try types.zigName(arena, param.checked_type orelse return error.ParseError) });
+            }
+            try decls.print(arena, ") {s};\n", .{try types.zigName(arena, decl.checked_return_type orelse return error.ParseError)});
+        },
         .test_decl => |t| {
             // Emit a Zig `test "name" { ... }` block into the top-level decls.
             try decls.appendSlice(arena, "test \"");

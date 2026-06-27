@@ -120,7 +120,31 @@ fn readSourceWithImports(arena: std.mem.Allocator, io: std.Io, path: []const u8)
 
 const Action = enum { build_exe, run_test };
 
-fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: CompileMode, action: Action, err: *std.Io.Writer) !u8 {
+/// Turns a link token into a zig build-exe argument: a bare name `m` becomes
+/// `-lm`; a path-like token (`./libfoo.a`, `foo.o`) is passed through verbatim
+/// so custom C/C++ objects and archives can be linked.
+fn appendLink(arena: std.mem.Allocator, argv: *std.ArrayListUnmanaged([]const u8), token: []const u8) !void {
+    if (std.mem.indexOfScalar(u8, token, '/') != null or std.mem.indexOfScalar(u8, token, '.') != null) {
+        try argv.append(arena, try arena.dupe(u8, token));
+    } else {
+        try argv.append(arena, try std.fmt.allocPrint(arena, "-l{s}", .{token}));
+    }
+}
+
+/// Links from each `// @link <lib>` pragma line in the source.
+fn collectLinkLibs(arena: std.mem.Allocator, source: []const u8, argv: *std.ArrayListUnmanaged([]const u8)) !void {
+    const marker = "// @link ";
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, marker)) continue;
+        const lib = std.mem.trim(u8, trimmed[marker.len..], " \t");
+        if (lib.len == 0) continue;
+        try appendLink(arena, argv, lib);
+    }
+}
+
+fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: CompileMode, action: Action, cli_libs: []const []const u8, err: *std.Io.Writer) !u8 {
     if (!std.mem.endsWith(u8, path, ".ts")) {
         try err.print("error: expected a .ts source file, got {s}\n", .{path});
         return 2;
@@ -155,12 +179,16 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zig_path, .data = zig_src });
 
     const emit = try std.fmt.allocPrint(arena, "-femit-bin={s}", .{exe_name});
-    const argv: []const []const u8 = switch (action) {
-        .build_exe => &.{ "zig", "build-exe", zig_path, "-O", mode.zigName(), emit },
-        .run_test => &.{ "zig", "test", zig_path },
-    };
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    switch (action) {
+        .build_exe => try argv.appendSlice(arena, &.{ "zig", "build-exe", zig_path, "-O", mode.zigName(), emit }),
+        .run_test => try argv.appendSlice(arena, &.{ "zig", "test", zig_path }),
+    }
+    // Link C libraries: from `// @link <lib>` source pragmas and `--link` flags.
+    try collectLinkLibs(arena, source, &argv);
+    for (cli_libs) |lib| try appendLink(arena, &argv, lib);
     var child = std.process.spawn(io, .{
-        .argv = argv,
+        .argv = argv.items,
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -212,37 +240,48 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    const usage = "usage: lumen compile [--release-fast] [--link <lib>] <file.ts>\n       lumen test <file.ts>\n";
     const code = if (std.mem.eql(u8, args[1], "test")) blk: {
         if (args.len < 3) {
             try err.writeAll("usage: lumen test <file.ts>\n");
             break :blk 2;
         }
-        break :blk try compileFile(arena, io, args[2], .release_safe, .run_test, err);
+        break :blk try compileFile(arena, io, args[2], .release_safe, .run_test, &.{}, err);
     } else if (std.mem.eql(u8, args[1], "compile")) blk: {
         if (args.len < 3) {
-            try err.writeAll("usage: lumen compile [--release-fast] <file.ts>\n");
+            try err.writeAll(usage);
             break :blk 2;
         }
         var mode: CompileMode = .release_safe;
         var source_arg: ?[]const u8 = null;
-        for (args[2..]) |arg| {
+        var libs: std.ArrayListUnmanaged([]const u8) = .empty;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
             if (std.mem.eql(u8, arg, "--release-fast")) {
                 mode = .release_fast;
             } else if (std.mem.eql(u8, arg, "--release-safe")) {
                 mode = .release_safe;
+            } else if (std.mem.eql(u8, arg, "--link")) {
+                i += 1;
+                if (i >= args.len) {
+                    try err.writeAll(usage);
+                    break :blk 2;
+                }
+                try libs.append(arena, args[i]);
             } else if (source_arg == null) {
                 source_arg = arg;
             } else {
-                try err.writeAll("usage: lumen compile [--release-fast] <file.ts>\n");
+                try err.writeAll(usage);
                 break :blk 2;
             }
         }
         break :blk try compileFile(arena, io, source_arg orelse {
-            try err.writeAll("usage: lumen compile [--release-fast] <file.ts>\n");
+            try err.writeAll(usage);
             break :blk 2;
-        }, mode, .build_exe, err);
+        }, mode, .build_exe, libs.items, err);
     } else blk: {
-        break :blk try compileFile(arena, io, args[1], .release_safe, .build_exe, err);
+        break :blk try compileFile(arena, io, args[1], .release_safe, .build_exe, &.{}, err);
     };
 
     try err.flush();

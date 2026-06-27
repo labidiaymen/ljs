@@ -1,0 +1,17 @@
+{
+  "feature": "009-ffi",
+  "cases": [
+    {
+      "id": "ffi.valid.ffi-math",
+      "source": "../examples/valid/ffi-math.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "5\n1024" }
+    },
+    {
+      "id": "ffi.invalid.nonscalar",
+      "source": "../examples/invalid/ffi-nonscalar.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_FFI_TYPE" }
+    }
+  ]
+}

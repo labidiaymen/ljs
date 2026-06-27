@@ -35,6 +35,17 @@ pub const FunctionParam = struct {
     checked_type: ?types.Type = null,
 };
 
+/// `extern function name(params): ret;` — an external C-ABI function. No body;
+/// resolved at link time. Params/return are restricted to C-safe scalar types.
+pub const ExternDecl = struct {
+    name: []const u8,
+    params: []FunctionParam,
+    return_annotation: []const u8,
+    checked_return_type: ?types.Type = null,
+    line: u32,
+    col: u32,
+};
+
 pub const FunctionDecl = struct {
     name: []const u8,
     params: []FunctionParam,
@@ -207,6 +218,7 @@ pub const Stmt = union(enum) {
     type_decl: TypeDecl,
     enum_decl: EnumDecl,
     test_decl: TestDecl,
+    extern_decl: ExternDecl,
     function_decl: FunctionDecl,
     var_decl: VarDecl,
     destructure_decl: DestructureDecl,

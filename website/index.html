@@ -66,6 +66,7 @@ console.log(`distance² = ${distanceSq(origin, p)}`);  // distance² = 25</code>
     <div class="card"><h3>Template literals</h3><p><code>`hi ${name}`</code> with string &amp; numeric interpolation.</p></div>
     <div class="card"><h3>defer</h3><p>Zig&#8209;style scope&#8209;exit cleanup, last&#8209;in&#8209;first&#8209;out.</p></div>
     <div class="card"><h3>Built-in tests</h3><p><code>test "…" { expect(…); }</code> run with <code>lumen test</code> on Zig's test runner.</p></div>
+    <div class="card"><h3>C FFI</h3><p><code>extern function</code> + <code>// @link</code> call native C libraries — and C++ via an <code>extern "C"</code> shim.</p></div>
     <div class="card"><h3>Native output</h3><p>Compiles through Zig to a small, fast, dependency&#8209;free binary.</p></div>
   </div>
 </section>
@@ -85,6 +86,28 @@ let nums: int[] = [1, 2, 3];
 for (const v of nums) {
   console.log((v: int) => v * factor);  // closes over `factor`
 }</code></pre>
+</section>
+
+<section class="wrap" id="ffi">
+  <h2>Call native libraries</h2>
+  <p class="sub">Declare an <code>extern function</code> and link a C library — no bindings generator, no runtime.</p>
+<pre><code class="lumen">// @link m
+extern function pow(base: number, exp: number): number;
+extern function sqrt(x: number): number;
+
+let hypotSq = pow(3.0, 2.0) + pow(4.0, 2.0);
+console.log(sqrt(hypotSq));   // 5
+console.log(pow(2.0, 10.0));  // 1024</code></pre>
+  <h3>C++ through an <code>extern "C"</code> shim</h3>
+  <p class="sub">Zig links the C ABI, so expose the C++ you need behind <code>extern "C"</code>, then link the object.</p>
+<pre><code class="lumen">// geometry.cpp
+extern "C" int rectangle_area(int w, int h) { return w * h; }</code></pre>
+<pre><code class="lumen">// demo.ts
+// @link ./geometry.o
+extern function rectangle_area(w: int, h: int): int;
+console.log(rectangle_area(6, 7));   // 42</code></pre>
+  <p class="note">V1 FFI passes scalar arguments (<code>int</code>, <code>i64</code>, <code>number</code>, <code>bool</code>).
+  This links local/system libraries — it is not a package manager.</p>
 </section>
 
 <section class="wrap" id="quickstart">
