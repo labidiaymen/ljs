@@ -9,6 +9,7 @@ const Diag = diag_mod.Diag;
 const TypeDeclInfo = struct {
     fields: []ast.TypeField,
     string_literals: ?[][]const u8 = null,
+    int_literals: ?[]i64 = null,
 };
 
 const FunctionInfo = struct {
@@ -149,9 +150,9 @@ const Checker = struct {
         scope.put(self.arena, stmt.catch_name, .{ .ty = .error_obj, .mutable = false, .emit_name = emit_name }) catch return error.OutOfMemory;
     }
 
-    fn declareType(self: *Checker, name: []const u8, fields: []ast.TypeField, string_literals: ?[][]const u8, line: u32, col: u32) CompileError!void {
+    fn declareType(self: *Checker, name: []const u8, fields: []ast.TypeField, string_literals: ?[][]const u8, int_literals: ?[]i64, line: u32, col: u32) CompileError!void {
         if (self.type_decls.get(name) != null) return self.fail(line, col, "E_DUPLICATE_BINDING");
-        self.type_decls.put(self.arena, name, .{ .fields = fields, .string_literals = string_literals }) catch return error.OutOfMemory;
+        self.type_decls.put(self.arena, name, .{ .fields = fields, .string_literals = string_literals, .int_literals = int_literals }) catch return error.OutOfMemory;
     }
 
     fn typeFromAnnotation(self: *Checker, annotation: []const u8, line: u32, col: u32) CompileError!types.Type {
@@ -166,6 +167,7 @@ const Checker = struct {
         }
         if (self.type_decls.get(annotation)) |decl| {
             if (decl.string_literals != null) return .{ .string_literal_union = annotation };
+            if (decl.int_literals != null) return .{ .int_literal_union = annotation };
         }
         return types.fromAnnotation(annotation);
     }
@@ -183,7 +185,7 @@ const Checker = struct {
     fn checkProgram(self: *Checker, program: *ast.Program) CompileError!void {
         try self.pushScope();
         for (program.stmts) |*stmt| {
-            if (stmt.* == .type_decl) try self.declareType(stmt.type_decl.name, stmt.type_decl.fields, stmt.type_decl.string_literals, stmt.type_decl.line, stmt.type_decl.col);
+            if (stmt.* == .type_decl) try self.declareType(stmt.type_decl.name, stmt.type_decl.fields, stmt.type_decl.string_literals, stmt.type_decl.int_literals, stmt.type_decl.line, stmt.type_decl.col);
         }
         for (program.stmts) |*stmt| {
             if (stmt.* == .enum_decl) {
@@ -267,6 +269,36 @@ const Checker = struct {
                 decl.checked_type = final_type;
                 try self.declare(decl.name, decl, final_type, decl.line, decl.col);
             },
+            .destructure_decl => |*d| {
+                const src_type = self.exprType(program, d.source, d.line, d.col) orelse
+                    return self.inferenceFail(d.line, d.col, "cannot infer destructured source type");
+                if (d.is_object) {
+                    const type_name = switch (src_type) {
+                        .named => |n| n,
+                        else => return self.fail(d.line, d.col, "E_TYPE_MISMATCH"),
+                    };
+                    for (d.bindings) |*b| {
+                        const field_type = self.fieldType(type_name, b.name, d.line, d.col) orelse return error.ParseError;
+                        b.checked_type = field_type;
+                        const scope = self.currentScope();
+                        if (scope.get(b.name) != null) return self.fail(d.line, d.col, "E_DUPLICATE_BINDING");
+                        const emit_name = try self.freshEmitName(b.name);
+                        b.emit_name = emit_name;
+                        scope.put(self.arena, b.name, .{ .ty = field_type, .mutable = d.mutable, .emit_name = emit_name }) catch return error.OutOfMemory;
+                    }
+                } else {
+                    if (!types.isArray(src_type)) return self.fail(d.line, d.col, "E_TYPE_MISMATCH");
+                    const elem = types.arrayElem(src_type) orelse return self.fail(d.line, d.col, "E_TYPE_MISMATCH");
+                    for (d.bindings) |*b| {
+                        b.checked_type = elem;
+                        const scope = self.currentScope();
+                        if (scope.get(b.name) != null) return self.fail(d.line, d.col, "E_DUPLICATE_BINDING");
+                        const emit_name = try self.freshEmitName(b.name);
+                        b.emit_name = emit_name;
+                        scope.put(self.arena, b.name, .{ .ty = elem, .mutable = d.mutable, .emit_name = emit_name }) catch return error.OutOfMemory;
+                    }
+                }
+            },
             .assign => |*assignment| {
                 const found_binding = self.bindingPtr(assignment.name) orelse
                     return self.undefined_(assignment.name, assignment.line, assignment.col);
@@ -276,7 +308,7 @@ const Checker = struct {
                 const expected_type = found_binding.ty;
                 if (std.mem.eql(u8, assignment.op, "=")) {
                     switch (expected_type) {
-                        .named, .named_array, .string_literal_union, .optional => {},
+                        .named, .named_array, .string_literal_union, .int_literal_union, .optional => {},
                         else => if (self.exprType(program, assignment.value, assignment.line, assignment.col)) |actual_type| {
                             if (!types.same(expected_type, actual_type)) {
                                 return self.fail(assignment.line, assignment.col, "E_TYPE_MISMATCH");
@@ -383,7 +415,7 @@ const Checker = struct {
                 defer self.switch_depth -= 1;
                 for (switch_stmt.cases) |*case| {
                     switch (switch_type) {
-                        .string_literal_union => try self.ensureAssignable(program, switch_type, case.value, case.line, case.col),
+                        .string_literal_union, .int_literal_union => try self.ensureAssignable(program, switch_type, case.value, case.line, case.col),
                         else => {
                             const case_type = self.exprType(program, case.value, case.line, case.col) orelse
                                 return self.inferenceFail(case.line, case.col, "cannot infer switch case type");
@@ -445,6 +477,18 @@ const Checker = struct {
                 if (value.* == .str) {
                     for (literals) |literal| {
                         if (std.mem.eql(u8, literal, value.str)) return;
+                    }
+                    return self.fail(line, col, "E_TYPE_MISMATCH");
+                }
+                const actual_type = self.exprType(program, value, line, col) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
+                if (!types.same(expected, actual_type)) return self.fail(line, col, "E_TYPE_MISMATCH");
+            },
+            .int_literal_union => |type_name| {
+                const decl = self.type_decls.get(type_name) orelse return self.fail(line, col, "unknown type name");
+                const literals = decl.int_literals orelse return self.fail(line, col, "E_TYPE_MISMATCH");
+                if (value.* == .num) {
+                    for (literals) |literal| {
+                        if (literal == value.num) return;
                     }
                     return self.fail(line, col, "E_TYPE_MISMATCH");
                 }
@@ -592,6 +636,13 @@ const Checker = struct {
                 {
                     return .bool;
                 }
+                // A numeric literal union compares like its integer backing type.
+                if ((std.mem.eql(u8, cmp.op, "==") or std.mem.eql(u8, cmp.op, "!=")) and
+                    ((left_type == .int_literal_union and (right_type == .i32 or right_type == .int_literal_union)) or
+                        (right_type == .int_literal_union and left_type == .i32)))
+                {
+                    return .bool;
+                }
                 // String-backed enum equality uses content comparison.
                 if ((std.mem.eql(u8, cmp.op, "==") or std.mem.eql(u8, cmp.op, "!=")) and
                     left_type == .enum_type and right_type == .enum_type and
@@ -624,6 +675,19 @@ const Checker = struct {
                     return null;
                 }
                 return then_type;
+            },
+            .template => |parts| {
+                for (parts) |*part| {
+                    if (part.expr) |hole| {
+                        const ht = self.exprType(program, hole, line, col) orelse return null;
+                        if (!types.isStringLike(ht) and !types.isNumeric(ht) and ht != .bool) {
+                            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                            return null;
+                        }
+                        part.expr_type = ht;
+                    }
+                }
+                return .string;
             },
             .coalesce => |*c| {
                 const left_type = self.exprType(program, c.l, line, col) orelse return null;

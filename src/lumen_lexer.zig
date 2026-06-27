@@ -5,6 +5,7 @@ pub const Tok = union(enum) {
     num: i64,
     flt: f64, // floating-point literal (e.g. 3.14, 1.5e-2)
     str: []const u8, // string literal content (raw, between quotes)
+    template: []const u8, // template literal raw content (between backticks)
     op: u8, // + - * / % ! ? ( ) { } ; , . : =
     op2: []const u8, // ++ -- += -= *= /= %=
     cmp: []const u8, // < > <= >= == != && ||
@@ -155,6 +156,24 @@ pub const Lexer = struct {
             const s = self.src[start..self.i];
             if (self.i < self.src.len) self.i += 1;
             return .{ .str = s };
+        }
+        if (c == '`') {
+            self.i += 1;
+            const start = self.i;
+            while (self.i < self.src.len and self.src[self.i] != '`') {
+                if (self.src[self.i] == '\\' and self.i + 1 < self.src.len) {
+                    self.i += 2;
+                    continue;
+                }
+                if (self.src[self.i] == '\n') {
+                    self.line += 1;
+                    self.line_start = self.i + 1;
+                }
+                self.i += 1;
+            }
+            const s = self.src[start..self.i];
+            if (self.i < self.src.len) self.i += 1; // closing backtick
+            return .{ .template = s };
         }
         switch (c) {
             '+', '-', '*', '/', '%', '?', '(', ')', '[', ']', ';', ',', '.', ':', '{', '}', '^', '~' => {

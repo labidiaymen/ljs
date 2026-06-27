@@ -1,0 +1,41 @@
+{
+  "feature": "005-unions-destructuring-templates",
+  "cases": [
+    {
+      "id": "union.valid.numeric-union",
+      "source": "../examples/valid/numeric-union.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "missing\nok\nb" }
+    },
+    {
+      "id": "union.invalid.numeric-union-value",
+      "source": "../examples/invalid/numeric-union-value.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "destr.valid.destructuring",
+      "source": "../examples/valid/destructuring.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "10\n20\n3\n4" }
+    },
+    {
+      "id": "destr.invalid.nonarray",
+      "source": "../examples/invalid/destructure-nonarray.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "tmpl.valid.template",
+      "source": "../examples/valid/template.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "hello ada, age 30\nsum is 3\nno holes here\nuser neo #7" }
+    },
+    {
+      "id": "tmpl.invalid.bad-hole",
+      "source": "../examples/invalid/template-bad-hole.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    }
+  ]
+}

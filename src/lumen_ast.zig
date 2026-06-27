@@ -24,6 +24,7 @@ pub const TypeDecl = struct {
     name: []const u8,
     fields: []TypeField = &.{},
     string_literals: ?[][]const u8 = null,
+    int_literals: ?[]i64 = null,
     line: u32,
     col: u32,
 };
@@ -52,6 +53,21 @@ pub const VarDecl = struct {
     checked_type: ?types.Type = null,
     reassigned: bool = false,
     init: *Expr,
+    line: u32,
+    col: u32,
+};
+
+pub const DestructBinding = struct {
+    name: []const u8,
+    emit_name: ?[]const u8 = null,
+    checked_type: ?types.Type = null,
+};
+
+pub const DestructureDecl = struct {
+    mutable: bool,
+    is_object: bool, // true: { x, y } from a record; false: [ a, b ] from an array
+    bindings: []DestructBinding,
+    source: *Expr,
     line: u32,
     col: u32,
 };
@@ -179,6 +195,7 @@ pub const Stmt = union(enum) {
     enum_decl: EnumDecl,
     function_decl: FunctionDecl,
     var_decl: VarDecl,
+    destructure_decl: DestructureDecl,
     assign: Assign,
     console_log: ConsoleLog,
     while_stmt: WhileStmt,
@@ -220,6 +237,7 @@ pub const Expr = union(enum) {
     cmp: struct { op: []const u8, l: *Expr, r: *Expr, checked_operand_type: ?types.Type = null }, // < > <= >= == !=
     ternary: struct { cond: *Expr, then_expr: *Expr, else_expr: *Expr },
     coalesce: struct { l: *Expr, r: *Expr }, // a ?? b
+    template: []TemplatePart, // `text ${expr} ...`
     obj: []FieldInit,
     field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null, enum_value: ?EnumValue = null, optional_chain: bool = false, chain_field_type: ?types.Type = null },
     index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null },
@@ -230,4 +248,12 @@ pub const Expr = union(enum) {
 pub const FieldBuiltin = enum {
     length,
     error_message,
+};
+
+/// One segment of a template literal: either literal `text` or an interpolated
+/// `expr` (with its checked type filled in for formatting).
+pub const TemplatePart = struct {
+    text: ?[]const u8 = null,
+    expr: ?*Expr = null,
+    expr_type: ?types.Type = null,
 };

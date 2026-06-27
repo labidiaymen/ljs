@@ -15,6 +15,7 @@ pub const Type = union(enum) {
     bool_array,
     string_array,
     string_literal_union: []const u8,
+    int_literal_union: []const u8,
     named: []const u8,
     named_array: []const u8,
     enum_type: EnumType,
@@ -42,6 +43,7 @@ pub fn inferExprType(e: *const ast.Expr) ?Type {
             const else_type = inferExprType(ternary.else_expr) orelse return null;
             return if (same(then_type, else_type)) then_type else null;
         },
+        .template => .string,
         .array, .var_ref, .obj, .field, .index, .call, .static_call, .coalesce => null,
     };
 }
@@ -62,6 +64,10 @@ pub fn same(a: Type, b: Type) bool {
         .string_array => b == .string_array,
         .string_literal_union => |a_name| switch (b) {
             .string_literal_union => |b_name| std.mem.eql(u8, a_name, b_name),
+            else => false,
+        },
+        .int_literal_union => |a_name| switch (b) {
+            .int_literal_union => |b_name| std.mem.eql(u8, a_name, b_name),
             else => false,
         },
         .named => |a_name| switch (b) {
@@ -181,6 +187,7 @@ pub fn zigName(arena: std.mem.Allocator, t: Type) ![]const u8 {
         .bool_array => "[]const bool",
         .string_array => "[]const []const u8",
         .string_literal_union => "[]const u8",
+        .int_literal_union => "i32",
         .named => |name| name,
         .named_array => |name| try std.fmt.allocPrint(arena, "[]const {s}", .{name}),
         .enum_type => |e| if (e.is_string) "[]const u8" else "i32",

@@ -29,6 +29,8 @@ uses TypeScript syntax, but with compiled static semantics:
 - bitwise `& | ^ ~ << >>` and exponent `**` operators (integers)
 - nullable types (`T | null`, `T | undefined`), optional `?` fields/params,
   `??` nullish coalescing, `?.` optional chaining, `if (x != null)` narrowing
+- numeric literal unions (`type Code = 200 | 404`), array/object destructuring
+  (`let [a, b] = …`, `let { x, y } = …`), template literals (`` `hi ${name}` ``)
 - no prototypes, `eval`, CommonJS, package.json resolution, or dynamic object
   mutation
 - native binary output through generated Zig

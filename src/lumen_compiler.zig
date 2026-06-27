@@ -78,7 +78,9 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
                     pending_dynamic_write_col = lex.tok_col;
                 }
                 prev_was_dot = false;
-                prev_was_ident = true;
+                // A declaration keyword before `[` is array destructuring, not an
+                // indexed dynamic write, so it must not start a write candidate.
+                prev_was_ident = !(eq(u8, name, "let") or eq(u8, name, "const") or eq(u8, name, "var"));
             },
             .op => |ch| {
                 if (bracket_depth > 0 and ch != '[' and ch != ']') bracket_has_content = true;
@@ -198,6 +200,45 @@ const Parser = struct {
 
     fn parseExpr(self: *Parser) CompileError!*Expr {
         return self.parseTernary();
+    }
+
+    /// Splits a template literal's raw inner text into literal-text and `${expr}`
+    /// parts, sub-parsing each hole as an expression.
+    fn parseTemplateParts(self: *Parser, raw: []const u8) CompileError![]ast.TemplatePart {
+        var parts: std.ArrayListUnmanaged(ast.TemplatePart) = .empty;
+        var i: usize = 0;
+        var text_start: usize = 0;
+        while (i < raw.len) {
+            if (raw[i] == '\\' and i + 1 < raw.len) {
+                i += 2;
+                continue;
+            }
+            if (raw[i] == '$' and i + 1 < raw.len and raw[i + 1] == '{') {
+                if (i > text_start) try parts.append(self.arena, .{ .text = raw[text_start..i] });
+                i += 2;
+                const hole_start = i;
+                var depth: u32 = 1;
+                while (i < raw.len and depth > 0) {
+                    if (raw[i] == '{') {
+                        depth += 1;
+                    } else if (raw[i] == '}') {
+                        depth -= 1;
+                        if (depth == 0) break;
+                    }
+                    i += 1;
+                }
+                const hole = raw[hole_start..i];
+                if (i < raw.len) i += 1; // skip closing '}'
+                text_start = i;
+                var sub = try Parser.init(self.arena, hole);
+                const e = try sub.parseExpr();
+                try parts.append(self.arena, .{ .expr = e });
+            } else {
+                i += 1;
+            }
+        }
+        if (raw.len > text_start) try parts.append(self.arena, .{ .text = raw[text_start..] });
+        return parts.toOwnedSlice(self.arena);
     }
     fn parseTernary(self: *Parser) CompileError!*Expr {
         const cond = try self.parseCoalesce();
@@ -398,6 +439,11 @@ const Parser = struct {
             try self.advance();
             return self.node(.null_lit);
         }
+        if (self.cur == .template) {
+            const raw = self.cur.template;
+            try self.advance();
+            return self.node(.{ .template = try self.parseTemplateParts(raw) });
+        }
         if (self.cur == .str) {
             const s = self.cur.str;
             try self.advance();
@@ -502,6 +548,19 @@ const Parser = struct {
             }
             try self.expectOp(';');
             return .{ .type_decl = .{ .name = tname, .string_literals = try literals.toOwnedSlice(self.arena), .line = line, .col = col } };
+        }
+        if (self.cur == .num) {
+            var int_literals: std.ArrayListUnmanaged(i64) = .empty;
+            while (true) {
+                if (self.cur != .num) return error.ParseError;
+                try int_literals.append(self.arena, self.cur.num);
+                try self.advance();
+                if (self.isOp(';')) break;
+                if (self.cur != .cmp or !std.mem.eql(u8, self.cur.cmp, "|")) return error.ParseError;
+                try self.advance();
+            }
+            try self.expectOp(';');
+            return .{ .type_decl = .{ .name = tname, .int_literals = try int_literals.toOwnedSlice(self.arena), .line = line, .col = col } };
         }
         try self.expectOp('{');
         var fields: std.ArrayListUnmanaged(ast.TypeField) = .empty;
@@ -692,6 +751,24 @@ const Parser = struct {
         if (eq(u8, kw, "let") or eq(u8, kw, "const") or eq(u8, kw, "var")) {
             const mutable = eq(u8, kw, "let") or eq(u8, kw, "var");
             try self.advance();
+            // Destructuring: `let [a, b] = e;` or `let { x, y } = e;`
+            if (self.isOp('[') or self.isOp('{')) {
+                const is_object = self.isOp('{');
+                try self.advance();
+                const close: u8 = if (is_object) '}' else ']';
+                var bindings: std.ArrayListUnmanaged(ast.DestructBinding) = .empty;
+                while (!self.isOp(close)) {
+                    if (self.cur != .ident) return error.ParseError;
+                    try bindings.append(self.arena, .{ .name = self.cur.ident });
+                    try self.advance();
+                    if (self.isOp(',')) try self.advance() else break;
+                }
+                try self.expectOp(close);
+                try self.expectOp('=');
+                const source = try self.parseExpr();
+                try self.expectOp(';');
+                return .{ .destructure_decl = .{ .mutable = mutable, .is_object = is_object, .bindings = try bindings.toOwnedSlice(self.arena), .source = source, .line = line, .col = col } };
+            }
             if (self.cur != .ident) return error.ParseError;
             const name = self.cur.ident;
             try self.advance();
@@ -1130,6 +1207,32 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try emitExpr(c.r, w, arena);
             try w.append(arena, ')');
         },
+        .template => |parts| {
+            // `a${e}b` -> (std.fmt.allocPrint(page, "a{s}b", .{ e }) catch unreachable)
+            try w.appendSlice(arena, "(std.fmt.allocPrint(std.heap.page_allocator, \"");
+            for (parts) |part| {
+                if (part.text) |t| {
+                    try emitTemplateText(t, w, arena);
+                } else {
+                    const spec = switch (part.expr_type orelse types.Type.string) {
+                        .string, .string_literal_union => "{s}",
+                        .bool => "{}",
+                        else => "{d}",
+                    };
+                    try w.appendSlice(arena, spec);
+                }
+            }
+            try w.appendSlice(arena, "\", .{ ");
+            var first = true;
+            for (parts) |part| {
+                if (part.expr) |hole| {
+                    if (!first) try w.appendSlice(arena, ", ");
+                    try emitExpr(hole, w, arena);
+                    first = false;
+                }
+            }
+            try w.appendSlice(arena, " }) catch unreachable)");
+        },
         .obj => |fields| {
             try w.appendSlice(arena, ".{ ");
             for (fields, 0..) |f, i| {
@@ -1176,6 +1279,24 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try emitExpr(idx.value, w, arena);
             try w.appendSlice(arena, "))]");
         },
+    }
+}
+
+/// Escapes template literal text for embedding inside a Zig `std.fmt` format
+/// string literal: quotes/backslashes escaped, braces doubled, control chars
+/// turned into escape sequences.
+fn emitTemplateText(text: []const u8, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
+    for (text) |ch| {
+        switch (ch) {
+            '"' => try w.appendSlice(arena, "\\\""),
+            '\\' => try w.appendSlice(arena, "\\\\"),
+            '{' => try w.appendSlice(arena, "{{"),
+            '}' => try w.appendSlice(arena, "}}"),
+            '\n' => try w.appendSlice(arena, "\\n"),
+            '\r' => try w.appendSlice(arena, "\\r"),
+            '\t' => try w.appendSlice(arena, "\\t"),
+            else => try w.append(arena, ch),
+        }
     }
 }
 
@@ -1244,6 +1365,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             .enum_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .function_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .var_decl => |decl| .{ .line = decl.line, .col = decl.col },
+            .destructure_decl => |d| .{ .line = d.line, .col = d.col },
             .assign => |assignment| .{ .line = assignment.line, .col = assignment.col },
             .console_log => |log| .{ .line = log.line, .col = log.col },
             .while_stmt => |loop| .{ .line = loop.line, .col = loop.col },
@@ -1290,6 +1412,23 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             try body.print(arena, "    {s} {s}: {s} = ", .{ if (decl.mutable and decl.reassigned) "var" else "const", decl.emit_name orelse decl.name, try types.zigName(arena, final_zty) });
             try emitExpr(decl.init, body, arena);
             try body.appendSlice(arena, ";\n");
+        },
+        .destructure_decl => |d| {
+            // Bind a temp to the source, then one const per element/field. No
+            // wrapping block, so the bindings remain in the enclosing scope.
+            const src = try std.fmt.allocPrint(arena, "__lumen_ds_{d}_{d}", .{ d.line, d.col });
+            try body.print(arena, "    const {s} = ", .{src});
+            try emitExpr(d.source, body, arena);
+            try body.appendSlice(arena, ";\n");
+            for (d.bindings, 0..) |b, i| {
+                const bty = b.checked_type orelse return error.ParseError;
+                try body.print(arena, "    const {s}: {s} = ", .{ b.emit_name orelse b.name, try types.zigName(arena, bty) });
+                if (d.is_object) {
+                    try body.print(arena, "{s}.{s};\n", .{ src, b.name });
+                } else {
+                    try body.print(arena, "{s}[{d}];\n", .{ src, i });
+                }
+            }
         },
         .assign => |assignment| {
             try body.appendSlice(arena, "    ");
