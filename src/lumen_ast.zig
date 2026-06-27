@@ -243,7 +243,7 @@ pub const Expr = union(enum) {
     str: []const u8,
     null_lit, // null / undefined
     array: []*Expr,
-    var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null, unwrap: bool = false, is_func_ref: bool = false },
+    var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null, unwrap: bool = false, is_func_ref: bool = false, capture: bool = false, func_sig: ?*const types.FuncSig = null },
     neg: *Expr,
     not: *Expr,
     bnot: *Expr, // bitwise ~
@@ -257,7 +257,7 @@ pub const Expr = union(enum) {
     obj: []FieldInit,
     field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null, enum_value: ?EnumValue = null, optional_chain: bool = false, chain_field_type: ?types.Type = null },
     index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null },
-    call: struct { name: []const u8, args: []*Expr, emit_name: ?[]const u8 = null }, // builtin / user / function-value call
+    call: struct { name: []const u8, args: []*Expr, emit_name: ?[]const u8 = null, is_closure: bool = false }, // builtin / user / function-value call
     static_call: StaticCall,
 };
 
@@ -266,13 +266,18 @@ pub const FieldBuiltin = enum {
     error_message,
 };
 
+/// A variable captured by a closure: stored by its outer emit-name in a heap
+/// environment struct.
+pub const Capture = struct { emit_name: []const u8, ty: types.Type };
+
 /// Arrow function expression `(x: T) => expr` (V1: typed params, expression
-/// body, no capture of enclosing locals).
+/// body; may capture enclosing locals by value into a heap environment).
 pub const ArrowExpr = struct {
     params: []FunctionParam,
     return_annotation: []const u8 = "",
     checked_return_type: ?types.Type = null,
     body_expr: *Expr,
+    captures: []Capture = &.{},
 };
 
 /// One segment of a template literal: either literal `text` or an interpolated

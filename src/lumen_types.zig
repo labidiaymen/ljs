@@ -28,6 +28,79 @@ pub const EnumType = struct { name: []const u8, is_string: bool };
 
 pub const FuncSig = struct { params: []const Type, ret: *const Type };
 
+// Registry of function-value (closure) signatures encountered during emission.
+// The compiler points this at a list before emitting and drains it afterward to
+// emit one `LumenFn_*` fat-pointer struct definition per distinct signature.
+pub const SigEntry = struct { name: []const u8, sig: FuncSig };
+pub var g_sig_registry: ?*std.ArrayListUnmanaged(SigEntry) = null;
+pub var g_sig_arena: ?std.mem.Allocator = null;
+
+fn mangle(arena: std.mem.Allocator, t: Type) error{OutOfMemory}![]const u8 {
+    return switch (t) {
+        .i32 => "i32",
+        .i64 => "i64",
+        .f64 => "f64",
+        .bool => "bool",
+        .string => "str",
+        .void => "void",
+        .error_obj => "err",
+        .none => "none",
+        .i32_array => "ar_i32",
+        .i64_array => "ar_i64",
+        .f64_array => "ar_f64",
+        .bool_array => "ar_bool",
+        .string_array => "ar_str",
+        .string_literal_union => |n| try std.fmt.allocPrint(arena, "slu_{s}", .{n}),
+        .int_literal_union => |n| try std.fmt.allocPrint(arena, "ilu_{s}", .{n}),
+        .named => |n| n,
+        .named_array => |n| try std.fmt.allocPrint(arena, "ar_{s}", .{n}),
+        .enum_type => |e| try std.fmt.allocPrint(arena, "enum_{s}", .{e.name}),
+        .optional => |inner| try std.fmt.allocPrint(arena, "opt_{s}", .{try mangle(arena, inner.*)}),
+        .func_type => |sig| blk: {
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            try buf.appendSlice(arena, "fn");
+            for (sig.params) |p| {
+                try buf.append(arena, '_');
+                try buf.appendSlice(arena, try mangle(arena, p));
+            }
+            try buf.appendSlice(arena, "_R_");
+            try buf.appendSlice(arena, try mangle(arena, sig.ret.*));
+            break :blk buf.items;
+        },
+    };
+}
+
+/// The Zig struct name for a function-value signature, registering it for
+/// emission. Sanitizes the mangle into a valid identifier.
+pub fn funcStructName(arena: std.mem.Allocator, sig: FuncSig) error{OutOfMemory}![]const u8 {
+    var name_buf: std.ArrayListUnmanaged(u8) = .empty;
+    try name_buf.appendSlice(arena, "LumenFn_");
+    for (sig.params, 0..) |p, i| {
+        if (i > 0) try name_buf.append(arena, '_');
+        try name_buf.appendSlice(arena, try mangle(arena, p));
+    }
+    if (sig.params.len == 0) try name_buf.appendSlice(arena, "void");
+    try name_buf.appendSlice(arena, "__R__");
+    try name_buf.appendSlice(arena, try mangle(arena, sig.ret.*));
+    for (name_buf.items) |*ch| {
+        const ok = (ch.* >= 'a' and ch.* <= 'z') or (ch.* >= 'A' and ch.* <= 'Z') or (ch.* >= '0' and ch.* <= '9') or ch.* == '_';
+        if (!ok) ch.* = '_';
+    }
+    const name = name_buf.items;
+    if (g_sig_registry) |reg| {
+        const arena2 = g_sig_arena orelse arena;
+        var present = false;
+        for (reg.items) |e| {
+            if (std.mem.eql(u8, e.name, name)) {
+                present = true;
+                break;
+            }
+        }
+        if (!present) reg.append(arena2, .{ .name = name, .sig = sig }) catch {};
+    }
+    return name;
+}
+
 pub fn inferExprType(e: *const ast.Expr) ?Type {
     return switch (e.*) {
         .num => .i32,
@@ -206,16 +279,6 @@ pub fn zigName(arena: std.mem.Allocator, t: Type) ![]const u8 {
         .enum_type => |e| if (e.is_string) "[]const u8" else "i32",
         .optional => |inner| try std.fmt.allocPrint(arena, "?{s}", .{try zigName(arena, inner.*)}),
         .none => "?u8", // defensive; a bare null is only valid in an optional context
-        .func_type => |sig| blk: {
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
-            try buf.appendSlice(arena, "*const fn(");
-            for (sig.params, 0..) |p, i| {
-                if (i > 0) try buf.appendSlice(arena, ", ");
-                try buf.appendSlice(arena, try zigName(arena, p));
-            }
-            try buf.appendSlice(arena, ") ");
-            try buf.appendSlice(arena, try zigName(arena, sig.ret.*));
-            break :blk buf.items;
-        },
+        .func_type => |sig| try funcStructName(arena, sig.*),
     };
 }

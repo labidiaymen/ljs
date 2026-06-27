@@ -12,8 +12,8 @@
 - [x] C2.3 Emit inline anonymous-struct function pointer.
 - [x] C2.4 Valid example + manifest; `zig build conformance`.
 
-## Cycle 3: closures (pending)
-- [ ] C3.1 Capturing arrows via heap environment + fat pointer.
+## Cycle 3: closures (P3)
+- [x] C3.1 Capturing arrows via heap environment + fat pointer (uniform fat-pointer function values; named functions + arrows + closures share one repr).
 
 ## Cycle 4: array higher-order methods (pending)
 - [ ] C4.1 `map`/`filter`/`reduce`/`forEach`.

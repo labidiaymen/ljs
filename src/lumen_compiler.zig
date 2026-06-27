@@ -1136,6 +1136,15 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try w.appendSlice(arena, ", ");
                 if (cl.args.len > 1) try emitExpr(cl.args[1], w, arena);
                 try w.append(arena, ')');
+            } else if (cl.is_closure) {
+                // Function-value call through the fat pointer: f.call(f.ctx, args).
+                const fname = cl.emit_name orelse cl.name;
+                try w.print(arena, "{s}.call({s}.ctx", .{ fname, fname });
+                for (cl.args) |arg| {
+                    try w.appendSlice(arena, ", ");
+                    try emitExpr(arg, w, arena);
+                }
+                try w.append(arena, ')');
             } else {
                 try w.print(arena, "{s}(", .{cl.emit_name orelse cl.name});
                 for (cl.args, 0..) |arg, i| {
@@ -1215,9 +1224,24 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             } else return error.ParseError;
         },
         .var_ref => |ref| {
-            if (ref.is_func_ref) try w.append(arena, '&'); // top-level function used as a value
-            try w.appendSlice(arena, ref.emit_name orelse ref.name);
-            if (ref.unwrap) try w.appendSlice(arena, ".?"); // narrowed optional access
+            if (ref.is_func_ref) {
+                // A named function used as a function value: a fat pointer whose
+                // call thunk ignores ctx and forwards to the real function.
+                const sig = ref.func_sig orelse return error.ParseError;
+                const sname = try types.funcStructName(arena, sig.*);
+                try w.print(arena, "{s}{{ .ctx = undefined, .call = struct {{ fn __t(__ctx: *const anyopaque", .{sname});
+                for (sig.params, 0..) |p, i| try w.print(arena, ", __p{d}: {s}", .{ i, try types.zigName(arena, p) });
+                try w.print(arena, ") {s} {{ _ = __ctx; return {s}(", .{ try types.zigName(arena, sig.ret.*), ref.emit_name orelse ref.name });
+                for (sig.params, 0..) |_, i| {
+                    if (i > 0) try w.appendSlice(arena, ", ");
+                    try w.print(arena, "__p{d}", .{i});
+                }
+                try w.appendSlice(arena, "); } }.__t }");
+            } else {
+                if (ref.capture) try w.appendSlice(arena, "__env."); // captured outer binding
+                try w.appendSlice(arena, ref.emit_name orelse ref.name);
+                if (ref.unwrap) try w.appendSlice(arena, ".?"); // narrowed optional access
+            }
         },
         .neg => |inner| {
             try w.appendSlice(arena, "-(");
@@ -1327,16 +1351,46 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try w.append(arena, ')');
         },
         .arrow => |arrow| {
-            // (x: T) => e  ->  &(struct { fn f(x: T) R { _ = x; return e; } }.f)
             const ret = arrow.checked_return_type orelse return error.ParseError;
-            try w.appendSlice(arena, "&(struct { fn __arrow(");
-            for (arrow.params, 0..) |p, i| {
-                if (i > 0) try w.appendSlice(arena, ", ");
-                try w.print(arena, "{s}: {s}", .{ p.name, try types.zigName(arena, p.checked_type orelse return error.ParseError) });
+            // Build the fat-pointer struct name for this signature.
+            const params = try arena.alloc(types.Type, arrow.params.len);
+            for (arrow.params, 0..) |p, i| params[i] = p.checked_type orelse return error.ParseError;
+            const ret_p = try arena.create(types.Type);
+            ret_p.* = ret;
+            const sname = try types.funcStructName(arena, .{ .params = params, .ret = ret_p });
+            const ret_zig = try types.zigName(arena, ret);
+
+            const Local = struct {
+                fn emitCallFn(a: std.mem.Allocator, ww: *std.ArrayListUnmanaged(u8), ar: *const ast.ArrowExpr, rz: []const u8, capturing: bool) CompileError!void {
+                    try ww.appendSlice(a, "struct { fn __a(__ctx: *const anyopaque");
+                    for (ar.params) |p| try ww.print(a, ", {s}: {s}", .{ p.name, try types.zigName(a, p.checked_type.?) });
+                    try ww.print(a, ") {s} {{ ", .{rz});
+                    if (capturing) {
+                        try ww.appendSlice(a, "const __env: *const Env = @ptrCast(@alignCast(__ctx)); ");
+                    } else {
+                        try ww.appendSlice(a, "_ = __ctx; ");
+                    }
+                    try ww.appendSlice(a, "return ");
+                    try emitExpr(ar.body_expr, ww, a);
+                    try ww.appendSlice(a, "; } }.__a");
+                }
+            };
+
+            if (arrow.captures.len == 0) {
+                try w.print(arena, "{s}{{ .ctx = undefined, .call = ", .{sname});
+                try Local.emitCallFn(arena, w, arrow, ret_zig, false);
+                try w.appendSlice(arena, " }");
+            } else {
+                // (blk: { const Env = struct {...}; const __e = heap; __e.* = {...};
+                //         break :blk Fn{ .ctx = __e, .call = struct {...}.__a }; })
+                try w.appendSlice(arena, "(blk: { const Env = struct { ");
+                for (arrow.captures) |c| try w.print(arena, "{s}: {s}, ", .{ c.emit_name, try types.zigName(arena, c.ty) });
+                try w.appendSlice(arena, "}; const __e = std.heap.page_allocator.create(Env) catch unreachable; __e.* = .{ ");
+                for (arrow.captures) |c| try w.print(arena, ".{s} = {s}, ", .{ c.emit_name, c.emit_name });
+                try w.print(arena, "}}; break :blk {s}{{ .ctx = __e, .call = ", .{sname});
+                try Local.emitCallFn(arena, w, arrow, ret_zig, true);
+                try w.appendSlice(arena, " }; })");
             }
-            try w.print(arena, ") {s} {{ return ", .{try types.zigName(arena, ret)});
-            try emitExpr(arrow.body_expr, w, arena);
-            try w.appendSlice(arena, "; } }.__arrow)");
         },
         .template => |parts| {
             // `a${e}b` -> (std.fmt.allocPrint(page, "a{s}b", .{ e }) catch unreachable)
@@ -1753,6 +1807,16 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
     var decls: std.ArrayListUnmanaged(u8) = .empty; // top-level struct type definitions
     var body: std.ArrayListUnmanaged(u8) = .empty;
 
+    // Collect function-value signatures used during emission so we can emit one
+    // fat-pointer struct definition per distinct signature.
+    var sig_list: std.ArrayListUnmanaged(types.SigEntry) = .empty;
+    types.g_sig_registry = &sig_list;
+    types.g_sig_arena = arena;
+    defer {
+        types.g_sig_registry = null;
+        types.g_sig_arena = null;
+    }
+
     try emitProgram(&program, &decls, &body, arena, options);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -1798,6 +1862,17 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\pub const panic = std.debug.FullPanic(__lumenPanic);
             \\
         );
+    }
+    // Emit a fat-pointer struct per function-value signature. Iterate by index
+    // because emitting a signature's param/return types can register more.
+    {
+        var i: usize = 0;
+        while (i < sig_list.items.len) : (i += 1) {
+            const entry = sig_list.items[i];
+            try out.print(arena, "const {s} = struct {{ ctx: *const anyopaque, call: *const fn (*const anyopaque", .{entry.name});
+            for (entry.sig.params) |param_ty| try out.print(arena, ", {s}", .{try types.zigName(arena, param_ty)});
+            try out.print(arena, ") {s} }};\n", .{try types.zigName(arena, entry.sig.ret.*)});
+        }
     }
     try out.appendSlice(arena, decls.items);
 

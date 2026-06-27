@@ -18,6 +18,12 @@
       "source": "../examples/invalid/function-arg-type.ts",
       "phase": "diagnostics",
       "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "fn.valid.closures",
+      "source": "../examples/valid/closures.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "15\n105\n42\nn=1007" }
     }
   ]
 }

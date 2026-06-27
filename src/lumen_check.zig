@@ -44,6 +44,8 @@ const Checker = struct {
     switch_depth: u32 = 0,
     test_depth: u32 = 0,
     narrowed: std.ArrayListUnmanaged([]const u8) = .empty,
+    arrow_base: usize = 0, // scope index at which the current arrow's params start
+    current_captures: ?*std.ArrayListUnmanaged(ast.Capture) = null,
     last_line: u32 = 1,
     last_col: u32 = 1,
     last_err: []const u8 = "syntax error",
@@ -109,6 +111,15 @@ const Checker = struct {
         while (i > 0) {
             i -= 1;
             if (self.scopes.items[i].get(name)) |found| return found;
+        }
+        return null;
+    }
+
+    fn bindingDepth(self: *Checker, name: []const u8) ?usize {
+        var i = self.scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.scopes.items[i].get(name) != null) return i;
         }
         return null;
     }
@@ -617,12 +628,28 @@ const Checker = struct {
                     // A top-level function name used as a value.
                     if (self.funcs.get(ref.name)) |finfo| {
                         ref.is_func_ref = true;
-                        break :blk self.funcSigType(finfo) catch return null;
+                        const t = self.funcSigType(finfo) catch return null;
+                        ref.func_sig = t.func_type;
+                        break :blk t;
                     }
                     _ = self.undefined_(ref.name, line, col) catch {};
                     return null;
                 };
                 ref.emit_name = found_binding.emit_name;
+                // Inside an arrow body, a reference to a binding declared outside
+                // the arrow is a capture (stored in the closure's heap env).
+                if (self.current_captures) |caps| {
+                    if (self.bindingDepth(ref.name)) |depth| {
+                        if (depth < self.arrow_base) {
+                            ref.capture = true;
+                            var present = false;
+                            for (caps.items) |c| {
+                                if (std.mem.eql(u8, c.emit_name, found_binding.emit_name)) present = true;
+                            }
+                            if (!present) caps.append(self.arena, .{ .emit_name = found_binding.emit_name, .ty = found_binding.ty }) catch return null;
+                        }
+                    }
+                }
                 if (found_binding.ty == .optional and self.isNarrowed(ref.name)) {
                     ref.unwrap = true;
                     break :blk found_binding.ty.optional.*;
@@ -738,23 +765,22 @@ const Checker = struct {
                 for (arrow.params) |*p| {
                     p.checked_type = self.typeFromAnnotation(p.annotation, line, col) catch return null;
                 }
-                // Check the body in an isolated scope containing only the params,
-                // so referencing an enclosing local is rejected (no capture in V1).
-                const saved_scopes = self.scopes;
-                const saved_ret = self.current_return_type;
-                const saved_nested = self.nested_stmt_depth;
-                const saved_narrowed = self.narrowed;
-                self.scopes = .empty;
-                self.narrowed = .empty;
+                // Check the body with outer scopes still visible; references to
+                // bindings declared outside the arrow are recorded as captures.
+                const saved_base = self.arrow_base;
+                const saved_caps = self.current_captures;
+                var caps: std.ArrayListUnmanaged(ast.Capture) = .empty;
                 self.pushScope() catch return null;
+                self.arrow_base = self.scopes.items.len - 1;
+                self.current_captures = &caps;
                 for (arrow.params) |p| {
                     self.currentScope().put(self.arena, p.name, .{ .ty = p.checked_type.?, .mutable = true, .emit_name = p.name }) catch return null;
                 }
                 const body_type = self.exprType(program, arrow.body_expr, line, col);
-                self.scopes = saved_scopes;
-                self.current_return_type = saved_ret;
-                self.nested_stmt_depth = saved_nested;
-                self.narrowed = saved_narrowed;
+                self.popScope();
+                self.arrow_base = saved_base;
+                self.current_captures = saved_caps;
+                arrow.captures = caps.toOwnedSlice(self.arena) catch return null;
                 const bt = body_type orelse return null;
                 var ret: types.Type = bt;
                 if (arrow.return_annotation.len > 0) {
@@ -956,6 +982,7 @@ const Checker = struct {
                                 };
                             }
                             call.emit_name = b.emit_name;
+                            call.is_closure = true;
                             return sig.ret.*;
                         }
                     }
