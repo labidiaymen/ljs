@@ -115,7 +115,12 @@ jobs:
 
       - name: Package (zip)
         if: matrix.archive == 'zip'
-        run: zip -qr "lumen-${{ matrix.name }}.zip" "lumen-${{ matrix.name }}"
+        run: |
+          if command -v zip >/dev/null 2>&1; then
+            zip -qr "lumen-${{ matrix.name }}.zip" "lumen-${{ matrix.name }}"
+          else
+            python3 -m zipfile -c "lumen-${{ matrix.name }}.zip" "lumen-${{ matrix.name }}"
+          fi
 
       - name: Upload to the GitHub Release
         uses: softprops/action-gh-release@v2
