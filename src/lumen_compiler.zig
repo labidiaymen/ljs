@@ -2068,6 +2068,16 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.appendSlice(arena, "const std = @import(\"std\");\n");
 
+    // I/O plumbing is hoisted to file scope so builtins (arg, fs, httpGet, …)
+    // work inside functions, not just at the top level. `main` assigns these.
+    if (program.uses_io) {
+        try out.appendSlice(arena, "var __io: std.Io = undefined;\n");
+        try out.appendSlice(arena, "var __alloc: std.mem.Allocator = std.heap.page_allocator;\n");
+    }
+    if (program.needs_args) {
+        try out.appendSlice(arena, "var __args: []const []const u8 = &.{};\n");
+    }
+
     if (options.runtime_locations) {
         // Sanitize the filename for a Zig string literal (backslashes/quotes break it).
         const safe_name = try arena.dupe(u8, filename);
@@ -2167,9 +2177,9 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
     }
     if (program.uses_io) {
         try out.appendSlice(arena, "pub fn main(__init: std.process.Init) !void {\n");
-        try out.appendSlice(arena, "    const __io = __init.io;\n    const __alloc = __init.arena.allocator();\n");
+        try out.appendSlice(arena, "    __io = __init.io;\n    __alloc = __init.arena.allocator();\n");
         if (program.needs_args) {
-            try out.appendSlice(arena, "    const __args = __init.minimal.args.toSlice(__alloc) catch std.process.exit(1);\n");
+            try out.appendSlice(arena, "    __args = __init.minimal.args.toSlice(__alloc) catch std.process.exit(1);\n");
         }
     } else {
         try out.appendSlice(arena, "pub fn main() void {\n");
