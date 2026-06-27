@@ -15,3 +15,6 @@ vendor/node-test/
 
 # OS
 .DS_Store
+
+# Lumen generated backend artifacts
+.lumen-*.zig

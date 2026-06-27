@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Lumen — TypeScript syntax, native speed</title>
-<meta name="description" content="Lumen is a statically compiled language with TypeScript syntax that lowers to Zig and builds a native binary.">
+<meta name="description" content="Lumen is a statically typed, compiled language with TypeScript syntax that builds a fast native binary.">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -22,11 +22,11 @@
 <header class="hero">
   <h1>TypeScript syntax.<br><span class="glow">Native speed.</span></h1>
   <p class="tag">Lumen is a statically&#8209;typed, compiled language. You write TypeScript&#8209;style
-  source; it type&#8209;checks, lowers to Zig, and builds a small native binary.</p>
+  source; it type&#8209;checks and compiles straight to a small native binary.</p>
   <div class="pipeline">
     <span>.ts source</span><span class="arrow">→</span>
     <span>type check</span><span class="arrow">→</span>
-    <span>generated Zig</span><span class="arrow">→</span>
+    <span>optimize</span><span class="arrow">→</span>
     <span>native binary</span>
   </div>
   <div>
@@ -65,10 +65,10 @@ console.log(`distance² = ${distanceSq(origin, p)}`);  // distance² = 25</code>
     <div class="card"><h3>First-class functions</h3><p>Function types, arrow functions, and capturing closures.</p></div>
     <div class="card"><h3>Classes</h3><p>Fields, constructor, <code>this</code>, and methods — instances lower to heap structs.</p></div>
     <div class="card"><h3>Template literals</h3><p><code>`hi ${name}`</code> with string &amp; numeric interpolation.</p></div>
-    <div class="card"><h3>defer</h3><p>Zig&#8209;style scope&#8209;exit cleanup, last&#8209;in&#8209;first&#8209;out.</p></div>
-    <div class="card"><h3>Built-in tests</h3><p><code>test "…" { expect(…); }</code> run with <code>lumen test</code> on Zig's test runner.</p></div>
+    <div class="card"><h3>defer</h3><p>Scope&#8209;exit cleanup, last&#8209;in&#8209;first&#8209;out.</p></div>
+    <div class="card"><h3>Built-in tests</h3><p><code>test "…" { expect(…); }</code> run with <code>lumen test</code>.</p></div>
     <div class="card"><h3>C FFI</h3><p><code>extern function</code> + <code>// @link</code> call native C libraries — and C++ via an <code>extern "C"</code> shim.</p></div>
-    <div class="card"><h3>Native output</h3><p>Compiles through Zig to a small, fast, dependency&#8209;free binary.</p></div>
+    <div class="card"><h3>Native output</h3><p>Compiles to a small, fast, dependency&#8209;free native binary.</p></div>
   </div>
 </section>
 
@@ -121,7 +121,7 @@ let hypotSq = pow(3.0, 2.0) + pow(4.0, 2.0);
 console.log(sqrt(hypotSq));   // 5
 console.log(pow(2.0, 10.0));  // 1024</code></pre>
   <h3>C++ through an <code>extern "C"</code> shim</h3>
-  <p class="sub">Zig links the C ABI, so expose the C++ you need behind <code>extern "C"</code>, then link the object.</p>
+  <p class="sub">Lumen links the C ABI, so expose the C++ you need behind <code>extern "C"</code>, then link the object.</p>
 <pre><code class="lumen">// geometry.cpp
 extern "C" int rectangle_area(int w, int h) { return w * h; }</code></pre>
 <pre><code class="lumen">// demo.ts
@@ -134,20 +134,19 @@ console.log(rectangle_area(6, 7));   // 42</code></pre>
 
 <section class="wrap" id="quickstart">
   <h2>Quickstart</h2>
-  <p class="sub">Requires <a href="https://ziglang.org/download/">Zig 0.16</a> on your PATH.</p>
-  <h3>Build the compiler</h3>
-<pre><code class="lumen">zig build</code></pre>
+  <p class="sub">Install the <code>lumen</code> compiler, then build and run a program.</p>
   <h3>Compile and run a program</h3>
-<pre><code class="lumen">./zig-out/bin/lumen compile hello.ts
+<pre><code class="lumen">lumen compile hello.ts
 ./hello</code></pre>
   <h3>Run tests</h3>
-<pre><code class="lumen">./zig-out/bin/lumen test math.test.ts</code></pre>
-  <p class="note">The generated Zig is an implementation detail — you think in the TypeScript-syntax
-  source language, not in Zig.</p>
+<pre><code class="lumen">lumen test math.test.ts</code></pre>
+  <p class="note">The native code Lumen generates is an implementation detail — you think
+  in the TypeScript-syntax source language. Building the compiler from source
+  requires the toolchain documented in the repository.</p>
 </section>
 
 <footer><div class="wrap">
-  Lumen — a compiled TypeScript-syntax language. Built with Zig.<br>
+  Lumen — a compiled TypeScript-syntax language.<br>
   <a href="examples.html">Examples</a> · <a href="stdlib.html">Standard library</a>
 </div></footer>
 

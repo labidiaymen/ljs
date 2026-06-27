@@ -170,42 +170,44 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
     };
 
     const base = std.fs.path.stem(path);
-    const zig_path = try std.fmt.allocPrint(arena, "{s}.zig", .{base});
+    // The generated backend source is an internal artifact: write it to a hidden
+    // temp file and remove it after building, so the user never sees it.
+    const gen_path = try std.fmt.allocPrint(arena, ".lumen-{s}.zig", .{base});
     const exe_name = if (@import("builtin").os.tag == .windows)
         try std.fmt.allocPrint(arena, "{s}.exe", .{base})
     else
         try arena.dupe(u8, base);
 
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zig_path, .data = zig_src });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = gen_path, .data = zig_src });
+    defer std.Io.Dir.cwd().deleteFile(io, gen_path) catch {};
 
     const emit = try std.fmt.allocPrint(arena, "-femit-bin={s}", .{exe_name});
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     switch (action) {
-        .build_exe => try argv.appendSlice(arena, &.{ "zig", "build-exe", zig_path, "-O", mode.zigName(), emit }),
-        .run_test => try argv.appendSlice(arena, &.{ "zig", "test", zig_path }),
+        .build_exe => try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-O", mode.zigName(), emit }),
+        .run_test => try argv.appendSlice(arena, &.{ "zig", "test", gen_path }),
     }
     // Link C libraries: from `// @link <lib>` source pragmas and `--link` flags.
     try collectLinkLibs(arena, source, &argv);
     for (cli_libs) |lib| try appendLink(arena, &argv, lib);
+    // Build mode: hide the backend's output entirely (a backend failure on valid
+    // Lumen is an internal error). Test mode: show test results.
+    const show_backend = action == .run_test;
     var child = std.process.spawn(io, .{
         .argv = argv.items,
         .stdin = .ignore,
-        .stdout = .inherit,
-        .stderr = .inherit,
-    }) catch |e| {
-        try err.print("error: could not invoke zig ({s}); is zig on PATH?\n", .{@errorName(e)});
+        .stdout = if (show_backend) .inherit else .ignore,
+        .stderr = if (show_backend) .inherit else .ignore,
+    }) catch {
+        try err.print("error: could not run the native backend\n", .{});
         return 2;
     };
 
-    const term = child.wait(io) catch |e| {
-        try err.print("error: waiting on zig failed ({s})\n", .{@errorName(e)});
+    const term = child.wait(io) catch {
+        try err.print("error: native build was interrupted\n", .{});
         return 2;
     };
 
-    const label = switch (action) {
-        .build_exe => "zig build-exe",
-        .run_test => "zig test",
-    };
     switch (term) {
         .exited => |code| {
             if (code == 0) {
@@ -215,11 +217,14 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
                 }
                 return 0;
             }
-            try err.print("{s} failed (exit {d})\n", .{ label, code });
+            switch (action) {
+                .build_exe => try err.print("error: failed to build native binary for {s}\n", .{path}),
+                .run_test => try err.print("tests failed: {s}\n", .{path}),
+            }
             return 1;
         },
         else => {
-            try err.print("{s} terminated abnormally\n", .{label});
+            try err.print("error: native build terminated abnormally\n", .{});
             return 1;
         },
     }
