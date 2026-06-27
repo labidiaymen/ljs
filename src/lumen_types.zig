@@ -21,9 +21,12 @@ pub const Type = union(enum) {
     enum_type: EnumType,
     optional: *const Type, // T | null / T | undefined  ->  Zig ?T
     none, // the bare null/undefined literal, assignable to any optional
+    func_type: *const FuncSig, // (A, B) => R  ->  Zig *const fn(A, B) R
 };
 
 pub const EnumType = struct { name: []const u8, is_string: bool };
+
+pub const FuncSig = struct { params: []const Type, ret: *const Type };
 
 pub fn inferExprType(e: *const ast.Expr) ?Type {
     return switch (e.*) {
@@ -44,7 +47,7 @@ pub fn inferExprType(e: *const ast.Expr) ?Type {
             return if (same(then_type, else_type)) then_type else null;
         },
         .template => .string,
-        .array, .var_ref, .obj, .field, .index, .call, .static_call, .coalesce => null,
+        .array, .var_ref, .obj, .field, .index, .call, .static_call, .coalesce, .arrow => null,
     };
 }
 
@@ -87,6 +90,16 @@ pub fn same(a: Type, b: Type) bool {
             else => false,
         },
         .none => b == .none,
+        .func_type => |a_sig| switch (b) {
+            .func_type => |b_sig| blk: {
+                if (a_sig.params.len != b_sig.params.len) break :blk false;
+                for (a_sig.params, b_sig.params) |ap, bp| {
+                    if (!same(ap, bp)) break :blk false;
+                }
+                break :blk same(a_sig.ret.*, b_sig.ret.*);
+            },
+            else => false,
+        },
     };
 }
 
@@ -193,5 +206,16 @@ pub fn zigName(arena: std.mem.Allocator, t: Type) ![]const u8 {
         .enum_type => |e| if (e.is_string) "[]const u8" else "i32",
         .optional => |inner| try std.fmt.allocPrint(arena, "?{s}", .{try zigName(arena, inner.*)}),
         .none => "?u8", // defensive; a bare null is only valid in an optional context
+        .func_type => |sig| blk: {
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            try buf.appendSlice(arena, "*const fn(");
+            for (sig.params, 0..) |p, i| {
+                if (i > 0) try buf.appendSlice(arena, ", ");
+                try buf.appendSlice(arena, try zigName(arena, p));
+            }
+            try buf.appendSlice(arena, ") ");
+            try buf.appendSlice(arena, try zigName(arena, sig.ret.*));
+            break :blk buf.items;
+        },
     };
 }

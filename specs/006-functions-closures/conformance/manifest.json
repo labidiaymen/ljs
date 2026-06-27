@@ -1,0 +1,23 @@
+{
+  "feature": "006-functions-closures",
+  "cases": [
+    {
+      "id": "fn.valid.function-values",
+      "source": "../examples/valid/function-values.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "11\n9\n42" }
+    },
+    {
+      "id": "fn.valid.arrow",
+      "source": "../examples/valid/arrow.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "42\n105\n81\ntrue\nfalse" }
+    },
+    {
+      "id": "fn.invalid.function-arg-type",
+      "source": "../examples/invalid/function-arg-type.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    }
+  ]
+}

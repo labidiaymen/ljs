@@ -178,8 +178,35 @@ const Parser = struct {
     /// Parses a type annotation. `T | null` / `T | undefined` (in either order)
     /// produce the canonical optional spelling `T?`; other `|` unions are
     /// deferred to a later milestone.
+    /// Function type annotation `(name: T, ...) => R`, encoded canonically as
+    /// `(T,...)=>R` for the checker to parse.
+    fn parseFunctionType(self: *Parser) CompileError![]const u8 {
+        try self.expectOp('(');
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        try buf.append(self.arena, '(');
+        var first = true;
+        while (!self.isOp(')')) {
+            if (self.cur != .ident) return error.ParseError;
+            try self.advance(); // param name
+            try self.expectOp(':');
+            const pty = try self.parseTypeAnnotation();
+            if (!first) try buf.append(self.arena, ',');
+            try buf.appendSlice(self.arena, pty);
+            first = false;
+            if (self.isOp(',')) try self.advance() else break;
+        }
+        try self.expectOp(')');
+        if (!self.isOp2("=>")) return error.ParseError;
+        try self.advance();
+        const ret = try self.parseTypeAnnotation();
+        try buf.appendSlice(self.arena, ")=>");
+        try buf.appendSlice(self.arena, ret);
+        return buf.items;
+    }
+
     fn parseTypeAnnotation(self: *Parser) CompileError![]const u8 {
         const eq = std.mem.eql;
+        if (self.isOp('(')) return self.parseFunctionType();
         var base = try self.parseTypeMember();
         var optional = false;
         while (self.isCmp("|")) {
@@ -419,6 +446,57 @@ const Parser = struct {
         }
         return e;
     }
+    /// Lookahead: is the `(` at `cur` the start of an arrow function? Scans to
+    /// the matching `)` and checks for a following `=>`, restoring parser state.
+    fn looksLikeArrow(self: *Parser) bool {
+        const save_lex = self.lex;
+        const save_cur = self.cur;
+        const save_line = self.cur_line;
+        const save_col = self.cur_col;
+        defer {
+            self.lex = save_lex;
+            self.cur = save_cur;
+            self.cur_line = save_line;
+            self.cur_col = save_col;
+        }
+        self.advance() catch return false; // consume '('
+        var depth: u32 = 1;
+        while (depth > 0) {
+            if (self.cur == .eof) return false;
+            if (self.isOp('(')) depth += 1;
+            if (self.isOp(')')) depth -= 1;
+            self.advance() catch return false;
+        }
+        return self.isOp2("=>");
+    }
+
+    /// `(x: T, ...) [: R] => expr` — typed params, expression body, no capture.
+    fn parseArrow(self: *Parser) CompileError!*Expr {
+        try self.expectOp('(');
+        var params: std.ArrayListUnmanaged(ast.FunctionParam) = .empty;
+        while (!self.isOp(')')) {
+            if (self.cur != .ident) return error.ParseError;
+            const pname = self.cur.ident;
+            try self.advance();
+            try self.expectOp(':');
+            const annotation = try self.parseTypeAnnotation();
+            try params.append(self.arena, .{ .name = pname, .annotation = annotation });
+            if (self.isOp(',')) try self.advance() else break;
+        }
+        try self.expectOp(')');
+        var ret_annotation: []const u8 = "";
+        if (self.isOp(':')) {
+            try self.advance();
+            ret_annotation = try self.parseTypeAnnotation();
+        }
+        if (!self.isOp2("=>")) return error.ParseError;
+        try self.advance();
+        const body_expr = try self.parseExpr();
+        const arrow = try self.arena.create(ast.ArrowExpr);
+        arrow.* = .{ .params = try params.toOwnedSlice(self.arena), .return_annotation = ret_annotation, .body_expr = body_expr };
+        return self.node(.{ .arrow = arrow });
+    }
+
     fn parsePrimary(self: *Parser) CompileError!*Expr {
         if (self.cur == .num) {
             const v = self.cur.num;
@@ -463,6 +541,9 @@ const Parser = struct {
                 return self.node(.{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.arena) } });
             }
             return self.node(.{ .var_ref = .{ .name = name } });
+        }
+        if (self.isOp('(') and self.looksLikeArrow()) {
+            return self.parseArrow();
         }
         if (self.isOp('(')) {
             try self.advance();
@@ -1019,7 +1100,7 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 if (cl.args.len > 1) try emitExpr(cl.args[1], w, arena);
                 try w.append(arena, ')');
             } else {
-                try w.print(arena, "{s}(", .{cl.name});
+                try w.print(arena, "{s}(", .{cl.emit_name orelse cl.name});
                 for (cl.args, 0..) |arg, i| {
                     if (i > 0) try w.appendSlice(arena, ", ");
                     try emitExpr(arg, w, arena);
@@ -1097,6 +1178,7 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             } else return error.ParseError;
         },
         .var_ref => |ref| {
+            if (ref.is_func_ref) try w.append(arena, '&'); // top-level function used as a value
             try w.appendSlice(arena, ref.emit_name orelse ref.name);
             if (ref.unwrap) try w.appendSlice(arena, ".?"); // narrowed optional access
         },
@@ -1206,6 +1288,18 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try w.appendSlice(arena, " orelse ");
             try emitExpr(c.r, w, arena);
             try w.append(arena, ')');
+        },
+        .arrow => |arrow| {
+            // (x: T) => e  ->  &(struct { fn f(x: T) R { _ = x; return e; } }.f)
+            const ret = arrow.checked_return_type orelse return error.ParseError;
+            try w.appendSlice(arena, "&(struct { fn __arrow(");
+            for (arrow.params, 0..) |p, i| {
+                if (i > 0) try w.appendSlice(arena, ", ");
+                try w.print(arena, "{s}: {s}", .{ p.name, try types.zigName(arena, p.checked_type orelse return error.ParseError) });
+            }
+            try w.print(arena, ") {s} {{ return ", .{try types.zigName(arena, ret)});
+            try emitExpr(arrow.body_expr, w, arena);
+            try w.appendSlice(arena, "; } }.__arrow)");
         },
         .template => |parts| {
             // `a${e}b` -> (std.fmt.allocPrint(page, "a{s}b", .{ e }) catch unreachable)

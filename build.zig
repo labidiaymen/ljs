@@ -88,10 +88,16 @@ pub fn build(b: *std.Build) void {
     conformance_cmd_005.addArg("specs/005-unions-destructuring-templates/conformance/manifest.json");
     conformance_cmd_005.addArg("zig-out/bin/lumen");
 
+    const conformance_cmd_006 = b.addRunArtifact(conformance_runner);
+    conformance_cmd_006.step.dependOn(b.getInstallStep());
+    conformance_cmd_006.addArg("specs/006-functions-closures/conformance/manifest.json");
+    conformance_cmd_006.addArg("zig-out/bin/lumen");
+
     const conformance_step = b.step("conformance", "Run Lumen manifest conformance cases");
     conformance_step.dependOn(&conformance_cmd.step);
     conformance_step.dependOn(&conformance_cmd_002.step);
     conformance_step.dependOn(&conformance_cmd_003.step);
     conformance_step.dependOn(&conformance_cmd_004.step);
     conformance_step.dependOn(&conformance_cmd_005.step);
+    conformance_step.dependOn(&conformance_cmd_006.step);
 }

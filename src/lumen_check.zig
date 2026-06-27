@@ -155,7 +155,51 @@ const Checker = struct {
         self.type_decls.put(self.arena, name, .{ .fields = fields, .string_literals = string_literals, .int_literals = int_literals }) catch return error.OutOfMemory;
     }
 
+    fn funcSigType(self: *Checker, finfo: FunctionInfo) CompileError!types.Type {
+        const params = self.arena.alloc(types.Type, finfo.params.len) catch return error.OutOfMemory;
+        for (finfo.params, 0..) |p, i| params[i] = p.checked_type orelse return error.ParseError;
+        const ret_p = self.arena.create(types.Type) catch return error.OutOfMemory;
+        ret_p.* = finfo.return_type;
+        const sig = self.arena.create(types.FuncSig) catch return error.OutOfMemory;
+        sig.* = .{ .params = params, .ret = ret_p };
+        return .{ .func_type = sig };
+    }
+
     fn typeFromAnnotation(self: *Checker, annotation: []const u8, line: u32, col: u32) CompileError!types.Type {
+        // Function type: `(T,...)=>R`
+        if (annotation.len > 0 and annotation[0] == '(') {
+            var depth: u32 = 0;
+            var close: usize = 0;
+            var found = false;
+            for (annotation, 0..) |ch, i| {
+                if (ch == '(') {
+                    depth += 1;
+                } else if (ch == ')') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        close = i;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (found and std.mem.startsWith(u8, annotation[close + 1 ..], "=>")) {
+                const params_str = annotation[1..close];
+                const ret_str = annotation[close + 3 ..];
+                var params: std.ArrayListUnmanaged(types.Type) = .empty;
+                if (params_str.len > 0) {
+                    var it = std.mem.splitScalar(u8, params_str, ',');
+                    while (it.next()) |ps| {
+                        try params.append(self.arena, try self.typeFromAnnotation(ps, line, col));
+                    }
+                }
+                const ret_p = self.arena.create(types.Type) catch return error.OutOfMemory;
+                ret_p.* = try self.typeFromAnnotation(ret_str, line, col);
+                const sig = self.arena.create(types.FuncSig) catch return error.OutOfMemory;
+                sig.* = .{ .params = try params.toOwnedSlice(self.arena), .ret = ret_p };
+                return .{ .func_type = sig };
+            }
+        }
         if (std.mem.endsWith(u8, annotation, "?")) {
             const inner = try self.typeFromAnnotation(annotation[0 .. annotation.len - 1], line, col);
             const p = self.arena.create(types.Type) catch return error.OutOfMemory;
@@ -561,6 +605,11 @@ const Checker = struct {
         return switch (e.*) {
             .var_ref => |*ref| blk: {
                 const found_binding = self.binding(ref.name) orelse {
+                    // A top-level function name used as a value.
+                    if (self.funcs.get(ref.name)) |finfo| {
+                        ref.is_func_ref = true;
+                        break :blk self.funcSigType(finfo) catch return null;
+                    }
                     _ = self.undefined_(ref.name, line, col) catch {};
                     return null;
                 };
@@ -676,6 +725,45 @@ const Checker = struct {
                 }
                 return then_type;
             },
+            .arrow => |arrow| {
+                for (arrow.params) |*p| {
+                    p.checked_type = self.typeFromAnnotation(p.annotation, line, col) catch return null;
+                }
+                // Check the body in an isolated scope containing only the params,
+                // so referencing an enclosing local is rejected (no capture in V1).
+                const saved_scopes = self.scopes;
+                const saved_ret = self.current_return_type;
+                const saved_nested = self.nested_stmt_depth;
+                const saved_narrowed = self.narrowed;
+                self.scopes = .empty;
+                self.narrowed = .empty;
+                self.pushScope() catch return null;
+                for (arrow.params) |p| {
+                    self.currentScope().put(self.arena, p.name, .{ .ty = p.checked_type.?, .mutable = true, .emit_name = p.name }) catch return null;
+                }
+                const body_type = self.exprType(program, arrow.body_expr, line, col);
+                self.scopes = saved_scopes;
+                self.current_return_type = saved_ret;
+                self.nested_stmt_depth = saved_nested;
+                self.narrowed = saved_narrowed;
+                const bt = body_type orelse return null;
+                var ret: types.Type = bt;
+                if (arrow.return_annotation.len > 0) {
+                    ret = self.typeFromAnnotation(arrow.return_annotation, line, col) catch return null;
+                    if (!types.same(ret, bt)) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                }
+                arrow.checked_return_type = ret;
+                const params = self.arena.alloc(types.Type, arrow.params.len) catch return null;
+                for (arrow.params, 0..) |p, i| params[i] = p.checked_type.?;
+                const ret_p = self.arena.create(types.Type) catch return null;
+                ret_p.* = ret;
+                const sig = self.arena.create(types.FuncSig) catch return null;
+                sig.* = .{ .params = params, .ret = ret_p };
+                return .{ .func_type = sig };
+            },
             .template => |parts| {
                 for (parts) |*part| {
                     if (part.expr) |hole| {
@@ -779,7 +867,7 @@ const Checker = struct {
                 return elem_type;
             },
             .obj => null,
-            .call => |call| {
+            .call => |*call| {
                 if (std.mem.eql(u8, call.name, "Error")) {
                     if (call.args.len != 1) {
                         _ = self.fail(line, col, "E_ARG_COUNT") catch {};
@@ -828,6 +916,24 @@ const Checker = struct {
                     return .void;
                 }
                 const func = self.funcs.get(call.name) orelse {
+                    // Calling a function-typed binding (parameter or local).
+                    if (self.binding(call.name)) |b| {
+                        if (b.ty == .func_type) {
+                            const sig = b.ty.func_type;
+                            if (call.args.len != sig.params.len) {
+                                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                                return null;
+                            }
+                            for (call.args, sig.params) |arg, pt| {
+                                self.ensureAssignable(program, pt, arg, line, col) catch {
+                                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                                    return null;
+                                };
+                            }
+                            call.emit_name = b.emit_name;
+                            return sig.ret.*;
+                        }
+                    }
                     _ = self.fail(line, col, "unknown function") catch {};
                     return null;
                 };
