@@ -1,6 +1,6 @@
 # Lumen
 
-Website & docs: **https://ljs-9ky.pages.dev**
+Website & docs: **https://lumen-lang.org**
 
 A statically typed, compiled language with TypeScript syntax. Source is
 type-checked and compiled straight to a small native binary.
@@ -30,10 +30,10 @@ Compiled static semantics — not a JavaScript runtime:
 Self-contained release, no other toolchain required:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/labidiaymen/ljs/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/lumen-lang-org/lumen/main/install.sh | sh
 ```
 
-Windows: download the `.zip` from the [releases page](https://github.com/labidiaymen/ljs/releases).
+Windows: download the `.zip` from the [releases page](https://github.com/lumen-lang-org/lumen/releases).
 
 ```sh
 lumen compile app.ts      # build a native binary

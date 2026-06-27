@@ -2,10 +2,10 @@
 # Lumen installer. Downloads a self-contained release for your platform and
 # installs it under ~/.lumen. No separate toolchain needed.
 #
-#   curl -fsSL https://raw.githubusercontent.com/labidiaymen/ljs/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/lumen-lang-org/lumen/main/install.sh | sh
 set -e
 
-REPO="labidiaymen/ljs"
+REPO="lumen-lang-org/lumen"
 LUMEN_HOME="${LUMEN_HOME:-$HOME/.lumen}"
 
 os=$(uname -s)
