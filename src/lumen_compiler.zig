@@ -1035,6 +1035,28 @@ const Parser = struct {
             return .{ .try_stmt = .{ .try_body = try_body, .catch_name = catch_name, .catch_body = catch_body, .finally_body = finally_body, .line = line, .col = col } };
         }
 
+        // `test "name" { ... }` — only when a string follows, so `test` stays
+        // usable as an ordinary identifier elsewhere.
+        if (eq(u8, kw, "test")) {
+            const save_lex = self.lex;
+            const save_cur = self.cur;
+            const save_line = self.cur_line;
+            const save_col = self.cur_col;
+            self.advance() catch {};
+            const is_test = self.cur == .str;
+            self.lex = save_lex;
+            self.cur = save_cur;
+            self.cur_line = save_line;
+            self.cur_col = save_col;
+            if (is_test) {
+                try self.advance(); // 'test'
+                const name = self.cur.str;
+                try self.advance(); // name string
+                const tbody = try self.parseBlock();
+                return .{ .test_decl = .{ .name = name, .body = tbody, .line = line, .col = col } };
+            }
+        }
+
         if (isBuiltin(kw)) {
             const value = try self.parseExpr();
             try self.expectOp(';');
@@ -1092,6 +1114,10 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             // builtins lower to a Zig std wrapper taking (__io, __alloc, args...).
             if (std.mem.eql(u8, cl.name, "Error")) {
                 if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
+            } else if (std.mem.eql(u8, cl.name, "expect")) {
+                try w.appendSlice(arena, "try std.testing.expect(");
+                if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
             } else if (std.mem.eql(u8, cl.name, "argsCount")) {
                 try w.appendSlice(arena, "@as(i32, @intCast(__args.len))");
             } else if (std.mem.eql(u8, cl.name, "arg")) {
@@ -1468,6 +1494,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
         const line_col: SourceLoc = switch (stmt.*) {
             .type_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .enum_decl => |decl| .{ .line = decl.line, .col = decl.col },
+            .test_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .function_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .var_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .destructure_decl => |d| .{ .line = d.line, .col = d.col },
@@ -1501,6 +1528,17 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             try decls.appendSlice(arena, "};\n");
         },
         .enum_decl => {}, // members are inlined as constants at each use site
+        .test_decl => |t| {
+            // Emit a Zig `test "name" { ... }` block into the top-level decls.
+            try decls.appendSlice(arena, "test \"");
+            for (t.name) |ch| {
+                if (ch == '"' or ch == '\\') try decls.append(arena, '\\');
+                try decls.append(arena, ch);
+            }
+            try decls.appendSlice(arena, "\" {\n");
+            for (t.body) |*test_stmt| try emitStmtWithThrow(test_stmt, decls, decls, arena, throw_target, switch_break_target, options);
+            try decls.appendSlice(arena, "}\n");
+        },
         .function_decl => |decl| {
             const return_type = decl.checked_return_type orelse types.fromAnnotation(decl.return_annotation);
             try decls.print(arena, "fn {s}(", .{decl.name});

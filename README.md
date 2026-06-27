@@ -34,6 +34,8 @@ uses TypeScript syntax, but with compiled static semantics:
 - first-class functions: function types `(x: int) => int`, named functions as
   values, arrow functions (`(x: int) => x*2`)
 - `defer` (Zig-style scope-exit, LIFO)
+- `test "name" { ... }` blocks with `expect(...)`, run via `lumen test <file.ts>`
+  (lowered to Zig's native test runner)
 - no prototypes, `eval`, CommonJS, package.json resolution, or dynamic object
   mutation
 - native binary output through generated Zig

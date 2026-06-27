@@ -188,6 +188,13 @@ pub const DeferStmt = struct {
     col: u32,
 };
 
+pub const TestDecl = struct {
+    name: []const u8,
+    body: []Stmt,
+    line: u32,
+    col: u32,
+};
+
 pub const StaticCall = struct {
     namespace: []const u8,
     name: []const u8,
@@ -199,6 +206,7 @@ pub const StaticCall = struct {
 pub const Stmt = union(enum) {
     type_decl: TypeDecl,
     enum_decl: EnumDecl,
+    test_decl: TestDecl,
     function_decl: FunctionDecl,
     var_decl: VarDecl,
     destructure_decl: DestructureDecl,

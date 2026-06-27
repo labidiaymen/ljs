@@ -1,0 +1,17 @@
+{
+  "feature": "008-test",
+  "cases": [
+    {
+      "id": "test.valid.tests",
+      "source": "../examples/valid/tests.ts",
+      "phase": "test-run",
+      "expect": {}
+    },
+    {
+      "id": "test.invalid.expect-nonbool",
+      "source": "../examples/invalid/expect-nonbool.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    }
+  ]
+}

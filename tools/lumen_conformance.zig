@@ -132,10 +132,24 @@ fn checkStatic(arena: std.mem.Allocator, io: std.Io, case: Case, source_path: []
     return true;
 }
 
+fn checkTestRun(arena: std.mem.Allocator, io: std.Io, case: Case, source_path: []const u8, lumen_bin: []const u8) !bool {
+    const run = try runProcess(arena, io, &.{ lumen_bin, "test", source_path });
+    const exe_name = try exeNameForSource(arena, source_path);
+    defer removeGenerated(io, source_path, exe_name);
+    if (!termSucceeded(run.term)) {
+        std.debug.print("FAIL {s}: tests failed\n{s}\n", .{ case.id, run.stderr });
+        return false;
+    }
+    return true;
+}
+
 fn runCase(arena: std.mem.Allocator, io: std.Io, manifest_path: []const u8, case: Case, lumen_bin: []const u8) !?bool {
     const source_path = try resolveSource(arena, manifest_path, case.source);
     if (std.mem.eql(u8, case.phase, "compile-run")) {
         return try checkCompileRun(arena, io, case, source_path, lumen_bin);
+    }
+    if (std.mem.eql(u8, case.phase, "test-run")) {
+        return try checkTestRun(arena, io, case, source_path, lumen_bin);
     }
     if (std.mem.eql(u8, case.phase, "diagnostics")) {
         return try checkDiagnostics(arena, io, case, source_path, lumen_bin);

@@ -118,7 +118,9 @@ fn readSourceWithImports(arena: std.mem.Allocator, io: std.Io, path: []const u8)
     return out.items;
 }
 
-fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: CompileMode, err: *std.Io.Writer) !u8 {
+const Action = enum { build_exe, run_test };
+
+fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: CompileMode, action: Action, err: *std.Io.Writer) !u8 {
     if (!std.mem.endsWith(u8, path, ".ts")) {
         try err.print("error: expected a .ts source file, got {s}\n", .{path});
         return 2;
@@ -153,8 +155,12 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zig_path, .data = zig_src });
 
     const emit = try std.fmt.allocPrint(arena, "-femit-bin={s}", .{exe_name});
+    const argv: []const []const u8 = switch (action) {
+        .build_exe => &.{ "zig", "build-exe", zig_path, "-O", mode.zigName(), emit },
+        .run_test => &.{ "zig", "test", zig_path },
+    };
     var child = std.process.spawn(io, .{
-        .argv = &.{ "zig", "build-exe", zig_path, "-O", mode.zigName(), emit },
+        .argv = argv,
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -168,17 +174,24 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
         return 2;
     };
 
+    const label = switch (action) {
+        .build_exe => "zig build-exe",
+        .run_test => "zig test",
+    };
     switch (term) {
         .exited => |code| {
             if (code == 0) {
-                try err.print("compiled {s} -> {s}\n", .{ path, exe_name });
+                switch (action) {
+                    .build_exe => try err.print("compiled {s} -> {s}\n", .{ path, exe_name }),
+                    .run_test => try err.print("tests passed: {s}\n", .{path}),
+                }
                 return 0;
             }
-            try err.print("zig build-exe failed (exit {d})\n", .{code});
+            try err.print("{s} failed (exit {d})\n", .{ label, code });
             return 1;
         },
         else => {
-            try err.writeAll("zig build-exe terminated abnormally\n");
+            try err.print("{s} terminated abnormally\n", .{label});
             return 1;
         },
     }
@@ -194,12 +207,18 @@ pub fn main(init: std.process.Init) !void {
     const err = &err_fw.interface;
 
     if (args.len < 2) {
-        try err.writeAll("usage: lumen compile [--release-fast] <file.ts>\n");
+        try err.writeAll("usage: lumen compile [--release-fast] <file.ts>\n       lumen test <file.ts>\n");
         try err.flush();
         std.process.exit(2);
     }
 
-    const code = if (std.mem.eql(u8, args[1], "compile")) blk: {
+    const code = if (std.mem.eql(u8, args[1], "test")) blk: {
+        if (args.len < 3) {
+            try err.writeAll("usage: lumen test <file.ts>\n");
+            break :blk 2;
+        }
+        break :blk try compileFile(arena, io, args[2], .release_safe, .run_test, err);
+    } else if (std.mem.eql(u8, args[1], "compile")) blk: {
         if (args.len < 3) {
             try err.writeAll("usage: lumen compile [--release-fast] <file.ts>\n");
             break :blk 2;
@@ -221,9 +240,9 @@ pub fn main(init: std.process.Init) !void {
         break :blk try compileFile(arena, io, source_arg orelse {
             try err.writeAll("usage: lumen compile [--release-fast] <file.ts>\n");
             break :blk 2;
-        }, mode, err);
+        }, mode, .build_exe, err);
     } else blk: {
-        break :blk try compileFile(arena, io, args[1], .release_safe, err);
+        break :blk try compileFile(arena, io, args[1], .release_safe, .build_exe, err);
     };
 
     try err.flush();

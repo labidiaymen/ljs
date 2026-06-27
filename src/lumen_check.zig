@@ -42,6 +42,7 @@ const Checker = struct {
     nested_stmt_depth: u32 = 0,
     loop_depth: u32 = 0,
     switch_depth: u32 = 0,
+    test_depth: u32 = 0,
     narrowed: std.ArrayListUnmanaged([]const u8) = .empty,
     last_line: u32 = 1,
     last_col: u32 = 1,
@@ -294,6 +295,11 @@ const Checker = struct {
                 }
             },
             .enum_decl => {}, // registered during the hoisting pre-pass
+            .test_decl => |*t| {
+                self.test_depth += 1;
+                defer self.test_depth -= 1;
+                try self.checkBlock(program, t.body);
+            },
 
             .function_decl => |*decl| {
                 if (self.nested_stmt_depth > 0) return self.fail(decl.line, decl.col, "E_UNSUPPORTED_NESTED_FUNCTION");
@@ -882,6 +888,22 @@ const Checker = struct {
                         return null;
                     }
                     return .error_obj;
+                }
+                if (std.mem.eql(u8, call.name, "expect")) {
+                    if (self.test_depth == 0) {
+                        _ = self.fail(line, col, "expect is only allowed inside a test block") catch {};
+                        return null;
+                    }
+                    if (call.args.len != 1) {
+                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    const cond_type = self.exprType(program, call.args[0], line, col) orelse return null;
+                    if (!types.same(.bool, cond_type)) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                    return .void;
                 }
                 if (std.mem.eql(u8, call.name, "argsCount")) {
                     if (call.args.len != 0) {
