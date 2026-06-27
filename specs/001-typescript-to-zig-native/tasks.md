@@ -72,12 +72,39 @@
 - [x] T056 Extend the V1 Math namespace.
 - [x] T057 Add String and Array namespace helpers without prototypes.
 - [x] T058 Reject class declarations with a stable V1 diagnostic.
+- [x] T059 Add Node-like V1 CLI/file helpers `argsCount()`, `arg(index)`,
+  and `fs.readFileSync(path, encoding?)` in `src/lumen_check.zig` and
+  `src/lumen_compiler.zig`.
+- [x] T060 Add recursive assignability for nested named object literals in
+  `src/lumen_check.zig`.
+- [x] T061 Add arrays of named object records (`FileScore[]`) to
+  `src/lumen_types.zig`, including element typing and generated native type
+  names.
+- [x] T062 Allow named object values and arrays of named objects to flow through
+  function parameters and return statements in `src/lumen_check.zig`.
+- [x] T068 Add V1 TypeScript-style `for (let i = init; condition; i = update)`
+  loops across `src/lumen_ast.zig`, `src/lumen_compiler.zig`, and
+  `src/lumen_check.zig`.
+- [x] T070 Add statement-level postfix update and compound assignment syntax
+  (`i++`, `i--`, `x += value`, `x -= value`) across `src/lumen_lexer.zig`,
+  `src/lumen_ast.zig`, `src/lumen_compiler.zig`, and `src/lumen_check.zig`.
 - [x] T017 Reject `eval` with `E_UNSUPPORTED_EVAL`.
 - [x] T018 Reject prototype access/mutation with `E_UNSUPPORTED_PROTOTYPE`.
 - [x] T019 Reject CommonJS `require` with `E_UNSUPPORTED_COMMONJS`.
 - [x] T020 Reject dynamic property writes with `E_DYNAMIC_PROPERTY_WRITE`.
 
-## Phase 5: Verification
+## Phase 5: Showcase Tooling
+
+- [x] T063 Create `packages/context-index` as an npm-style wrapper plus
+  Lumen-compiled native scorer.
+- [x] T064 Add `examples/context-index-demo` as an agent-oriented sample project
+  for build/search demonstrations.
+- [x] T065 Batch context-index scoring so the wrapper spawns the native scorer
+  once per query instead of once per file.
+- [x] T066 Benchmark context-index scoring against a comparable Node scorer and
+  record the current Lumen-vs-Node process comparison.
+
+## Phase 6: Verification
 
 - [x] T021 Add conformance manifest cases for valid and invalid examples.
 - [x] T022 Verify `zig build`.
@@ -85,3 +112,25 @@
 - [x] T024 Verify invalid examples fail before generated Zig is emitted.
 - [x] T054 Add a manifest-driven conformance runner and `zig build
   conformance` step.
+- [x] T067 Add conformance cases for V1 I/O helpers, nested records, arrays of
+  records, record return/argument flow, and invalid record-array field
+  mismatches.
+- [x] T069 Add conformance cases for valid `for` loops and invalid non-boolean
+  `for` loop conditions.
+- [x] T071 Add conformance cases for postfix update, compound assignment, and
+  invalid compound assignment operand types.
+- [x] T072 Add conformance cases for TypeScript-style `else if` chains and
+  invalid non-boolean `else if` conditions.
+- [x] T073 Add statement-level `break;` and `continue;` in loop bodies,
+  including invalid outside-loop diagnostics and `for` update preservation.
+- [x] T074 Add TypeScript-style ternary expressions with boolean condition
+  checking, same-type arm checking, and conformance fixtures.
+- [x] T075 Add statement-level prefix update syntax `++name` and `--name`,
+  including `for` loop update positions.
+- [x] T076 Extend numeric compound assignment to `*=`, `/=`, and `%=`.
+- [x] T077 Lower signed integer division and remainder explicitly in generated
+  native code and cover them with conformance.
+- [x] T078 Add V1 TypeScript-style `switch` statements with typed cases,
+  optional default, switch-local `break;`, and conformance fixtures.
+- [x] T079 Add TypeScript-style `do...while` loops with boolean condition
+  checking and `continue` condition preservation.

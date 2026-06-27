@@ -140,6 +140,12 @@ const Parser = struct {
     fn isOp(self: *Parser, ch: u8) bool {
         return self.cur == .op and self.cur.op == ch;
     }
+    fn isOp2(self: *Parser, op: []const u8) bool {
+        return self.cur == .op2 and std.mem.eql(u8, self.cur.op2, op);
+    }
+    fn oneExpr(self: *Parser, value: i64) CompileError!*Expr {
+        return self.node(.{ .num = value });
+    }
     fn expectOp(self: *Parser, ch: u8) CompileError!void {
         if (!self.isOp(ch)) return error.ParseError;
         try self.advance();
@@ -153,7 +159,7 @@ const Parser = struct {
         return p;
     }
     fn isStdNamespace(name: []const u8) bool {
-        return std.mem.eql(u8, name, "Math") or std.mem.eql(u8, name, "String") or std.mem.eql(u8, name, "Array");
+        return std.mem.eql(u8, name, "Math") or std.mem.eql(u8, name, "String") or std.mem.eql(u8, name, "Array") or std.mem.eql(u8, name, "fs");
     }
     fn parseTypeAnnotation(self: *Parser) CompileError![]const u8 {
         if (self.cur != .ident) return error.ParseError;
@@ -168,7 +174,16 @@ const Parser = struct {
     }
 
     fn parseExpr(self: *Parser) CompileError!*Expr {
-        return self.parseOr();
+        return self.parseTernary();
+    }
+    fn parseTernary(self: *Parser) CompileError!*Expr {
+        const cond = try self.parseOr();
+        if (!self.isOp('?')) return cond;
+        try self.advance();
+        const then_expr = try self.parseExpr();
+        try self.expectOp(':');
+        const else_expr = try self.parseExpr();
+        return self.node(.{ .ternary = .{ .cond = cond, .then_expr = then_expr, .else_expr = else_expr } });
     }
     fn isCmp(self: *Parser, op: []const u8) bool {
         return self.cur == .cmp and std.mem.eql(u8, self.cur.cmp, op);
@@ -340,6 +355,38 @@ const Parser = struct {
         return error.ParseError;
     }
 
+    fn parseAssignmentTail(self: *Parser, name: []const u8, line: u32, col: u32, needs_semicolon: bool) CompileError!ast.Assign {
+        if (self.isOp('=')) {
+            try self.advance();
+            const value = try self.parseExpr();
+            if (needs_semicolon) try self.expectOp(';');
+            return .{ .name = name, .op = "=", .value = value, .line = line, .col = col };
+        }
+        if (self.isOp2("+=") or self.isOp2("-=") or self.isOp2("*=") or self.isOp2("/=") or self.isOp2("%=")) {
+            const op = self.cur.op2;
+            try self.advance();
+            const value = try self.parseExpr();
+            if (needs_semicolon) try self.expectOp(';');
+            return .{ .name = name, .op = op, .value = value, .line = line, .col = col };
+        }
+        if (self.isOp2("++") or self.isOp2("--")) {
+            const op = self.cur.op2;
+            try self.advance();
+            if (needs_semicolon) try self.expectOp(';');
+            return .{ .name = name, .op = if (std.mem.eql(u8, op, "++")) "+=" else "-=", .value = try self.oneExpr(1), .line = line, .col = col };
+        }
+        return error.ParseError;
+    }
+
+    fn parsePrefixUpdate(self: *Parser, op: []const u8, line: u32, col: u32, needs_semicolon: bool) CompileError!ast.Assign {
+        try self.advance();
+        if (self.cur != .ident) return error.ParseError;
+        const name = self.cur.ident;
+        try self.advance();
+        if (needs_semicolon) try self.expectOp(';');
+        return .{ .name = name, .op = if (std.mem.eql(u8, op, "++")) "+=" else "-=", .value = try self.oneExpr(1), .line = line, .col = col };
+    }
+
     fn parseTypeDecl(self: *Parser, line: u32, col: u32) CompileError!Stmt {
         try self.advance();
         if (self.cur != .ident) return error.ParseError;
@@ -400,15 +447,57 @@ const Parser = struct {
         return body.toOwnedSlice(self.arena);
     }
 
+    fn parseSwitchBody(self: *Parser) CompileError![]Stmt {
+        var body: std.ArrayListUnmanaged(Stmt) = .empty;
+        while (!self.isOp('}') and !self.isKw("case") and !self.isKw("default")) {
+            try body.append(self.arena, try self.parseStmt());
+        }
+        return body.toOwnedSlice(self.arena);
+    }
+
+    fn parseSwitch(self: *Parser, line: u32, col: u32) CompileError!Stmt {
+        try self.advance();
+        try self.expectOp('(');
+        const value = try self.parseExpr();
+        try self.expectOp(')');
+        try self.expectOp('{');
+        var cases: std.ArrayListUnmanaged(ast.SwitchCase) = .empty;
+        var default_body: ?[]Stmt = null;
+        while (!self.isOp('}')) {
+            if (self.isKw("case")) {
+                const case_line = self.cur_line;
+                const case_col = self.cur_col;
+                try self.advance();
+                const case_value = try self.parseExpr();
+                try self.expectOp(':');
+                try cases.append(self.arena, .{ .value = case_value, .body = try self.parseSwitchBody(), .line = case_line, .col = case_col });
+            } else if (self.isKw("default")) {
+                if (default_body != null) return error.ParseError;
+                try self.advance();
+                try self.expectOp(':');
+                default_body = try self.parseSwitchBody();
+            } else {
+                return error.ParseError;
+            }
+        }
+        try self.expectOp('}');
+        return .{ .switch_stmt = .{ .value = value, .cases = try cases.toOwnedSlice(self.arena), .default_body = default_body, .line = line, .col = col } };
+    }
+
     fn parseStmt(self: *Parser) CompileError!Stmt {
         const eq = std.mem.eql;
-        if (self.cur != .ident) return error.ParseError;
-        const kw = self.cur.ident;
         const line = self.cur_line;
         const col = self.cur_col;
+        if (self.cur == .op2 and (std.mem.eql(u8, self.cur.op2, "++") or std.mem.eql(u8, self.cur.op2, "--"))) {
+            const op = self.cur.op2;
+            return .{ .assign = try self.parsePrefixUpdate(op, line, col, true) };
+        }
+        if (self.cur != .ident) return error.ParseError;
+        const kw = self.cur.ident;
 
         if (eq(u8, kw, "type")) return self.parseTypeDecl(line, col);
         if (eq(u8, kw, "function")) return self.parseFunctionDecl(line, col);
+        if (eq(u8, kw, "switch")) return self.parseSwitch(line, col);
         if (eq(u8, kw, "class")) {
             self.last_err = "E_UNSUPPORTED_CLASS";
             return error.ParseError;
@@ -457,6 +546,63 @@ const Parser = struct {
             return .{ .while_stmt = .{ .cond = cond, .body = body, .line = line, .col = col } };
         }
 
+        if (eq(u8, kw, "do")) {
+            try self.advance();
+            const body = try self.parseBlock();
+            if (!self.isKw("while")) return error.ParseError;
+            try self.advance();
+            try self.expectOp('(');
+            const cond = try self.parseExpr();
+            try self.expectOp(')');
+            try self.expectOp(';');
+            return .{ .do_while_stmt = .{ .body = body, .cond = cond, .line = line, .col = col } };
+        }
+
+        if (eq(u8, kw, "for")) {
+            try self.advance();
+            try self.expectOp('(');
+            if (self.cur != .ident) return error.ParseError;
+            const init_kw = self.cur.ident;
+            if (!eq(u8, init_kw, "let") and !eq(u8, init_kw, "var")) return error.ParseError;
+            try self.advance();
+            if (self.cur != .ident) return error.ParseError;
+            const init_name = self.cur.ident;
+            const init_line = self.cur_line;
+            const init_col = self.cur_col;
+            try self.advance();
+            var annotation: ?[]const u8 = null;
+            if (self.isOp(':')) {
+                try self.advance();
+                annotation = try self.parseTypeAnnotation();
+            }
+            try self.expectOp('=');
+            const init_value = try self.parseExpr();
+            try self.expectOp(';');
+            const cond = try self.parseExpr();
+            try self.expectOp(';');
+            const update_line = self.cur_line;
+            const update_col = self.cur_col;
+            const update = if (self.cur == .op2 and (std.mem.eql(u8, self.cur.op2, "++") or std.mem.eql(u8, self.cur.op2, "--"))) blk: {
+                const op = self.cur.op2;
+                break :blk try self.parsePrefixUpdate(op, update_line, update_col, false);
+            } else blk: {
+                if (self.cur != .ident) return error.ParseError;
+                const update_name = self.cur.ident;
+                try self.advance();
+                break :blk try self.parseAssignmentTail(update_name, update_line, update_col, false);
+            };
+            try self.expectOp(')');
+            const body = try self.parseBlock();
+            return .{ .for_stmt = .{
+                .init = .{ .mutable = true, .name = init_name, .annotation = annotation, .init = init_value, .line = init_line, .col = init_col },
+                .cond = cond,
+                .update = update,
+                .body = body,
+                .line = line,
+                .col = col,
+            } };
+        }
+
         if (eq(u8, kw, "if")) {
             try self.advance();
             try self.expectOp('(');
@@ -466,7 +612,14 @@ const Parser = struct {
             var else_body: ?[]Stmt = null;
             if (self.isKw("else")) {
                 try self.advance();
-                else_body = try self.parseBlock();
+                if (self.isKw("if")) {
+                    const nested_if = try self.parseStmt();
+                    const nested_body = try self.arena.alloc(Stmt, 1);
+                    nested_body[0] = nested_if;
+                    else_body = nested_body;
+                } else {
+                    else_body = try self.parseBlock();
+                }
             }
             return .{ .if_stmt = .{ .cond = cond, .then_body = then_body, .else_body = else_body, .line = line, .col = col } };
         }
@@ -476,6 +629,18 @@ const Parser = struct {
             const value = if (self.isOp(';')) null else try self.parseExpr();
             try self.expectOp(';');
             return .{ .return_stmt = .{ .value = value, .line = line, .col = col } };
+        }
+
+        if (eq(u8, kw, "break")) {
+            try self.advance();
+            try self.expectOp(';');
+            return .{ .break_stmt = .{ .line = line, .col = col } };
+        }
+
+        if (eq(u8, kw, "continue")) {
+            try self.advance();
+            try self.expectOp(';');
+            return .{ .continue_stmt = .{ .line = line, .col = col } };
         }
 
         if (eq(u8, kw, "throw")) {
@@ -524,10 +689,7 @@ const Parser = struct {
             const value = try self.node(.{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.arena) } });
             return .{ .expr_stmt = .{ .value = value, .line = line, .col = col } };
         }
-        try self.expectOp('=');
-        const value = try self.parseExpr();
-        try self.expectOp(';');
-        return .{ .assign = .{ .name = name, .value = value, .line = line, .col = col } };
+        return .{ .assign = try self.parseAssignmentTail(name, line, col, true) };
     }
 
     fn parseProgram(self: *Parser) CompileError!Program {
@@ -562,6 +724,14 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             // builtins lower to a Zig std wrapper taking (__io, __alloc, args...).
             if (std.mem.eql(u8, cl.name, "Error")) {
                 if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
+            } else if (std.mem.eql(u8, cl.name, "argsCount")) {
+                try w.appendSlice(arena, "@as(i32, @intCast(__args.len))");
+            } else if (std.mem.eql(u8, cl.name, "arg")) {
+                try w.appendSlice(arena, "(if (@as(usize, @intCast(");
+                if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ")) < __args.len) __args[@as(usize, @intCast(");
+                if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, "))] else \"\")");
             } else if (std.mem.eql(u8, cl.name, "httpGet")) {
                 try w.appendSlice(arena, "__httpGet(__io, __alloc, ");
                 if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
@@ -589,7 +759,7 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                     try emitExpr(cl.args[0], w, arena);
                     try w.append(arena, ')');
                 } else {
-                    try w.print(arena, "@as({s}, @intCast(@abs(", .{types.zigName(checked_type)});
+                    try w.print(arena, "@as({s}, @intCast(@abs(", .{try types.zigName(arena, checked_type)});
                     try emitExpr(cl.args[0], w, arena);
                     try w.appendSlice(arena, ")))");
                 }
@@ -644,6 +814,10 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try w.append(arena, '(');
                 try emitExpr(cl.args[0], w, arena);
                 try w.appendSlice(arena, ".len == 0)");
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "readFileSync")) {
+                try w.appendSlice(arena, "__readFileSync(__io, __alloc, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
             } else return error.ParseError;
         },
         .var_ref => |ref| try w.appendSlice(arena, ref.emit_name orelse ref.name),
@@ -664,6 +838,12 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try w.appendSlice(arena, ", ");
                 try emitExpr(b.r, w, arena);
                 try w.appendSlice(arena, " }) catch std.process.exit(1))");
+            } else if (b.op == '/') {
+                try w.appendSlice(arena, "@divTrunc(");
+                try emitExpr(b.l, w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(b.r, w, arena);
+                try w.append(arena, ')');
             } else if (b.op == '%') {
                 // Zig's `%` rejects signed operands → use @rem (operands are non-negative here).
                 try w.appendSlice(arena, "@rem(");
@@ -701,6 +881,15 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try emitExpr(b.r, w, arena);
                 try w.append(arena, ')');
             }
+        },
+        .ternary => |ternary| {
+            try w.appendSlice(arena, "(if (");
+            try emitExpr(ternary.cond, w, arena);
+            try w.appendSlice(arena, ") ");
+            try emitExpr(ternary.then_expr, w, arena);
+            try w.appendSlice(arena, " else ");
+            try emitExpr(ternary.else_expr, w, arena);
+            try w.append(arena, ')');
         },
         .obj => |fields| {
             try w.appendSlice(arena, ".{ ");
@@ -745,10 +934,46 @@ pub const CompileOptions = struct {
 };
 
 fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, options: CompileOptions) CompileError!void {
-    return emitStmtWithThrow(stmt, decls, body, arena, null, options);
+    return emitStmtWithThrow(stmt, decls, body, arena, null, null, options);
 }
 
-fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, throw_target: ?[]const u8, options: CompileOptions) CompileError!void {
+fn emitAssignExpr(assignment: ast.Assign, body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
+    const name = assignment.emit_name orelse assignment.name;
+    try body.print(arena, "{s} = ", .{name});
+    if (std.mem.eql(u8, assignment.op, "=")) {
+        try emitExpr(assignment.value, body, arena);
+    } else if (assignment.op[0] == '/') {
+        try body.print(arena, "@divTrunc({s}, ", .{name});
+        try emitExpr(assignment.value, body, arena);
+        try body.append(arena, ')');
+    } else if (assignment.op[0] == '%') {
+        try body.print(arena, "@rem({s}, ", .{name});
+        try emitExpr(assignment.value, body, arena);
+        try body.append(arena, ')');
+    } else {
+        try body.print(arena, "({s} {c} ", .{ name, assignment.op[0] });
+        try emitExpr(assignment.value, body, arena);
+        try body.append(arena, ')');
+    }
+}
+
+fn emitSwitchCaseMatch(switch_type: types.Type, switch_value: *const Expr, case_value: *const Expr, body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
+    if (switch_type == .string) {
+        try body.appendSlice(arena, "std.mem.eql(u8, ");
+        try emitExpr(switch_value, body, arena);
+        try body.appendSlice(arena, ", ");
+        try emitExpr(case_value, body, arena);
+        try body.append(arena, ')');
+    } else {
+        try body.append(arena, '(');
+        try emitExpr(switch_value, body, arena);
+        try body.appendSlice(arena, " == ");
+        try emitExpr(case_value, body, arena);
+        try body.append(arena, ')');
+    }
+}
+
+fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, throw_target: ?[]const u8, switch_break_target: ?[]const u8, options: CompileOptions) CompileError!void {
     if (options.runtime_locations) {
         const line_col: SourceLoc = switch (stmt.*) {
             .type_decl => |decl| .{ .line = decl.line, .col = decl.col },
@@ -757,10 +982,15 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             .assign => |assignment| .{ .line = assignment.line, .col = assignment.col },
             .console_log => |log| .{ .line = log.line, .col = log.col },
             .while_stmt => |loop| .{ .line = loop.line, .col = loop.col },
+            .do_while_stmt => |loop| .{ .line = loop.line, .col = loop.col },
+            .for_stmt => |loop| .{ .line = loop.line, .col = loop.col },
             .if_stmt => |branch| .{ .line = branch.line, .col = branch.col },
+            .switch_stmt => |switch_stmt| .{ .line = switch_stmt.line, .col = switch_stmt.col },
             .return_stmt => |ret| .{ .line = ret.line, .col = ret.col },
             .throw_stmt => |throw_stmt| .{ .line = throw_stmt.line, .col = throw_stmt.col },
             .try_stmt => |try_stmt| .{ .line = try_stmt.line, .col = try_stmt.col },
+            .break_stmt => |control| .{ .line = control.line, .col = control.col },
+            .continue_stmt => |control| .{ .line = control.line, .col = control.col },
             .expr_stmt => |expr_stmt| .{ .line = expr_stmt.line, .col = expr_stmt.col },
         };
         try body.print(arena, "    __lumen_line = {d}; __lumen_col = {d};\n", .{ line_col.line, line_col.col });
@@ -771,7 +1001,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             try decls.print(arena, "const {s} = struct {{\n", .{decl.name});
             for (decl.fields) |field| {
                 const field_type = field.checked_type orelse return error.ParseError;
-                try decls.print(arena, "    {s}: {s},\n", .{ field.name, types.zigName(field_type) });
+                try decls.print(arena, "    {s}: {s},\n", .{ field.name, try types.zigName(arena, field_type) });
             }
             try decls.appendSlice(arena, "};\n");
         },
@@ -781,21 +1011,21 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             for (decl.params, 0..) |param, i| {
                 if (i > 0) try decls.appendSlice(arena, ", ");
                 const param_type = param.checked_type orelse types.fromAnnotation(param.annotation);
-                try decls.print(arena, "{s}: {s}", .{ param.name, types.zigName(param_type) });
+                try decls.print(arena, "{s}: {s}", .{ param.name, try types.zigName(arena, param_type) });
             }
-            try decls.print(arena, ") {s} {{\n", .{types.zigName(return_type)});
+            try decls.print(arena, ") {s} {{\n", .{try types.zigName(arena, return_type)});
             for (decl.body) |*body_stmt| try emitStmt(body_stmt, decls, decls, arena, options);
             try decls.appendSlice(arena, "}\n");
         },
         .var_decl => |decl| {
             const final_zty = decl.checked_type orelse return error.ParseError;
-            try body.print(arena, "    {s} {s}: {s} = ", .{ if (decl.mutable and decl.reassigned) "var" else "const", decl.emit_name orelse decl.name, types.zigName(final_zty) });
+            try body.print(arena, "    {s} {s}: {s} = ", .{ if (decl.mutable and decl.reassigned) "var" else "const", decl.emit_name orelse decl.name, try types.zigName(arena, final_zty) });
             try emitExpr(decl.init, body, arena);
             try body.appendSlice(arena, ";\n");
         },
         .assign => |assignment| {
-            try body.print(arena, "    {s} = ", .{assignment.emit_name orelse assignment.name});
-            try emitExpr(assignment.value, body, arena);
+            try body.appendSlice(arena, "    ");
+            try emitAssignExpr(assignment, body, arena);
             try body.appendSlice(arena, ";\n");
         },
         .console_log => |log| {
@@ -808,21 +1038,59 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             try body.appendSlice(arena, "    while (");
             try emitExpr(loop.cond, body, arena);
             try body.appendSlice(arena, ") {\n");
-            for (loop.body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target, options);
+            for (loop.body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target, null, options);
+            try body.appendSlice(arena, "    }\n");
+        },
+        .do_while_stmt => |loop| {
+            try body.appendSlice(arena, "    while (true) : ({ if (!(");
+            try emitExpr(loop.cond, body, arena);
+            try body.appendSlice(arena, ")) break; }) {\n");
+            for (loop.body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target, null, options);
+            try body.appendSlice(arena, "    }\n");
+        },
+        .for_stmt => |loop| {
+            try body.appendSlice(arena, "    {\n");
+            var init_stmt: Stmt = .{ .var_decl = loop.init };
+            try emitStmtWithThrow(&init_stmt, decls, body, arena, throw_target, switch_break_target, options);
+            try body.appendSlice(arena, "    while (");
+            try emitExpr(loop.cond, body, arena);
+            try body.appendSlice(arena, ") : (");
+            try emitAssignExpr(loop.update, body, arena);
+            try body.appendSlice(arena, ") {\n");
+            for (loop.body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target, null, options);
+            try body.appendSlice(arena, "    }\n");
             try body.appendSlice(arena, "    }\n");
         },
         .if_stmt => |branch| {
             try body.appendSlice(arena, "    if (");
             try emitExpr(branch.cond, body, arena);
             try body.appendSlice(arena, ") {\n");
-            for (branch.then_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target, options);
+            for (branch.then_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target, switch_break_target, options);
             try body.appendSlice(arena, "    }");
             if (branch.else_body) |else_body| {
                 try body.appendSlice(arena, " else {\n");
-                for (else_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target, options);
+                for (else_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target, switch_break_target, options);
                 try body.appendSlice(arena, "    }");
             }
             try body.appendSlice(arena, "\n");
+        },
+        .switch_stmt => |switch_stmt| {
+            const switch_type = switch_stmt.checked_type orelse return error.ParseError;
+            const label = try std.fmt.allocPrint(arena, "__lumen_switch_{d}_{d}", .{ switch_stmt.line, switch_stmt.col });
+            try body.print(arena, "    {s}: {{\n", .{label});
+            for (switch_stmt.cases, 0..) |case, i| {
+                try body.appendSlice(arena, if (i == 0) "    if (" else "    else if (");
+                try emitSwitchCaseMatch(switch_type, switch_stmt.value, case.value, body, arena);
+                try body.appendSlice(arena, ") {\n");
+                for (case.body) |*case_stmt| try emitStmtWithThrow(case_stmt, decls, body, arena, throw_target, label, options);
+                try body.appendSlice(arena, "    }\n");
+            }
+            if (switch_stmt.default_body) |default_body| {
+                try body.appendSlice(arena, if (switch_stmt.cases.len == 0) "    {\n" else "    else {\n");
+                for (default_body) |*default_stmt| try emitStmtWithThrow(default_stmt, decls, body, arena, throw_target, label, options);
+                try body.appendSlice(arena, "    }\n");
+            }
+            try body.appendSlice(arena, "    }\n");
         },
         .return_stmt => |ret| {
             if (ret.value) |value| {
@@ -850,16 +1118,26 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             try body.appendSlice(arena, "    {\n");
             for (try_stmt.try_body) |*try_body_stmt| {
                 try body.print(arena, "    if ({s} == null) {{\n", .{slot});
-                try emitStmtWithThrow(try_body_stmt, decls, body, arena, slot, options);
+                try emitStmtWithThrow(try_body_stmt, decls, body, arena, slot, switch_break_target, options);
                 try body.appendSlice(arena, "    }\n");
             }
             try body.appendSlice(arena, "    }\n");
             try body.print(arena, "    if ({s}) |{s}| {{\n", .{ slot, try_stmt.catch_emit_name orelse try_stmt.catch_name });
-            for (try_stmt.catch_body) |*catch_stmt| try emitStmtWithThrow(catch_stmt, decls, body, arena, throw_target, options);
+            for (try_stmt.catch_body) |*catch_stmt| try emitStmtWithThrow(catch_stmt, decls, body, arena, throw_target, switch_break_target, options);
             try body.appendSlice(arena, "    }\n");
             if (try_stmt.finally_body) |finally_body| {
-                for (finally_body) |*finally_stmt| try emitStmtWithThrow(finally_stmt, decls, body, arena, throw_target, options);
+                for (finally_body) |*finally_stmt| try emitStmtWithThrow(finally_stmt, decls, body, arena, throw_target, switch_break_target, options);
             }
+        },
+        .break_stmt => {
+            if (switch_break_target) |target| {
+                try body.print(arena, "    break :{s};\n", .{target});
+            } else {
+                try body.appendSlice(arena, "    break;\n");
+            }
+        },
+        .continue_stmt => {
+            try body.appendSlice(arena, "    continue;\n");
         },
         .expr_stmt => |expr_stmt| {
             const is_serve = expr_stmt.value.* == .call and std.mem.eql(u8, expr_stmt.value.call.name, "serve");
@@ -943,6 +1221,14 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
     }
     try out.appendSlice(arena, decls.items);
 
+    if (program.needs_read_file_sync) {
+        try out.appendSlice(arena,
+            \\fn __readFileSync(io: std.Io, alloc: std.mem.Allocator, path: []const u8) []const u8 {
+            \\    return std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024)) catch "";
+            \\}
+            \\
+        );
+    }
     if (program.needs_httpget) {
         // A real std.http one-shot GET, wrapped to a Lumen-friendly `i64` (status code, or -1 on error).
         try out.appendSlice(arena,
@@ -981,6 +1267,9 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
     if (program.uses_io) {
         try out.appendSlice(arena, "pub fn main(__init: std.process.Init) !void {\n");
         try out.appendSlice(arena, "    const __io = __init.io;\n    const __alloc = __init.arena.allocator();\n");
+        if (program.needs_args) {
+            try out.appendSlice(arena, "    const __args = __init.minimal.args.toSlice(__alloc) catch std.process.exit(1);\n");
+        }
     } else {
         try out.appendSlice(arena, "pub fn main() void {\n");
     }

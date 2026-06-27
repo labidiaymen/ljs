@@ -42,6 +42,7 @@ pub const VarDecl = struct {
 pub const Assign = struct {
     name: []const u8,
     emit_name: ?[]const u8 = null,
+    op: []const u8 = "=",
     value: *Expr,
     line: u32,
     col: u32,
@@ -62,10 +63,42 @@ pub const WhileStmt = struct {
     col: u32,
 };
 
+pub const DoWhileStmt = struct {
+    body: []Stmt,
+    cond: *Expr,
+    line: u32,
+    col: u32,
+};
+
+pub const ForStmt = struct {
+    init: VarDecl,
+    cond: *Expr,
+    update: Assign,
+    body: []Stmt,
+    line: u32,
+    col: u32,
+};
+
 pub const IfStmt = struct {
     cond: *Expr,
     then_body: []Stmt,
     else_body: ?[]Stmt = null,
+    line: u32,
+    col: u32,
+};
+
+pub const SwitchCase = struct {
+    value: *Expr,
+    body: []Stmt,
+    line: u32,
+    col: u32,
+};
+
+pub const SwitchStmt = struct {
+    value: *Expr,
+    cases: []SwitchCase,
+    default_body: ?[]Stmt = null,
+    checked_type: ?types.Type = null,
     line: u32,
     col: u32,
 };
@@ -99,6 +132,11 @@ pub const TryStmt = struct {
     col: u32,
 };
 
+pub const ControlStmt = struct {
+    line: u32,
+    col: u32,
+};
+
 pub const StaticCall = struct {
     namespace: []const u8,
     name: []const u8,
@@ -114,16 +152,23 @@ pub const Stmt = union(enum) {
     assign: Assign,
     console_log: ConsoleLog,
     while_stmt: WhileStmt,
+    do_while_stmt: DoWhileStmt,
+    for_stmt: ForStmt,
     if_stmt: IfStmt,
+    switch_stmt: SwitchStmt,
     return_stmt: ReturnStmt,
     throw_stmt: ThrowStmt,
     try_stmt: TryStmt,
+    break_stmt: ControlStmt,
+    continue_stmt: ControlStmt,
     expr_stmt: ExprStmt,
 };
 
 pub const Program = struct {
     stmts: []Stmt,
     uses_io: bool = false,
+    needs_args: bool = false,
+    needs_read_file_sync: bool = false,
     needs_httpget: bool = false,
     needs_serve: bool = false,
 };
@@ -139,6 +184,7 @@ pub const Expr = union(enum) {
     bin: struct { op: u8, l: *Expr, r: *Expr, checked_type: ?types.Type = null }, // + - * / %
     bool_bin: struct { op: []const u8, l: *Expr, r: *Expr }, // && ||
     cmp: struct { op: []const u8, l: *Expr, r: *Expr, checked_operand_type: ?types.Type = null }, // < > <= >= == !=
+    ternary: struct { cond: *Expr, then_expr: *Expr, else_expr: *Expr },
     obj: []FieldInit,
     field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null },
     index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null },

@@ -3,7 +3,8 @@ const diag = @import("lumen_diag.zig");
 pub const Tok = union(enum) {
     num: i64,
     str: []const u8, // string literal content (raw, between quotes)
-    op: u8, // + - * / % ! ( ) { } ; , . : =
+    op: u8, // + - * / % ! ? ( ) { } ; , . : =
+    op2: []const u8, // ++ -- += -= *= /= %=
     cmp: []const u8, // < > <= >= == != && ||
     ident: []const u8,
     eof,
@@ -54,6 +55,16 @@ pub const Lexer = struct {
             self.i += 2;
             return .{ .cmp = s };
         }
+        if ((c == '+' or c == '-' or c == '*' or c == '/' or c == '%') and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
+            const s = self.src[self.i .. self.i + 2];
+            self.i += 2;
+            return .{ .op2 = s };
+        }
+        if ((c == '+' or c == '-') and self.i + 1 < self.src.len and self.src[self.i + 1] == c) {
+            const s = self.src[self.i .. self.i + 2];
+            self.i += 2;
+            return .{ .op2 = s };
+        }
         if (c == '<' or c == '>' or c == '=' or c == '!') {
             const two = self.i + 1 < self.src.len and self.src[self.i + 1] == '=';
             if (c == '=' and !two) {
@@ -85,7 +96,7 @@ pub const Lexer = struct {
             return .{ .str = s };
         }
         switch (c) {
-            '+', '-', '*', '/', '%', '(', ')', '[', ']', ';', ',', '.', ':', '{', '}' => {
+            '+', '-', '*', '/', '%', '?', '(', ')', '[', ']', ';', ',', '.', ':', '{', '}' => {
                 self.i += 1;
                 return .{ .op = c };
             },

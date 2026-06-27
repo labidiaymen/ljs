@@ -15,6 +15,7 @@ pub const Type = union(enum) {
     bool_array,
     string_array,
     named: []const u8,
+    named_array: []const u8,
 };
 
 pub fn inferExprType(e: *const ast.Expr) ?Type {
@@ -27,6 +28,11 @@ pub fn inferExprType(e: *const ast.Expr) ?Type {
         .bin => .i32,
         .bool_bin => .bool,
         .cmp => .bool,
+        .ternary => |ternary| {
+            const then_type = inferExprType(ternary.then_expr) orelse return null;
+            const else_type = inferExprType(ternary.else_expr) orelse return null;
+            return if (same(then_type, else_type)) then_type else null;
+        },
         .array, .var_ref, .obj, .field, .index, .call, .static_call => null,
     };
 }
@@ -49,6 +55,10 @@ pub fn same(a: Type, b: Type) bool {
             .named => |b_name| std.mem.eql(u8, a_name, b_name),
             else => false,
         },
+        .named_array => |a_name| switch (b) {
+            .named_array => |b_name| std.mem.eql(u8, a_name, b_name),
+            else => false,
+        },
     };
 }
 
@@ -61,7 +71,7 @@ pub fn isNumeric(t: Type) bool {
 
 pub fn isArray(t: Type) bool {
     return switch (t) {
-        .i32_array, .i64_array, .f64_array, .bool_array, .string_array => true,
+        .i32_array, .i64_array, .f64_array, .bool_array, .string_array, .named_array => true,
         else => false,
     };
 }
@@ -73,6 +83,7 @@ pub fn arrayElem(t: Type) ?Type {
         .f64_array => .f64,
         .bool_array => .bool,
         .string_array => .string,
+        .named_array => |name| .{ .named = name },
         else => null,
     };
 }
@@ -84,6 +95,7 @@ pub fn arrayOf(t: Type) ?Type {
         .f64 => .f64_array,
         .bool => .bool_array,
         .string => .string_array,
+        .named => |name| .{ .named_array = name },
         else => null,
     };
 }
@@ -105,7 +117,7 @@ pub fn fromAnnotation(name: []const u8) Type {
     return .{ .named = name };
 }
 
-pub fn zigName(t: Type) []const u8 {
+pub fn zigName(arena: std.mem.Allocator, t: Type) ![]const u8 {
     return switch (t) {
         .i32 => "i32",
         .i64 => "i64",
@@ -120,5 +132,6 @@ pub fn zigName(t: Type) []const u8 {
         .bool_array => "[]const bool",
         .string_array => "[]const []const u8",
         .named => |name| name,
+        .named_array => |name| try std.fmt.allocPrint(arena, "[]const {s}", .{name}),
     };
 }

@@ -1,0 +1,18 @@
+{
+  "name": "@lumen/context-index",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Native context indexing experiment for AI-agent Node projects.",
+  "bin": {
+    "lumen-context-index": "bin/context-index.js"
+  },
+  "scripts": {
+    "build:native": "node scripts/build-native.js"
+  },
+  "files": [
+    "bin",
+    "native",
+    "src"
+  ],
+  "license": "MIT"
+}

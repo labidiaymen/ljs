@@ -173,14 +173,48 @@ being precise enough for native output.
 - **FR-014**: Named object type declarations MUST define closed static shapes.
   Object literals assigned to those names MUST provide exactly the declared
   fields with compatible field types.
+- **FR-014A**: Named object type fields MAY reference other named object types,
+  and the checker MUST validate nested object literals recursively.
+- **FR-014B**: Arrays of named object types such as `FileScore[]` MUST be
+  accepted when every element is assignable to the named object type. Indexing
+  such arrays MUST expose the named element type for field access.
+- **FR-014C**: Named object values MUST be assignable through function
+  parameters and return statements when their closed static shapes match the
+  declared parameter or return type.
 - **FR-015**: `let` declarations MUST create reassignable bindings and `const`
   declarations MUST create non-reassignable bindings.
 - **FR-016**: `console.log` emission MUST use the checked argument type rather
   than assuming every argument is an integer.
 - **FR-017**: The compiler MUST accept `true` and `false` as boolean literals.
-- **FR-018**: The compiler MUST accept TypeScript-style `if`/`else` block
-  statements and require their conditions to be boolean.
+- **FR-018**: The compiler MUST accept TypeScript-style `if`, `else if`, and
+  `else` block statements and require every branch condition to be boolean.
 - **FR-019**: The compiler MUST require `while` conditions to be boolean.
+- **FR-019A**: The compiler MUST accept TypeScript-style `for` loops in the
+  V1 form `for (let name = init; condition; name = update) { ... }`. The
+  initializer MUST create a loop-scoped mutable binding, the condition MUST be
+  boolean, and the update MUST type-check as an assignment.
+- **FR-019A1**: The compiler MUST accept TypeScript-style `do { ... } while
+  (condition);` loops. The body MUST run before the condition is checked, the
+  condition MUST be boolean, and `continue;` inside the body MUST evaluate the
+  condition before the next iteration.
+- **FR-019B**: The compiler MUST accept postfix update statements `name++` and
+  `name--`, prefix update statements `++name` and `--name`, plus compound
+  assignment statements `name += value`, `name -= value`, `name *= value`,
+  `name /= value`, and `name %= value`, for numeric mutable bindings. Update
+  operators are statement syntax in V1 and MUST NOT yet be treated as
+  value-producing expressions.
+- **FR-019C**: The compiler MUST accept `break;` and `continue;` inside
+  `while` and `for` loop bodies. The checker MUST reject those statements
+  outside loops with stable diagnostics, and `continue` inside a `for` loop MUST
+  still run the loop update step.
+- **FR-019D**: The compiler MUST accept TypeScript-style ternary expressions
+  `condition ? thenExpr : elseExpr`. The condition MUST be boolean and both
+  expression arms MUST have the same static type.
+- **FR-019E**: The compiler MUST accept V1 TypeScript-style `switch`
+  statements with `case` labels, an optional `default`, and `break;` inside
+  switch cases. Case expressions MUST have the same static type as the switch
+  expression. V1 switch cases MUST be isolated branches and MUST NOT implicitly
+  fall through.
 - **FR-020**: `let`, `const`, and `var` declarations MUST be tracked in
   lexical scopes, reject duplicate declarations in the same scope, and allow
   shadowing in nested block scopes.
@@ -233,6 +267,14 @@ being precise enough for native output.
   adding prototype dispatch.
 - **FR-037C**: The compiler MUST support `console.error` as a V1 console API
   sibling to `console.log`.
+- **FR-037D**: The compiler MUST support the V1 process and filesystem helpers
+  `argsCount()`, `arg(index)`, and `fs.readFileSync(path, encoding?)` for native CLI tooling.
+  `argsCount()` MUST return the native argument count, `arg(index)` MUST return
+  the argument at a zero-based index or an empty string when absent, and
+  `fs.readFileSync(path, encoding?)` MUST return file contents as a string or an
+  empty string when the file cannot be read. The optional `encoding` argument
+  MUST be accepted as a string for Node-like call shape; V1 treats the result as
+  UTF-8 text.
 - **FR-038**: The compiler MUST support TypeScript-style `throw`,
   `try`/`catch`, optional `finally`, `Error("message")`, and `err.message` for
   caught errors; thrown values MUST be Error values.

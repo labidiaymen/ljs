@@ -72,6 +72,14 @@
       }
     },
     {
+      "id": "native.valid.else-if",
+      "source": "../examples/valid/else-if.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "high"
+      }
+    },
+    {
       "id": "native.valid.block-shadow",
       "source": "../examples/valid/block-shadow.ts",
       "phase": "compile-run",
@@ -152,6 +160,14 @@
       }
     },
     {
+      "id": "native.valid.division",
+      "source": "../examples/valid/division.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "3\n2"
+      }
+    },
+    {
       "id": "native.valid.math-more",
       "source": "../examples/valid/math-more.ts",
       "phase": "compile-run",
@@ -197,6 +213,110 @@
       "phase": "compile-run",
       "expect": {
         "stdout": "12"
+      }
+    },
+    {
+      "id": "native.valid.io-stdlib",
+      "source": "../examples/valid/io-stdlib.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "ok"
+      }
+    },
+    {
+      "id": "native.valid.nested-record",
+      "source": "../examples/valid/nested-record.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "24"
+      }
+    },
+    {
+      "id": "native.valid.record-array",
+      "source": "../examples/valid/record-array.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "src/agent.ts\n2"
+      }
+    },
+    {
+      "id": "native.valid.record-flow",
+      "source": "../examples/valid/record-flow.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "25"
+      }
+    },
+    {
+      "id": "native.valid.for-loop",
+      "source": "../examples/valid/for-loop.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "10"
+      }
+    },
+    {
+      "id": "native.valid.do-while",
+      "source": "../examples/valid/do-while.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "8"
+      }
+    },
+    {
+      "id": "native.valid.postfix-and-compound",
+      "source": "../examples/valid/postfix-and-compound.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "9"
+      }
+    },
+    {
+      "id": "native.valid.compound-more",
+      "source": "../examples/valid/compound-more.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "3"
+      }
+    },
+    {
+      "id": "native.valid.postfix-decrement",
+      "source": "../examples/valid/postfix-decrement.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "6"
+      }
+    },
+    {
+      "id": "native.valid.prefix-update",
+      "source": "../examples/valid/prefix-update.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "6\n2"
+      }
+    },
+    {
+      "id": "native.valid.break-continue",
+      "source": "../examples/valid/break-continue.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "13"
+      }
+    },
+    {
+      "id": "native.valid.ternary",
+      "source": "../examples/valid/ternary.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "high\n3"
+      }
+    },
+    {
+      "id": "native.valid.switch",
+      "source": "../examples/valid/switch.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "2"
       }
     },
     {
@@ -256,8 +376,80 @@
       }
     },
     {
+      "id": "native.invalid.else-if-condition-type",
+      "source": "../examples/invalid/else-if-condition-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
       "id": "native.invalid.while-condition-type",
       "source": "../examples/invalid/while-condition-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.for-condition-type",
+      "source": "../examples/invalid/for-condition-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.do-while-condition-type",
+      "source": "../examples/invalid/do-while-condition-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.compound-assignment-type",
+      "source": "../examples/invalid/compound-assignment-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.break-outside-loop",
+      "source": "../examples/invalid/break-outside-loop.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_BREAK_OUTSIDE_LOOP"
+      }
+    },
+    {
+      "id": "native.invalid.continue-outside-loop",
+      "source": "../examples/invalid/continue-outside-loop.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_CONTINUE_OUTSIDE_LOOP"
+      }
+    },
+    {
+      "id": "native.invalid.ternary-condition-type",
+      "source": "../examples/invalid/ternary-condition-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.ternary-arm-type",
+      "source": "../examples/invalid/ternary-arm-type.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.switch-case-type",
+      "source": "../examples/invalid/switch-case-type.ts",
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_TYPE_MISMATCH"
@@ -466,6 +658,14 @@
     {
       "id": "native.invalid.named-type-field-mismatch",
       "source": "../examples/invalid/named-type-field-mismatch.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "native.invalid.record-array-field-mismatch",
+      "source": "../examples/invalid/record-array-field-mismatch.ts",
       "phase": "diagnostics",
       "expect": {
         "diagnostic": "E_TYPE_MISMATCH"

@@ -66,6 +66,16 @@ specs/001-typescript-to-zig-native/
 │   └── invalid/
 └── conformance/
     └── manifest.json
+
+packages/context-index/
+├── package.json              # npm-style package metadata
+├── bin/context-index.js      # Node wrapper for project walking and CLI UX
+├── scripts/build-native.js   # builds the Lumen scorer binary
+└── src/score-file.ts         # Lumen source for native file scoring
+
+examples/context-index-demo/
+├── README.md
+└── src/agent.ts
 ```
 
 **Structure Decision**: Keep compiler code isolated in its own module path. Do
@@ -82,6 +92,47 @@ keeps a separate small source scanner and expression representation for now.
 Reusable implementation ideas may be borrowed later, but the old JavaScript AST
 must not become the semantic contract for the Lumen compiler.
 
+**Node-like Stdlib Decision**: V1 host APIs should follow familiar Node-style
+names where possible, but each supported member must be explicitly contracted.
+For the current CLI tooling slice, `fs.readFileSync(path, encoding?)` is
+supported as a namespaced synchronous text read. The optional encoding argument
+is accepted for Node-like call shape and currently treated as UTF-8 text. The
+process argument helpers remain minimal (`argsCount()`, `arg(index)`) until a
+full `process.argv` record/array surface is specified.
+
+**Records Before Classes Decision**: Named object types are the next object
+model milestone before classes. The compiler supports closed record shapes,
+nested record fields, arrays of records, indexed record field access, and
+record values flowing through function parameters and return statements. Classes
+remain out of V1 until constructor, `this`, method, visibility, identity, and
+inheritance semantics are designed.
+
+**TypeScript Syntax Iteration Decision**: TypeScript syntax support grows in
+small conformance-backed slices. The first loop syntax slice supports
+`for (let i = init; condition; i = update) { ... }`, lowering to scoped native
+`while` emission. The follow-up update syntax slice supports statement-level
+`i++`, `i--`, `++i`, `--i`, and numeric compound assignments for mutable
+bindings.
+Branch syntax accepts normal TypeScript `else if` chains and lowers them as
+nested checked branches.
+Loop control accepts TypeScript `break;` and `continue;` inside `while` and
+`for`; generated `for` loops use a native loop-update slot so `continue`
+preserves TypeScript update semantics.
+`do...while` loops preserve TypeScript's body-before-condition behavior and
+ensure `continue` reaches the condition check.
+Expression syntax accepts TypeScript ternary conditionals with boolean
+conditions and same-type arms.
+Switch syntax accepts typed `case` labels plus optional `default`, lowered to
+isolated native branches without implicit fallthrough for V1.
+Destructuring, comma expressions, and value-producing update expressions remain
+separate future syntax slices.
+
+**Context Index Showcase Decision**: `packages/context-index` demonstrates the
+intended npm integration model: a small Node wrapper handles ecosystem glue
+(directory walking, package command UX), while a Lumen-compiled native binary
+handles deterministic scoring work. The scorer accepts a batch of file paths per
+query to avoid spawning once per file.
+
 ## Milestone Strategy
 
 1. Keep `.ts` as the source-facing extension.
@@ -90,6 +141,10 @@ must not become the semantic contract for the Lumen compiler.
 3. Implement V1 type and dynamic-feature rejection rules.
 4. Add local modules and explicit standard-library wrappers after the core
    checker is stable.
+5. Grow records/static objects before classes so tooling examples can model
+   structured data without JavaScript prototype semantics.
+6. Use medium-complexity npm-style showcase packages to guide practical stdlib
+   additions without broad Node compatibility creep.
 
 ## Complexity Tracking
 

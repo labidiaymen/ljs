@@ -32,6 +32,8 @@ const Checker = struct {
     next_binding_id: u32 = 0,
     current_return_type: ?types.Type = null,
     nested_stmt_depth: u32 = 0,
+    loop_depth: u32 = 0,
+    switch_depth: u32 = 0,
     last_line: u32 = 1,
     last_col: u32 = 1,
     last_err: []const u8 = "syntax error",
@@ -213,15 +215,23 @@ const Checker = struct {
                     return self.fail(assignment.line, assignment.col, "E_CONST_ASSIGNMENT");
                 }
                 const expected_type = found_binding.ty;
-                if (self.exprType(program, assignment.value, assignment.line, assignment.col)) |actual_type| {
-                    if (!types.same(expected_type, actual_type)) {
+                if (std.mem.eql(u8, assignment.op, "=")) {
+                    if (self.exprType(program, assignment.value, assignment.line, assignment.col)) |actual_type| {
+                        if (!types.same(expected_type, actual_type)) {
+                            return self.fail(assignment.line, assignment.col, "E_TYPE_MISMATCH");
+                        }
+                    } else switch (expected_type) {
+                        .named, .named_array => {},
+                        else => return self.inferenceFail(assignment.line, assignment.col, "cannot infer assignment type"),
+                    }
+                    try self.ensureAssignable(program, expected_type, assignment.value, assignment.line, assignment.col);
+                } else {
+                    const actual_type = self.exprType(program, assignment.value, assignment.line, assignment.col) orelse
+                        return self.inferenceFail(assignment.line, assignment.col, "cannot infer assignment type");
+                    if (!types.isNumeric(expected_type) or !types.same(expected_type, actual_type)) {
                         return self.fail(assignment.line, assignment.col, "E_TYPE_MISMATCH");
                     }
-                } else switch (expected_type) {
-                    .named => {},
-                    else => return self.inferenceFail(assignment.line, assignment.col, "cannot infer assignment type"),
                 }
-                try self.ensureAssignable(program, expected_type, assignment.value, assignment.line, assignment.col);
                 if (found_binding.decl) |decl| decl.reassigned = true;
                 assignment.emit_name = found_binding.emit_name;
             },
@@ -235,7 +245,33 @@ const Checker = struct {
                 const cond_type = self.exprType(program, loop.cond, loop.line, loop.col) orelse
                     return self.inferenceFail(loop.line, loop.col, "cannot infer while condition type");
                 if (!types.same(.bool, cond_type)) return self.fail(loop.line, loop.col, "E_TYPE_MISMATCH");
+                self.loop_depth += 1;
+                defer self.loop_depth -= 1;
                 try self.checkBlock(program, loop.body);
+            },
+            .do_while_stmt => |*loop| {
+                self.loop_depth += 1;
+                defer self.loop_depth -= 1;
+                try self.checkBlock(program, loop.body);
+                const cond_type = self.exprType(program, loop.cond, loop.line, loop.col) orelse
+                    return self.inferenceFail(loop.line, loop.col, "cannot infer do-while condition type");
+                if (!types.same(.bool, cond_type)) return self.fail(loop.line, loop.col, "E_TYPE_MISMATCH");
+            },
+            .for_stmt => |*loop| {
+                try self.pushScope();
+                defer self.popScope();
+                var init_stmt: ast.Stmt = .{ .var_decl = loop.init };
+                try self.checkStmt(program, &init_stmt);
+                const cond_type = self.exprType(program, loop.cond, loop.line, loop.col) orelse
+                    return self.inferenceFail(loop.line, loop.col, "cannot infer for condition type");
+                if (!types.same(.bool, cond_type)) return self.fail(loop.line, loop.col, "E_TYPE_MISMATCH");
+                self.loop_depth += 1;
+                defer self.loop_depth -= 1;
+                try self.checkBlock(program, loop.body);
+                var update_stmt: ast.Stmt = .{ .assign = loop.update };
+                try self.checkStmt(program, &update_stmt);
+                loop.init = init_stmt.var_decl;
+                loop.update = update_stmt.assign;
             },
             .if_stmt => |*branch| {
                 const cond_type = self.exprType(program, branch.cond, branch.line, branch.col) orelse
@@ -245,6 +281,20 @@ const Checker = struct {
                 if (branch.else_body) |else_body| {
                     try self.checkBlock(program, else_body);
                 }
+            },
+            .switch_stmt => |*switch_stmt| {
+                const switch_type = self.exprType(program, switch_stmt.value, switch_stmt.line, switch_stmt.col) orelse
+                    return self.inferenceFail(switch_stmt.line, switch_stmt.col, "cannot infer switch value type");
+                switch_stmt.checked_type = switch_type;
+                self.switch_depth += 1;
+                defer self.switch_depth -= 1;
+                for (switch_stmt.cases) |*case| {
+                    const case_type = self.exprType(program, case.value, case.line, case.col) orelse
+                        return self.inferenceFail(case.line, case.col, "cannot infer switch case type");
+                    if (!types.same(switch_type, case_type)) return self.fail(case.line, case.col, "E_TYPE_MISMATCH");
+                    try self.checkBlock(program, case.body);
+                }
+                if (switch_stmt.default_body) |default_body| try self.checkBlock(program, default_body);
             },
             .expr_stmt => |expr_stmt| {
                 _ = self.exprType(program, expr_stmt.value, expr_stmt.line, expr_stmt.col) orelse
@@ -260,10 +310,8 @@ const Checker = struct {
                     }
                     return self.fail(ret.line, ret.col, "E_RETURN_TYPE");
                 };
-                const actual_return = self.exprType(program, value, ret.line, ret.col) orelse
-                    return self.inferenceFail(ret.line, ret.col, "cannot infer return type");
-                if (!types.same(expected_return, actual_return)) return self.fail(ret.line, ret.col, "E_RETURN_TYPE");
-                ret.checked_type = actual_return;
+                self.ensureAssignable(program, expected_return, value, ret.line, ret.col) catch return self.fail(ret.line, ret.col, "E_RETURN_TYPE");
+                ret.checked_type = expected_return;
             },
             .throw_stmt => |throw_stmt| {
                 const thrown_type = self.exprType(program, throw_stmt.value, throw_stmt.line, throw_stmt.col) orelse
@@ -282,32 +330,47 @@ const Checker = struct {
                     try self.checkBlock(program, finally_body);
                 }
             },
+            .break_stmt => |control| {
+                if (self.loop_depth == 0 and self.switch_depth == 0) return self.fail(control.line, control.col, "E_BREAK_OUTSIDE_LOOP");
+            },
+            .continue_stmt => |control| {
+                if (self.loop_depth == 0) return self.fail(control.line, control.col, "E_CONTINUE_OUTSIDE_LOOP");
+            },
         }
     }
 
     fn ensureAssignable(self: *Checker, program: *ast.Program, expected: types.Type, value: *ast.Expr, line: u32, col: u32) CompileError!void {
         switch (expected) {
             .named => |type_name| {
+                if (value.* != .obj) {
+                    const actual_type = self.exprType(program, value, line, col) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
+                    if (!types.same(expected, actual_type)) return self.fail(line, col, "E_TYPE_MISMATCH");
+                    return;
+                }
                 const decl = self.type_decls.get(type_name) orelse return self.fail(line, col, "unknown type name");
-                if (value.* != .obj) return self.fail(line, col, "E_TYPE_MISMATCH");
                 const fields = value.obj;
                 if (fields.len != decl.fields.len) return self.fail(line, col, "E_TYPE_MISMATCH");
                 for (decl.fields) |expected_field| {
                     const expected_field_type = expected_field.checked_type orelse return self.fail(line, col, "unknown field type");
                     const value_field = findField(fields, expected_field.name) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
-                    const actual_field_type = self.exprType(program, value_field.value, line, col) orelse return self.fail(line, col, "cannot infer object field type");
-                    if (!types.same(expected_field_type, actual_field_type)) return self.fail(line, col, "E_TYPE_MISMATCH");
+                    try self.ensureAssignable(program, expected_field_type, value_field.value, line, col);
                 }
             },
-            .i32_array, .i64_array, .f64_array, .bool_array, .string_array => {
-                if (value.* != .array) return self.fail(line, col, "E_TYPE_MISMATCH");
+            .i32_array, .i64_array, .f64_array, .bool_array, .string_array, .named_array => {
+                if (value.* != .array) {
+                    const actual_type = self.exprType(program, value, line, col) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
+                    if (!types.same(expected, actual_type)) return self.fail(line, col, "E_TYPE_MISMATCH");
+                    return;
+                }
                 const elem_type = types.arrayElem(expected) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
                 for (value.array) |item| {
-                    const item_type = self.exprType(program, item, line, col) orelse return self.fail(line, col, "cannot infer array element type");
-                    if (!types.same(elem_type, item_type)) return self.fail(line, col, "E_TYPE_MISMATCH");
+                    try self.ensureAssignable(program, elem_type, item, line, col);
                 }
             },
-            else => {},
+            else => {
+                const actual_type = self.exprType(program, value, line, col) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
+                if (!types.same(expected, actual_type)) return self.fail(line, col, "E_TYPE_MISMATCH");
+            },
         }
     }
 
@@ -366,6 +429,20 @@ const Checker = struct {
                 }
                 cmp.checked_operand_type = left_type;
                 return .bool;
+            },
+            .ternary => |ternary| {
+                const cond_type = self.exprType(program, ternary.cond, line, col) orelse return null;
+                if (!types.same(.bool, cond_type)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+                const then_type = self.exprType(program, ternary.then_expr, line, col) orelse return null;
+                const else_type = self.exprType(program, ternary.else_expr, line, col) orelse return null;
+                if (!types.same(then_type, else_type)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+                return then_type;
             },
             .array => |items| {
                 if (items.len == 0) {
@@ -428,6 +505,29 @@ const Checker = struct {
                     }
                     return .error_obj;
                 }
+                if (std.mem.eql(u8, call.name, "argsCount")) {
+                    if (call.args.len != 0) {
+                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    program.uses_io = true;
+                    program.needs_args = true;
+                    return .i32;
+                }
+                if (std.mem.eql(u8, call.name, "arg")) {
+                    if (call.args.len != 1) {
+                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    const index_type = self.exprType(program, call.args[0], line, col) orelse return null;
+                    if (!types.same(.i32, index_type)) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                    program.uses_io = true;
+                    program.needs_args = true;
+                    return .string;
+                }
                 if (std.mem.eql(u8, call.name, "httpGet")) {
                     for (call.args) |arg| _ = self.exprType(program, arg, line, col) orelse return null;
                     program.uses_io = true;
@@ -449,12 +549,11 @@ const Checker = struct {
                     return null;
                 }
                 for (call.args, func.params) |arg, param| {
-                    const arg_type = self.exprType(program, arg, line, col) orelse return null;
                     const param_type = param.checked_type orelse types.fromAnnotation(param.annotation);
-                    if (!types.same(param_type, arg_type)) {
+                    self.ensureAssignable(program, param_type, arg, line, col) catch {
                         _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                         return null;
-                    }
+                    };
                 }
                 return func.return_type;
             },
@@ -486,6 +585,34 @@ const Checker = struct {
         if (std.mem.eql(u8, call.namespace, "Math")) return self.mathCallType(program, call, line, col);
         if (std.mem.eql(u8, call.namespace, "String")) return self.stringCallType(program, call, line, col);
         if (std.mem.eql(u8, call.namespace, "Array")) return self.arrayCallType(program, call, line, col);
+        if (std.mem.eql(u8, call.namespace, "fs")) return self.fsCallType(program, call, line, col);
+        _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+        return null;
+    }
+
+    fn fsCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
+        if (std.mem.eql(u8, call.name, "readFileSync")) {
+            if (call.args.len != 1 and call.args.len != 2) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            if (!types.same(.string, path_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            if (call.args.len == 2) {
+                const encoding_type = self.exprType(program, call.args[1], line, col) orelse return null;
+                if (!types.same(.string, encoding_type)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+            }
+            program.uses_io = true;
+            program.needs_read_file_sync = true;
+            call.checked_type = .string;
+            return .string;
+        }
         _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
         return null;
     }
