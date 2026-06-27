@@ -1,0 +1,14 @@
+# Cloudflare Pages redirects for Lumen package URLs.
+#
+# Package source lives in its own GitHub repo (e.g. std-contrib); these rules
+# just forward lumen-lang.org/... to that repo's raw files with a 302. The
+# Lumen compiler follows the redirect when fetching a URL import, so nothing is
+# copied into this website repo.
+
+# Curated standard packages (std-contrib layout: packages/<name>/<name>.ts):
+#   https://lumen-lang.org/package/std-contrib/args/args.ts
+/package/:repo/*  https://raw.githubusercontent.com/lumen-lang-org/:repo/main/packages/:splat  302
+
+# Generic passthrough to any lumen-lang-org repo at main:
+#   https://lumen-lang.org/gh/<repo>/<path>.ts
+/gh/:repo/*  https://raw.githubusercontent.com/lumen-lang-org/:repo/main/:splat  302
