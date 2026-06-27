@@ -17,7 +17,10 @@ pub const Type = union(enum) {
     string_literal_union: []const u8,
     named: []const u8,
     named_array: []const u8,
+    enum_type: EnumType,
 };
+
+pub const EnumType = struct { name: []const u8, is_string: bool };
 
 pub fn inferExprType(e: *const ast.Expr) ?Type {
     return switch (e.*) {
@@ -27,6 +30,7 @@ pub fn inferExprType(e: *const ast.Expr) ?Type {
         .str => .string,
         .neg => |inner| inferExprType(inner),
         .not => .bool,
+        .bnot => |inner| inferExprType(inner),
         .bin => .i32,
         .bool_bin => .bool,
         .cmp => .bool,
@@ -65,12 +69,23 @@ pub fn same(a: Type, b: Type) bool {
             .named_array => |b_name| std.mem.eql(u8, a_name, b_name),
             else => false,
         },
+        .enum_type => |a_enum| switch (b) {
+            .enum_type => |b_enum| std.mem.eql(u8, a_enum.name, b_enum.name),
+            else => false,
+        },
     };
 }
 
 pub fn isNumeric(t: Type) bool {
     return switch (t) {
         .i32, .i64, .f64 => true,
+        else => false,
+    };
+}
+
+pub fn isInteger(t: Type) bool {
+    return switch (t) {
+        .i32, .i64 => true,
         else => false,
     };
 }
@@ -148,5 +163,6 @@ pub fn zigName(arena: std.mem.Allocator, t: Type) ![]const u8 {
         .string_literal_union => "[]const u8",
         .named => |name| name,
         .named_array => |name| try std.fmt.allocPrint(arena, "[]const {s}", .{name}),
+        .enum_type => |e| if (e.is_string) "[]const u8" else "i32",
     };
 }

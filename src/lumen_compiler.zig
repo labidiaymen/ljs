@@ -209,22 +209,59 @@ const Parser = struct {
         return left;
     }
     fn parseAnd(self: *Parser) CompileError!*Expr {
-        var left = try self.parseCmp();
+        var left = try self.parseBitOr();
         while (self.isCmp("&&")) {
             const op = self.cur.cmp;
             try self.advance();
-            const right = try self.parseCmp();
+            const right = try self.parseBitOr();
             left = try self.node(.{ .bool_bin = .{ .op = op, .l = left, .r = right } });
         }
         return left;
     }
+    fn parseBitOr(self: *Parser) CompileError!*Expr {
+        var left = try self.parseBitXor();
+        while (self.isCmp("|")) {
+            try self.advance();
+            const right = try self.parseBitXor();
+            left = try self.node(.{ .bin = .{ .op = '|', .l = left, .r = right } });
+        }
+        return left;
+    }
+    fn parseBitXor(self: *Parser) CompileError!*Expr {
+        var left = try self.parseBitAnd();
+        while (self.isOp('^')) {
+            try self.advance();
+            const right = try self.parseBitAnd();
+            left = try self.node(.{ .bin = .{ .op = '^', .l = left, .r = right } });
+        }
+        return left;
+    }
+    fn parseBitAnd(self: *Parser) CompileError!*Expr {
+        var left = try self.parseCmp();
+        while (self.isOp('&')) {
+            try self.advance();
+            const right = try self.parseCmp();
+            left = try self.node(.{ .bin = .{ .op = '&', .l = left, .r = right } });
+        }
+        return left;
+    }
     fn parseCmp(self: *Parser) CompileError!*Expr {
-        var left = try self.parseAdd();
+        var left = try self.parseShift();
         if (self.isComparison()) {
             const op = self.cur.cmp;
             try self.advance();
-            const right = try self.parseAdd();
+            const right = try self.parseShift();
             left = try self.node(.{ .cmp = .{ .op = op, .l = left, .r = right } });
+        }
+        return left;
+    }
+    fn parseShift(self: *Parser) CompileError!*Expr {
+        var left = try self.parseAdd();
+        while (self.isOp2("<<") or self.isOp2(">>")) {
+            const op: u8 = if (self.isOp2("<<")) 'L' else 'R';
+            try self.advance();
+            const right = try self.parseAdd();
+            left = try self.node(.{ .bin = .{ .op = op, .l = left, .r = right } });
         }
         return left;
     }
@@ -239,12 +276,21 @@ const Parser = struct {
         return left;
     }
     fn parseMul(self: *Parser) CompileError!*Expr {
-        var left = try self.parseUnary();
+        var left = try self.parseExp();
         while (self.isOp('*') or self.isOp('/') or self.isOp('%')) {
             const op = self.cur.op;
             try self.advance();
-            const right = try self.parseUnary();
+            const right = try self.parseExp();
             left = try self.node(.{ .bin = .{ .op = op, .l = left, .r = right } });
+        }
+        return left;
+    }
+    fn parseExp(self: *Parser) CompileError!*Expr {
+        const left = try self.parseUnary();
+        if (self.isOp2("**")) {
+            try self.advance();
+            const right = try self.parseExp(); // right-associative
+            return self.node(.{ .bin = .{ .op = 'P', .l = left, .r = right } });
         }
         return left;
     }
@@ -256,6 +302,10 @@ const Parser = struct {
         if (self.isOp('!')) {
             try self.advance();
             return self.node(.{ .not = try self.parseUnary() });
+        }
+        if (self.isOp('~')) {
+            try self.advance();
+            return self.node(.{ .bnot = try self.parseUnary() });
         }
         return self.parsePostfix();
     }
@@ -427,6 +477,67 @@ const Parser = struct {
         return .{ .type_decl = .{ .name = tname, .fields = try fields.toOwnedSlice(self.arena), .line = line, .col = col } };
     }
 
+    /// `interface Name { field: T; field2: U }` — a synonym for an object `type`.
+    /// Accepts `;` or `,` (or newline) between members.
+    fn parseInterfaceDecl(self: *Parser, line: u32, col: u32) CompileError!Stmt {
+        try self.advance(); // 'interface'
+        if (self.cur != .ident) return error.ParseError;
+        const tname = self.cur.ident;
+        try self.advance();
+        try self.expectOp('{');
+        var fields: std.ArrayListUnmanaged(ast.TypeField) = .empty;
+        while (!self.isOp('}')) {
+            if (self.cur != .ident) return error.ParseError;
+            const fname = self.cur.ident;
+            try self.advance();
+            try self.expectOp(':');
+            const annotation = try self.parseTypeAnnotation();
+            try fields.append(self.arena, .{ .name = fname, .annotation = annotation });
+            if (self.isOp(',') or self.isOp(';')) try self.advance();
+        }
+        try self.expectOp('}');
+        if (self.isOp(';')) try self.advance();
+        return .{ .type_decl = .{ .name = tname, .fields = try fields.toOwnedSlice(self.arena), .line = line, .col = col } };
+    }
+
+    /// `enum Name { A, B = 2, C }` (numeric) or `enum Name { Up = "up" }` (string).
+    fn parseEnumDecl(self: *Parser, line: u32, col: u32) CompileError!Stmt {
+        try self.advance(); // 'enum'
+        if (self.cur != .ident) return error.ParseError;
+        const ename = self.cur.ident;
+        try self.advance();
+        try self.expectOp('{');
+        var members: std.ArrayListUnmanaged(ast.EnumMember) = .empty;
+        var is_string = false;
+        var auto: i64 = 0;
+        while (!self.isOp('}')) {
+            if (self.cur != .ident) return error.ParseError;
+            const mname = self.cur.ident;
+            try self.advance();
+            var member: ast.EnumMember = .{ .name = mname };
+            if (self.isOp('=')) {
+                try self.advance();
+                if (self.cur == .num) {
+                    member.int_value = self.cur.num;
+                    auto = self.cur.num + 1;
+                    try self.advance();
+                } else if (self.cur == .str) {
+                    member.str_value = self.cur.str;
+                    is_string = true;
+                    try self.advance();
+                } else return error.ParseError;
+            } else {
+                member.int_value = auto;
+                auto += 1;
+            }
+            try members.append(self.arena, member);
+            if (self.isOp(',')) try self.advance() else break;
+        }
+        try self.expectOp('}');
+        if (self.isOp(';')) try self.advance();
+        return .{ .enum_decl = .{ .name = ename, .is_string = is_string, .members = try members.toOwnedSlice(self.arena), .line = line, .col = col } };
+    }
+
     fn parseFunctionDecl(self: *Parser, line: u32, col: u32) CompileError!Stmt {
         try self.advance();
         if (self.cur != .ident) return error.ParseError;
@@ -514,6 +625,8 @@ const Parser = struct {
         const kw = self.cur.ident;
 
         if (eq(u8, kw, "type")) return self.parseTypeDecl(line, col);
+        if (eq(u8, kw, "interface")) return self.parseInterfaceDecl(line, col);
+        if (eq(u8, kw, "enum")) return self.parseEnumDecl(line, col);
         if (eq(u8, kw, "function")) return self.parseFunctionDecl(line, col);
         if (eq(u8, kw, "switch")) return self.parseSwitch(line, col);
         if (eq(u8, kw, "class")) {
@@ -581,13 +694,24 @@ const Parser = struct {
             try self.expectOp('(');
             if (self.cur != .ident) return error.ParseError;
             const init_kw = self.cur.ident;
-            if (!eq(u8, init_kw, "let") and !eq(u8, init_kw, "var")) return error.ParseError;
+            const is_const = eq(u8, init_kw, "const");
+            if (!eq(u8, init_kw, "let") and !eq(u8, init_kw, "var") and !is_const) return error.ParseError;
             try self.advance();
             if (self.cur != .ident) return error.ParseError;
             const init_name = self.cur.ident;
             const init_line = self.cur_line;
             const init_col = self.cur_col;
             try self.advance();
+            // for...of: `for (const|let name of iterable) { ... }`
+            if (self.isKw("of")) {
+                try self.advance();
+                const iterable = try self.parseExpr();
+                try self.expectOp(')');
+                const body = try self.parseBlock();
+                return .{ .for_of_stmt = .{ .mutable = !is_const, .binding = init_name, .iterable = iterable, .body = body, .line = line, .col = col } };
+            }
+            // C-style for loops require a reassignable binding for the update step.
+            if (is_const) return error.ParseError;
             var annotation: ?[]const u8 = null;
             if (self.isOp(':')) {
                 try self.advance();
@@ -850,6 +974,11 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try emitExpr(inner, w, arena);
             try w.append(arena, ')');
         },
+        .bnot => |inner| {
+            try w.appendSlice(arena, "~(");
+            try emitExpr(inner, w, arena);
+            try w.append(arena, ')');
+        },
         .bin => |b| {
             if (b.op == '+' and b.checked_type != null and b.checked_type.? == .string) {
                 try w.appendSlice(arena, "(std.mem.concat(std.heap.page_allocator, u8, &.{ ");
@@ -870,6 +999,31 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try w.appendSlice(arena, ", ");
                 try emitExpr(b.r, w, arena);
                 try w.append(arena, ')');
+            } else if (b.op == 'L' or b.op == 'R') {
+                // Shifts: std.math.shl/shr handle the shift-amount cast for signed ints.
+                const ty = try types.zigName(arena, b.checked_type orelse .i32);
+                try w.print(arena, "std.math.{s}({s}, ", .{ if (b.op == 'L') "shl" else "shr", ty });
+                try emitExpr(b.l, w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(b.r, w, arena);
+                try w.append(arena, ')');
+            } else if (b.op == 'P') {
+                // Exponent: powi for integers, pow for floats.
+                const t = b.checked_type orelse .i32;
+                const ty = try types.zigName(arena, t);
+                if (t == .f64) {
+                    try w.print(arena, "std.math.pow({s}, ", .{ty});
+                    try emitExpr(b.l, w, arena);
+                    try w.appendSlice(arena, ", ");
+                    try emitExpr(b.r, w, arena);
+                    try w.append(arena, ')');
+                } else {
+                    try w.print(arena, "(std.math.powi({s}, ", .{ty});
+                    try emitExpr(b.l, w, arena);
+                    try w.appendSlice(arena, ", ");
+                    try emitExpr(b.r, w, arena);
+                    try w.appendSlice(arena, ") catch std.process.exit(1))");
+                }
             } else {
                 try w.append(arena, '(');
                 try emitExpr(b.l, w, arena);
@@ -920,7 +1074,19 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try w.appendSlice(arena, " }");
         },
         .field => |fa| {
-            if (fa.builtin == .length) {
+            if (fa.enum_value) |ev| {
+                switch (ev) {
+                    .int => |n| try w.print(arena, "{d}", .{n}),
+                    .str => |s| {
+                        try w.append(arena, '"');
+                        for (s) |ch| {
+                            if (ch == '"' or ch == '\\') try w.append(arena, '\\');
+                            try w.append(arena, ch);
+                        }
+                        try w.append(arena, '"');
+                    },
+                }
+            } else if (fa.builtin == .length) {
                 try w.appendSlice(arena, "@as(i64, @intCast(");
                 try emitExpr(fa.obj, w, arena);
                 try w.appendSlice(arena, ".len))");
@@ -944,6 +1110,7 @@ fn printFormat(t: types.Type) []const u8 {
     return switch (t) {
         .string, .string_literal_union => "{s}",
         .bool => "{}",
+        .enum_type => |e| if (e.is_string) "{s}" else "{d}",
         else => "{d}",
     };
 }
@@ -996,6 +1163,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
     if (options.runtime_locations) {
         const line_col: SourceLoc = switch (stmt.*) {
             .type_decl => |decl| .{ .line = decl.line, .col = decl.col },
+            .enum_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .function_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .var_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .assign => |assignment| .{ .line = assignment.line, .col = assignment.col },
@@ -1003,6 +1171,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             .while_stmt => |loop| .{ .line = loop.line, .col = loop.col },
             .do_while_stmt => |loop| .{ .line = loop.line, .col = loop.col },
             .for_stmt => |loop| .{ .line = loop.line, .col = loop.col },
+            .for_of_stmt => |loop| .{ .line = loop.line, .col = loop.col },
             .if_stmt => |branch| .{ .line = branch.line, .col = branch.col },
             .switch_stmt => |switch_stmt| .{ .line = switch_stmt.line, .col = switch_stmt.col },
             .return_stmt => |ret| .{ .line = ret.line, .col = ret.col },
@@ -1025,6 +1194,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             }
             try decls.appendSlice(arena, "};\n");
         },
+        .enum_decl => {}, // members are inlined as constants at each use site
         .function_decl => |decl| {
             const return_type = decl.checked_return_type orelse types.fromAnnotation(decl.return_annotation);
             try decls.print(arena, "fn {s}(", .{decl.name});
@@ -1077,6 +1247,30 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             try body.appendSlice(arena, ") : (");
             try emitAssignExpr(loop.update, body, arena);
             try body.appendSlice(arena, ") {\n");
+            for (loop.body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target, null, options);
+            try body.appendSlice(arena, "    }\n");
+            try body.appendSlice(arena, "    }\n");
+        },
+        .for_of_stmt => |loop| {
+            const iter_ty = loop.iter_type orelse return error.ParseError;
+            const elem_ty = loop.elem_type orelse return error.ParseError;
+            const seq = try std.fmt.allocPrint(arena, "__lumen_of_seq_{d}_{d}", .{ loop.line, loop.col });
+            const idx = try std.fmt.allocPrint(arena, "__lumen_of_idx_{d}_{d}", .{ loop.line, loop.col });
+            const binding = loop.binding_emit_name orelse loop.binding;
+            const elem_zig = try types.zigName(arena, elem_ty);
+            try body.appendSlice(arena, "    {\n");
+            try body.print(arena, "    const {s} = ", .{seq});
+            try emitExpr(loop.iterable, body, arena);
+            try body.appendSlice(arena, ";\n");
+            try body.print(arena, "    var {s}: usize = 0;\n", .{idx});
+            try body.print(arena, "    while ({s} < {s}.len) : ({s} += 1) {{\n", .{ idx, seq, idx });
+            // String iteration yields single-character substrings ([]const u8);
+            // array iteration yields the element directly.
+            if (types.isStringLike(iter_ty)) {
+                try body.print(arena, "    const {s}: {s} = {s}[{s} .. {s} + 1];\n", .{ binding, elem_zig, seq, idx, idx });
+            } else {
+                try body.print(arena, "    const {s}: {s} = {s}[{s}];\n", .{ binding, elem_zig, seq, idx });
+            }
             for (loop.body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, body, arena, throw_target, null, options);
             try body.appendSlice(arena, "    }\n");
             try body.appendSlice(arena, "    }\n");

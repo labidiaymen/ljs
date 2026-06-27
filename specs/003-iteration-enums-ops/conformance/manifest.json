@@ -1,0 +1,61 @@
+{
+  "feature": "003-iteration-enums-ops",
+  "cases": [
+    {
+      "id": "iter.valid.for-of",
+      "source": "../examples/valid/for-of.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "60\na\nb\nc\n40"
+      }
+    },
+    {
+      "id": "iter.invalid.for-of-noniterable",
+      "source": "../examples/invalid/for-of-noniterable.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "enum.valid.enums",
+      "source": "../examples/valid/enums.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "1\ngreen\nup\nup-match"
+      }
+    },
+    {
+      "id": "enum.invalid.raw-assign",
+      "source": "../examples/invalid/enum-raw-assign.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    },
+    {
+      "id": "iface.valid.interface",
+      "source": "../examples/valid/interface.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "ada\n1"
+      }
+    },
+    {
+      "id": "ops.valid.bitwise-exp",
+      "source": "../examples/valid/bitwise-exp.ts",
+      "phase": "compile-run",
+      "expect": {
+        "stdout": "1\n7\n5\n16\n5\n1024\n-13"
+      }
+    },
+    {
+      "id": "ops.invalid.bitwise-float",
+      "source": "../examples/invalid/bitwise-float.ts",
+      "phase": "diagnostics",
+      "expect": {
+        "diagnostic": "E_TYPE_MISMATCH"
+      }
+    }
+  ]
+}

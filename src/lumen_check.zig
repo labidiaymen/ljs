@@ -16,6 +16,11 @@ const FunctionInfo = struct {
     return_type: types.Type,
 };
 
+const EnumInfo = struct {
+    is_string: bool,
+    members: []ast.EnumMember,
+};
+
 const Binding = struct {
     ty: types.Type,
     mutable: bool,
@@ -29,6 +34,7 @@ const Checker = struct {
     arena: std.mem.Allocator,
     scopes: std.ArrayListUnmanaged(Scope) = .empty,
     type_decls: std.StringHashMapUnmanaged(TypeDeclInfo) = .empty,
+    enums: std.StringHashMapUnmanaged(EnumInfo) = .empty,
     funcs: std.StringHashMapUnmanaged(FunctionInfo) = .empty,
     next_binding_id: u32 = 0,
     current_return_type: ?types.Type = null,
@@ -125,6 +131,9 @@ const Checker = struct {
     }
 
     fn typeFromAnnotation(self: *Checker, annotation: []const u8, line: u32, col: u32) CompileError!types.Type {
+        if (self.enums.get(annotation)) |einfo| {
+            return .{ .enum_type = .{ .name = annotation, .is_string = einfo.is_string } };
+        }
         if (self.type_decls.get(annotation)) |decl| {
             if (decl.string_literals != null) return .{ .string_literal_union = annotation };
         }
@@ -147,6 +156,13 @@ const Checker = struct {
         try self.pushScope();
         for (program.stmts) |*stmt| {
             if (stmt.* == .type_decl) try self.declareType(stmt.type_decl.name, stmt.type_decl.fields, stmt.type_decl.string_literals, stmt.type_decl.line, stmt.type_decl.col);
+        }
+        for (program.stmts) |*stmt| {
+            if (stmt.* == .enum_decl) {
+                const e = stmt.enum_decl;
+                if (self.enums.get(e.name) != null or self.type_decls.get(e.name) != null) return self.fail(e.line, e.col, "E_DUPLICATE_BINDING");
+                self.enums.put(self.arena, e.name, .{ .is_string = e.is_string, .members = e.members }) catch return error.OutOfMemory;
+            }
         }
         for (program.stmts) |*stmt| {
             if (stmt.* == .function_decl) try self.declareFunction(&stmt.function_decl);
@@ -203,6 +219,8 @@ const Checker = struct {
                     field.checked_type = try self.typeFromAnnotation(field.annotation, decl.line, decl.col);
                 }
             },
+            .enum_decl => {}, // registered during the hoisting pre-pass
+
             .function_decl => |*decl| {
                 if (self.nested_stmt_depth > 0) return self.fail(decl.line, decl.col, "E_UNSUPPORTED_NESTED_FUNCTION");
                 if (decl.checked_return_type == null) try self.declareFunction(decl);
@@ -284,6 +302,27 @@ const Checker = struct {
                 try self.checkStmt(program, &update_stmt);
                 loop.init = init_stmt.var_decl;
                 loop.update = update_stmt.assign;
+            },
+            .for_of_stmt => |*loop| {
+                const iter_type = self.exprType(program, loop.iterable, loop.line, loop.col) orelse
+                    return self.inferenceFail(loop.line, loop.col, "cannot infer for-of iterable type");
+                const elem_type: types.Type = if (types.isArray(iter_type))
+                    (types.arrayElem(iter_type) orelse return self.fail(loop.line, loop.col, "E_TYPE_MISMATCH"))
+                else if (types.isStringLike(iter_type))
+                    .string
+                else
+                    return self.fail(loop.line, loop.col, "E_TYPE_MISMATCH");
+                loop.iter_type = iter_type;
+                loop.elem_type = elem_type;
+                try self.pushScope();
+                defer self.popScope();
+                const scope = self.currentScope();
+                const emit_name = try self.freshEmitName(loop.binding);
+                loop.binding_emit_name = emit_name;
+                scope.put(self.arena, loop.binding, .{ .ty = elem_type, .mutable = loop.mutable, .emit_name = emit_name }) catch return error.OutOfMemory;
+                self.loop_depth += 1;
+                defer self.loop_depth -= 1;
+                try self.checkBlock(program, loop.body);
             },
             .if_stmt => |*branch| {
                 const cond_type = self.exprType(program, branch.cond, branch.line, branch.col) orelse
@@ -423,12 +462,29 @@ const Checker = struct {
                 }
                 return .bool;
             },
+            .bnot => |inner| {
+                const inner_type = self.exprType(program, inner, line, col) orelse return null;
+                if (!types.isInteger(inner_type)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+                return inner_type;
+            },
             .bin => |*bin| {
                 const left_type = self.exprType(program, bin.l, line, col) orelse return null;
                 const right_type = self.exprType(program, bin.r, line, col) orelse return null;
                 if (bin.op == '+' and types.same(.string, left_type) and types.same(.string, right_type)) {
                     bin.checked_type = .string;
                     return .string;
+                }
+                // Bitwise and shift operators require integer operands.
+                if (bin.op == '&' or bin.op == '|' or bin.op == '^' or bin.op == 'L' or bin.op == 'R') {
+                    if (!types.isInteger(left_type) or !types.isInteger(right_type) or !types.same(left_type, right_type)) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                    bin.checked_type = left_type;
+                    return left_type;
                 }
                 if (!types.isNumeric(left_type) or !types.same(left_type, right_type)) {
                     _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
@@ -450,6 +506,14 @@ const Checker = struct {
                 const left_type = self.exprType(program, cmp.l, line, col) orelse return null;
                 const right_type = self.exprType(program, cmp.r, line, col) orelse return null;
                 if ((std.mem.eql(u8, cmp.op, "==") or std.mem.eql(u8, cmp.op, "!=")) and types.isStringLike(left_type) and types.isStringLike(right_type)) {
+                    cmp.checked_operand_type = .string;
+                    return .bool;
+                }
+                // String-backed enum equality uses content comparison.
+                if ((std.mem.eql(u8, cmp.op, "==") or std.mem.eql(u8, cmp.op, "!=")) and
+                    left_type == .enum_type and right_type == .enum_type and
+                    std.mem.eql(u8, left_type.enum_type.name, right_type.enum_type.name) and left_type.enum_type.is_string)
+                {
                     cmp.checked_operand_type = .string;
                     return .bool;
                 }
@@ -497,6 +561,20 @@ const Checker = struct {
                 };
             },
             .field => |*field| {
+                // Enum member access: `EnumName.Member` resolves to the enum type
+                // and carries the member's backing value for emission.
+                if (field.obj.* == .var_ref) {
+                    if (self.enums.get(field.obj.var_ref.name)) |einfo| {
+                        for (einfo.members) |m| {
+                            if (std.mem.eql(u8, m.name, field.name)) {
+                                field.enum_value = if (einfo.is_string) .{ .str = m.str_value orelse "" } else .{ .int = m.int_value };
+                                return .{ .enum_type = .{ .name = field.obj.var_ref.name, .is_string = einfo.is_string } };
+                            }
+                        }
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                }
                 const obj_type = self.exprType(program, field.obj, line, col) orelse return null;
                 if ((types.isStringLike(obj_type) or types.isArray(obj_type)) and std.mem.eql(u8, field.name, "length")) {
                     field.builtin = .length;

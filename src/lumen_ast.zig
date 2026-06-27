@@ -4,6 +4,22 @@ pub const FieldInit = struct { name: []const u8, value: *Expr };
 
 pub const TypeField = struct { name: []const u8, annotation: []const u8, checked_type: ?types.Type = null };
 
+pub const EnumValue = union(enum) { int: i64, str: []const u8 };
+
+pub const EnumMember = struct {
+    name: []const u8,
+    int_value: i64 = 0,
+    str_value: ?[]const u8 = null,
+};
+
+pub const EnumDecl = struct {
+    name: []const u8,
+    is_string: bool = false,
+    members: []EnumMember,
+    line: u32,
+    col: u32,
+};
+
 pub const TypeDecl = struct {
     name: []const u8,
     fields: []TypeField = &.{},
@@ -80,6 +96,18 @@ pub const ForStmt = struct {
     col: u32,
 };
 
+pub const ForOfStmt = struct {
+    mutable: bool,
+    binding: []const u8,
+    binding_emit_name: ?[]const u8 = null,
+    iterable: *Expr,
+    iter_type: ?types.Type = null,
+    elem_type: ?types.Type = null,
+    body: []Stmt,
+    line: u32,
+    col: u32,
+};
+
 pub const IfStmt = struct {
     cond: *Expr,
     then_body: []Stmt,
@@ -148,6 +176,7 @@ pub const StaticCall = struct {
 
 pub const Stmt = union(enum) {
     type_decl: TypeDecl,
+    enum_decl: EnumDecl,
     function_decl: FunctionDecl,
     var_decl: VarDecl,
     assign: Assign,
@@ -155,6 +184,7 @@ pub const Stmt = union(enum) {
     while_stmt: WhileStmt,
     do_while_stmt: DoWhileStmt,
     for_stmt: ForStmt,
+    for_of_stmt: ForOfStmt,
     if_stmt: IfStmt,
     switch_stmt: SwitchStmt,
     return_stmt: ReturnStmt,
@@ -183,12 +213,13 @@ pub const Expr = union(enum) {
     var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null },
     neg: *Expr,
     not: *Expr,
-    bin: struct { op: u8, l: *Expr, r: *Expr, checked_type: ?types.Type = null }, // + - * / %
+    bnot: *Expr, // bitwise ~
+    bin: struct { op: u8, l: *Expr, r: *Expr, checked_type: ?types.Type = null }, // + - * / % & | ^ and L=<< R=>> P=**
     bool_bin: struct { op: []const u8, l: *Expr, r: *Expr }, // && ||
     cmp: struct { op: []const u8, l: *Expr, r: *Expr, checked_operand_type: ?types.Type = null }, // < > <= >= == !=
     ternary: struct { cond: *Expr, then_expr: *Expr, else_expr: *Expr },
     obj: []FieldInit,
-    field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null },
+    field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null, enum_value: ?EnumValue = null },
     index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null },
     call: struct { name: []const u8, args: []*Expr }, // builtin call, e.g. httpGet(url) / serve(port, body)
     static_call: StaticCall,

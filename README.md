@@ -24,6 +24,9 @@ uses TypeScript syntax, but with compiled static semantics:
   `_` separators
 - `//` line and `/* ... */` block comments
 - `===`/`!==` accepted (equivalent to `==`/`!=` under static typing)
+- `for...of` over arrays and strings
+- `enum` (numeric and string), `interface` (object-type synonym)
+- bitwise `& | ^ ~ << >>` and exponent `**` operators (integers)
 - no prototypes, `eval`, CommonJS, package.json resolution, or dynamic object
   mutation
 - native binary output through generated Zig

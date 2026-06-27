@@ -85,10 +85,13 @@ pub const Lexer = struct {
             return .{ .cmp = s };
         }
         if (c == '&') {
-            if (self.i + 1 >= self.src.len or self.src[self.i + 1] != c) return error.ParseError;
-            const s = self.src[self.i .. self.i + 2];
-            self.i += 2;
-            return .{ .cmp = s };
+            if (self.i + 1 < self.src.len and self.src[self.i + 1] == '&') {
+                const s = self.src[self.i .. self.i + 2];
+                self.i += 2;
+                return .{ .cmp = s };
+            }
+            self.i += 1;
+            return .{ .op = '&' }; // bitwise and
         }
         if ((c == '+' or c == '-' or c == '*' or c == '/' or c == '%') and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
             const s = self.src[self.i .. self.i + 2];
@@ -96,6 +99,17 @@ pub const Lexer = struct {
             return .{ .op2 = s };
         }
         if ((c == '+' or c == '-') and self.i + 1 < self.src.len and self.src[self.i + 1] == c) {
+            const s = self.src[self.i .. self.i + 2];
+            self.i += 2;
+            return .{ .op2 = s };
+        }
+        // `**` exponent and `<<`/`>>` shifts are two-char operator tokens.
+        if (c == '*' and self.i + 1 < self.src.len and self.src[self.i + 1] == '*') {
+            const s = self.src[self.i .. self.i + 2];
+            self.i += 2;
+            return .{ .op2 = s };
+        }
+        if ((c == '<' or c == '>') and self.i + 1 < self.src.len and self.src[self.i + 1] == c) {
             const s = self.src[self.i .. self.i + 2];
             self.i += 2;
             return .{ .op2 = s };
@@ -137,7 +151,7 @@ pub const Lexer = struct {
             return .{ .str = s };
         }
         switch (c) {
-            '+', '-', '*', '/', '%', '?', '(', ')', '[', ']', ';', ',', '.', ':', '{', '}' => {
+            '+', '-', '*', '/', '%', '?', '(', ')', '[', ']', ';', ',', '.', ':', '{', '}', '^', '~' => {
                 self.i += 1;
                 return .{ .op = c };
             },
