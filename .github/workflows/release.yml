@@ -60,7 +60,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Build-time Zig comes from the self-hosted runner's PATH (expected 0.16.0).
+      # Provide a host Zig for building (don't rely on the runner's PATH).
+      - name: Set up host Zig
+        run: |
+          host_arch=$(uname -m)
+          case "$host_arch" in
+            x86_64|amd64) za=x86_64 ;;
+            aarch64|arm64) za=aarch64 ;;
+            *) echo "unsupported host arch: $host_arch"; exit 1 ;;
+          esac
+          hz="zig-${za}-linux-${ZIG_VERSION}"
+          curl -fSL "https://ziglang.org/download/${ZIG_VERSION}/${hz}.tar.xz" -o hostzig.tar.xz
+          mkdir -p hostzig
+          tar -xf hostzig.tar.xz -C hostzig
+          echo "$PWD/hostzig/${hz}" >> "$GITHUB_PATH"
+
       - name: Show Zig version
         run: zig version
 
