@@ -10,28 +10,35 @@
 <body>
 
 <nav><div class="wrap">
-  <span class="brand">Lumen<span class="dot">.</span></span>
+  <a class="brand" href="index.html">Lumen<span class="dot">.</span></a>
   <span class="links">
     <a href="#features">Features</a>
     <a href="examples.html">Examples</a>
     <a href="stdlib.html">Stdlib</a>
-    <a href="#quickstart">Quickstart</a>
+    <a href="#quickstart">Install</a>
+    <a href="https://github.com/labidiaymen/ljs">GitHub</a>
   </span>
 </div></nav>
 
 <header class="hero">
-  <h1>TypeScript syntax.<br><span class="glow">Native speed.</span></h1>
-  <p class="tag">Lumen is a statically&#8209;typed, compiled language. You write TypeScript&#8209;style
-  source; it type&#8209;checks and compiles straight to a small native binary.</p>
-  <div class="pipeline">
-    <span>.ts source</span><span class="arrow">→</span>
-    <span>type check</span><span class="arrow">→</span>
-    <span>optimize</span><span class="arrow">→</span>
-    <span>native binary</span>
-  </div>
-  <div>
-    <a class="btn primary" href="#quickstart">Get started</a>
-    <a class="btn ghost" href="examples.html">See examples</a>
+  <div class="wrap">
+    <h1>TypeScript syntax.<br><span class="glow">Native speed.</span></h1>
+    <p class="tag">A statically&#8209;typed, compiled language with TypeScript syntax. Write
+    familiar source; it type&#8209;checks and compiles straight to a small, fast native binary.</p>
+    <div class="cta">
+      <a class="btn primary" href="#quickstart">Get started</a>
+      <a class="btn ghost" href="examples.html">See examples</a>
+    </div>
+    <div class="install-row">
+      <code id="install-cmd">curl -fsSL https://raw.githubusercontent.com/labidiaymen/ljs/main/install.sh | sh</code>
+      <button class="copy" data-copy="install-cmd" aria-label="Copy install command">Copy</button>
+    </div>
+    <div class="pipeline">
+      <span>.ts source</span><span class="arrow">→</span>
+      <span>type check</span><span class="arrow">→</span>
+      <span>optimize</span><span class="arrow">→</span>
+      <span>native binary</span>
+    </div>
   </div>
 </header>
 
@@ -149,10 +156,27 @@ console.log(rectangle_area(6, 7));   // 42</code></pre>
 </section>
 
 <footer><div class="wrap">
-  Lumen — a compiled TypeScript-syntax language.<br>
-  <a href="examples.html">Examples</a> · <a href="stdlib.html">Standard library</a>
+  <span class="brand">Lumen<span class="dot">.</span></span>
+  <p>A compiled TypeScript-syntax language.</p>
+  <p class="footlinks">
+    <a href="examples.html">Examples</a> ·
+    <a href="stdlib.html">Standard library</a> ·
+    <a href="https://github.com/labidiaymen/ljs">GitHub</a> ·
+    <a href="https://github.com/labidiaymen/ljs/releases">Releases</a>
+  </p>
 </div></footer>
 
 <script src="highlight.js"></script>
+<script>
+  document.querySelectorAll(".copy").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var el = document.getElementById(b.dataset.copy);
+      navigator.clipboard.writeText(el.textContent).then(function () {
+        var t = b.textContent; b.textContent = "Copied"; b.classList.add("ok");
+        setTimeout(function () { b.textContent = t; b.classList.remove("ok"); }, 1400);
+      });
+    });
+  });
+</script>
 </body>
 </html>

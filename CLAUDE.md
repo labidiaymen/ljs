@@ -7,6 +7,11 @@ Active stack: Zig 0.16.0, Spec Kit, existing `src/lumen_compiler.zig` prototype.
 Active product goal: TypeScript syntax -> generated Zig -> native binary.
 <!-- SPECKIT END -->
 
+## Commit Conventions
+
+Do NOT add `Co-Authored-By:` trailers (or any AI/assistant attribution) to commit
+messages. Write plain commit messages with no co-author lines.
+
 ## Project Direction
 
 This branch is no longer driven by Test262 or ECMAScript engine conformance.
