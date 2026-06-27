@@ -1,0 +1,11 @@
+{
+  "feature": "007-defer",
+  "cases": [
+    {
+      "id": "defer.valid.defer",
+      "source": "../examples/valid/defer.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "work\nb\na\nbody\nx\ny" }
+    }
+  ]
+}

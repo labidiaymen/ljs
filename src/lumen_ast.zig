@@ -182,6 +182,12 @@ pub const ControlStmt = struct {
     col: u32,
 };
 
+pub const DeferStmt = struct {
+    body: []Stmt,
+    line: u32,
+    col: u32,
+};
+
 pub const StaticCall = struct {
     namespace: []const u8,
     name: []const u8,
@@ -209,6 +215,7 @@ pub const Stmt = union(enum) {
     try_stmt: TryStmt,
     break_stmt: ControlStmt,
     continue_stmt: ControlStmt,
+    defer_stmt: DeferStmt,
     expr_stmt: ExprStmt,
 };
 

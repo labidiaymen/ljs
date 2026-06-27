@@ -1005,6 +1005,17 @@ const Parser = struct {
             return .{ .throw_stmt = .{ .value = value, .line = line, .col = col } };
         }
 
+        if (eq(u8, kw, "defer")) {
+            try self.advance();
+            if (self.isOp('{')) {
+                const body = try self.parseBlock();
+                return .{ .defer_stmt = .{ .body = body, .line = line, .col = col } };
+            }
+            const single = try self.arena.alloc(Stmt, 1);
+            single[0] = try self.parseStmt();
+            return .{ .defer_stmt = .{ .body = single, .line = line, .col = col } };
+        }
+
         if (eq(u8, kw, "try")) {
             try self.advance();
             const try_body = try self.parseBlock();
@@ -1473,6 +1484,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             .try_stmt => |try_stmt| .{ .line = try_stmt.line, .col = try_stmt.col },
             .break_stmt => |control| .{ .line = control.line, .col = control.col },
             .continue_stmt => |control| .{ .line = control.line, .col = control.col },
+            .defer_stmt => |d| .{ .line = d.line, .col = d.col },
             .expr_stmt => |expr_stmt| .{ .line = expr_stmt.line, .col = expr_stmt.col },
         };
         try body.print(arena, "    __lumen_line = {d}; __lumen_col = {d};\n", .{ line_col.line, line_col.col });
@@ -1653,6 +1665,11 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             if (try_stmt.finally_body) |finally_body| {
                 for (finally_body) |*finally_stmt| try emitStmtWithThrow(finally_stmt, decls, body, arena, throw_target, switch_break_target, options);
             }
+        },
+        .defer_stmt => |d| {
+            try body.appendSlice(arena, "    defer {\n");
+            for (d.body) |*defer_stmt| try emitStmtWithThrow(defer_stmt, decls, body, arena, throw_target, switch_break_target, options);
+            try body.appendSlice(arena, "    }\n");
         },
         .break_stmt => {
             if (switch_break_target) |target| {

@@ -504,6 +504,9 @@ const Checker = struct {
                     try self.checkBlock(program, finally_body);
                 }
             },
+            .defer_stmt => |*d| {
+                try self.checkBlock(program, d.body);
+            },
             .break_stmt => |control| {
                 if (self.loop_depth == 0 and self.switch_depth == 0) return self.fail(control.line, control.col, "E_BREAK_OUTSIDE_LOOP");
             },

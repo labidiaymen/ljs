@@ -31,6 +31,9 @@ uses TypeScript syntax, but with compiled static semantics:
   `??` nullish coalescing, `?.` optional chaining, `if (x != null)` narrowing
 - numeric literal unions (`type Code = 200 | 404`), array/object destructuring
   (`let [a, b] = …`, `let { x, y } = …`), template literals (`` `hi ${name}` ``)
+- first-class functions: function types `(x: int) => int`, named functions as
+  values, arrow functions (`(x: int) => x*2`)
+- `defer` (Zig-style scope-exit, LIFO)
 - no prototypes, `eval`, CommonJS, package.json resolution, or dynamic object
   mutation
 - native binary output through generated Zig
