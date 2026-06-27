@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Standard library — Lumen</title>
-<meta name="description" content="The Lumen V1 standard library: console, Math, String, Array, errors, files, and process args.">
+<meta name="description" content="The Lumen standard library: console, Math, String, Array, fs, path, process, os and more — familiar APIs, statically typed, compiled.">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -24,62 +24,127 @@
 
 <section class="wrap">
   <h2>Standard library</h2>
-  <p class="sub">A small, explicit standard library. Every member is statically typed and
-  arity-checked before it lowers to native code.</p>
+  <p class="sub">Familiar, conventional APIs — the names you already know
+  (<code>fs.readFileSync</code>, <code>path.join</code>, <code>process.cwd</code>) —
+  but statically typed and compiled to native code. Every member is type- and
+  arity-checked before it lowers.</p>
 
-  <h3>console</h3>
+  <h3>Available now</h3>
+
+  <h4>console</h4>
   <table>
-    <tr><th>API</th><th>Type</th><th>Notes</th></tr>
-    <tr><td><code>console.log(x)</code></td><td>any → void</td><td>Prints the value using its checked type.</td></tr>
-    <tr><td><code>console.error(x)</code></td><td>any → void</td><td>Prints to standard error.</td></tr>
+    <tr><th>API</th><th>Type</th></tr>
+    <tr><td><code>console.log(x)</code></td><td>any → void</td></tr>
+    <tr><td><code>console.error(x)</code></td><td>any → void</td></tr>
   </table>
 
-  <h3>Math</h3>
+  <h4>Math</h4>
   <table>
     <tr><th>API</th><th>Type</th></tr>
     <tr><td><code>Math.abs(n)</code></td><td>number → number</td></tr>
-    <tr><td><code>Math.max(a, b)</code> / <code>Math.min(a, b)</code></td><td>(number, number) → number</td></tr>
+    <tr><td><code>Math.max(a, b)</code> · <code>Math.min(a, b)</code></td><td>(number, number) → number</td></tr>
     <tr><td><code>Math.sign(n)</code></td><td>number → int</td></tr>
     <tr><td><code>Math.clamp(n, lo, hi)</code></td><td>(number, number, number) → number</td></tr>
     <tr><td><code>Math.sqrt(n)</code></td><td>number → number</td></tr>
   </table>
 
-  <h3>String</h3>
+  <h4>String</h4>
   <table>
     <tr><th>API</th><th>Type</th></tr>
-    <tr><td><code>s.length</code></td><td>int</td></tr>
-    <tr><td><code>s + t</code></td><td>string concatenation</td></tr>
+    <tr><td><code>s.length</code> · <code>s + t</code></td><td>int · concatenation</td></tr>
     <tr><td><code>String.isEmpty(s)</code></td><td>string → bool</td></tr>
     <tr><td><code>String.contains(s, sub)</code></td><td>(string, string) → bool</td></tr>
     <tr><td><code>String.startsWith(s, prefix)</code></td><td>(string, string) → bool</td></tr>
   </table>
 
-  <h3>Array</h3>
+  <h4>Array</h4>
   <table>
     <tr><th>API</th><th>Type</th></tr>
-    <tr><td><code>a[i]</code></td><td>element access (integer index)</td></tr>
-    <tr><td><code>a.length</code></td><td>int</td></tr>
+    <tr><td><code>a[i]</code> · <code>a.length</code></td><td>element access · int</td></tr>
     <tr><td><code>Array.isEmpty(a)</code></td><td>T[] → bool</td></tr>
   </table>
 
-  <h3>Errors</h3>
+  <h4>Errors</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
-    <tr><td><code>Error("message")</code></td><td>Constructs an error value.</td></tr>
-    <tr><td><code>throw e</code></td><td>Throws an Error value.</td></tr>
-    <tr><td><code>try { … } catch (e) { … } finally { … }</code></td><td><code>e.message</code> is the thrown message.</td></tr>
+    <tr><td><code>Error("message")</code> · <code>throw e</code></td><td>throw an error value</td></tr>
+    <tr><td><code>try { … } catch (e) { … } finally { … }</code></td><td><code>e.message</code> holds the message</td></tr>
   </table>
 
-  <h3>Files &amp; process</h3>
+  <h4>fs · process</h4>
   <table>
     <tr><th>API</th><th>Type</th><th>Notes</th></tr>
-    <tr><td><code>fs.readFileSync(path, encoding?)</code></td><td>(string, string?) → string</td><td>UTF-8 text; empty string if unreadable.</td></tr>
-    <tr><td><code>argsCount()</code></td><td>→ int</td><td>Number of native arguments.</td></tr>
-    <tr><td><code>arg(i)</code></td><td>int → string</td><td>Argument at index, or "" if absent.</td></tr>
+    <tr><td><code>fs.readFileSync(path, encoding?)</code></td><td>(string, string?) → string</td><td>UTF-8 text; "" if unreadable</td></tr>
+    <tr><td><code>argsCount()</code> · <code>arg(i)</code></td><td>→ int · int → string</td><td>process arguments</td></tr>
   </table>
 
-  <p class="note">V1 is intentionally small. The surface grows in explicit,
-  conformance-backed slices rather than inheriting an entire runtime.</p>
+  <h3>Planned</h3>
+  <p class="sub">The surface grows in explicit, conformance-backed slices. These
+  modules use the same conventional names; some depend on upcoming language
+  features (noted below).</p>
+
+  <h4>fs</h4>
+  <table>
+    <tr><th>API</th><th>Notes</th></tr>
+    <tr><td><code>fs.writeFileSync(path, data)</code></td><td></td></tr>
+    <tr><td><code>fs.appendFileSync(path, data)</code></td><td></td></tr>
+    <tr><td><code>fs.existsSync(path)</code></td><td>→ bool</td></tr>
+    <tr><td><code>fs.mkdirSync(path, recursive?)</code></td><td></td></tr>
+    <tr><td><code>fs.rmSync(path)</code> · <code>fs.unlinkSync(path)</code></td><td></td></tr>
+    <tr><td><code>fs.renameSync(a, b)</code> · <code>fs.copyFileSync(a, b)</code></td><td></td></tr>
+    <tr><td><code>fs.statSync(path)</code> → <code>{ size, isFile, isDirectory }</code></td><td>record return</td></tr>
+    <tr><td><code>fs.readdirSync(path)</code> → <code>string[]</code></td><td>needs growable arrays</td></tr>
+  </table>
+
+  <h4>path</h4>
+  <table>
+    <tr><th>API</th><th>Notes</th></tr>
+    <tr><td><code>path.join(a, b, …)</code> · <code>path.resolve(…)</code></td><td></td></tr>
+    <tr><td><code>path.basename(p)</code> · <code>path.dirname(p)</code> · <code>path.extname(p)</code></td><td></td></tr>
+    <tr><td><code>path.isAbsolute(p)</code> · <code>path.sep</code></td><td></td></tr>
+  </table>
+
+  <h4>process</h4>
+  <table>
+    <tr><th>API</th><th>Notes</th></tr>
+    <tr><td><code>process.cwd()</code></td><td>→ string</td></tr>
+    <tr><td><code>process.exit(code)</code></td><td></td></tr>
+    <tr><td><code>process.env(key)</code></td><td>→ string | null</td></tr>
+    <tr><td><code>process.platform</code> · <code>process.arch</code></td><td>compile-time constants</td></tr>
+    <tr><td><code>process.argv</code> → <code>string[]</code></td><td>needs growable arrays</td></tr>
+  </table>
+
+  <h4>os</h4>
+  <table>
+    <tr><th>API</th><th>Notes</th></tr>
+    <tr><td><code>os.platform()</code> · <code>os.arch()</code></td><td></td></tr>
+    <tr><td><code>os.tmpdir()</code> · <code>os.homedir()</code></td><td></td></tr>
+    <tr><td><code>os.cpus()</code> · <code>os.hostname()</code></td><td></td></tr>
+  </table>
+
+  <h4>Math · String · Array (more)</h4>
+  <table>
+    <tr><th>API</th><th>Notes</th></tr>
+    <tr><td><code>Math.floor/ceil/round/trunc/pow/log/sin/cos</code> · <code>Math.PI</code></td><td></td></tr>
+    <tr><td><code>s.toUpperCase/toLowerCase/trim/replace/indexOf/slice</code></td><td></td></tr>
+    <tr><td><code>s.split(sep)</code> → <code>string[]</code></td><td>needs growable arrays</td></tr>
+    <tr><td><code>a.map/filter/reduce/forEach(fn)</code></td><td>uses closures</td></tr>
+    <tr><td><code>a.push/pop/sort</code></td><td>needs growable arrays</td></tr>
+  </table>
+
+  <h4>time · crypto · http</h4>
+  <table>
+    <tr><th>API</th><th>Notes</th></tr>
+    <tr><td><code>time.now()</code> · <code>time.monotonic()</code></td><td>milliseconds</td></tr>
+    <tr><td><code>crypto.sha256(data)</code> · <code>crypto.sha1(data)</code></td><td>→ hex string</td></tr>
+    <tr><td><code>http.get(url)</code> → <code>{ status, body }</code></td><td>record return</td></tr>
+    <tr><td>async <code>fs</code> / <code>http</code> / timers</td><td>needs the async runtime</td></tr>
+  </table>
+
+  <p class="note">Lumen is statically typed and has no dynamic <code>JSON</code> value —
+  <code>JSON.parse&lt;T&gt;</code> and generic containers (<code>Map</code>,
+  <code>Set</code>) arrive with generics. This is not a package manager; the
+  library is a fixed, contracted surface.</p>
 </section>
 
 <footer><div class="wrap">
