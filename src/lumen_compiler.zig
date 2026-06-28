@@ -254,9 +254,30 @@ const Parser = struct {
         return buf.items;
     }
 
+    /// Tuple type annotation `[A, B, ...]`, encoded canonically as `[A,B,...]`
+    /// for the checker to parse.
+    fn parseTupleType(self: *Parser) CompileError![]const u8 {
+        try self.expectOp('[');
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        try buf.append(self.arena, '[');
+        var first = true;
+        while (!self.isOp(']')) {
+            const elem = try self.parseTypeAnnotation();
+            if (!first) try buf.append(self.arena, ',');
+            try buf.appendSlice(self.arena, elem);
+            first = false;
+            if (self.isOp(',')) try self.advance() else break;
+        }
+        try self.expectOp(']');
+        if (first) return error.ParseError; // `[]` is not a tuple
+        try buf.append(self.arena, ']');
+        return buf.items;
+    }
+
     fn parseTypeAnnotation(self: *Parser) CompileError![]const u8 {
         const eq = std.mem.eql;
         if (self.isOp('(')) return self.parseFunctionType();
+        if (self.isOp('[')) return self.parseTupleType();
         var base = try self.parseTypeMember();
         var optional = false;
         while (self.isCmp("|")) {
@@ -1606,6 +1627,16 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             }
             try w.appendSlice(arena, " }");
         },
+        .tuple_lit => |t| {
+            // A positional struct literal `.{ .@"0" = a, .@"1" = b, ... }`.
+            try w.appendSlice(arena, ".{ ");
+            for (t.items, 0..) |item, i| {
+                if (i > 0) try w.appendSlice(arena, ", ");
+                try w.print(arena, ".@\"{d}\" = ", .{i});
+                try emitExpr(item, w, arena);
+            }
+            try w.appendSlice(arena, " }");
+        },
         .call => |cl| {
             // builtins lower to a Zig std wrapper taking (__io, __alloc, args...).
             if (std.mem.eql(u8, cl.name, "Error")) {
@@ -1848,6 +1879,12 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
         },
         .this_expr => try w.appendSlice(arena, "self"),
         .new_expr => |ne| {
+            if (ne.container_type) |ct| {
+                // Map/Set: allocate the generic container on the heap.
+                const tname = (try types.zigName(arena, ct))[1..]; // strip leading '*'
+                try w.print(arena, "{s}.__init()", .{tname});
+                return;
+            }
             try w.print(arena, "{s}.__init(", .{ne.class_name});
             for (ne.args, 0..) |arg, i| {
                 if (i > 0) try w.appendSlice(arena, ", ");
@@ -1858,6 +1895,15 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
         .method_call => |mc| {
             if (mc.string_method) {
                 try emitStringMethod(mc, w, arena);
+            } else if (mc.container_type != null) {
+                // Map/Set method: dispatch directly to the runtime container method.
+                try emitExpr(mc.obj, w, arena);
+                try w.print(arena, ".{s}(", .{mc.name});
+                for (mc.args, 0..) |arg, i| {
+                    if (i > 0) try w.appendSlice(arena, ", ");
+                    try emitExpr(arg, w, arena);
+                }
+                try w.append(arena, ')');
             } else if (mc.array_result_type != null) {
                 try emitArrayMethod(mc, w, arena);
             } else if (mc.is_static) {
@@ -1988,6 +2034,9 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try w.appendSlice(arena, "@as(i64, @intCast(");
                 try emitExpr(fa.obj, w, arena);
                 try w.appendSlice(arena, ".len))");
+            } else if (fa.builtin == .container_size) {
+                try emitExpr(fa.obj, w, arena);
+                try w.appendSlice(arena, ".size()");
             } else if (fa.builtin == .error_message) {
                 try emitExpr(fa.obj, w, arena);
             } else if (fa.is_static) {
@@ -2004,6 +2053,12 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             }
         },
         .index => |idx| {
+            if (idx.tuple_index) |pos| {
+                // Tuple positional access -> struct field `t.@"N"`.
+                try emitExpr(idx.obj, w, arena);
+                try w.print(arena, ".@\"{d}\"", .{pos});
+                return;
+            }
             try emitExpr(idx.obj, w, arena);
             try w.appendSlice(arena, "[@as(usize, @intCast(");
             try emitExpr(idx.value, w, arena);
@@ -2348,6 +2403,10 @@ fn exprUsesName(e: *const Expr, name: []const u8) bool {
             for (items) |it| if (exprUsesName(it, name)) break :blk true;
             break :blk false;
         },
+        .tuple_lit => |t| blk: {
+            for (t.items) |it| if (exprUsesName(it, name)) break :blk true;
+            break :blk false;
+        },
         .neg, .not, .bnot => |inner| exprUsesName(inner, name),
         .bin => |b| exprUsesName(b.l, name) or exprUsesName(b.r, name),
         .bool_bin => |b| exprUsesName(b.l, name) or exprUsesName(b.r, name),
@@ -2482,6 +2541,10 @@ fn exprUsesThis(e: *const Expr) bool {
         .num, .float, .bool, .str, .null_lit, .var_ref => false,
         .array => |items| blk: {
             for (items) |it| if (exprUsesThis(it)) break :blk true;
+            break :blk false;
+        },
+        .tuple_lit => |t| blk: {
+            for (t.items) |it| if (exprUsesThis(it)) break :blk true;
             break :blk false;
         },
         .neg, .not, .bnot => |inner| exprUsesThis(inner),
@@ -3282,9 +3345,12 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
     var sig_list: std.ArrayListUnmanaged(types.SigEntry) = .empty;
     types.g_sig_registry = &sig_list;
     types.g_sig_arena = arena;
+    var tuple_list: std.ArrayListUnmanaged(types.TupleEntry) = .empty;
+    types.g_tuple_registry = &tuple_list;
     defer {
         types.g_sig_registry = null;
         types.g_sig_arena = null;
+        types.g_tuple_registry = null;
     }
 
     try emitProgram(&program, &decls, &body, arena, options);
@@ -3353,6 +3419,111 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             for (entry.sig.params) |param_ty| try out.print(arena, ", {s}", .{try types.zigName(arena, param_ty)});
             try out.print(arena, ") {s} }};\n", .{try types.zigName(arena, entry.sig.ret.*)});
         }
+    }
+    // Emit one nominal struct per distinct tuple shape. Iterate by index because
+    // emitting an element type can register a nested tuple shape.
+    {
+        var i: usize = 0;
+        while (i < tuple_list.items.len) : (i += 1) {
+            const entry = tuple_list.items[i];
+            try out.print(arena, "const {s} = struct {{ ", .{entry.name});
+            for (entry.elems, 0..) |el, j| {
+                try out.print(arena, "@\"{d}\": {s}, ", .{ j, try types.zigName(arena, el) });
+            }
+            try out.appendSlice(arena, "};\n");
+        }
+    }
+    if (program.needs_map or program.needs_set) {
+        // Value equality that treats `[]const u8` (strings) specially.
+        try out.appendSlice(arena,
+            \\fn __lumenEql(comptime T: type, a: T, b: T) bool {
+            \\    if (T == []const u8) return std.mem.eql(u8, a, b);
+            \\    return a == b;
+            \\}
+            \\
+        );
+    }
+    if (program.needs_map) {
+        // Insertion-ordered Map<K, V>: linear-probe over parallel key/value lists
+        // so keys()/values()/forEach iterate in insertion order deterministically.
+        try out.appendSlice(arena,
+            \\fn LumenMap(comptime K: type, comptime V: type) type {
+            \\    return struct {
+            \\        const Self = @This();
+            \\        keys_: std.ArrayListUnmanaged(K) = .empty,
+            \\        values_: std.ArrayListUnmanaged(V) = .empty,
+            \\        fn __init() *Self {
+            \\            const p = std.heap.page_allocator.create(Self) catch unreachable;
+            \\            p.* = .{};
+            \\            return p;
+            \\        }
+            \\        fn __find(self: *Self, key: K) ?usize {
+            \\            for (self.keys_.items, 0..) |k, i| { if (__lumenEql(K, k, key)) return i; }
+            \\            return null;
+            \\        }
+            \\        fn set(self: *Self, key: K, value: V) void {
+            \\            if (self.__find(key)) |i| { self.values_.items[i] = value; return; }
+            \\            self.keys_.append(std.heap.page_allocator, key) catch unreachable;
+            \\            self.values_.append(std.heap.page_allocator, value) catch unreachable;
+            \\        }
+            \\        fn get(self: *Self, key: K) ?V {
+            \\            if (self.__find(key)) |i| return self.values_.items[i];
+            \\            return null;
+            \\        }
+            \\        fn has(self: *Self, key: K) bool { return self.__find(key) != null; }
+            \\        fn delete(self: *Self, key: K) bool {
+            \\            if (self.__find(key)) |i| {
+            \\                _ = self.keys_.orderedRemove(i);
+            \\                _ = self.values_.orderedRemove(i);
+            \\                return true;
+            \\            }
+            \\            return false;
+            \\        }
+            \\        fn size(self: *Self) i32 { return @intCast(self.keys_.items.len); }
+            \\        fn keys(self: *Self) []const K { return self.keys_.items; }
+            \\        fn values(self: *Self) []const V { return self.values_.items; }
+            \\        fn forEach(self: *Self, cb: anytype) void {
+            \\            for (self.keys_.items, 0..) |k, i| { _ = cb.call(cb.ctx, self.values_.items[i], k); }
+            \\        }
+            \\    };
+            \\}
+            \\
+        );
+    }
+    if (program.needs_set) {
+        // Insertion-ordered Set<T>.
+        try out.appendSlice(arena,
+            \\fn LumenSet(comptime T: type) type {
+            \\    return struct {
+            \\        const Self = @This();
+            \\        items_: std.ArrayListUnmanaged(T) = .empty,
+            \\        fn __init() *Self {
+            \\            const p = std.heap.page_allocator.create(Self) catch unreachable;
+            \\            p.* = .{};
+            \\            return p;
+            \\        }
+            \\        fn __find(self: *Self, value: T) ?usize {
+            \\            for (self.items_.items, 0..) |v, i| { if (__lumenEql(T, v, value)) return i; }
+            \\            return null;
+            \\        }
+            \\        fn add(self: *Self, value: T) void {
+            \\            if (self.__find(value) != null) return;
+            \\            self.items_.append(std.heap.page_allocator, value) catch unreachable;
+            \\        }
+            \\        fn has(self: *Self, value: T) bool { return self.__find(value) != null; }
+            \\        fn delete(self: *Self, value: T) bool {
+            \\            if (self.__find(value)) |i| { _ = self.items_.orderedRemove(i); return true; }
+            \\            return false;
+            \\        }
+            \\        fn size(self: *Self) i32 { return @intCast(self.items_.items.len); }
+            \\        fn values(self: *Self) []const T { return self.items_.items; }
+            \\        fn forEach(self: *Self, cb: anytype) void {
+            \\            for (self.items_.items) |v| { _ = cb.call(cb.ctx, v); }
+            \\        }
+            \\    };
+            \\}
+            \\
+        );
     }
     try out.appendSlice(arena, decls.items);
 

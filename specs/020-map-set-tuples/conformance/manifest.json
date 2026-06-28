@@ -1,0 +1,59 @@
+{
+  "feature": "020-map-set-tuples",
+  "cases": [
+    {
+      "id": "container.valid.map-basics",
+      "source": "../examples/valid/map-basics.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "2\n10\nnull\ntrue\nfalse\ntrue\nfalse\n1\na\n10\na\n10\nc\n30" }
+    },
+    {
+      "id": "container.valid.set-basics",
+      "source": "../examples/valid/set-basics.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "3\ntrue\nfalse\ntrue\nfalse\n2\n2\nred\nred\nblue" }
+    },
+    {
+      "id": "container.valid.tuples",
+      "source": "../examples/valid/tuples.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "42\nhi\nx\n7\ntrue\n7" }
+    },
+    {
+      "id": "container.invalid.map-key-type",
+      "source": "../examples/invalid/map-key-type.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "container.invalid.map-value-type",
+      "source": "../examples/invalid/map-value-type.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "container.invalid.set-element-type",
+      "source": "../examples/invalid/set-element-type.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "container.invalid.tuple-element-type",
+      "source": "../examples/invalid/tuple-element-type.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "container.invalid.tuple-length",
+      "source": "../examples/invalid/tuple-length.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "container.invalid.unknown-method",
+      "source": "../examples/invalid/unknown-method.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    }
+  ]
+}

@@ -371,12 +371,40 @@ const Checker = struct {
             p.* = inner;
             return .{ .optional = p };
         }
+        // Tuple type `[A, B, ...]` — a bracketed, comma-separated positional list.
+        // (Array element annotations end with `[]` and are handled by
+        // fromAnnotation, so a leading `[` with matching `]` is always a tuple.)
+        if (annotation.len >= 2 and annotation[0] == '[' and annotation[annotation.len - 1] == ']') {
+            const inner = annotation[1 .. annotation.len - 1];
+            const parts = try self.splitTypeArgs(inner, line, col);
+            if (parts.len == 0) return self.fail(line, col, "E_TYPE_MISMATCH");
+            const elems = self.arena.alloc(types.Type, parts.len) catch return error.OutOfMemory;
+            for (parts, 0..) |p, i| elems[i] = try self.typeFromAnnotation(p, line, col);
+            return .{ .tuple_type = elems };
+        }
         // Generic type reference `Name<arg, ...>` (interface or class). Specialize
         // the template on demand and resolve to the concrete named/class type.
         if (std.mem.indexOfScalar(u8, annotation, '<')) |lt| {
             if (std.mem.endsWith(u8, annotation, ">")) {
                 const base = annotation[0..lt];
                 const args = try self.splitTypeArgs(annotation[lt + 1 .. annotation.len - 1], line, col);
+                // Built-in generic containers Map<K,V> and Set<T>.
+                if (std.mem.eql(u8, base, "Map")) {
+                    if (args.len != 2) return self.fail(line, col, "E_TYPE_ARG_COUNT");
+                    const k = self.arena.create(types.Type) catch return error.OutOfMemory;
+                    const v = self.arena.create(types.Type) catch return error.OutOfMemory;
+                    k.* = try self.typeFromAnnotation(args[0], line, col);
+                    v.* = try self.typeFromAnnotation(args[1], line, col);
+                    const m = self.arena.create(types.MapType) catch return error.OutOfMemory;
+                    m.* = .{ .key = k, .value = v };
+                    return .{ .map_type = m };
+                }
+                if (std.mem.eql(u8, base, "Set")) {
+                    if (args.len != 1) return self.fail(line, col, "E_TYPE_ARG_COUNT");
+                    const e = self.arena.create(types.Type) catch return error.OutOfMemory;
+                    e.* = try self.typeFromAnnotation(args[0], line, col);
+                    return .{ .set_type = e };
+                }
                 if (self.generic_types.get(base)) |gt| {
                     if (args.len != gt.type_params.len) return self.fail(line, col, "E_TYPE_ARG_COUNT");
                     const mname = try self.specializeType(gt, args, line, col);
@@ -823,6 +851,11 @@ const Checker = struct {
                 for (items, 0..) |it, i| c[i] = try self.cloneExpr(it);
                 break :blk .{ .array = c };
             },
+            .tuple_lit => |t| blk: {
+                const c = self.arena.alloc(*ast.Expr, t.items.len) catch return error.OutOfMemory;
+                for (t.items, 0..) |it, i| c[i] = try self.cloneExpr(it);
+                break :blk .{ .tuple_lit = .{ .items = c, .tuple_type = t.tuple_type } };
+            },
             .var_ref => |r| .{ .var_ref = .{ .name = r.name } },
             .neg => |inner| .{ .neg = try self.cloneExpr(inner) },
             .not => |inner| .{ .not = try self.cloneExpr(inner) },
@@ -1182,6 +1215,144 @@ const Checker = struct {
             return .string;
         }
 
+        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+        return null;
+    }
+
+    /// Validate a method call on a `Map<K,V>` receiver and return its result type.
+    fn mapMethod(self: *Checker, program: *ast.Program, mc: anytype, obj_type: types.Type, line: u32, col: u32) ?types.Type {
+        mc.container_type = obj_type;
+        const key = obj_type.map_type.key.*;
+        const value = obj_type.map_type.value.*;
+        const name = mc.name;
+        const eq = std.mem.eql;
+
+        if (eq(u8, name, "set")) {
+            if (mc.args.len != 2) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            self.ensureAssignable(program, key, mc.args[0], line, col) catch {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            self.ensureAssignable(program, value, mc.args[1], line, col) catch {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            return .void;
+        }
+        if (eq(u8, name, "get")) {
+            if (mc.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            self.ensureAssignable(program, key, mc.args[0], line, col) catch {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            const inner = self.arena.create(types.Type) catch return null;
+            inner.* = value;
+            return .{ .optional = inner };
+        }
+        if (eq(u8, name, "has") or eq(u8, name, "delete")) {
+            if (mc.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            self.ensureAssignable(program, key, mc.args[0], line, col) catch {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            return .bool;
+        }
+        if (eq(u8, name, "keys")) {
+            if (mc.args.len != 0) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            return types.arrayOf(key) orelse {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+        }
+        if (eq(u8, name, "values")) {
+            if (mc.args.len != 0) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            return types.arrayOf(value) orelse {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+        }
+        if (eq(u8, name, "forEach")) {
+            if (mc.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const want = self.makeFuncType(&.{ value, key }, .void) orelse return null;
+            self.ensureAssignable(program, want, mc.args[0], line, col) catch {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            return .void;
+        }
+        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+        return null;
+    }
+
+    /// Validate a method call on a `Set<T>` receiver and return its result type.
+    fn setMethod(self: *Checker, program: *ast.Program, mc: anytype, obj_type: types.Type, line: u32, col: u32) ?types.Type {
+        mc.container_type = obj_type;
+        const elem = obj_type.set_type.*;
+        const name = mc.name;
+        const eq = std.mem.eql;
+
+        if (eq(u8, name, "add")) {
+            if (mc.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            self.ensureAssignable(program, elem, mc.args[0], line, col) catch {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            return .void;
+        }
+        if (eq(u8, name, "has") or eq(u8, name, "delete")) {
+            if (mc.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            self.ensureAssignable(program, elem, mc.args[0], line, col) catch {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            return .bool;
+        }
+        if (eq(u8, name, "values")) {
+            if (mc.args.len != 0) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            return types.arrayOf(elem) orelse {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+        }
+        if (eq(u8, name, "forEach")) {
+            if (mc.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const want = self.makeFuncType(&.{elem}, .void) orelse return null;
+            self.ensureAssignable(program, want, mc.args[0], line, col) catch {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            return .void;
+        }
         _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
         return null;
     }
@@ -1832,6 +2003,26 @@ const Checker = struct {
                     try self.ensureAssignable(program, elem_type, item, line, col);
                 }
             },
+            .tuple_type => |elems| {
+                // A tuple is written as an array literal of matching length whose
+                // elements satisfy each position's declared type. Rewrite the
+                // `.array` node into a `.tuple_lit` carrying the tuple type so the
+                // emitter produces a positional struct rather than a slice.
+                const items = switch (value.*) {
+                    .array => |a| a,
+                    .tuple_lit => |t| t.items,
+                    else => {
+                        const actual_type = self.exprType(program, value, line, col) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
+                        if (!types.same(expected, actual_type)) return self.fail(line, col, "E_TYPE_MISMATCH");
+                        return;
+                    },
+                };
+                if (items.len != elems.len) return self.fail(line, col, "E_TYPE_MISMATCH");
+                for (items, elems) |item, et| {
+                    try self.ensureAssignable(program, et, item, line, col);
+                }
+                value.* = .{ .tuple_lit = .{ .items = items, .tuple_type = expected } };
+            },
             else => {
                 const actual_type = self.exprType(program, value, line, col) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
                 if (!types.same(expected, actual_type)) return self.fail(line, col, "E_TYPE_MISMATCH");
@@ -2058,6 +2249,7 @@ const Checker = struct {
                     return null;
                 };
             },
+            .tuple_lit => |t| t.tuple_type,
             .field => |*field| {
                 // Enum member access: `EnumName.Member` resolves to the enum type
                 // and carries the member's backing value for emission.
@@ -2111,6 +2303,10 @@ const Checker = struct {
                     field.builtin = .length;
                     return .i64;
                 }
+                if ((types.isMap(obj_type) or types.isSet(obj_type)) and std.mem.eql(u8, field.name, "size")) {
+                    field.builtin = .container_size;
+                    return .i32;
+                }
                 if (obj_type == .error_obj and std.mem.eql(u8, field.name, "message")) {
                     field.builtin = .error_message;
                     return .string;
@@ -2158,6 +2354,43 @@ const Checker = struct {
                 break :blk .{ .class_type = cls };
             },
             .new_expr => |*ne| {
+                // Built-in container instantiation `new Map<K,V>()` / `new Set<T>()`.
+                if (std.mem.eql(u8, ne.class_name, "Map") and self.classes.get("Map") == null) {
+                    if (ne.type_args.len != 2) {
+                        _ = self.fail(line, col, "E_TYPE_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    if (ne.args.len != 0) {
+                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    const k = self.arena.create(types.Type) catch return null;
+                    const v = self.arena.create(types.Type) catch return null;
+                    k.* = self.typeFromAnnotation(ne.type_args[0], line, col) catch return null;
+                    v.* = self.typeFromAnnotation(ne.type_args[1], line, col) catch return null;
+                    const m = self.arena.create(types.MapType) catch return null;
+                    m.* = .{ .key = k, .value = v };
+                    const ct = types.Type{ .map_type = m };
+                    ne.container_type = ct;
+                    program.needs_map = true;
+                    return ct;
+                }
+                if (std.mem.eql(u8, ne.class_name, "Set") and self.classes.get("Set") == null) {
+                    if (ne.type_args.len != 1) {
+                        _ = self.fail(line, col, "E_TYPE_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    if (ne.args.len != 0) {
+                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    const set_elem = self.arena.create(types.Type) catch return null;
+                    set_elem.* = self.typeFromAnnotation(ne.type_args[0], line, col) catch return null;
+                    const ct = types.Type{ .set_type = set_elem };
+                    ne.container_type = ct;
+                    program.needs_set = true;
+                    return ct;
+                }
                 // Generic class instantiation `new C<...>(...)`: specialize the
                 // class and retarget `new` to the concrete mangled class.
                 if (self.generic_classes.get(ne.class_name)) |gcls| {
@@ -2239,6 +2472,12 @@ const Checker = struct {
                 if (types.isStringLike(obj_type)) {
                     return self.stringMethod(program, mc, line, col);
                 }
+                if (types.isMap(obj_type)) {
+                    return self.mapMethod(program, mc, obj_type, line, col);
+                }
+                if (types.isSet(obj_type)) {
+                    return self.setMethod(program, mc, obj_type, line, col);
+                }
                 if (obj_type != .class_type) {
                     _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                     return null;
@@ -2292,6 +2531,18 @@ const Checker = struct {
             },
             .index => |*index| {
                 const obj_type = self.exprType(program, index.obj, line, col) orelse return null;
+                // Tuple indexed access: requires an integer-literal index in range.
+                if (obj_type == .tuple_type) {
+                    const elems = obj_type.tuple_type;
+                    if (index.value.* != .num or index.value.num < 0 or index.value.num >= @as(i64, @intCast(elems.len))) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                    const pos: usize = @intCast(index.value.num);
+                    index.tuple_index = pos;
+                    index.checked_element_type = elems[pos];
+                    return elems[pos];
+                }
                 const index_type = self.exprType(program, index.value, line, col) orelse return null;
                 if (!types.same(.i32, index_type) and !types.same(.i64, index_type)) {
                     _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};

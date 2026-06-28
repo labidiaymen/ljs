@@ -317,6 +317,8 @@ pub const Program = struct {
     needs_read_file_sync: bool = false,
     needs_httpget: bool = false,
     needs_serve: bool = false,
+    needs_map: bool = false,
+    needs_set: bool = false,
 };
 
 pub const Expr = union(enum) {
@@ -326,6 +328,7 @@ pub const Expr = union(enum) {
     str: []const u8,
     null_lit, // null / undefined
     array: []*Expr,
+    tuple_lit: struct { items: []*Expr, tuple_type: ?types.Type = null }, // [a, b] checked against a tuple type
     var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null, unwrap: bool = false, is_func_ref: bool = false, capture: bool = false, func_sig: ?*const types.FuncSig = null },
     neg: *Expr,
     not: *Expr,
@@ -338,12 +341,12 @@ pub const Expr = union(enum) {
     arrow: *ArrowExpr, // (x: T) => expr
     this_expr, // `this` inside a method/constructor
     super_call: struct { name: []const u8, args: []*Expr, parent: ?[]const u8 = null }, // super.m(args)
-    new_expr: struct { class_name: []const u8, args: []*Expr, type_args: [][]const u8 = &.{} }, // new C(args) / new C<T>(args)
-    method_call: struct { obj: *Expr, name: []const u8, args: []*Expr, class_name: ?[]const u8 = null, is_static: bool = false, array_elem_type: ?types.Type = null, array_acc_type: ?types.Type = null, array_result_type: ?types.Type = null, string_method: bool = false }, // obj.m(args) / Class.m(args)
+    new_expr: struct { class_name: []const u8, args: []*Expr, type_args: [][]const u8 = &.{}, container_type: ?types.Type = null }, // new C(args) / new C<T>(args) / new Map/Set<...>()
+    method_call: struct { obj: *Expr, name: []const u8, args: []*Expr, class_name: ?[]const u8 = null, is_static: bool = false, array_elem_type: ?types.Type = null, array_acc_type: ?types.Type = null, array_result_type: ?types.Type = null, string_method: bool = false, container_type: ?types.Type = null }, // obj.m(args) / Class.m(args) / Map|Set method
     template: []TemplatePart, // `text ${expr} ...`
     obj: []FieldInit,
     field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null, enum_value: ?EnumValue = null, optional_chain: bool = false, chain_field_type: ?types.Type = null, class_name: ?[]const u8 = null, is_static: bool = false, is_getter: bool = false },
-    index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null },
+    index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null, tuple_index: ?usize = null },
     call: struct { name: []const u8, args: []*Expr, emit_name: ?[]const u8 = null, is_closure: bool = false, type_args: [][]const u8 = &.{} }, // builtin / user / function-value call; type_args from explicit f<T>(...)
     static_call: StaticCall,
     cast: struct { inner: *Expr, annotation: []const u8, checked_type: ?types.Type = null }, // `expr as T` (safe-subset assertion; erased at emit)
@@ -352,6 +355,7 @@ pub const Expr = union(enum) {
 pub const FieldBuiltin = enum {
     length,
     error_message,
+    container_size,
 };
 
 /// A variable captured by a closure: stored by its outer emit-name in a heap

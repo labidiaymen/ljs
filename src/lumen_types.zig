@@ -26,7 +26,12 @@ pub const Type = union(enum) {
     none, // the bare null/undefined literal, assignable to any optional
     func_type: *const FuncSig, // (A, B) => R  ->  Zig *const fn(A, B) R
     class_type: []const u8, // a class instance  ->  Zig *Name (heap pointer)
+    map_type: *const MapType, // Map<K, V>  ->  *LumenMap_<k>_<v> (heap pointer)
+    set_type: *const Type, // Set<T>  ->  *LumenSet_<t> (heap pointer)
+    tuple_type: []const Type, // [A, B, ...]  ->  struct { @"0": A, @"1": B, ... }
 };
+
+pub const MapType = struct { key: *const Type, value: *const Type };
 
 pub const EnumType = struct { name: []const u8, is_string: bool };
 
@@ -38,6 +43,39 @@ pub const FuncSig = struct { params: []const Type, ret: *const Type };
 pub const SigEntry = struct { name: []const u8, sig: FuncSig };
 pub var g_sig_registry: ?*std.ArrayListUnmanaged(SigEntry) = null;
 pub var g_sig_arena: ?std.mem.Allocator = null;
+
+// Registry of tuple shapes encountered during emission. Tuples lower to a
+// nominal Zig struct (one `LumenTuple_*` definition per distinct element-type
+// list) so values flow across function boundaries with a single shared type.
+pub const TupleEntry = struct { name: []const u8, elems: []const Type };
+pub var g_tuple_registry: ?*std.ArrayListUnmanaged(TupleEntry) = null;
+
+/// The nominal Zig struct name for a tuple shape, registering it for emission.
+pub fn tupleStructName(arena: std.mem.Allocator, elems: []const Type) error{OutOfMemory}![]const u8 {
+    var name_buf: std.ArrayListUnmanaged(u8) = .empty;
+    try name_buf.appendSlice(arena, "LumenTuple_");
+    for (elems, 0..) |el, i| {
+        if (i > 0) try name_buf.append(arena, '_');
+        try name_buf.appendSlice(arena, try mangle(arena, el));
+    }
+    for (name_buf.items) |*ch| {
+        const ok = (ch.* >= 'a' and ch.* <= 'z') or (ch.* >= 'A' and ch.* <= 'Z') or (ch.* >= '0' and ch.* <= '9') or ch.* == '_';
+        if (!ok) ch.* = '_';
+    }
+    const name = name_buf.items;
+    if (g_tuple_registry) |reg| {
+        const arena2 = g_sig_arena orelse arena;
+        var present = false;
+        for (reg.items) |e| {
+            if (std.mem.eql(u8, e.name, name)) {
+                present = true;
+                break;
+            }
+        }
+        if (!present) reg.append(arena2, .{ .name = name, .elems = elems }) catch {};
+    }
+    return name;
+}
 
 fn mangle(arena: std.mem.Allocator, t: Type) error{OutOfMemory}![]const u8 {
     return switch (t) {
@@ -62,6 +100,17 @@ fn mangle(arena: std.mem.Allocator, t: Type) error{OutOfMemory}![]const u8 {
         .enum_type => |e| try std.fmt.allocPrint(arena, "enum_{s}", .{e.name}),
         .optional => |inner| try std.fmt.allocPrint(arena, "opt_{s}", .{try mangle(arena, inner.*)}),
         .class_type => |n| try std.fmt.allocPrint(arena, "cls_{s}", .{n}),
+        .map_type => |m| try std.fmt.allocPrint(arena, "map_{s}_{s}", .{ try mangle(arena, m.key.*), try mangle(arena, m.value.*) }),
+        .set_type => |elem| try std.fmt.allocPrint(arena, "set_{s}", .{try mangle(arena, elem.*)}),
+        .tuple_type => |elems| blk2: {
+            var buf2: std.ArrayListUnmanaged(u8) = .empty;
+            try buf2.appendSlice(arena, "tup");
+            for (elems) |el| {
+                try buf2.append(arena, '_');
+                try buf2.appendSlice(arena, try mangle(arena, el));
+            }
+            break :blk2 buf2.items;
+        },
         .func_type => |sig| blk: {
             var buf: std.ArrayListUnmanaged(u8) = .empty;
             try buf.appendSlice(arena, "fn");
@@ -126,7 +175,7 @@ pub fn inferExprType(e: *const ast.Expr) ?Type {
             return if (same(then_type, else_type)) then_type else null;
         },
         .template => .string,
-        .array, .var_ref, .obj, .field, .index, .call, .static_call, .coalesce, .arrow, .this_expr, .new_expr, .method_call, .super_call, .cast => null,
+        .array, .tuple_lit, .var_ref, .obj, .field, .index, .call, .static_call, .coalesce, .arrow, .this_expr, .new_expr, .method_call, .super_call, .cast => null,
     };
 }
 
@@ -187,6 +236,24 @@ pub fn same(a: Type, b: Type) bool {
             },
             else => false,
         },
+        .map_type => |a_m| switch (b) {
+            .map_type => |b_m| same(a_m.key.*, b_m.key.*) and same(a_m.value.*, b_m.value.*),
+            else => false,
+        },
+        .set_type => |a_e| switch (b) {
+            .set_type => |b_e| same(a_e.*, b_e.*),
+            else => false,
+        },
+        .tuple_type => |a_t| switch (b) {
+            .tuple_type => |b_t| blk: {
+                if (a_t.len != b_t.len) break :blk false;
+                for (a_t, b_t) |ae, be| {
+                    if (!same(ae, be)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        },
     };
 }
 
@@ -221,6 +288,14 @@ pub fn isStringLike(t: Type) bool {
         .string, .string_literal_union => true,
         else => false,
     };
+}
+
+pub fn isMap(t: Type) bool {
+    return t == .map_type;
+}
+
+pub fn isSet(t: Type) bool {
+    return t == .set_type;
 }
 
 pub fn isArray(t: Type) bool {
@@ -283,6 +358,26 @@ pub fn toAnnotation(arena: std.mem.Allocator, t: Type) error{OutOfMemory}!?[]con
             const inner_ann = (try toAnnotation(arena, inner.*)) orelse break :blk null;
             break :blk try std.fmt.allocPrint(arena, "{s}?", .{inner_ann});
         },
+        .map_type => |m| blk: {
+            const k = (try toAnnotation(arena, m.key.*)) orelse break :blk null;
+            const v = (try toAnnotation(arena, m.value.*)) orelse break :blk null;
+            break :blk try std.fmt.allocPrint(arena, "Map<{s},{s}>", .{ k, v });
+        },
+        .set_type => |elem| blk: {
+            const e = (try toAnnotation(arena, elem.*)) orelse break :blk null;
+            break :blk try std.fmt.allocPrint(arena, "Set<{s}>", .{e});
+        },
+        .tuple_type => |elems| blk: {
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            try buf.append(arena, '[');
+            for (elems, 0..) |el, i| {
+                if (i > 0) try buf.append(arena, ',');
+                const a = (try toAnnotation(arena, el)) orelse break :blk null;
+                try buf.appendSlice(arena, a);
+            }
+            try buf.append(arena, ']');
+            break :blk buf.items;
+        },
         else => null,
     };
 }
@@ -328,5 +423,8 @@ pub fn zigName(arena: std.mem.Allocator, t: Type) ![]const u8 {
         .none => "?u8", // defensive; a bare null is only valid in an optional context
         .func_type => |sig| try funcStructName(arena, sig.*),
         .class_type => |name| try std.fmt.allocPrint(arena, "*{s}", .{name}),
+        .map_type => |m| try std.fmt.allocPrint(arena, "*LumenMap({s}, {s})", .{ try zigName(arena, m.key.*), try zigName(arena, m.value.*) }),
+        .set_type => |elem| try std.fmt.allocPrint(arena, "*LumenSet({s})", .{try zigName(arena, elem.*)}),
+        .tuple_type => |elems| try tupleStructName(arena, elems),
     };
 }
