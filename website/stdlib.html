@@ -105,7 +105,7 @@
   <h4>C FFI</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
-    <tr><td><code>extern function name(args): T;</code></td><td>calls a C function directly</td></tr>
+    <tr><td><code>declare function name(args): T;</code></td><td>calls a C function directly (<code>extern function</code> also works)</td></tr>
     <tr><td><code>// @link m</code> · <code>// @link ./shim.o</code></td><td>link a library or object</td></tr>
     <tr><td>string &amp; scalar marshaling</td><td>string params/returns and numeric scalars cross the boundary</td></tr>
   </table>

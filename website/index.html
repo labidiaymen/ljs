@@ -42,7 +42,7 @@
     <div class="hero-code">
 <pre><code class="lumen">// Call libm directly -- no bindings, no runtime.
 // @link m
-extern function sqrt(x: number): number;
+declare function sqrt(x: number): number;
 
 function hypot(a: number, b: number): number {
   defer console.log("computed");   // runs at scope exit
@@ -86,7 +86,7 @@ console.log(`distance² = ${distanceSq(origin, p)}`);  // distance² = 25</code>
     <div class="card"><h3>Template literals</h3><p><code>`hi ${name}`</code> with string &amp; numeric interpolation.</p></div>
     <div class="card"><h3>defer</h3><p>Scope&#8209;exit cleanup, last&#8209;in&#8209;first&#8209;out.</p></div>
     <div class="card"><h3>Built-in tests</h3><p><code>test "…" { expect(…); }</code> run with <code>lumen test</code>.</p></div>
-    <div class="card"><h3>C FFI</h3><p><code>extern function</code> + <code>// @link</code> call native C libraries — scalars and strings marshal across the boundary.</p></div>
+    <div class="card"><h3>C FFI</h3><p><code>declare function</code> + <code>// @link</code> call native C libraries — scalars and strings marshal across the boundary.</p></div>
     <div class="card"><h3>String methods</h3><p><code>split</code>, <code>slice</code>, <code>trim</code>, <code>includes</code>, <code>indexOf</code>, <code>replace</code>, <code>repeat</code>, <code>padStart</code>, <code>toUpperCase</code>, and more.</p></div>
     <div class="card"><h3>Array methods</h3><p><code>map</code>, <code>filter</code>, <code>reduce</code>, <code>forEach</code>, <code>find</code>, <code>some</code>, <code>every</code>, <code>includes</code>, <code>indexOf</code>, <code>join</code>.</p></div>
     <div class="card"><h3>Generics</h3><p>Generic functions, classes, and interfaces with <code>Array&lt;T&gt;</code> — monomorphized at compile time, no boxing.</p></div>
@@ -236,10 +236,10 @@ checkAge(-1);   // error: age cannot be negative / checked</code></pre>
 
 <section class="wrap" id="ffi">
   <h2>Call native libraries</h2>
-  <p class="sub">Declare an <code>extern function</code> and link a C library — no bindings generator, no runtime.</p>
+  <p class="sub">Write a <code>declare function</code> and link a C library — no bindings generator, no runtime. (<code>extern function</code> works too.)</p>
 <pre><code class="lumen">// @link m
-extern function pow(base: number, exp: number): number;
-extern function sqrt(x: number): number;
+declare function pow(base: number, exp: number): number;
+declare function sqrt(x: number): number;
 
 let hypotSq = pow(3.0, 2.0) + pow(4.0, 2.0);
 console.log(sqrt(hypotSq));   // 5
@@ -250,12 +250,12 @@ console.log(pow(2.0, 10.0));  // 1024</code></pre>
 extern "C" int rectangle_area(int w, int h) { return w * h; }</code></pre>
 <pre><code class="lumen">// demo.ts
 // @link ./geometry.o
-extern function rectangle_area(w: int, h: int): int;
+declare function rectangle_area(w: int, h: int): int;
 console.log(rectangle_area(6, 7));   // 42</code></pre>
   <h3>Strings across the boundary</h3>
   <p class="sub">Strings marshal too: pass a Lumen string to a C function and copy the returned C string back.</p>
 <pre><code class="lumen">// @link ./shim.o
-extern function shout(s: string): string;   // C: const char* shout(const char*)
+declare function shout(s: string): string;   // C: const char* shout(const char*)
 
 console.log(shout("hi there"));   // HI THERE</code></pre>
   <p class="note">FFI marshals scalars (<code>int</code>, <code>i64</code>, <code>number</code>, <code>bool</code>) and strings.

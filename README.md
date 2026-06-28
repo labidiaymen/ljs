@@ -22,7 +22,7 @@ Compiled static semantics — not a JavaScript runtime:
 - first-class functions, arrow functions, capturing closures
 - classes: fields, constructor, `this`, methods
 - `defer`; built-in `test` blocks with `expect`
-- C FFI via `extern function` + library linking
+- C FFI via `declare function` (TypeScript-valid; `extern function` also works) + library linking
 - imports from a relative path or an `https://` URL (a package is just a URL)
 - no prototypes, `eval`, CommonJS, or dynamic object mutation
 

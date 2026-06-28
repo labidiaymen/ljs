@@ -1,0 +1,17 @@
+{
+  "feature": "025-declare-ffi",
+  "cases": [
+    {
+      "id": "declare-ffi.valid.declare-math",
+      "source": "../examples/valid/declare-math.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "5\n1024" }
+    },
+    {
+      "id": "declare-ffi.invalid.array-param",
+      "source": "../examples/invalid/declare-array-param.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_FFI_TYPE" }
+    }
+  ]
+}

@@ -864,9 +864,12 @@ const Parser = struct {
         return annotation;
     }
 
-    /// `extern function name(p: T, ...): R;` — an external C-ABI function.
+    /// An external C-ABI function declaration. Two spellings are accepted and
+    /// lower identically: the TypeScript-valid `declare function name(...): R;`
+    /// (the preferred form, since it parses under `tsc` as an ambient
+    /// declaration) and the legacy `extern function name(...): R;` alias.
     fn parseExternDecl(self: *Parser, line: u32, col: u32) CompileError!Stmt {
-        try self.advance(); // 'extern'
+        try self.advance(); // 'extern' or 'declare'
         if (!self.isKw("function")) return error.ParseError;
         try self.advance(); // 'function'
         if (self.cur != .ident) return error.ParseError;
@@ -1278,6 +1281,9 @@ const Parser = struct {
         if (eq(u8, kw, "interface")) return self.parseInterfaceDecl(line, col);
         if (eq(u8, kw, "enum")) return self.parseEnumDecl(line, col);
         if (eq(u8, kw, "extern")) return self.parseExternDecl(line, col);
+        // `declare function NAME(...): R;` — the TypeScript-valid spelling for an
+        // FFI declaration; identical lowering to `extern function`.
+        if (eq(u8, kw, "declare")) return self.parseExternDecl(line, col);
         if (eq(u8, kw, "function")) return self.parseFunctionDecl(line, col, false);
         // `async function ...` — an asynchronous function returning a Promise<T>.
         if (eq(u8, kw, "async")) {

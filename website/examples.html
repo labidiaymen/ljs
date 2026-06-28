@@ -121,10 +121,10 @@ test "gcd computes greatest common divisor" {
   </div>
 
   <div class="example">
-    <h3>ffi-math.ts <span class="meta">extern functions · linking libm — <code>lumen compile</code></span></h3>
+    <h3>ffi-math.ts <span class="meta">declare functions · linking libm — <code>lumen compile</code></span></h3>
 <pre><code class="lumen">// @link m
-extern function pow(base: number, exp: number): number;
-extern function sqrt(x: number): number;
+declare function pow(base: number, exp: number): number;
+declare function sqrt(x: number): number;
 
 let hypotSq = pow(3.0, 2.0) + pow(4.0, 2.0);
 console.log(sqrt(hypotSq));   // 5

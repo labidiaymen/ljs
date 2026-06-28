@@ -1,4 +1,5 @@
-// Call C standard-library math functions directly.
+// Call C standard-library math functions using the TypeScript-valid `declare
+// function` FFI form. Identical to `extern function`; links libm via `// @link`.
 // @link m
 declare function pow(base: number, exp: number): number;
 declare function sqrt(x: number): number;
