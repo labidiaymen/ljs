@@ -2429,6 +2429,52 @@ fn stmtUsesName(stmt: *const Stmt, name: []const u8) bool {
     };
 }
 
+/// Whether a statement can assign the enclosing try's throw slot, i.e. it
+/// contains a `throw` that is not swallowed by a fully-handling nested
+/// try/catch. Used to choose `var` vs `const` for the slot so the generated
+/// Zig does not warn about an unmutated `var`.
+fn stmtCanThrow(stmt: *const Stmt) bool {
+    return switch (stmt.*) {
+        .throw_stmt => true,
+        .while_stmt => |w| bodyCanThrow(w.body),
+        .do_while_stmt => |w| bodyCanThrow(w.body),
+        .for_stmt => |f| bodyCanThrow(f.body),
+        .for_of_stmt => |f| bodyCanThrow(f.body),
+        .if_stmt => |b| bodyCanThrow(b.then_body) or (b.else_body != null and bodyCanThrow(b.else_body.?)),
+        .switch_stmt => |sw| blk: {
+            for (sw.cases) |cse| if (bodyCanThrow(cse.body)) break :blk true;
+            if (sw.default_body) |db| if (bodyCanThrow(db)) break :blk true;
+            break :blk false;
+        },
+        .defer_stmt => |d| bodyCanThrow(d.body),
+        // A nested try swallows throws from its own try body via its own slot;
+        // it propagates to the outer slot only if its catch or finally throws.
+        .try_stmt => |t| bodyCanThrow(t.catch_body) or (t.finally_body != null and bodyCanThrow(t.finally_body.?)),
+        else => false,
+    };
+}
+
+fn bodyCanThrow(body: []const Stmt) bool {
+    for (body) |*stmt| if (stmtCanThrow(stmt)) return true;
+    return false;
+}
+
+/// Whether a statement unconditionally diverts control via `throw` (lowered to
+/// a `break` out of the enclosing try). Anything after such a statement in the
+/// same try body is dead code, which Zig rejects, so the emitter stops there.
+fn stmtAlwaysThrows(stmt: *const Stmt) bool {
+    return switch (stmt.*) {
+        .throw_stmt => true,
+        .if_stmt => |b| b.else_body != null and bodyAlwaysThrows(b.then_body) and bodyAlwaysThrows(b.else_body.?),
+        else => false,
+    };
+}
+
+fn bodyAlwaysThrows(body: []const Stmt) bool {
+    if (body.len == 0) return false;
+    return stmtAlwaysThrows(&body[body.len - 1]);
+}
+
 /// Whether an expression reads `this` (so the enclosing method needs `self`).
 fn exprUsesThis(e: *const Expr) bool {
     return switch (e.*) {
@@ -3111,9 +3157,12 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
         },
         .throw_stmt => |throw_stmt| {
             if (throw_target) |target| {
+                // Set the enclosing try's slot, then break out of its labeled
+                // try block so the remaining try statements are skipped.
+                const label = try std.mem.replaceOwned(u8, arena, target, "__lumen_throw_", "__lumen_try_");
                 try body.print(arena, "    {s} = ", .{target});
                 try emitExpr(throw_stmt.value, body, arena);
-                try body.appendSlice(arena, ";\n");
+                try body.print(arena, ";\n    break :{s};\n", .{label});
             } else {
                 try body.appendSlice(arena, "    @panic(");
                 try emitExpr(throw_stmt.value, body, arena);
@@ -3122,20 +3171,49 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
         },
         .try_stmt => |try_stmt| {
             const slot = try std.fmt.allocPrint(arena, "__lumen_throw_{d}_{d}", .{ try_stmt.line, try_stmt.col });
-            try body.print(arena, "    var {s}: ?[]const u8 = null;\n", .{slot});
+            const label = try std.fmt.allocPrint(arena, "__lumen_try_{d}_{d}", .{ try_stmt.line, try_stmt.col });
+            const can_throw = bodyCanThrow(try_stmt.try_body);
+            const slot_kw = if (can_throw) "var" else "const";
+            try body.print(arena, "    {s} {s}: ?[]const u8 = null;\n", .{ slot_kw, slot });
+            // Wrap the whole try/catch in an outer block. `finally` lowers to a
+            // `defer` at the top of that block, so it always runs on every exit
+            // — normal fallthrough, a caught throw, or a rethrow that breaks out
+            // to an enclosing try (the defer unwinds before the break leaves).
             try body.appendSlice(arena, "    {\n");
-            for (try_stmt.try_body) |*try_body_stmt| {
-                try body.print(arena, "    if ({s} == null) {{\n", .{slot});
-                try emitStmtWithThrow(try_body_stmt, decls, body, arena, slot, switch_break_target, options);
+            if (try_stmt.finally_body) |finally_body| {
+                try body.appendSlice(arena, "    defer {\n");
+                for (finally_body) |*finally_stmt| try emitStmtWithThrow(finally_stmt, decls, body, arena, throw_target, switch_break_target, options);
                 try body.appendSlice(arena, "    }\n");
             }
-            try body.appendSlice(arena, "    }\n");
-            try body.print(arena, "    if ({s}) |{s}| {{\n", .{ slot, try_stmt.catch_emit_name orelse try_stmt.catch_name });
-            for (try_stmt.catch_body) |*catch_stmt| try emitStmtWithThrow(catch_stmt, decls, body, arena, throw_target, switch_break_target, options);
-            try body.appendSlice(arena, "    }\n");
-            if (try_stmt.finally_body) |finally_body| {
-                for (finally_body) |*finally_stmt| try emitStmtWithThrow(finally_stmt, decls, body, arena, throw_target, switch_break_target, options);
+            // The try body runs in a single block so its locals share one scope.
+            // When it can throw, the block is labeled so a `throw` can set the
+            // slot and break out, skipping the remaining try statements.
+            if (can_throw) {
+                try body.print(arena, "    {s}: {{\n", .{label});
+            } else {
+                try body.appendSlice(arena, "    {\n");
             }
+            for (try_stmt.try_body) |*try_body_stmt| {
+                try emitStmtWithThrow(try_body_stmt, decls, body, arena, slot, switch_break_target, options);
+                // A `throw` lowers to a `break`; later siblings are dead code.
+                if (stmtAlwaysThrows(try_body_stmt)) break;
+            }
+            try body.appendSlice(arena, "    }\n");
+            const catch_emit = try_stmt.catch_emit_name orelse try_stmt.catch_name;
+            try body.print(arena, "    if ({s}) |{s}| {{\n", .{ slot, catch_emit });
+            // Zig rejects an unused capture, so discard the binding when the
+            // catch body never reads it.
+            if (!bodyUsesName(try_stmt.catch_body, try_stmt.catch_name)) {
+                try body.print(arena, "    _ = {s};\n", .{catch_emit});
+            }
+            for (try_stmt.catch_body) |*catch_stmt| {
+                try emitStmtWithThrow(catch_stmt, decls, body, arena, throw_target, switch_break_target, options);
+                // A rethrow lowers to a `break`; later siblings are dead code.
+                // Only meaningful when an enclosing try provides a throw target.
+                if (throw_target != null and stmtAlwaysThrows(catch_stmt)) break;
+            }
+            try body.appendSlice(arena, "    }\n");
+            try body.appendSlice(arena, "    }\n");
         },
         .defer_stmt => |d| {
             try body.appendSlice(arena, "    defer {\n");

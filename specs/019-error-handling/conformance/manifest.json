@@ -1,0 +1,41 @@
+{
+  "feature": "019-error-handling",
+  "cases": [
+    {
+      "id": "error.valid.throw-catch-finally",
+      "source": "../examples/valid/throw-catch-finally.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "before\ncaught\nboom\ncleanup\nclean\ndone" }
+    },
+    {
+      "id": "error.valid.nested-rethrow",
+      "source": "../examples/valid/nested-rethrow.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "outer-start\ninner-catch\ninner\ninner-finally\nouter-continue\nouter-finally\nrethrowing\nrethrow-finally\nouter-handler\nsecond" }
+    },
+    {
+      "id": "error.valid.conditional-throw",
+      "source": "../examples/valid/conditional-throw.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "checking\nin range\nchecked\nchecking\ntoo small\nchecked\nchecking\ntoo big\nchecked" }
+    },
+    {
+      "id": "error.invalid.throw-string",
+      "source": "../examples/invalid/throw-string.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_THROW_TYPE" }
+    },
+    {
+      "id": "error.invalid.throw-number",
+      "source": "../examples/invalid/throw-number.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_THROW_TYPE" }
+    },
+    {
+      "id": "error.invalid.error-arg-type",
+      "source": "../examples/invalid/error-arg-type.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    }
+  ]
+}
