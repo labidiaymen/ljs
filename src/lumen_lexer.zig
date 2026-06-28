@@ -8,6 +8,7 @@ pub const Tok = union(enum) {
     template: []const u8, // template literal raw content (between backticks)
     op: u8, // + - * / % ! ? ( ) { } ; , . : =
     op2: []const u8, // ++ -- += -= *= /= %=
+    op3: []const u8, // ... (spread/rest)
     cmp: []const u8, // < > <= >= == != && ||
     ident: []const u8,
     eof,
@@ -180,6 +181,12 @@ pub const Lexer = struct {
             const s = self.src[start..self.i];
             if (self.i < self.src.len) self.i += 1; // closing backtick
             return .{ .template = s };
+        }
+        // `...` spread/rest operator (three dots).
+        if (c == '.' and self.i + 2 < self.src.len and self.src[self.i + 1] == '.' and self.src[self.i + 2] == '.') {
+            const s = self.src[self.i .. self.i + 3];
+            self.i += 3;
+            return .{ .op3 = s };
         }
         switch (c) {
             '+', '-', '*', '/', '%', '?', '(', ')', '[', ']', ';', ',', '.', ':', '{', '}', '^', '~' => {

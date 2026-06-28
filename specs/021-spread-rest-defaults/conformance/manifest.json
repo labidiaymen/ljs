@@ -1,0 +1,53 @@
+{
+  "feature": "021-spread-rest-defaults",
+  "cases": [
+    {
+      "id": "spread.valid.default-params",
+      "source": "../examples/valid/default-params.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "Hello, World\nHi, World\n3\n12\n15" }
+    },
+    {
+      "id": "spread.valid.rest-and-spread-call",
+      "source": "../examples/valid/rest-and-spread-call.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "0\n6\n15\n26\np\np-a-b\np-x-y" }
+    },
+    {
+      "id": "spread.valid.array-object-spread",
+      "source": "../examples/valid/array-object-spread.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "1\n2\n3\n4\n5\n5\n7\n10\n2\norig" }
+    },
+    {
+      "id": "spread.invalid.default-type-mismatch",
+      "source": "../examples/invalid/default-type-mismatch.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "spread.invalid.spread-call-type-mismatch",
+      "source": "../examples/invalid/spread-call-type-mismatch.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "spread.invalid.array-spread-type-mismatch",
+      "source": "../examples/invalid/array-spread-type-mismatch.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "spread.invalid.required-after-optional",
+      "source": "../examples/invalid/required-after-optional.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_REQUIRED_AFTER_OPTIONAL" }
+    },
+    {
+      "id": "spread.invalid.missing-required-arg",
+      "source": "../examples/invalid/missing-required-arg.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_ARG_COUNT" }
+    }
+  ]
+}

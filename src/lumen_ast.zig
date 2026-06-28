@@ -1,6 +1,8 @@
 const types = @import("lumen_types.zig");
 
-pub const FieldInit = struct { name: []const u8, value: *Expr };
+/// An object-literal entry. A normal field has a `name`; a spread entry
+/// (`{...src}`) has `is_spread = true`, `name = ""`, and `value` is the source.
+pub const FieldInit = struct { name: []const u8, value: *Expr, is_spread: bool = false };
 
 pub const Visibility = enum { public, private, protected };
 
@@ -49,6 +51,11 @@ pub const FunctionParam = struct {
     name: []const u8,
     annotation: []const u8,
     checked_type: ?types.Type = null,
+    // `...rest: T[]` — collects trailing arguments into an array. The annotation
+    // names the array type; `checked_type` holds the array type.
+    is_rest: bool = false,
+    // `x: T = expr` — default value used when the call omits this trailing arg.
+    default: ?*Expr = null,
 };
 
 /// `extern function name(params): ret;` — an external C-ABI function. No body;
@@ -327,7 +334,8 @@ pub const Expr = union(enum) {
     bool: bool,
     str: []const u8,
     null_lit, // null / undefined
-    array: []*Expr,
+    array: struct { items: []*Expr, elem_type: ?types.Type = null }, // `[a, b, ...rest]`; elem_type is filled by the checker when a spread element is present
+    spread: *Expr, // `...expr` element inside an array literal or call argument list
     tuple_lit: struct { items: []*Expr, tuple_type: ?types.Type = null }, // [a, b] checked against a tuple type
     var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null, unwrap: bool = false, is_func_ref: bool = false, capture: bool = false, func_sig: ?*const types.FuncSig = null },
     neg: *Expr,

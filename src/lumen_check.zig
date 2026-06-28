@@ -437,8 +437,121 @@ const Checker = struct {
         for (decl.params) |*param| {
             param.checked_type = try self.typeFromAnnotation(param.annotation, decl.line, decl.col);
         }
+        try self.validateParamSignature(decl.params);
         decl.checked_return_type = return_type;
         self.funcs.put(self.arena, decl.name, .{ .params = decl.params, .return_type = return_type }) catch return error.OutOfMemory;
+    }
+
+    /// Validates structural default-value and rest-parameter rules over a resolved
+    /// parameter list: a rest param must be the last and array-typed; once a
+    /// parameter has a default, every following non-rest parameter must also have
+    /// one. Default-value *types* are checked later in checkFunctionBody (where the
+    /// program context is available).
+    fn validateParamSignature(self: *Checker, params: []ast.FunctionParam) CompileError!void {
+        var seen_default = false;
+        for (params, 0..) |*param, i| {
+            if (param.is_rest) {
+                if (i != params.len - 1) return self.fail(0, 0, "E_REST_NOT_LAST");
+                const pt = param.checked_type orelse return self.fail(0, 0, "E_TYPE_MISMATCH");
+                if (!types.isArray(pt)) return self.fail(0, 0, "E_REST_NOT_ARRAY");
+                continue;
+            }
+            if (param.default != null) {
+                seen_default = true;
+            } else if (seen_default) {
+                // A required parameter after an optional one is not allowed.
+                return self.fail(0, 0, "E_REQUIRED_AFTER_OPTIONAL");
+            }
+        }
+    }
+
+    /// Validates a call's arguments against a parameter list that may include
+    /// defaults and a trailing rest parameter, and returns a normalized argument
+    /// slice with exactly one entry per parameter (defaults filled in, rest
+    /// collected into an array literal). Spread arguments (`...src`) are only
+    /// permitted feeding a rest parameter. Returns null after recording a
+    /// diagnostic on any mismatch.
+    fn checkCallArgs(self: *Checker, program: *ast.Program, params: []const ast.FunctionParam, args: []const *ast.Expr, line: u32, col: u32) ?[]*ast.Expr {
+        const has_rest = params.len > 0 and params[params.len - 1].is_rest;
+        const fixed_count = if (has_rest) params.len - 1 else params.len;
+
+        // Minimum required positional args: fixed params without a default.
+        var required: usize = 0;
+        for (params[0..fixed_count]) |p| {
+            if (p.default == null) required += 1;
+        }
+
+        // A spread argument is only valid when it lands in the rest slot.
+        for (args, 0..) |a, i| {
+            if (a.* == .spread and !(has_rest and i >= fixed_count)) {
+                _ = self.fail(line, col, "E_SPREAD_TARGET") catch {};
+                return null;
+            }
+        }
+
+        if (args.len < required or (!has_rest and args.len > fixed_count)) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+
+        var out: std.ArrayListUnmanaged(*ast.Expr) = .empty;
+
+        // Fixed parameters: use the positional arg or fall back to the default.
+        for (params[0..fixed_count], 0..) |p, i| {
+            const pt = p.checked_type orelse {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            if (i < args.len) {
+                self.ensureAssignable(program, pt, args[i], line, col) catch {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                };
+                out.append(self.arena, args[i]) catch return null;
+            } else {
+                out.append(self.arena, p.default.?) catch return null;
+            }
+        }
+
+        if (has_rest) {
+            const rest_param = params[params.len - 1];
+            const rest_type = rest_param.checked_type orelse {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            const elem_type = types.arrayElem(rest_type) orelse {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            const rest_args = args[fixed_count..];
+            // Build an array literal node from the trailing args; spread entries
+            // carry their array source, plain entries their element value.
+            const items = self.arena.alloc(*ast.Expr, rest_args.len) catch return null;
+            var has_spread = false;
+            for (rest_args, 0..) |a, i| {
+                if (a.* == .spread) {
+                    has_spread = true;
+                    self.ensureAssignable(program, rest_type, a.spread, line, col) catch {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    };
+                } else {
+                    self.ensureAssignable(program, elem_type, a, line, col) catch {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    };
+                }
+                items[i] = a;
+            }
+            const arr_node = self.arena.create(ast.Expr) catch return null;
+            // Use the runtime-concat form (carry elem_type) when spreading or when
+            // empty, so the slice gets an explicit element type Zig can coerce.
+            const need_typed = has_spread or rest_args.len == 0;
+            arr_node.* = .{ .array = .{ .items = items, .elem_type = if (need_typed) elem_type else null } };
+            out.append(self.arena, arr_node) catch return null;
+        }
+
+        return out.toOwnedSlice(self.arena) catch return null;
     }
 
     fn checkProgram(self: *Checker, program: *ast.Program) CompileError!void {
@@ -718,7 +831,7 @@ const Checker = struct {
         }
         const new_params = self.arena.alloc(ast.FunctionParam, decl.params.len) catch return error.OutOfMemory;
         for (decl.params, 0..) |p, i| {
-            new_params[i] = .{ .name = p.name, .annotation = try self.substCur(p.annotation) };
+            new_params[i] = .{ .name = p.name, .annotation = try self.substCur(p.annotation), .is_rest = p.is_rest, .default = if (p.default) |d| try self.cloneExpr(d) else null };
         }
         const body = try self.cloneBody(decl.body);
         const spec = self.arena.create(ast.FunctionDecl) catch return error.OutOfMemory;
@@ -846,10 +959,10 @@ const Checker = struct {
         const p = self.arena.create(ast.Expr) catch return error.OutOfMemory;
         p.* = switch (e.*) {
             .num, .float, .bool, .str, .null_lit, .this_expr => e.*,
-            .array => |items| blk: {
-                const c = self.arena.alloc(*ast.Expr, items.len) catch return error.OutOfMemory;
-                for (items, 0..) |it, i| c[i] = try self.cloneExpr(it);
-                break :blk .{ .array = c };
+            .array => |a| blk: {
+                const c = self.arena.alloc(*ast.Expr, a.items.len) catch return error.OutOfMemory;
+                for (a.items, 0..) |it, i| c[i] = try self.cloneExpr(it);
+                break :blk .{ .array = .{ .items = c, .elem_type = a.elem_type } };
             },
             .tuple_lit => |t| blk: {
                 const c = self.arena.alloc(*ast.Expr, t.items.len) catch return error.OutOfMemory;
@@ -857,6 +970,7 @@ const Checker = struct {
                 break :blk .{ .tuple_lit = .{ .items = c, .tuple_type = t.tuple_type } };
             },
             .var_ref => |r| .{ .var_ref = .{ .name = r.name } },
+            .spread => |inner| .{ .spread = try self.cloneExpr(inner) },
             .neg => |inner| .{ .neg = try self.cloneExpr(inner) },
             .not => |inner| .{ .not = try self.cloneExpr(inner) },
             .bnot => |inner| .{ .bnot = try self.cloneExpr(inner) },
@@ -894,7 +1008,7 @@ const Checker = struct {
             },
             .obj => |fields| blk: {
                 const c = self.arena.alloc(ast.FieldInit, fields.len) catch return error.OutOfMemory;
-                for (fields, 0..) |f, i| c[i] = .{ .name = f.name, .value = try self.cloneExpr(f.value) };
+                for (fields, 0..) |f, i| c[i] = .{ .name = f.name, .value = try self.cloneExpr(f.value), .is_spread = f.is_spread };
                 break :blk .{ .obj = c };
             },
             .field => |f| .{ .field = .{ .obj = try self.cloneExpr(f.obj), .name = f.name, .optional_chain = f.optional_chain } },
@@ -1436,6 +1550,15 @@ const Checker = struct {
         self.current_return_type = decl.checked_return_type;
         defer self.current_return_type = previous_return_type;
 
+        // A default value must be assignable to its parameter's declared type.
+        for (decl.params) |param| {
+            if (param.default) |d| {
+                const pt = param.checked_type orelse return self.fail(decl.line, decl.col, "E_TYPE_MISMATCH");
+                self.ensureAssignable(program, pt, d, decl.line, decl.col) catch {
+                    return self.fail(decl.line, decl.col, "E_TYPE_MISMATCH");
+                };
+            }
+        }
         try self.pushScope();
         defer self.popScope();
         for (decl.params) |param| try self.declareParam(param, decl.line, decl.col);
@@ -1931,8 +2054,18 @@ const Checker = struct {
                 const decl = self.type_decls.get(type_name) orelse return self.fail(line, col, "unknown type name");
                 if (decl.string_literals != null) return self.fail(line, col, "E_TYPE_MISMATCH");
                 const provided = value.obj;
-                // Reject fields not declared on the target type.
+                // A single `...src` spread may supply any fields not written
+                // explicitly. The spread source must be a record assignable to the
+                // target type.
+                var spread_src: ?*ast.Expr = null;
                 for (provided) |pf| {
+                    if (pf.is_spread) {
+                        if (spread_src != null) return self.fail(line, col, "E_TYPE_MISMATCH");
+                        try self.ensureAssignable(program, expected, pf.value, line, col);
+                        spread_src = pf.value;
+                        continue;
+                    }
+                    // Reject explicit fields not declared on the target type.
                     var known = false;
                     for (decl.fields) |df| {
                         if (std.mem.eql(u8, df.name, pf.name)) known = true;
@@ -1947,6 +2080,11 @@ const Checker = struct {
                     if (findField(provided, expected_field.name)) |value_field| {
                         try self.ensureAssignable(program, expected_field_type, value_field.value, line, col);
                         ordered[i] = value_field;
+                    } else if (spread_src) |src| {
+                        // Inherit the field from the spread source: `src.field`.
+                        const fref = self.arena.create(ast.Expr) catch return error.OutOfMemory;
+                        fref.* = .{ .field = .{ .obj = src, .name = expected_field.name } };
+                        ordered[i] = .{ .name = expected_field.name, .value = fref };
                     } else if (expected_field_type == .optional) {
                         const absent = self.arena.create(ast.Expr) catch return error.OutOfMemory;
                         absent.* = .null_lit;
@@ -1999,9 +2137,17 @@ const Checker = struct {
                     return;
                 }
                 const elem_type = types.arrayElem(expected) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
-                for (value.array) |item| {
-                    try self.ensureAssignable(program, elem_type, item, line, col);
+                var has_spread = false;
+                for (value.array.items) |item| {
+                    if (item.* == .spread) {
+                        // `...src` must itself be an array of the same element type.
+                        has_spread = true;
+                        try self.ensureAssignable(program, expected, item.spread, line, col);
+                    } else {
+                        try self.ensureAssignable(program, elem_type, item, line, col);
+                    }
                 }
+                if (has_spread) value.array.elem_type = elem_type;
             },
             .tuple_type => |elems| {
                 // A tuple is written as an array literal of matching length whose
@@ -2009,7 +2155,7 @@ const Checker = struct {
                 // `.array` node into a `.tuple_lit` carrying the tuple type so the
                 // emitter produces a positional struct rather than a slice.
                 const items = switch (value.*) {
-                    .array => |a| a,
+                    .array => |a| a.items,
                     .tuple_lit => |t| t.items,
                     else => {
                         const actual_type = self.exprType(program, value, line, col) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
@@ -2231,23 +2377,46 @@ const Checker = struct {
                 self.ensureAssignable(program, inner, c.r, line, col) catch return null;
                 return inner;
             },
-            .array => |items| {
+            .array => |*arr| {
+                const items = arr.items;
                 if (items.len == 0) {
                     _ = self.fail(line, col, "cannot infer array type") catch {};
                     return null;
                 }
-                const first_type = self.exprType(program, items[0], line, col) orelse return null;
-                for (items[1..]) |item| {
-                    const item_type = self.exprType(program, item, line, col) orelse return null;
-                    if (!types.same(first_type, item_type)) {
-                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
-                        return null;
+                // The element type of each entry: a normal entry contributes its
+                // own type; a `...src` spread contributes its source array's
+                // element type. All entries must agree.
+                var elem_type: ?types.Type = null;
+                var has_spread = false;
+                for (items) |item| {
+                    var this_elem: types.Type = undefined;
+                    if (item.* == .spread) {
+                        has_spread = true;
+                        const src_type = self.exprType(program, item.spread, line, col) orelse return null;
+                        if (!types.isArray(src_type)) {
+                            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                            return null;
+                        }
+                        this_elem = types.arrayElem(src_type) orelse {
+                            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                            return null;
+                        };
+                    } else {
+                        this_elem = self.exprType(program, item, line, col) orelse return null;
                     }
+                    if (elem_type) |et| {
+                        if (!types.same(et, this_elem)) {
+                            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                            return null;
+                        }
+                    } else elem_type = this_elem;
                 }
-                return types.arrayOf(first_type) orelse {
+                const result = types.arrayOf(elem_type.?) orelse {
                     _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                     return null;
                 };
+                if (has_spread) arr.elem_type = elem_type;
+                return result;
             },
             .tuple_lit => |t| t.tuple_type,
             .field => |*field| {
@@ -2666,20 +2835,7 @@ const Checker = struct {
                     _ = self.fail(line, col, "unknown function") catch {};
                     return null;
                 };
-                if (call.args.len != func.params.len) {
-                    _ = self.fail(line, col, "E_ARG_COUNT") catch {};
-                    return null;
-                }
-                for (call.args, func.params) |arg, param| {
-                    const param_type = param.checked_type orelse {
-                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
-                        return null;
-                    };
-                    self.ensureAssignable(program, param_type, arg, line, col) catch {
-                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
-                        return null;
-                    };
-                }
+                call.args = self.checkCallArgs(program, func.params, call.args, line, col) orelse return null;
                 return func.return_type;
             },
             .static_call => |*call| {

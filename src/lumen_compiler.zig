@@ -145,6 +145,9 @@ const Parser = struct {
     fn isOp2(self: *Parser, op: []const u8) bool {
         return self.cur == .op2 and std.mem.eql(u8, self.cur.op2, op);
     }
+    fn isSpread(self: *Parser) bool {
+        return self.cur == .op3 and std.mem.eql(u8, self.cur.op3, "...");
+    }
     fn oneExpr(self: *Parser, value: i64) CompileError!*Expr {
         return self.node(.{ .num = value });
     }
@@ -298,6 +301,17 @@ const Parser = struct {
 
     fn parseExpr(self: *Parser) CompileError!*Expr {
         return self.parseTernary();
+    }
+
+    /// Parses one array-literal element or call argument, recognizing a leading
+    /// `...` spread (`...expr`) and wrapping it in a `spread` node.
+    fn parseSpreadOrExpr(self: *Parser) CompileError!*Expr {
+        if (self.isSpread()) {
+            try self.advance();
+            const inner = try self.parseExpr();
+            return self.node(.{ .spread = inner });
+        }
+        return self.parseExpr();
     }
 
     /// Splits a template literal's raw inner text into literal-text and `${expr}`
@@ -508,7 +522,7 @@ const Parser = struct {
                     try self.expectOp('(');
                     var args: std.ArrayListUnmanaged(*Expr) = .empty;
                     while (!self.isOp(')')) {
-                        try args.append(self.arena, try self.parseExpr());
+                        try args.append(self.arena, try self.parseSpreadOrExpr());
                         if (self.isOp(',')) try self.advance() else break;
                     }
                     try self.expectOp(')');
@@ -630,7 +644,7 @@ const Parser = struct {
             try self.expectOp('(');
             var args: std.ArrayListUnmanaged(*Expr) = .empty;
             while (!self.isOp(')')) {
-                try args.append(self.arena, try self.parseExpr());
+                try args.append(self.arena, try self.parseSpreadOrExpr());
                 if (self.isOp(',')) try self.advance() else break;
             }
             try self.expectOp(')');
@@ -659,7 +673,7 @@ const Parser = struct {
                 try self.expectOp('(');
                 var args: std.ArrayListUnmanaged(*Expr) = .empty;
                 while (!self.isOp(')')) {
-                    try args.append(self.arena, try self.parseExpr());
+                    try args.append(self.arena, try self.parseSpreadOrExpr());
                     if (self.isOp(',')) try self.advance() else break;
                 }
                 try self.expectOp(')');
@@ -680,16 +694,24 @@ const Parser = struct {
             try self.advance();
             var items: std.ArrayListUnmanaged(*Expr) = .empty;
             while (!self.isOp(']')) {
-                try items.append(self.arena, try self.parseExpr());
+                try items.append(self.arena, try self.parseSpreadOrExpr());
                 if (self.isOp(',')) try self.advance() else break;
             }
             try self.expectOp(']');
-            return self.node(.{ .array = try items.toOwnedSlice(self.arena) });
+            return self.node(.{ .array = .{ .items = try items.toOwnedSlice(self.arena) } });
         }
         if (self.isOp('{')) {
             try self.advance();
             var fields: std.ArrayListUnmanaged(FieldInit) = .empty;
             while (!self.isOp('}')) {
+                // Object spread `...src` copies fields from another record.
+                if (self.isSpread()) {
+                    try self.advance();
+                    const src = try self.parseExpr();
+                    try fields.append(self.arena, .{ .name = "", .value = src, .is_spread = true });
+                    if (self.isOp(',')) try self.advance() else break;
+                    continue;
+                }
                 if (self.cur != .ident) return error.ParseError;
                 const fname = self.cur.ident;
                 try self.advance();
@@ -930,23 +952,13 @@ const Parser = struct {
         const name = self.cur.ident;
         try self.advance();
         const type_params = try self.parseTypeParams();
-        try self.expectOp('(');
-        var params: std.ArrayListUnmanaged(ast.FunctionParam) = .empty;
-        while (!self.isOp(')')) {
-            if (self.cur != .ident) return error.ParseError;
-            const param_name = self.cur.ident;
-            try self.advance();
-            const annotation = try self.parseOptionalMember();
-            try params.append(self.arena, .{ .name = param_name, .annotation = annotation });
-            if (self.isOp(',')) try self.advance() else break;
-        }
-        try self.expectOp(')');
+        const params = try self.parseParamList();
         try self.expectOp(':');
         const return_annotation = try self.parseTypeAnnotation();
         const body = try self.parseBlock();
         return .{ .function_decl = .{
             .name = name,
-            .params = try params.toOwnedSlice(self.arena),
+            .params = params,
             .return_annotation = return_annotation,
             .body = body,
             .type_params = type_params,
@@ -958,14 +970,32 @@ const Parser = struct {
     fn parseParamList(self: *Parser) CompileError![]ast.FunctionParam {
         try self.expectOp('(');
         var params: std.ArrayListUnmanaged(ast.FunctionParam) = .empty;
+        var seen_rest = false;
         while (!self.isOp(')')) {
+            // A rest parameter `...name: T[]` may only appear last.
+            var is_rest = false;
+            if (self.isSpread()) {
+                if (seen_rest) return error.ParseError;
+                try self.advance();
+                is_rest = true;
+                seen_rest = true;
+            }
             if (self.cur != .ident) return error.ParseError;
             const param_name = self.cur.ident;
             try self.advance();
             const annotation = try self.parseOptionalMember();
-            try params.append(self.arena, .{ .name = param_name, .annotation = annotation });
+            // Optional default value `= expr`. Not allowed on a rest parameter.
+            var default_value: ?*Expr = null;
+            if (self.isOp('=')) {
+                if (is_rest) return error.ParseError;
+                try self.advance();
+                default_value = try self.parseExpr();
+            }
+            try params.append(self.arena, .{ .name = param_name, .annotation = annotation, .is_rest = is_rest, .default = default_value });
             if (self.isOp(',')) try self.advance() else break;
         }
+        // A rest parameter must be the final parameter.
+        if (seen_rest and !params.items[params.items.len - 1].is_rest) return error.ParseError;
         try self.expectOp(')');
         return params.toOwnedSlice(self.arena);
     }
@@ -1541,7 +1571,7 @@ const Parser = struct {
             try self.expectOp('(');
             var args: std.ArrayListUnmanaged(*Expr) = .empty;
             while (!self.isOp(')')) {
-                try args.append(self.arena, try self.parseExpr());
+                try args.append(self.arena, try self.parseSpreadOrExpr());
                 if (self.isOp(',')) try self.advance() else break;
             }
             try self.expectOp(')');
@@ -1619,13 +1649,38 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             }
             try w.append(arena, '"');
         },
-        .array => |items| {
-            try w.appendSlice(arena, "&.{ ");
-            for (items, 0..) |item, i| {
-                if (i > 0) try w.appendSlice(arena, ", ");
-                try emitExpr(item, w, arena);
+        .array => |arr| {
+            if (arr.elem_type) |elem| {
+                // Array literal with `...spread` entries → runtime concatenation.
+                // Each plain entry becomes a one-element slice; each spread emits
+                // its source slice directly.
+                const ez = try types.zigName(arena, elem);
+                try w.print(arena, "(std.mem.concat(std.heap.page_allocator, {s}, &.{{ ", .{ez});
+                for (arr.items, 0..) |item, i| {
+                    if (i > 0) try w.appendSlice(arena, ", ");
+                    if (item.* == .spread) {
+                        try emitExpr(item.spread, w, arena);
+                    } else {
+                        try w.print(arena, "&[_]{s}{{ ", .{ez});
+                        try emitExpr(item, w, arena);
+                        try w.appendSlice(arena, " }");
+                    }
+                }
+                try w.appendSlice(arena, " }) catch unreachable)");
+            } else {
+                try w.appendSlice(arena, "&.{ ");
+                for (arr.items, 0..) |item, i| {
+                    if (i > 0) try w.appendSlice(arena, ", ");
+                    try emitExpr(item, w, arena);
+                }
+                try w.appendSlice(arena, " }");
             }
-            try w.appendSlice(arena, " }");
+        },
+        .spread => |inner| {
+            // A bare spread only appears inside array/call/object emitters, which
+            // handle it specially; emitting the inner expression is the safe
+            // fallback should one slip through.
+            try emitExpr(inner, w, arena);
         },
         .tuple_lit => |t| {
             // A positional struct literal `.{ .@"0" = a, .@"1" = b, ... }`.
@@ -2399,14 +2454,15 @@ fn exprUsesName(e: *const Expr, name: []const u8) bool {
     return switch (e.*) {
         .num, .float, .bool, .str, .null_lit, .this_expr => false,
         .var_ref => |r| std.mem.eql(u8, r.name, name),
-        .array => |items| blk: {
-            for (items) |it| if (exprUsesName(it, name)) break :blk true;
+        .array => |a| blk: {
+            for (a.items) |it| if (exprUsesName(it, name)) break :blk true;
             break :blk false;
         },
         .tuple_lit => |t| blk: {
             for (t.items) |it| if (exprUsesName(it, name)) break :blk true;
             break :blk false;
         },
+        .spread => |inner| exprUsesName(inner, name),
         .neg, .not, .bnot => |inner| exprUsesName(inner, name),
         .bin => |b| exprUsesName(b.l, name) or exprUsesName(b.r, name),
         .bool_bin => |b| exprUsesName(b.l, name) or exprUsesName(b.r, name),
@@ -2539,14 +2595,15 @@ fn exprUsesThis(e: *const Expr) bool {
     return switch (e.*) {
         .this_expr => true,
         .num, .float, .bool, .str, .null_lit, .var_ref => false,
-        .array => |items| blk: {
-            for (items) |it| if (exprUsesThis(it)) break :blk true;
+        .array => |a| blk: {
+            for (a.items) |it| if (exprUsesThis(it)) break :blk true;
             break :blk false;
         },
         .tuple_lit => |t| blk: {
             for (t.items) |it| if (exprUsesThis(it)) break :blk true;
             break :blk false;
         },
+        .spread => |inner| exprUsesThis(inner),
         .neg, .not, .bnot => |inner| exprUsesThis(inner),
         .bin => |b| exprUsesThis(b.l) or exprUsesThis(b.r),
         .bool_bin => |b| exprUsesThis(b.l) or exprUsesThis(b.r),
