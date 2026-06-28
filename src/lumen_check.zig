@@ -441,6 +441,60 @@ const Checker = struct {
         return null;
     }
 
+    /// Validate an instance method call on a `string` receiver and return its
+    /// statically-known result type. Mirrors `arrayMethod`.
+    fn stringMethod(self: *Checker, program: *ast.Program, mc: anytype, line: u32, col: u32) ?types.Type {
+        mc.string_method = true;
+        const name = mc.name;
+        const eq = std.mem.eql;
+
+        const ArgKind = enum { string, int };
+        const Spec = struct { min: usize, max: usize, kinds: []const ArgKind, result: types.Type };
+
+        // Each method's expected argument shape and result type.
+        const spec: Spec = blk: {
+            if (eq(u8, name, "charAt")) break :blk .{ .min = 1, .max = 1, .kinds = &.{.int}, .result = .string };
+            if (eq(u8, name, "charCodeAt")) break :blk .{ .min = 1, .max = 1, .kinds = &.{.int}, .result = .i32 };
+            if (eq(u8, name, "indexOf")) break :blk .{ .min = 1, .max = 1, .kinds = &.{.string}, .result = .i32 };
+            if (eq(u8, name, "includes")) break :blk .{ .min = 1, .max = 1, .kinds = &.{.string}, .result = .bool };
+            if (eq(u8, name, "startsWith")) break :blk .{ .min = 1, .max = 1, .kinds = &.{.string}, .result = .bool };
+            if (eq(u8, name, "endsWith")) break :blk .{ .min = 1, .max = 1, .kinds = &.{.string}, .result = .bool };
+            if (eq(u8, name, "slice")) break :blk .{ .min = 1, .max = 2, .kinds = &.{ .int, .int }, .result = .string };
+            if (eq(u8, name, "substring")) break :blk .{ .min = 1, .max = 2, .kinds = &.{ .int, .int }, .result = .string };
+            if (eq(u8, name, "repeat")) break :blk .{ .min = 1, .max = 1, .kinds = &.{.int}, .result = .string };
+            if (eq(u8, name, "padStart")) break :blk .{ .min = 2, .max = 2, .kinds = &.{ .int, .string }, .result = .string };
+            if (eq(u8, name, "replace")) break :blk .{ .min = 2, .max = 2, .kinds = &.{ .string, .string }, .result = .string };
+            if (eq(u8, name, "toUpperCase")) break :blk .{ .min = 0, .max = 0, .kinds = &.{}, .result = .string };
+            if (eq(u8, name, "toLowerCase")) break :blk .{ .min = 0, .max = 0, .kinds = &.{}, .result = .string };
+            if (eq(u8, name, "trim")) break :blk .{ .min = 0, .max = 0, .kinds = &.{}, .result = .string };
+            if (eq(u8, name, "split")) break :blk .{ .min = 1, .max = 1, .kinds = &.{.string}, .result = types.arrayOf(.string).? };
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        };
+
+        if (mc.args.len < spec.min or mc.args.len > spec.max) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        for (mc.args, 0..) |arg, i| {
+            switch (spec.kinds[i]) {
+                .string => self.ensureAssignable(program, .string, arg, line, col) catch {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                },
+                .int => {
+                    const at = self.exprType(program, arg, line, col) orelse return null;
+                    if (!types.isInteger(at)) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                },
+            }
+        }
+        mc.array_result_type = spec.result;
+        return spec.result;
+    }
+
     fn declareExtern(self: *Checker, decl: *ast.ExternDecl) CompileError!void {
         if (self.funcs.get(decl.name) != null) return self.fail(decl.line, decl.col, "E_DUPLICATE_BINDING");
         const ret = try self.typeFromAnnotation(decl.return_annotation, decl.line, decl.col);
@@ -1152,6 +1206,9 @@ const Checker = struct {
                 const obj_type = self.exprType(program, mc.obj, line, col) orelse return null;
                 if (types.isArray(obj_type)) {
                     return self.arrayMethod(program, mc, obj_type, line, col);
+                }
+                if (types.isStringLike(obj_type)) {
+                    return self.stringMethod(program, mc, line, col);
                 }
                 if (obj_type != .class_type) {
                     _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};

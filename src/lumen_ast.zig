@@ -289,7 +289,7 @@ pub const Expr = union(enum) {
     arrow: *ArrowExpr, // (x: T) => expr
     this_expr, // `this` inside a method/constructor
     new_expr: struct { class_name: []const u8, args: []*Expr }, // new C(args)
-    method_call: struct { obj: *Expr, name: []const u8, args: []*Expr, class_name: ?[]const u8 = null, array_elem_type: ?types.Type = null, array_acc_type: ?types.Type = null, array_result_type: ?types.Type = null }, // obj.m(args)
+    method_call: struct { obj: *Expr, name: []const u8, args: []*Expr, class_name: ?[]const u8 = null, array_elem_type: ?types.Type = null, array_acc_type: ?types.Type = null, array_result_type: ?types.Type = null, string_method: bool = false }, // obj.m(args)
     template: []TemplatePart, // `text ${expr} ...`
     obj: []FieldInit,
     field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null, enum_value: ?EnumValue = null, optional_chain: bool = false, chain_field_type: ?types.Type = null },

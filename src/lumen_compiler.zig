@@ -1527,7 +1527,9 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try w.append(arena, ')');
         },
         .method_call => |mc| {
-            if (mc.array_result_type != null) {
+            if (mc.string_method) {
+                try emitStringMethod(mc, w, arena);
+            } else if (mc.array_result_type != null) {
                 try emitArrayMethod(mc, w, arena);
             } else {
                 try emitExpr(mc.obj, w, arena);
@@ -1789,6 +1791,152 @@ fn emitArrayMethod(mc: anytype, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
         }
         try w.appendSlice(arena, "; var __buf: std.ArrayListUnmanaged(u8) = .empty; for (__arr, 0..) |__e, __i| { if (__i > 0) __buf.appendSlice(std.heap.page_allocator, __sep) catch unreachable; ");
         try w.print(arena, "__buf.appendSlice(std.heap.page_allocator, std.fmt.allocPrint(std.heap.page_allocator, \"{s}\", .{{__e}}) catch unreachable) catch unreachable; }} break :{s} @as([]const u8, __buf.items); }})", .{ spec, lbl });
+        return;
+    }
+
+    return error.ParseError;
+}
+
+/// Monotonic counter giving each emitted string-method block a unique label.
+var g_string_method_seq: usize = 0;
+
+/// Lower a string instance method `s.m(args)` to an inline Zig expression block
+/// over the underlying byte slice. Results are allocated with the page allocator
+/// (allocate-and-leak), matching the array-method lowering.
+fn emitStringMethod(mc: anytype, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
+    const eq = std.mem.eql;
+    const name = mc.name;
+    g_string_method_seq += 1;
+    const lbl = try std.fmt.allocPrint(arena, "__sm{d}", .{g_string_method_seq});
+
+    // Open the block and bind `__s` to the receiver string.
+    try w.print(arena, "({s}: {{ const __s: []const u8 = ", .{lbl});
+    try emitExpr(mc.obj, w, arena);
+    try w.appendSlice(arena, "; ");
+
+    // Helper to emit an argument coerced to isize (indices may be i32 or i64).
+    const A = struct {
+        fn idx(varname: []const u8, e: anytype, ww: *std.ArrayListUnmanaged(u8), ar: std.mem.Allocator) CompileError!void {
+            try ww.print(ar, "const {s}: isize = @intCast(", .{varname});
+            try emitExpr(e, ww, ar);
+            try ww.appendSlice(ar, "); ");
+        }
+    };
+
+    if (eq(u8, name, "charAt")) {
+        try A.idx("__i", mc.args[0], w, arena);
+        try w.print(arena, "break :{s} @as([]const u8, if (__i >= 0 and __i < @as(isize, @intCast(__s.len))) __s[@intCast(__i)..@as(usize, @intCast(__i)) + 1] else \"\"); }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "charCodeAt")) {
+        try A.idx("__i", mc.args[0], w, arena);
+        try w.print(arena, "break :{s} @as(i32, if (__i >= 0 and __i < @as(isize, @intCast(__s.len))) @intCast(__s[@intCast(__i)]) else -1); }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "indexOf")) {
+        try w.appendSlice(arena, "const __needle: []const u8 = ");
+        try emitExpr(mc.args[0], w, arena);
+        try w.print(arena, "; break :{s} @as(i32, if (std.mem.indexOf(u8, __s, __needle)) |__p| @intCast(__p) else -1); }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "includes")) {
+        try w.appendSlice(arena, "const __needle: []const u8 = ");
+        try emitExpr(mc.args[0], w, arena);
+        try w.print(arena, "; break :{s} (std.mem.indexOf(u8, __s, __needle) != null); }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "startsWith")) {
+        try w.appendSlice(arena, "const __needle: []const u8 = ");
+        try emitExpr(mc.args[0], w, arena);
+        try w.print(arena, "; break :{s} std.mem.startsWith(u8, __s, __needle); }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "endsWith")) {
+        try w.appendSlice(arena, "const __needle: []const u8 = ");
+        try emitExpr(mc.args[0], w, arena);
+        try w.print(arena, "; break :{s} std.mem.endsWith(u8, __s, __needle); }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "slice") or eq(u8, name, "substring")) {
+        const is_sub = eq(u8, name, "substring");
+        try w.appendSlice(arena, "const __len: isize = @intCast(__s.len); ");
+        try A.idx("__a", mc.args[0], w, arena);
+        if (mc.args.len == 2) {
+            try A.idx("__b", mc.args[1], w, arena);
+        } else {
+            try w.appendSlice(arena, "const __b: isize = __len; ");
+        }
+        // Clamp both endpoints into [0, len].
+        try w.appendSlice(arena, "const __c0: isize = if (__a < 0) 0 else if (__a > __len) __len else __a; ");
+        try w.appendSlice(arena, "const __c1: isize = if (__b < 0) 0 else if (__b > __len) __len else __b; ");
+        if (is_sub) {
+            // substring swaps so the smaller endpoint is the start.
+            try w.appendSlice(arena, "const __lo: isize = if (__c0 < __c1) __c0 else __c1; const __hi: isize = if (__c0 < __c1) __c1 else __c0; ");
+        } else {
+            // slice yields empty when start > end.
+            try w.appendSlice(arena, "const __lo: isize = __c0; const __hi: isize = if (__c1 < __c0) __c0 else __c1; ");
+        }
+        try w.print(arena, "break :{s} @as([]const u8, __s[@intCast(__lo)..@intCast(__hi)]); }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "toUpperCase")) {
+        try w.print(arena, "const __r = std.heap.page_allocator.alloc(u8, __s.len) catch unreachable; for (__s, 0..) |__c, __i| {{ __r[__i] = std.ascii.toUpper(__c); }} break :{s} @as([]const u8, __r); }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "toLowerCase")) {
+        try w.print(arena, "const __r = std.heap.page_allocator.alloc(u8, __s.len) catch unreachable; for (__s, 0..) |__c, __i| {{ __r[__i] = std.ascii.toLower(__c); }} break :{s} @as([]const u8, __r); }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "trim")) {
+        try w.print(arena, "break :{s} @as([]const u8, std.mem.trim(u8, __s, \" \\t\\r\\n\")); }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "repeat")) {
+        try A.idx("__n", mc.args[0], w, arena);
+        try w.appendSlice(arena, "const __count: usize = if (__n < 0) 0 else @intCast(__n); ");
+        try w.appendSlice(arena, "var __buf: std.ArrayListUnmanaged(u8) = .empty; var __k: usize = 0; while (__k < __count) : (__k += 1) { __buf.appendSlice(std.heap.page_allocator, __s) catch unreachable; } ");
+        try w.print(arena, "break :{s} @as([]const u8, __buf.items); }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "padStart")) {
+        try A.idx("__target", mc.args[0], w, arena);
+        try w.appendSlice(arena, "const __pad: []const u8 = ");
+        try emitExpr(mc.args[1], w, arena);
+        try w.appendSlice(arena, "; const __goal: usize = if (__target < 0) 0 else @intCast(__target); ");
+        try w.appendSlice(arena, "var __buf: std.ArrayListUnmanaged(u8) = .empty; if (__goal > __s.len and __pad.len > 0) { var __need: usize = __goal - __s.len; while (__need > 0) { const __take = if (__need < __pad.len) __need else __pad.len; __buf.appendSlice(std.heap.page_allocator, __pad[0..__take]) catch unreachable; __need -= __take; } } ");
+        try w.appendSlice(arena, "__buf.appendSlice(std.heap.page_allocator, __s) catch unreachable; ");
+        try w.print(arena, "break :{s} @as([]const u8, __buf.items); }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "replace")) {
+        try w.appendSlice(arena, "const __from: []const u8 = ");
+        try emitExpr(mc.args[0], w, arena);
+        try w.appendSlice(arena, "; const __to: []const u8 = ");
+        try emitExpr(mc.args[1], w, arena);
+        try w.appendSlice(arena, "; var __buf: std.ArrayListUnmanaged(u8) = .empty; if (__from.len > 0) { if (std.mem.indexOf(u8, __s, __from)) |__p| { __buf.appendSlice(std.heap.page_allocator, __s[0..__p]) catch unreachable; __buf.appendSlice(std.heap.page_allocator, __to) catch unreachable; __buf.appendSlice(std.heap.page_allocator, __s[__p + __from.len ..]) catch unreachable; } else { __buf.appendSlice(std.heap.page_allocator, __s) catch unreachable; } } else { __buf.appendSlice(std.heap.page_allocator, __s) catch unreachable; } ");
+        try w.print(arena, "break :{s} @as([]const u8, __buf.items); }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "split")) {
+        try w.appendSlice(arena, "const __sep: []const u8 = ");
+        try emitExpr(mc.args[0], w, arena);
+        try w.appendSlice(arena, "; var __parts: std.ArrayListUnmanaged([]const u8) = .empty; ");
+        try w.appendSlice(arena, "if (__sep.len == 0) { for (__s) |*__cp| __parts.append(std.heap.page_allocator, __cp[0..1]) catch unreachable; } ");
+        try w.appendSlice(arena, "else { var __it = std.mem.splitSequence(u8, __s, __sep); while (__it.next()) |__seg| __parts.append(std.heap.page_allocator, __seg) catch unreachable; } ");
+        try w.print(arena, "break :{s} @as([]const []const u8, __parts.items); }})", .{lbl});
         return;
     }
 

@@ -1,0 +1,47 @@
+{
+  "feature": "014-string-methods",
+  "cases": [
+    {
+      "id": "string.valid.query-methods",
+      "source": "../examples/valid/query-methods.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "e\n72\n7\n-1\ntrue\nfalse\ntrue\ntrue" }
+    },
+    {
+      "id": "string.valid.transform-methods",
+      "source": "../examples/valid/transform-methods.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "World\nHello\n, \nHELLO, WORLD\nhello, world\nspaced\nababab\n007\nHello, Lumen" }
+    },
+    {
+      "id": "string.valid.split-method",
+      "source": "../examples/valid/split-method.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "3\nalpha\ngamma\na | b | c" }
+    },
+    {
+      "id": "string.invalid.indexof-arg-type",
+      "source": "../examples/invalid/indexof-arg-type.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "string.invalid.charat-arg-type",
+      "source": "../examples/invalid/charat-arg-type.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "string.invalid.repeat-arg-count",
+      "source": "../examples/invalid/repeat-arg-count.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_ARG_COUNT" }
+    },
+    {
+      "id": "string.invalid.unknown-method",
+      "source": "../examples/invalid/unknown-method.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    }
+  ]
+}

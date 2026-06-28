@@ -1,0 +1,10 @@
+const s: string = "Hello, World";
+console.log(s.slice(7));
+console.log(s.slice(0, 5));
+console.log(s.substring(7, 5));
+console.log(s.toUpperCase());
+console.log(s.toLowerCase());
+console.log("  spaced  ".trim());
+console.log("ab".repeat(3));
+console.log("7".padStart(3, "0"));
+console.log(s.replace("World", "Lumen"));
