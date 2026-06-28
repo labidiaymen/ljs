@@ -79,13 +79,24 @@ nav .links a:hover { color: var(--fg); text-decoration: none; }
   .nav-toggle:checked ~ .links { display: flex; }
 }
 
-/* Hero — flat, no gradients or glow */
-.hero { padding: 84px 0 64px; border-bottom: 1px solid var(--border); }
-.hero .wrap { text-align: center; }
-.hero h1 { font-size: clamp(38px, 6.5vw, 54px); margin: 0 0 18px; letter-spacing: -0.03em; line-height: 1.06; font-weight: 750; }
-.hero h1 .glow { color: var(--accent); }
-.hero .tag { font-size: 18px; color: var(--muted); max-width: 640px; margin: 0 auto 30px; }
-.cta { margin-bottom: 26px; }
+/* Hero — two columns: copy left, code right, flat */
+.hero { padding: 72px 0 60px; border-bottom: 1px solid var(--border); }
+.hero-grid { display: grid; grid-template-columns: 1.05fr 1fr; gap: 52px; align-items: center; }
+/* Let grid children shrink below content width so the code panel scrolls
+   internally instead of widening the whole page (mobile overflow). */
+.hero-copy, .hero-code { min-width: 0; }
+.hero-copy { text-align: left; }
+.hero h1 { font-size: clamp(32px, 4vw, 46px); margin: 0 0 18px; letter-spacing: -0.03em; line-height: 1.08; font-weight: 760; }
+.hero h1 .accent { color: var(--accent); }
+.hero .tag { font-size: 17px; color: var(--muted); max-width: 520px; margin: 0 0 26px; }
+.cta { margin-bottom: 24px; }
+.hero-code pre { margin: 0; max-width: 100%; }
+.hero .install-row { margin: 0; max-width: 100%; }
+@media (max-width: 860px) {
+  .hero { padding: 48px 0 44px; }
+  .hero-grid { grid-template-columns: 1fr; gap: 30px; }
+  .hero .tag { max-width: none; }
+}
 
 .btn { display: inline-block; padding: 11px 20px; border-radius: 8px; font-weight: 600; font-size: 15px; border: 1px solid transparent; }
 .btn.primary { background: var(--accent); color: var(--accent-fg); }

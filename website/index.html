@@ -24,17 +24,31 @@
 </div></nav>
 
 <header class="hero">
-  <div class="wrap">
-    <h1>TypeScript syntax.<br><span class="glow">Native speed.</span></h1>
-    <p class="tag">A statically&#8209;typed, compiled language with TypeScript syntax. Write
-    familiar source; it type&#8209;checks and compiles straight to a small, fast native binary.</p>
-    <div class="cta">
-      <a class="btn primary" href="#quickstart">Get started</a>
-      <a class="btn ghost" href="/examples">See examples</a>
+  <div class="wrap hero-grid">
+    <div class="hero-copy">
+      <h1>Write TypeScript.<br>Compile to a <span class="accent">native binary</span>.</h1>
+      <p class="tag">Lumen type&#8209;checks familiar TypeScript syntax and compiles it straight to a
+      small, dependency&#8209;free executable. No VM, no garbage collector, no runtime.</p>
+      <div class="cta">
+        <a class="btn primary" href="#quickstart">Get started</a>
+        <a class="btn ghost" href="/examples">Examples</a>
+      </div>
+      <div class="install-row">
+        <code id="install-cmd">curl -fsSL https://lumen-lang.org/install.sh | sh</code>
+        <button class="copy" data-copy="install-cmd" aria-label="Copy install command">Copy</button>
+      </div>
     </div>
-    <div class="install-row">
-      <code id="install-cmd">curl -fsSL https://lumen-lang.org/install.sh | sh</code>
-      <button class="copy" data-copy="install-cmd" aria-label="Copy install command">Copy</button>
+    <div class="hero-code">
+<pre><code class="lumen">// Call libm directly -- no bindings, no runtime.
+// @link m
+extern function sqrt(x: number): number;
+
+function hypot(a: number, b: number): number {
+  defer console.log("computed");   // runs at scope exit
+  return sqrt(a * a + b * b);
+}
+
+console.log(hypot(3.0, 4.0));   // computed → 5</code></pre>
     </div>
   </div>
 </header>
