@@ -492,7 +492,7 @@
       "source": "../examples/invalid/import-named.ts",
       "phase": "diagnostics",
       "expect": {
-        "diagnostic": "E_UNSUPPORTED_IMPORT"
+        "diagnostic": "E_MISSING_EXPORT"
       }
     },
     {

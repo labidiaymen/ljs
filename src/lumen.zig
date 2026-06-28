@@ -38,19 +38,43 @@ fn printDiag(err: *std.Io.Writer, source: []const u8, file: []const u8, diag: co
     }
 }
 
+/// A parsed `import ... from "..."` clause. A module may be pulled in either by
+/// its default export (`import name from "..."`) or by a list of named exports
+/// (`import { a, b } from "..."`).
 const ImportSpec = struct {
-    binding: []const u8,
+    kind: Kind,
     spec: []const u8,
+
+    const Kind = union(enum) {
+        /// `import <binding> from "..."` — binds the module's default export.
+        default: []const u8,
+        /// `import { a, b } from "..."` — binds the listed named exports.
+        named: []const []const u8,
+    };
 };
 
-fn parseImportSpec(line: []const u8) !?ImportSpec {
+/// Splits a comma-separated `{ a, b, c }` binding list into trimmed names.
+/// Rejects empty entries, modifiers (`* as`, `as`), and stray punctuation so the
+/// import surface stays the simple TypeScript named-import form.
+fn parseNamedBindings(arena: std.mem.Allocator, inner: []const u8) ![]const []const u8 {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, inner, ',');
+    while (it.next()) |raw| {
+        const name = std.mem.trim(u8, raw, " \t");
+        if (name.len == 0) return error.InvalidImport;
+        if (std.mem.indexOfAny(u8, name, " \t{}*") != null) return error.InvalidImport;
+        try names.append(arena, name);
+    }
+    if (names.items.len == 0) return error.InvalidImport;
+    return names.items;
+}
+
+fn parseImportSpec(arena: std.mem.Allocator, line: []const u8) !?ImportSpec {
     const trimmed = std.mem.trim(u8, line, " \t\r");
     if (!std.mem.startsWith(u8, trimmed, "import ")) return null;
-    if (std.mem.startsWith(u8, trimmed, "import {")) return error.InvalidImport;
     const marker = " from \"";
     const marker_pos = std.mem.indexOf(u8, trimmed, marker) orelse return error.InvalidImport;
-    const binding = std.mem.trim(u8, trimmed["import ".len..marker_pos], " \t");
-    if (binding.len == 0 or std.mem.indexOfAny(u8, binding, " \t{},*") != null) return error.InvalidImport;
+    const clause = std.mem.trim(u8, trimmed["import ".len..marker_pos], " \t");
     const spec_start = marker_pos + marker.len;
     const spec_end = std.mem.indexOfScalarPos(u8, trimmed, spec_start, '"') orelse return error.InvalidImport;
     const spec = trimmed[spec_start..spec_end];
@@ -59,7 +83,16 @@ fn parseImportSpec(line: []const u8) !?ImportSpec {
     // Local relative or https URL only; reject http://, bare, and others.
     if (!is_local and !is_url) return error.InvalidImport;
     if (!std.mem.endsWith(u8, spec, ".ts")) return error.InvalidImport;
-    return .{ .binding = binding, .spec = spec };
+
+    if (std.mem.startsWith(u8, clause, "{")) {
+        if (!std.mem.endsWith(u8, clause, "}")) return error.InvalidImport;
+        const inner = clause[1 .. clause.len - 1];
+        const names = try parseNamedBindings(arena, inner);
+        return .{ .kind = .{ .named = names }, .spec = spec };
+    }
+
+    if (clause.len == 0 or std.mem.indexOfAny(u8, clause, " \t{},*") != null) return error.InvalidImport;
+    return .{ .kind = .{ .default = clause }, .spec = spec };
 }
 
 fn appendExportDefaultFunction(arena: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), trimmed: []const u8, default_name: ?[]const u8) !bool {
@@ -72,6 +105,57 @@ fn appendExportDefaultFunction(arena: std.mem.Allocator, out: *std.ArrayListUnma
     const emit_name = default_name orelse original_name;
     try out.print(arena, "function {s}{s}\n", .{ emit_name, rest[paren..] });
     return true;
+}
+
+/// Reads the symbol name introduced by a `export function NAME` / `export const
+/// NAME` declaration, returning the name and the keyword (`function`/`const`).
+const NamedExport = struct {
+    name: []const u8,
+    /// The declaration with the leading `export ` removed.
+    decl: []const u8,
+};
+
+fn parseNamedExportDecl(trimmed: []const u8) ?NamedExport {
+    const decls = [_]struct { prefix: []const u8 }{
+        .{ .prefix = "export function " },
+        .{ .prefix = "export const " },
+        .{ .prefix = "export let " },
+    };
+    for (decls) |d| {
+        if (!std.mem.startsWith(u8, trimmed, d.prefix)) continue;
+        const decl = trimmed["export ".len..];
+        const rest = trimmed[d.prefix.len..];
+        // Name runs up to the first `(`, `:`, `=`, or whitespace.
+        const end = std.mem.indexOfAny(u8, rest, "(:= \t") orelse rest.len;
+        const name = std.mem.trim(u8, rest[0..end], " \t");
+        if (name.len == 0) return null;
+        return .{ .name = name, .decl = decl };
+    }
+    return null;
+}
+
+/// Parses an `export { a, b }` re-export list into its names. Returns null when
+/// the line is not such a statement.
+fn parseExportList(arena: std.mem.Allocator, trimmed: []const u8) !?[]const []const u8 {
+    if (!std.mem.startsWith(u8, trimmed, "export {")) return null;
+    const close = std.mem.indexOfScalar(u8, trimmed, '}') orelse return error.InvalidImport;
+    const inner = trimmed["export {".len..close];
+    return try parseNamedBindings(arena, inner);
+}
+
+/// Collects every symbol a module exports: default-function name (if any),
+/// `export function/const/let NAME` declarations, and `export { a, b }` lists.
+/// Used to validate that named imports refer to real exports.
+fn collectExports(arena: std.mem.Allocator, source: []const u8, set: *std.StringHashMapUnmanaged(void)) !void {
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (parseNamedExportDecl(trimmed)) |ne| {
+            try set.put(arena, ne.name, {});
+        } else if (try parseExportList(arena, trimmed)) |names| {
+            for (names) |n| try set.put(arena, n, {});
+        }
+    }
 }
 
 /// Resolves a relative specifier (`./x.ts`, `../y/z.ts`) against a remote
@@ -128,6 +212,31 @@ fn fetchUrl(arena: std.mem.Allocator, io: std.Io, url: []const u8) ![]const u8 {
     return aw.toArrayList().items;
 }
 
+/// Validates a named import against an already-inlined module by re-reading its
+/// source and checking each requested binding is exported. (Default imports and
+/// the entry module need no check.)
+fn validateNamedImport(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    is_url: bool,
+    path: []const u8,
+    key: []const u8,
+    import_kind: ?ImportSpec.Kind,
+) !void {
+    const kind = import_kind orelse return;
+    const names = switch (kind) {
+        .named => |n| n,
+        .default => return,
+    };
+    const source = if (is_url)
+        fetchUrl(arena, io, path) catch return error.ImportReadFailed
+    else
+        std.Io.Dir.cwd().readFileAlloc(io, key, arena, .limited(16 * 1024 * 1024)) catch return error.ImportReadFailed;
+    var exports: std.StringHashMapUnmanaged(void) = .empty;
+    try collectExports(arena, source, &exports);
+    for (names) |n| if (exports.get(n) == null) return error.MissingExport;
+}
+
 fn appendExpandedSource(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -135,7 +244,7 @@ fn appendExpandedSource(
     out: *std.ArrayListUnmanaged(u8),
     visiting: *std.StringHashMapUnmanaged(void),
     emitted: *std.StringHashMapUnmanaged(void),
-    default_name: ?[]const u8,
+    import_kind: ?ImportSpec.Kind,
     depth: u8,
 ) !void {
     if (depth > 16) return error.InvalidImport;
@@ -143,7 +252,12 @@ fn appendExpandedSource(
     // Cycle/dedup key: the URL itself for remote modules, the resolved path otherwise.
     const key = if (is_url) path else try std.fs.path.resolve(arena, &.{path});
     if (visiting.get(key) != null) return error.ImportCycle;
-    if (emitted.get(key) != null) return;
+    if (emitted.get(key) != null) {
+        // The module is already inlined, but a fresh importer may still request
+        // named bindings: validate them against what the module exports.
+        try validateNamedImport(arena, io, is_url, path, key, import_kind);
+        return;
+    }
     try visiting.put(arena, key, {});
     defer _ = visiting.remove(key);
 
@@ -151,6 +265,21 @@ fn appendExpandedSource(
         fetchUrl(arena, io, path) catch return error.ImportReadFailed
     else
         std.Io.Dir.cwd().readFileAlloc(io, key, arena, .limited(16 * 1024 * 1024)) catch return error.ImportReadFailed;
+
+    // Named imports must name real exports. Default import of the module's
+    // default export needs no name check (the rename happens during emit).
+    if (import_kind) |kind| switch (kind) {
+        .named => |names| {
+            var exports: std.StringHashMapUnmanaged(void) = .empty;
+            try collectExports(arena, source, &exports);
+            for (names) |n| if (exports.get(n) == null) return error.MissingExport;
+        },
+        .default => {},
+    };
+    const default_name: ?[]const u8 = if (import_kind) |kind| switch (kind) {
+        .default => |b| b,
+        .named => null,
+    } else null;
     // Base directory for resolving relative child imports: for a URL it is the
     // URL up to its last `/`; for a local file it is the file's directory.
     const dir = if (is_url) blk: {
@@ -168,7 +297,7 @@ fn appendExpandedSource(
             test_skip += braceDelta(line);
             continue;
         }
-        if (try parseImportSpec(line)) |import_spec| {
+        if (try parseImportSpec(arena, line)) |import_spec| {
             if (local_imports.get(import_spec.spec) != null) return error.DuplicateImport;
             try local_imports.put(arena, import_spec.spec, {});
             const child_is_url = std.mem.startsWith(u8, import_spec.spec, "https://");
@@ -180,7 +309,7 @@ fn appendExpandedSource(
                 try joinUrl(arena, dir, import_spec.spec)
             else
                 try std.fs.path.join(arena, &.{ dir, import_spec.spec });
-            try appendExpandedSource(arena, io, imported_path, out, visiting, emitted, import_spec.binding, depth + 1);
+            try appendExpandedSource(arena, io, imported_path, out, visiting, emitted, import_spec.kind, depth + 1);
             continue;
         }
         const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -189,6 +318,17 @@ fn appendExpandedSource(
             continue;
         }
         if (try appendExportDefaultFunction(arena, out, trimmed, default_name)) continue;
+        // `export { a, b }` re-export lists carry no declaration of their own:
+        // the underlying functions/consts are emitted from their own lines.
+        if (try parseExportList(arena, trimmed)) |_| continue;
+        // `export function/const/let NAME` declarations: drop the `export `
+        // keyword and emit the plain declaration into the shared program.
+        if (parseNamedExportDecl(trimmed)) |ne| {
+            // Preserve original indentation by emitting onto its own line.
+            try out.appendSlice(arena, ne.decl);
+            try out.append(arena, '\n');
+            continue;
+        }
         if (std.mem.startsWith(u8, trimmed, "export ")) return error.InvalidImport;
         try out.appendSlice(arena, line);
         try out.append(arena, '\n');
@@ -242,6 +382,7 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
             error.ImportReadFailed => try err.print("{s}:1:1: error: E_IMPORT_NOT_FOUND\n", .{path}),
             error.ImportCycle => try err.print("{s}:1:1: error: E_IMPORT_CYCLE\n", .{path}),
             error.DuplicateImport => try err.print("{s}:1:1: error: E_DUPLICATE_IMPORT\n", .{path}),
+            error.MissingExport => try err.print("{s}:1:1: error: E_MISSING_EXPORT\n", .{path}),
             else => try err.print("error: cannot read file {s}\n", .{path}),
         }
         return 2;

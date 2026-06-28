@@ -1,0 +1,29 @@
+{
+  "feature": "015-multi-symbol-modules",
+  "cases": [
+    {
+      "id": "modules.valid.named-import",
+      "source": "../examples/valid/named-import-main.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "5\n20\n42" }
+    },
+    {
+      "id": "modules.valid.export-list",
+      "source": "../examples/valid/export-list-main.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "25\n27" }
+    },
+    {
+      "id": "modules.invalid.missing-export",
+      "source": "../examples/invalid/missing-export.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_MISSING_EXPORT" }
+    },
+    {
+      "id": "modules.invalid.duplicate-binding",
+      "source": "../examples/invalid/duplicate-binding.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_DUPLICATE_BINDING" }
+    }
+  ]
+}

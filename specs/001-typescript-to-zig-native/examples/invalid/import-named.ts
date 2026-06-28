@@ -1,3 +1,3 @@
-import { add } from "./math.ts";
+import { add } from "../valid/import-math.ts";
 
-console.log(1);
+console.log(add(1, 2));
