@@ -39,6 +39,7 @@ const ClassInfo = struct {
     methods: []ast.FunctionDecl,
     ctor_params: []ast.FunctionParam,
     has_ctor: bool,
+    parent: ?[]const u8 = null,
 };
 
 const Binding = struct {
@@ -77,6 +78,7 @@ const Checker = struct {
     subst_params: []const []const u8 = &.{},
     subst_args: []const []const u8 = &.{},
     current_class: ?[]const u8 = null,
+    in_constructor: bool = false,
     next_binding_id: u32 = 0,
     current_return_type: ?types.Type = null,
     nested_stmt_depth: u32 = 0,
@@ -454,7 +456,7 @@ const Checker = struct {
                     continue;
                 }
                 if (self.classes.get(c.name) != null) return self.fail(c.line, c.col, "E_DUPLICATE_BINDING");
-                self.classes.put(self.arena, c.name, .{ .fields = c.fields, .methods = c.methods, .ctor_params = c.ctor_params, .has_ctor = c.has_ctor }) catch return error.OutOfMemory;
+                self.classes.put(self.arena, c.name, .{ .fields = c.fields, .methods = c.methods, .ctor_params = c.ctor_params, .has_ctor = c.has_ctor, .parent = c.parent }) catch return error.OutOfMemory;
             }
         }
         for (program.stmts) |*stmt| {
@@ -847,6 +849,11 @@ const Checker = struct {
                 for (mc.args, 0..) |it, i| c[i] = try self.cloneExpr(it);
                 break :blk .{ .method_call = .{ .obj = try self.cloneExpr(mc.obj), .name = mc.name, .args = c } };
             },
+            .super_call => |sc| blk: {
+                const c = self.arena.alloc(*ast.Expr, sc.args.len) catch return error.OutOfMemory;
+                for (sc.args, 0..) |it, i| c[i] = try self.cloneExpr(it);
+                break :blk .{ .super_call = .{ .name = sc.name, .args = c } };
+            },
             .template => |parts| blk: {
                 const c = self.arena.alloc(ast.TemplatePart, parts.len) catch return error.OutOfMemory;
                 for (parts, 0..) |pt, i| c[i] = .{ .text = pt.text, .expr = if (pt.expr) |x| try self.cloneExpr(x) else null };
@@ -887,7 +894,12 @@ const Checker = struct {
         return switch (s) {
             .var_decl => |d| .{ .var_decl = try self.cloneVarDecl(d) },
             .assign => |a| .{ .assign = try self.cloneAssign(a) },
-            .member_assign => |ma| .{ .member_assign = .{ .field = ma.field, .op = ma.op, .value = try self.cloneExpr(ma.value), .line = ma.line, .col = ma.col } },
+            .member_assign => |ma| .{ .member_assign = .{ .field = ma.field, .op = ma.op, .value = try self.cloneExpr(ma.value), .obj = if (ma.obj) |o| try self.cloneExpr(o) else null, .line = ma.line, .col = ma.col } },
+            .super_ctor => |sc| blk: {
+                const c = self.arena.alloc(*ast.Expr, sc.args.len) catch return error.OutOfMemory;
+                for (sc.args, 0..) |it, i| c[i] = try self.cloneExpr(it);
+                break :blk .{ .super_ctor = .{ .args = c, .line = sc.line, .col = sc.col } };
+            },
             .console_log => |log| .{ .console_log = .{ .method = log.method, .value = try self.cloneExpr(log.value), .line = log.line, .col = log.col } },
             .return_stmt => |r| .{ .return_stmt = .{ .value = if (r.value) |x| try self.cloneExpr(x) else null, .line = r.line, .col = r.col } },
             .throw_stmt => |t| .{ .throw_stmt = .{ .value = try self.cloneExpr(t.value), .line = t.line, .col = t.col } },
@@ -932,11 +944,109 @@ const Checker = struct {
     }
 
     fn classField(self: *Checker, class_name: []const u8, field: []const u8) ?types.Type {
-        const info = self.classes.get(class_name) orelse return null;
-        for (info.fields) |f| {
-            if (std.mem.eql(u8, f.name, field)) return f.checked_type;
+        if (self.resolveField(class_name, field)) |r| return r.field.checked_type;
+        return null;
+    }
+
+    const ResolvedField = struct { field: ast.TypeField, owner: []const u8 };
+    const ResolvedMethod = struct { method: ast.FunctionDecl, owner: []const u8 };
+
+    /// Find an instance field by name, walking the inheritance chain. Static
+    /// fields are excluded (looked up separately via `resolveStaticField`).
+    fn resolveField(self: *Checker, class_name: []const u8, field: []const u8) ?ResolvedField {
+        var cur: ?[]const u8 = class_name;
+        while (cur) |name| {
+            const info = self.classes.get(name) orelse return null;
+            for (info.fields) |f| {
+                if (!f.is_static and std.mem.eql(u8, f.name, field)) return .{ .field = f, .owner = name };
+            }
+            cur = info.parent;
         }
         return null;
+    }
+
+    fn resolveStaticField(self: *Checker, class_name: []const u8, field: []const u8) ?ResolvedField {
+        var cur: ?[]const u8 = class_name;
+        while (cur) |name| {
+            const info = self.classes.get(name) orelse return null;
+            for (info.fields) |f| {
+                if (f.is_static and std.mem.eql(u8, f.name, field)) return .{ .field = f, .owner = name };
+            }
+            cur = info.parent;
+        }
+        return null;
+    }
+
+    /// Find an instance method/accessor by name, walking the chain. The most
+    /// derived definition wins (override).
+    fn resolveMethod(self: *Checker, class_name: []const u8, name: []const u8) ?ResolvedMethod {
+        var cur: ?[]const u8 = class_name;
+        while (cur) |cname| {
+            const info = self.classes.get(cname) orelse return null;
+            for (info.methods) |m| {
+                if (!m.is_static and m.accessor == .none and std.mem.eql(u8, m.name, name)) return .{ .method = m, .owner = cname };
+            }
+            cur = info.parent;
+        }
+        return null;
+    }
+
+    fn resolveStaticMethod(self: *Checker, class_name: []const u8, name: []const u8) ?ResolvedMethod {
+        var cur: ?[]const u8 = class_name;
+        while (cur) |cname| {
+            const info = self.classes.get(cname) orelse return null;
+            for (info.methods) |m| {
+                if (m.is_static and m.accessor == .none and std.mem.eql(u8, m.name, name)) return .{ .method = m, .owner = cname };
+            }
+            cur = info.parent;
+        }
+        return null;
+    }
+
+    fn resolveAccessor(self: *Checker, class_name: []const u8, name: []const u8, kind: ast.Accessor) ?ResolvedMethod {
+        var cur: ?[]const u8 = class_name;
+        while (cur) |cname| {
+            const info = self.classes.get(cname) orelse return null;
+            for (info.methods) |m| {
+                if (m.accessor == kind and std.mem.eql(u8, m.name, name)) return .{ .method = m, .owner = cname };
+            }
+            cur = info.parent;
+        }
+        return null;
+    }
+
+    /// True if `sub` is `ancestor` or a (transitive) subclass of it.
+    fn isSubclassOf(self: *Checker, sub: []const u8, ancestor: []const u8) bool {
+        var cur: ?[]const u8 = sub;
+        while (cur) |name| {
+            if (std.mem.eql(u8, name, ancestor)) return true;
+            const info = self.classes.get(name) orelse return false;
+            cur = info.parent;
+        }
+        return false;
+    }
+
+    /// Enforce member visibility for an access whose member is declared in
+    /// `owner` with `vis`, from the currently-checked class context.
+    fn checkVisibility(self: *Checker, vis: ast.Visibility, owner: []const u8, line: u32, col: u32) CompileError!void {
+        switch (vis) {
+            .public => {},
+            .private => {
+                const here = self.current_class orelse return self.fail(line, col, "E_PRIVATE_ACCESS");
+                if (!std.mem.eql(u8, here, owner)) return self.fail(line, col, "E_PRIVATE_ACCESS");
+            },
+            .protected => {
+                const here = self.current_class orelse return self.fail(line, col, "E_PROTECTED_ACCESS");
+                if (!self.isSubclassOf(here, owner)) return self.fail(line, col, "E_PROTECTED_ACCESS");
+            },
+        }
+    }
+
+    /// Non-erroring visibility check for use inside `exprType` (which returns
+    /// `?Type`). Records the diagnostic and returns false on violation.
+    fn visibilityOk(self: *Checker, vis: ast.Visibility, owner: []const u8, line: u32, col: u32) bool {
+        self.checkVisibility(vis, owner, line, col) catch return false;
+        return true;
     }
 
     /// Build a function type `(params...) => ret` for callback validation.
@@ -1172,15 +1282,126 @@ const Checker = struct {
         const prev = self.current_class;
         self.current_class = c.name;
         defer self.current_class = prev;
+
+        // Validate the parent reference and reject inheritance cycles.
+        if (c.parent) |pname| {
+            if (self.classes.get(pname) == null) return self.fail(c.line, c.col, "E_TYPE_MISMATCH");
+            var cur: ?[]const u8 = pname;
+            while (cur) |name| {
+                if (std.mem.eql(u8, name, c.name)) return self.fail(c.line, c.col, "E_TYPE_MISMATCH");
+                cur = (self.classes.get(name) orelse break).parent;
+            }
+        }
+
+        // `implements I`: every interface member must be provided by the class
+        // (own or inherited).
+        for (c.implements) |iface| {
+            const tinfo = self.type_decls.get(iface) orelse return self.fail(c.line, c.col, "E_TYPE_MISMATCH");
+            for (tinfo.fields) |req| {
+                if (self.resolveField(c.name, req.name) != null) continue;
+                if (self.resolveMethod(c.name, req.name) != null) continue;
+                if (self.resolveAccessor(c.name, req.name, .getter) != null) continue;
+                return self.fail(c.line, c.col, "E_MISSING_MEMBER");
+            }
+        }
+
+        // Whether the parent has a parameterized constructor that requires a
+        // matching `super(...)` call in this child's constructor.
+        const parent_needs_super = blk: {
+            var cur = c.parent;
+            while (cur) |pname| {
+                const pinfo = self.classes.get(pname) orelse break;
+                if (pinfo.has_ctor) break :blk pinfo.ctor_params.len > 0;
+                cur = pinfo.parent;
+            }
+            break :blk false;
+        };
+
         if (c.has_ctor) {
             try self.pushScope();
             defer self.popScope();
             for (c.ctor_params) |param| try self.declareParam(param, c.line, c.col);
             self.nested_stmt_depth += 1;
             defer self.nested_stmt_depth -= 1;
+            self.in_constructor = true;
+            defer self.in_constructor = false;
+            // A `super(...)` call, if present, must be the first statement.
+            var has_super = false;
+            for (c.ctor_body, 0..) |*body_stmt, i| {
+                if (body_stmt.* == .super_ctor) {
+                    if (i != 0) return self.fail(c.line, c.col, "E_MISSING_SUPER");
+                    has_super = true;
+                }
+            }
+            if (parent_needs_super and !has_super) return self.fail(c.line, c.col, "E_MISSING_SUPER");
             for (c.ctor_body) |*body_stmt| try self.checkStmt(program, body_stmt);
+        } else if (parent_needs_super) {
+            // No constructor at all but the parent demands super args.
+            return self.fail(c.line, c.col, "E_MISSING_SUPER");
         }
         for (c.methods) |*m| try self.checkFunctionBody(program, m);
+    }
+
+    fn checkMemberAssign(self: *Checker, program: *ast.Program, ma: *ast.MemberAssign) CompileError!void {
+        // `obj.field = value` / `Class.staticField = value` / setter write.
+        if (ma.obj) |obj| {
+            // Static field write: `Class.field = value`.
+            if (obj.* == .var_ref and self.bindingPtr(obj.var_ref.name) == null and self.classes.get(obj.var_ref.name) != null) {
+                const cname = obj.var_ref.name;
+                const rf = self.resolveStaticField(cname, ma.field) orelse return self.fail(ma.line, ma.col, "E_TYPE_MISMATCH");
+                try self.checkVisibility(rf.field.visibility, rf.owner, ma.line, ma.col);
+                if (rf.field.is_readonly) return self.fail(ma.line, ma.col, "E_READONLY_ASSIGNMENT");
+                ma.is_static = true;
+                ma.class_name = rf.owner;
+                try self.assignField(program, rf.field.checked_type orelse return error.ParseError, ma);
+                return;
+            }
+            const obj_type = self.exprType(program, obj, ma.line, ma.col) orelse
+                return self.inferenceFail(ma.line, ma.col, "cannot infer assignment target type");
+            // Records and other non-class shapes are immutable in V1: writing a
+            // field on them is a dynamic property write.
+            if (obj_type != .class_type) return self.fail(ma.line, ma.col, "E_DYNAMIC_PROPERTY_WRITE");
+            const cls = obj_type.class_type;
+            // Setter property write: `obj.prop = value`.
+            if (self.resolveField(cls, ma.field) == null) {
+                if (self.resolveAccessor(cls, ma.field, .setter)) |ra| {
+                    try self.checkVisibility(ra.method.visibility, ra.owner, ma.line, ma.col);
+                    if (!std.mem.eql(u8, ma.op, "=")) return self.fail(ma.line, ma.col, "E_TYPE_MISMATCH");
+                    ma.is_setter = true;
+                    ma.class_name = cls;
+                    const pt = if (ra.method.params.len == 1) ra.method.params[0].checked_type orelse return error.ParseError else return self.fail(ma.line, ma.col, "E_ARG_COUNT");
+                    try self.ensureAssignable(program, pt, ma.value, ma.line, ma.col);
+                    return;
+                }
+                return self.fail(ma.line, ma.col, "E_TYPE_MISMATCH");
+            }
+            const rf = self.resolveField(cls, ma.field).?;
+            try self.checkVisibility(rf.field.visibility, rf.owner, ma.line, ma.col);
+            // External writes to readonly fields are never allowed.
+            if (rf.field.is_readonly) return self.fail(ma.line, ma.col, "E_READONLY_ASSIGNMENT");
+            ma.class_name = rf.owner;
+            try self.assignField(program, rf.field.checked_type orelse return error.ParseError, ma);
+            return;
+        }
+        // `this.field = value` inside a method/constructor.
+        const cls = self.current_class orelse return self.fail(ma.line, ma.col, "E_RETURN_OUTSIDE_FUNCTION");
+        const rf = self.resolveField(cls, ma.field) orelse return self.fail(ma.line, ma.col, "E_TYPE_MISMATCH");
+        // readonly: writable only inside a constructor.
+        if (rf.field.is_readonly and !self.in_constructor) return self.fail(ma.line, ma.col, "E_READONLY_ASSIGNMENT");
+        ma.class_name = rf.owner;
+        try self.assignField(program, rf.field.checked_type orelse return error.ParseError, ma);
+    }
+
+    fn assignField(self: *Checker, program: *ast.Program, field_type: types.Type, ma: *ast.MemberAssign) CompileError!void {
+        if (std.mem.eql(u8, ma.op, "=")) {
+            try self.ensureAssignable(program, field_type, ma.value, ma.line, ma.col);
+        } else {
+            const value_type = self.exprType(program, ma.value, ma.line, ma.col) orelse
+                return self.inferenceFail(ma.line, ma.col, "cannot infer assignment type");
+            if (!types.isNumeric(field_type) or !types.same(field_type, value_type)) {
+                return self.fail(ma.line, ma.col, "E_TYPE_MISMATCH");
+            }
+        }
     }
 
     fn blockReturns(body: []ast.Stmt) bool {
@@ -1209,17 +1430,31 @@ const Checker = struct {
             .enum_decl => {}, // registered during the hoisting pre-pass
             .extern_decl => {}, // registered during the hoisting pre-pass
             .class_decl => |*c| try self.checkClass(program, c),
-            .member_assign => |*ma| {
-                const cls = self.current_class orelse return self.fail(ma.line, ma.col, "E_RETURN_OUTSIDE_FUNCTION");
-                const field_type = self.classField(cls, ma.field) orelse return self.fail(ma.line, ma.col, "E_TYPE_MISMATCH");
-                if (std.mem.eql(u8, ma.op, "=")) {
-                    try self.ensureAssignable(program, field_type, ma.value, ma.line, ma.col);
-                } else {
-                    const value_type = self.exprType(program, ma.value, ma.line, ma.col) orelse
-                        return self.inferenceFail(ma.line, ma.col, "cannot infer assignment type");
-                    if (!types.isNumeric(field_type) or !types.same(field_type, value_type)) {
-                        return self.fail(ma.line, ma.col, "E_TYPE_MISMATCH");
+            .member_assign => |*ma| try self.checkMemberAssign(program, ma),
+            .super_ctor => |*sc| {
+                const cls = self.current_class orelse return self.fail(sc.line, sc.col, "E_RETURN_OUTSIDE_FUNCTION");
+                if (!self.in_constructor) return self.fail(sc.line, sc.col, "E_TYPE_MISMATCH");
+                const parent = (self.classes.get(cls) orelse return self.fail(sc.line, sc.col, "E_TYPE_MISMATCH")).parent orelse
+                    return self.fail(sc.line, sc.col, "E_TYPE_MISMATCH");
+                sc.parent = parent;
+                // Resolve the parent's effective constructor params.
+                var ctor_params: []ast.FunctionParam = &.{};
+                var has_ctor = false;
+                var cur: ?[]const u8 = parent;
+                while (cur) |pname| {
+                    const pinfo = self.classes.get(pname) orelse break;
+                    if (pinfo.has_ctor) {
+                        ctor_params = pinfo.ctor_params;
+                        has_ctor = true;
+                        sc.parent = pname;
+                        break;
                     }
+                    cur = pinfo.parent;
+                }
+                const want: usize = if (has_ctor) ctor_params.len else 0;
+                if (sc.args.len != want) return self.fail(sc.line, sc.col, "E_ARG_COUNT");
+                for (sc.args, 0..) |arg, i| {
+                    try self.ensureAssignable(program, ctor_params[i].checked_type orelse return error.ParseError, arg, sc.line, sc.col);
                 }
             },
             .test_decl => |*t| {
@@ -1837,6 +2072,21 @@ const Checker = struct {
                         _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                         return null;
                     }
+                    // `ClassName.staticField` — a static member read. Only when the
+                    // name is a class and not shadowed by a local binding.
+                    if (self.bindingPtr(field.obj.var_ref.name) == null) {
+                        if (self.classes.get(field.obj.var_ref.name) != null) {
+                            const cname = field.obj.var_ref.name;
+                            const rf = self.resolveStaticField(cname, field.name) orelse {
+                                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                                return null;
+                            };
+                            if (!self.visibilityOk(rf.field.visibility, rf.owner, line, col)) return null;
+                            field.is_static = true;
+                            field.class_name = rf.owner;
+                            return rf.field.checked_type;
+                        }
+                    }
                 }
                 const obj_type = self.exprType(program, field.obj, line, col) orelse return null;
                 if (field.optional_chain) {
@@ -1880,7 +2130,20 @@ const Checker = struct {
                         _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                         return null;
                     },
-                    .class_type => |class_name| self.classField(class_name, field.name) orelse {
+                    .class_type => |class_name| blk3: {
+                        // Instance field read, walking the inheritance chain.
+                        if (self.resolveField(class_name, field.name)) |rf| {
+                            if (!self.visibilityOk(rf.field.visibility, rf.owner, line, col)) return null;
+                            field.class_name = rf.owner;
+                            break :blk3 rf.field.checked_type;
+                        }
+                        // Getter accessor read: `obj.prop`.
+                        if (self.resolveAccessor(class_name, field.name, .getter)) |ra| {
+                            if (!self.visibilityOk(ra.method.visibility, ra.owner, line, col)) return null;
+                            field.is_getter = true;
+                            field.class_name = class_name;
+                            break :blk3 ra.method.checked_return_type orelse return null;
+                        }
                         _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                         return null;
                     },
@@ -1912,12 +2175,28 @@ const Checker = struct {
                     _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                     return null;
                 };
-                if (info.has_ctor) {
-                    if (ne.args.len != info.ctor_params.len) {
+                // Resolve the effective constructor: the class's own, else the
+                // nearest inherited one.
+                var ctor_params: []ast.FunctionParam = info.ctor_params;
+                var has_ctor = info.has_ctor;
+                if (!has_ctor) {
+                    var cur = info.parent;
+                    while (cur) |pname| {
+                        const pinfo = self.classes.get(pname) orelse break;
+                        if (pinfo.has_ctor) {
+                            ctor_params = pinfo.ctor_params;
+                            has_ctor = true;
+                            break;
+                        }
+                        cur = pinfo.parent;
+                    }
+                }
+                if (has_ctor) {
+                    if (ne.args.len != ctor_params.len) {
                         _ = self.fail(line, col, "E_ARG_COUNT") catch {};
                         return null;
                     }
-                    for (ne.args, info.ctor_params) |arg, p| {
+                    for (ne.args, ctor_params) |arg, p| {
                         const pt = p.checked_type orelse return null;
                         self.ensureAssignable(program, pt, arg, line, col) catch {
                             _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
@@ -1931,6 +2210,28 @@ const Checker = struct {
                 return .{ .class_type = ne.class_name };
             },
             .method_call => |*mc| {
+                // `ClassName.staticMethod(args)` — static method call.
+                if (mc.obj.* == .var_ref and self.bindingPtr(mc.obj.var_ref.name) == null and self.classes.get(mc.obj.var_ref.name) != null) {
+                    const cname = mc.obj.var_ref.name;
+                    const rm = self.resolveStaticMethod(cname, mc.name) orelse {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    };
+                    if (!self.visibilityOk(rm.method.visibility, rm.owner, line, col)) return null;
+                    if (mc.args.len != rm.method.params.len) {
+                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    for (mc.args, rm.method.params) |arg, p| {
+                        self.ensureAssignable(program, p.checked_type orelse return null, arg, line, col) catch {
+                            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                            return null;
+                        };
+                    }
+                    mc.is_static = true;
+                    mc.class_name = rm.owner;
+                    return rm.method.checked_return_type orelse return null;
+                }
                 const obj_type = self.exprType(program, mc.obj, line, col) orelse return null;
                 if (types.isArray(obj_type)) {
                     return self.arrayMethod(program, mc, obj_type, line, col);
@@ -1943,25 +2244,51 @@ const Checker = struct {
                     return null;
                 }
                 const cls = obj_type.class_type;
-                const info = self.classes.get(cls) orelse return null;
-                for (info.methods) |m| {
-                    if (std.mem.eql(u8, m.name, mc.name)) {
-                        if (mc.args.len != m.params.len) {
-                            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
-                            return null;
-                        }
-                        for (mc.args, m.params) |arg, p| {
-                            self.ensureAssignable(program, p.checked_type orelse return null, arg, line, col) catch {
-                                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
-                                return null;
-                            };
-                        }
-                        mc.class_name = cls;
-                        return m.checked_return_type orelse return null;
-                    }
+                const rm = self.resolveMethod(cls, mc.name) orelse {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                };
+                if (!self.visibilityOk(rm.method.visibility, rm.owner, line, col)) return null;
+                if (mc.args.len != rm.method.params.len) {
+                    _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                    return null;
                 }
-                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
-                return null;
+                for (mc.args, rm.method.params) |arg, p| {
+                    self.ensureAssignable(program, p.checked_type orelse return null, arg, line, col) catch {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    };
+                }
+                // Methods are emitted on the most-derived struct (flattened), so
+                // the call dispatches on the static receiver class.
+                mc.class_name = cls;
+                return rm.method.checked_return_type orelse return null;
+            },
+            .super_call => |*sc| {
+                const cls = self.current_class orelse {
+                    _ = self.fail(line, col, "E_RETURN_OUTSIDE_FUNCTION") catch {};
+                    return null;
+                };
+                const parent = (self.classes.get(cls) orelse return null).parent orelse {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                };
+                const rm = self.resolveMethod(parent, sc.name) orelse {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                };
+                if (sc.args.len != rm.method.params.len) {
+                    _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                    return null;
+                }
+                for (sc.args, rm.method.params) |arg, p| {
+                    self.ensureAssignable(program, p.checked_type orelse return null, arg, line, col) catch {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    };
+                }
+                sc.parent = rm.owner;
+                return rm.method.checked_return_type orelse return null;
             },
             .index => |*index| {
                 const obj_type = self.exprType(program, index.obj, line, col) orelse return null;

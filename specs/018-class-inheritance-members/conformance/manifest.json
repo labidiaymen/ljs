@@ -1,0 +1,41 @@
+{
+  "feature": "018-class-inheritance-members",
+  "cases": [
+    {
+      "id": "inherit.valid.inheritance",
+      "source": "../examples/valid/inheritance.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "Cat makes a sound\nRex makes a sound (woof)\nRex [animal]\n3\n2\n0\n42" }
+    },
+    {
+      "id": "inherit.invalid.private-access",
+      "source": "../examples/invalid/private-access.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_PRIVATE_ACCESS" }
+    },
+    {
+      "id": "inherit.invalid.protected-access",
+      "source": "../examples/invalid/protected-access.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_PROTECTED_ACCESS" }
+    },
+    {
+      "id": "inherit.invalid.readonly-write",
+      "source": "../examples/invalid/readonly-write.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_READONLY_ASSIGNMENT" }
+    },
+    {
+      "id": "inherit.invalid.missing-super",
+      "source": "../examples/invalid/missing-super.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_MISSING_SUPER" }
+    },
+    {
+      "id": "inherit.invalid.missing-member",
+      "source": "../examples/invalid/missing-member.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_MISSING_MEMBER" }
+    }
+  ]
+}

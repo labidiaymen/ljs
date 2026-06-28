@@ -2,7 +2,16 @@ const types = @import("lumen_types.zig");
 
 pub const FieldInit = struct { name: []const u8, value: *Expr };
 
-pub const TypeField = struct { name: []const u8, annotation: []const u8, checked_type: ?types.Type = null };
+pub const Visibility = enum { public, private, protected };
+
+pub const TypeField = struct {
+    name: []const u8,
+    annotation: []const u8,
+    checked_type: ?types.Type = null,
+    visibility: Visibility = .public,
+    is_static: bool = false,
+    is_readonly: bool = false,
+};
 
 pub const EnumValue = union(enum) { int: i64, str: []const u8 };
 
@@ -60,6 +69,10 @@ pub const ClassDecl = struct {
     ctor_params: []FunctionParam = &.{},
     ctor_body: []Stmt = &.{},
     methods: []FunctionDecl = &.{},
+    // Single-inheritance parent class name from `extends Parent`.
+    parent: ?[]const u8 = null,
+    // Interface names from `implements I, J`.
+    implements: [][]const u8 = &.{},
     // Type parameters for a generic class, e.g. `Box<T>`. When non-empty the
     // class is a template; concrete copies are generated per `new C<...>`.
     type_params: [][]const u8 = &.{},
@@ -67,14 +80,23 @@ pub const ClassDecl = struct {
     col: u32,
 };
 
-/// `this.field = value` (field write inside a method/constructor).
+/// Field/property write. When `obj` is null this is `this.field = value` inside a
+/// method/constructor; otherwise it is `obj.field = value` (instance field,
+/// static field, or setter property) from anywhere.
 pub const MemberAssign = struct {
     field: []const u8,
     op: []const u8 = "=",
     value: *Expr,
+    obj: ?*Expr = null,
+    // Filled by the checker for emission routing.
+    class_name: ?[]const u8 = null,
+    is_static: bool = false,
+    is_setter: bool = false,
     line: u32,
     col: u32,
 };
+
+pub const Accessor = enum { none, getter, setter };
 
 pub const FunctionDecl = struct {
     name: []const u8,
@@ -82,6 +104,10 @@ pub const FunctionDecl = struct {
     return_annotation: []const u8,
     checked_return_type: ?types.Type = null,
     body: []Stmt,
+    // Class-member modifiers (unused for free functions).
+    visibility: Visibility = .public,
+    is_static: bool = false,
+    accessor: Accessor = .none,
     // Type parameters for a generic function, e.g. `f<T, U>`. When non-empty the
     // function is a template; concrete copies are generated per call instance.
     type_params: [][]const u8 = &.{},
@@ -239,6 +265,15 @@ pub const TestDecl = struct {
     col: u32,
 };
 
+/// `super(args);` — invoke the parent constructor. Only valid as the first
+/// statement of a child constructor. `parent` is filled by the checker.
+pub const SuperCtor = struct {
+    args: []*Expr,
+    parent: ?[]const u8 = null,
+    line: u32,
+    col: u32,
+};
+
 pub const StaticCall = struct {
     namespace: []const u8,
     name: []const u8,
@@ -257,6 +292,7 @@ pub const Stmt = union(enum) {
     var_decl: VarDecl,
     destructure_decl: DestructureDecl,
     member_assign: MemberAssign,
+    super_ctor: SuperCtor,
     assign: Assign,
     console_log: ConsoleLog,
     while_stmt: WhileStmt,
@@ -301,11 +337,12 @@ pub const Expr = union(enum) {
     coalesce: struct { l: *Expr, r: *Expr }, // a ?? b
     arrow: *ArrowExpr, // (x: T) => expr
     this_expr, // `this` inside a method/constructor
+    super_call: struct { name: []const u8, args: []*Expr, parent: ?[]const u8 = null }, // super.m(args)
     new_expr: struct { class_name: []const u8, args: []*Expr, type_args: [][]const u8 = &.{} }, // new C(args) / new C<T>(args)
-    method_call: struct { obj: *Expr, name: []const u8, args: []*Expr, class_name: ?[]const u8 = null, array_elem_type: ?types.Type = null, array_acc_type: ?types.Type = null, array_result_type: ?types.Type = null, string_method: bool = false }, // obj.m(args)
+    method_call: struct { obj: *Expr, name: []const u8, args: []*Expr, class_name: ?[]const u8 = null, is_static: bool = false, array_elem_type: ?types.Type = null, array_acc_type: ?types.Type = null, array_result_type: ?types.Type = null, string_method: bool = false }, // obj.m(args) / Class.m(args)
     template: []TemplatePart, // `text ${expr} ...`
     obj: []FieldInit,
-    field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null, enum_value: ?EnumValue = null, optional_chain: bool = false, chain_field_type: ?types.Type = null },
+    field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null, enum_value: ?EnumValue = null, optional_chain: bool = false, chain_field_type: ?types.Type = null, class_name: ?[]const u8 = null, is_static: bool = false, is_getter: bool = false },
     index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null },
     call: struct { name: []const u8, args: []*Expr, emit_name: ?[]const u8 = null, is_closure: bool = false, type_args: [][]const u8 = &.{} }, // builtin / user / function-value call; type_args from explicit f<T>(...)
     static_call: StaticCall,

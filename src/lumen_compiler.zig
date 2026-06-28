@@ -45,8 +45,6 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
     var lex = Lexer{ .src = source };
     var prev_was_dot = false;
     var prev_was_ident = false;
-    var last_ident_this = false; // the most recent ident was `this`
-    var dot_obj_this = false; // the object before the current `.` was `this`
     var pending_dynamic_write_line: u32 = 0;
     var pending_dynamic_write_col: u32 = 0;
     var bracket_depth: u32 = 0;
@@ -75,14 +73,11 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
                 if (prev_was_dot and eq(u8, name, "prototype")) {
                     return setDiag(diag, lex.tok_line, lex.tok_col, "E_UNSUPPORTED_PROTOTYPE");
                 }
-                // Writes through `this` are declared class fields, not dynamic
-                // property writes, so don't flag them.
-                if (prev_was_dot and !dot_obj_this) {
-                    pending_dynamic_write_line = lex.tok_line;
-                    pending_dynamic_write_col = lex.tok_col;
-                }
+                // Dotted property writes are validated precisely by the checker
+                // (class fields, statics, and setters are allowed; record-shape
+                // mutation is rejected there as E_DYNAMIC_PROPERTY_WRITE). Only
+                // bracket-indexed writes (`obj["k"] = ...`) are flagged here.
                 prev_was_dot = false;
-                last_ident_this = eq(u8, name, "this");
                 // A declaration keyword before `[` is array destructuring, not an
                 // indexed dynamic write, so it must not start a write candidate.
                 prev_was_ident = !(eq(u8, name, "let") or eq(u8, name, "const") or eq(u8, name, "var"));
@@ -109,9 +104,7 @@ fn rejectUnsupportedDynamic(source: []const u8, diag: *Diag) CompileError!void {
                     pending_dynamic_write_line = 0;
                     pending_dynamic_write_col = 0;
                 }
-                if (ch == '.') dot_obj_this = last_ident_this;
                 prev_was_dot = ch == '.';
-                last_ident_this = false;
                 prev_was_ident = false;
             },
             else => {
@@ -591,6 +584,21 @@ const Parser = struct {
             try self.advance();
             return self.node(.this_expr);
         }
+        if (self.isKw("super")) {
+            try self.advance();
+            try self.expectOp('.');
+            if (self.cur != .ident) return error.ParseError;
+            const member = self.cur.ident;
+            try self.advance();
+            try self.expectOp('(');
+            var args: std.ArrayListUnmanaged(*Expr) = .empty;
+            while (!self.isOp(')')) {
+                try args.append(self.arena, try self.parseExpr());
+                if (self.isOp(',')) try self.advance() else break;
+            }
+            try self.expectOp(')');
+            return self.node(.{ .super_call = .{ .name = member, .args = try args.toOwnedSlice(self.arena) } });
+        }
         if (self.isKw("new")) {
             try self.advance();
             if (self.cur != .ident) return error.ParseError;
@@ -1020,6 +1028,32 @@ const Parser = struct {
         const name = self.cur.ident;
         try self.advance();
         const type_params = try self.parseTypeParams();
+        var parent: ?[]const u8 = null;
+        if (self.isKw("extends")) {
+            try self.advance();
+            if (self.cur != .ident) return error.ParseError;
+            parent = self.cur.ident;
+            try self.advance();
+            // ignore any type args on the parent, e.g. `extends Base<T>`
+            if (self.isCmp("<")) {
+                try self.advance();
+                while (!self.isCmp(">")) {
+                    _ = try self.parseTypeAnnotation();
+                    if (self.isOp(',')) try self.advance() else break;
+                }
+                try self.consumeTypeArgClose();
+            }
+        }
+        var implements: std.ArrayListUnmanaged([]const u8) = .empty;
+        if (self.isKw("implements")) {
+            try self.advance();
+            while (true) {
+                if (self.cur != .ident) return error.ParseError;
+                try implements.append(self.arena, self.cur.ident);
+                try self.advance();
+                if (self.isOp(',')) try self.advance() else break;
+            }
+        }
         try self.expectOp('{');
         var fields: std.ArrayListUnmanaged(ast.TypeField) = .empty;
         var methods: std.ArrayListUnmanaged(ast.FunctionDecl) = .empty;
@@ -1027,26 +1061,79 @@ const Parser = struct {
         var ctor_params: []ast.FunctionParam = &.{};
         var ctor_body: []Stmt = &.{};
         while (!self.isOp('}')) {
+            // Optional member modifiers, in any order.
+            var visibility: ast.Visibility = .public;
+            var is_static = false;
+            var is_readonly = false;
+            var accessor: ast.Accessor = .none;
+            while (self.cur == .ident) {
+                const kw = self.cur.ident;
+                if (std.mem.eql(u8, kw, "public")) {
+                    visibility = .public;
+                } else if (std.mem.eql(u8, kw, "private")) {
+                    visibility = .private;
+                } else if (std.mem.eql(u8, kw, "protected")) {
+                    visibility = .protected;
+                } else if (std.mem.eql(u8, kw, "static")) {
+                    is_static = true;
+                } else if (std.mem.eql(u8, kw, "readonly")) {
+                    is_readonly = true;
+                } else if (std.mem.eql(u8, kw, "get") or std.mem.eql(u8, kw, "set")) {
+                    // `get`/`set` is an accessor prefix only when followed by an
+                    // identifier name (not e.g. a method literally named `get`).
+                    const save = self.lex;
+                    const save_cur = self.cur;
+                    try self.advance();
+                    if (self.cur == .ident) {
+                        accessor = if (std.mem.eql(u8, kw, "get")) .getter else .setter;
+                        break;
+                    }
+                    // not an accessor: restore and treat `get`/`set` as the name
+                    self.lex = save;
+                    self.cur = save_cur;
+                    break;
+                } else break;
+                try self.advance();
+            }
             if (self.cur != .ident) return error.ParseError;
             const member = self.cur.ident;
             const m_line = self.cur_line;
             const m_col = self.cur_col;
             try self.advance();
-            if (std.mem.eql(u8, member, "constructor")) {
+            if (accessor == .none and std.mem.eql(u8, member, "constructor")) {
                 ctor_params = try self.parseParamList();
                 ctor_body = try self.parseBlock();
                 has_ctor = true;
             } else if (self.isOp('(')) {
-                // method
+                // method (or accessor)
                 const params = try self.parseParamList();
-                try self.expectOp(':');
-                const return_annotation = try self.parseTypeAnnotation();
+                var return_annotation: []const u8 = "void";
+                if (self.isOp(':')) {
+                    try self.advance();
+                    return_annotation = try self.parseTypeAnnotation();
+                }
                 const body = try self.parseBlock();
-                try methods.append(self.arena, .{ .name = member, .params = params, .return_annotation = return_annotation, .body = body, .line = m_line, .col = m_col });
+                try methods.append(self.arena, .{
+                    .name = member,
+                    .params = params,
+                    .return_annotation = return_annotation,
+                    .body = body,
+                    .visibility = visibility,
+                    .is_static = is_static,
+                    .accessor = accessor,
+                    .line = m_line,
+                    .col = m_col,
+                });
             } else {
                 // field: name: T ;
                 const annotation = try self.parseOptionalMember();
-                try fields.append(self.arena, .{ .name = member, .annotation = annotation });
+                try fields.append(self.arena, .{
+                    .name = member,
+                    .annotation = annotation,
+                    .visibility = visibility,
+                    .is_static = is_static,
+                    .is_readonly = is_readonly,
+                });
                 if (self.isOp(';') or self.isOp(',')) try self.advance();
             }
         }
@@ -1059,6 +1146,8 @@ const Parser = struct {
             .ctor_params = ctor_params,
             .ctor_body = ctor_body,
             .methods = try methods.toOwnedSlice(self.arena),
+            .parent = parent,
+            .implements = try implements.toOwnedSlice(self.arena),
             .type_params = type_params,
             .line = line,
             .col = col,
@@ -1159,6 +1248,36 @@ const Parser = struct {
             const value = try self.parseExpr();
             try self.expectOp(';');
             return .{ .member_assign = .{ .field = member, .op = op, .value = value, .line = line, .col = col } };
+        }
+
+        // `super(args);` (parent constructor) or `super.method(args);`.
+        if (eq(u8, kw, "super")) {
+            try self.advance(); // 'super'
+            if (self.isOp('(')) {
+                try self.expectOp('(');
+                var args: std.ArrayListUnmanaged(*Expr) = .empty;
+                while (!self.isOp(')')) {
+                    try args.append(self.arena, try self.parseExpr());
+                    if (self.isOp(',')) try self.advance() else break;
+                }
+                try self.expectOp(')');
+                try self.expectOp(';');
+                return .{ .super_ctor = .{ .args = try args.toOwnedSlice(self.arena), .line = line, .col = col } };
+            }
+            try self.expectOp('.');
+            if (self.cur != .ident) return error.ParseError;
+            const member = self.cur.ident;
+            try self.advance();
+            try self.expectOp('(');
+            var args: std.ArrayListUnmanaged(*Expr) = .empty;
+            while (!self.isOp(')')) {
+                try args.append(self.arena, try self.parseExpr());
+                if (self.isOp(',')) try self.advance() else break;
+            }
+            try self.expectOp(')');
+            try self.expectOp(';');
+            const sc = try self.node(.{ .super_call = .{ .name = member, .args = try args.toOwnedSlice(self.arena) } });
+            return .{ .expr_stmt = .{ .value = sc, .line = line, .col = col } };
         }
 
         if (eq(u8, kw, "let") or eq(u8, kw, "const") or eq(u8, kw, "var")) {
@@ -1416,6 +1535,36 @@ const Parser = struct {
             try self.expectOp(';');
             const value = try self.node(.{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.arena) } });
             return .{ .expr_stmt = .{ .value = value, .line = line, .col = col } };
+        }
+        // Single-level member assignment: `obj.field = value;`,
+        // `Class.staticField += value;`, or a setter property write.
+        if (self.isOp('.')) {
+            const save_lex = self.lex;
+            const save_cur = self.cur;
+            try self.advance(); // '.'
+            if (self.cur == .ident) {
+                const field = self.cur.ident;
+                try self.advance();
+                var op: []const u8 = "=";
+                var is_assign = false;
+                if (self.isOp('=')) {
+                    is_assign = true;
+                    try self.advance();
+                } else if (self.cur == .op2 and (eq(u8, self.cur.op2, "+=") or eq(u8, self.cur.op2, "-=") or eq(u8, self.cur.op2, "*=") or eq(u8, self.cur.op2, "/=") or eq(u8, self.cur.op2, "%="))) {
+                    is_assign = true;
+                    op = self.cur.op2;
+                    try self.advance();
+                }
+                if (is_assign) {
+                    const obj = try self.node(.{ .var_ref = .{ .name = name } });
+                    const value = try self.parseExpr();
+                    try self.expectOp(';');
+                    return .{ .member_assign = .{ .field = field, .op = op, .value = value, .obj = obj, .line = line, .col = col } };
+                }
+            }
+            // Not a simple assignment: restore and fall through to postfix.
+            self.lex = save_lex;
+            self.cur = save_cur;
         }
         // Member-expression statement: `obj.method(args);`, `obj.field...`.
         if (self.isOp('.') or self.isOp('[') or self.isOp2("?.")) {
@@ -1711,6 +1860,14 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try emitStringMethod(mc, w, arena);
             } else if (mc.array_result_type != null) {
                 try emitArrayMethod(mc, w, arena);
+            } else if (mc.is_static) {
+                // Class.staticMethod(args) -> Class.__static_m_name(args)
+                try w.print(arena, "{s}.__static_m_{s}(", .{ mc.class_name orelse "", mc.name });
+                for (mc.args, 0..) |arg, i| {
+                    if (i > 0) try w.appendSlice(arena, ", ");
+                    try emitExpr(arg, w, arena);
+                }
+                try w.append(arena, ')');
             } else {
                 try emitExpr(mc.obj, w, arena);
                 try w.print(arena, ".{s}(", .{mc.name});
@@ -1720,6 +1877,15 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 }
                 try w.append(arena, ')');
             }
+        },
+        .super_call => |sc| {
+            // super.method(args) -> self.__super_<owner>_method(args)
+            try w.print(arena, "self.__super_{s}_{s}(", .{ sc.parent orelse "", sc.name });
+            for (sc.args, 0..) |arg, i| {
+                if (i > 0) try w.appendSlice(arena, ", ");
+                try emitExpr(arg, w, arena);
+            }
+            try w.append(arena, ')');
         },
         .arrow => |arrow| {
             const ret = arrow.checked_return_type orelse return error.ParseError;
@@ -1824,6 +1990,14 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try w.appendSlice(arena, ".len))");
             } else if (fa.builtin == .error_message) {
                 try emitExpr(fa.obj, w, arena);
+            } else if (fa.is_static) {
+                // Class.staticField -> Owner.__static_Owner_field
+                const owner = fa.class_name orelse "";
+                try w.print(arena, "{s}.__static_{s}_{s}", .{ owner, owner, fa.name });
+            } else if (fa.is_getter) {
+                // obj.prop -> obj.__get_prop()
+                try emitExpr(fa.obj, w, arena);
+                try w.print(arena, ".__get_{s}()", .{fa.name});
             } else {
                 try emitExpr(fa.obj, w, arena);
                 try w.print(arena, ".{s}", .{fa.name});
@@ -2190,6 +2364,10 @@ fn exprUsesName(e: *const Expr, name: []const u8) bool {
             for (mc.args) |it| if (exprUsesName(it, name)) break :blk true;
             break :blk false;
         },
+        .super_call => |sc| blk: {
+            for (sc.args) |it| if (exprUsesName(it, name)) break :blk true;
+            break :blk false;
+        },
         .template => |parts| blk: {
             for (parts) |pt| if (pt.expr) |x| {
                 if (exprUsesName(x, name)) break :blk true;
@@ -2225,7 +2403,11 @@ fn stmtUsesName(stmt: *const Stmt, name: []const u8) bool {
         .var_decl => |d| exprUsesName(d.init, name),
         .destructure_decl => |d| exprUsesName(d.source, name),
         .assign => |a| std.mem.eql(u8, a.name, name) or exprUsesName(a.value, name),
-        .member_assign => |ma| exprUsesName(ma.value, name),
+        .member_assign => |ma| exprUsesName(ma.value, name) or (ma.obj != null and exprUsesName(ma.obj.?, name)),
+        .super_ctor => |sc| blk: {
+            for (sc.args) |it| if (exprUsesName(it, name)) break :blk true;
+            break :blk false;
+        },
         .console_log => |log| exprUsesName(log.value, name),
         .return_stmt => |r| if (r.value) |x| exprUsesName(x, name) else false,
         .throw_stmt => |t| exprUsesName(t.value, name),
@@ -2272,6 +2454,7 @@ fn exprUsesThis(e: *const Expr) bool {
             for (mc.args) |it| if (exprUsesThis(it)) break :blk true;
             break :blk false;
         },
+        .super_call => true, // emits `self.__super_...`
         .template => |parts| blk: {
             for (parts) |pt| if (pt.expr) |x| {
                 if (exprUsesThis(x)) break :blk true;
@@ -2298,7 +2481,8 @@ fn exprUsesThis(e: *const Expr) bool {
 
 fn stmtUsesThis(stmt: *const Stmt) bool {
     return switch (stmt.*) {
-        .member_assign => true, // `this.field = ...` requires self
+        .member_assign => |ma| ma.obj == null or exprUsesThis(ma.obj.?) or exprUsesThis(ma.value),
+        .super_ctor => true, // inlined parent ctor writes `self.field`
         .var_decl => |d| exprUsesThis(d.init),
         .destructure_decl => |d| exprUsesThis(d.source),
         .assign => |a| exprUsesThis(a.value),
@@ -2356,6 +2540,226 @@ fn printFormat(t: types.Type) []const u8 {
 pub const CompileOptions = struct {
     runtime_locations: bool = true,
 };
+
+/// Collect the inheritance chain from a root ancestor down to `c` (inclusive).
+fn collectChain(c: *const ast.ClassDecl, arena: std.mem.Allocator) CompileError![]*const ast.ClassDecl {
+    var list: std.ArrayListUnmanaged(*const ast.ClassDecl) = .empty;
+    var cur: ?*const ast.ClassDecl = c;
+    while (cur) |cc| {
+        try list.append(arena, cc);
+        cur = if (cc.parent) |p| findClass(p) else null;
+    }
+    // Reverse to root-first order.
+    const items = list.items;
+    var i: usize = 0;
+    while (i < items.len / 2) : (i += 1) {
+        const t = items[i];
+        items[i] = items[items.len - 1 - i];
+        items[items.len - 1 - i] = t;
+    }
+    return items;
+}
+
+/// A zero/default initializer literal for a static field of the given type.
+fn zeroValue(ty: types.Type) []const u8 {
+    return switch (ty) {
+        .i32, .i64 => "0",
+        .f64 => "0",
+        .bool => "false",
+        .string => "\"\"",
+        else => "undefined",
+    };
+}
+
+/// Lower a class to a Zig struct: ancestor fields are flattened in, instance
+/// methods (own + inherited, with overrides) are emitted bound to the struct,
+/// `super.method` copies are emitted under internal names, statics become struct
+/// globals/free functions, and getters/setters become `__get_`/`__set_` methods.
+fn emitClass(c: *const ast.ClassDecl, decls: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, throw_target: ?[]const u8, switch_break_target: ?[]const u8, options: CompileOptions) CompileError!void {
+    const chain = try collectChain(c, arena);
+
+    try decls.print(arena, "const {s} = struct {{\n", .{c.name});
+
+    // Instance fields, ancestors first (flattened layout).
+    for (chain) |cc| {
+        for (cc.fields) |field| {
+            if (field.is_static) continue;
+            try decls.print(arena, "    {s}: {s},\n", .{ field.name, try types.zigName(arena, field.checked_type orelse return error.ParseError) });
+        }
+    }
+
+    // Static fields -> struct-scoped vars with a zero default. Declared only on
+    // the owning class so the whole hierarchy shares one storage location,
+    // accessed as `Owner.__static_Owner_field`.
+    for (c.fields) |field| {
+        if (!field.is_static) continue;
+        const ty = field.checked_type orelse return error.ParseError;
+        try decls.print(arena, "    var __static_{s}_{s}: {s} = {s};\n", .{ c.name, field.name, try types.zigName(arena, ty), zeroValue(ty) });
+    }
+
+    // Constructor: resolve the nearest ctor among the chain that the most
+    // derived class provides; if the class has none, inherit the parent's.
+    try decls.print(arena, "    fn __init(", .{});
+    var ctor_owner: *const ast.ClassDecl = c;
+    if (!c.has_ctor) {
+        var k: usize = chain.len;
+        while (k > 0) {
+            k -= 1;
+            if (chain[k].has_ctor) {
+                ctor_owner = chain[k];
+                break;
+            }
+        }
+    }
+    for (ctor_owner.ctor_params, 0..) |param, i| {
+        if (i > 0) try decls.appendSlice(arena, ", ");
+        try decls.print(arena, "{s}: {s}", .{ param.name, try types.zigName(arena, param.checked_type orelse return error.ParseError) });
+    }
+    try decls.print(arena, ") *{s} {{\n", .{c.name});
+    try decls.print(arena, "    const self = std.heap.page_allocator.create({s}) catch unreachable;\n", .{c.name});
+    try emitUnusedParamDiscards(ctor_owner.ctor_params, ctor_owner.ctor_body, decls, arena);
+    for (ctor_owner.ctor_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, decls, arena, throw_target, switch_break_target, options);
+    try decls.appendSlice(arena, "    return self;\n    }\n");
+
+    // Instance methods, getters, setters: most-derived definition wins. Walk the
+    // chain root-first; a later (more derived) definition overwrites an earlier
+    // one by emitting under the same name, so emit only the resolved definition.
+    var emitted: std.StringHashMapUnmanaged(void) = .empty;
+    var d: usize = chain.len;
+    while (d > 0) {
+        d -= 1;
+        const cc = chain[d];
+        for (cc.methods) |m| {
+            if (m.is_static) continue;
+            const key = switch (m.accessor) {
+                .none => try std.fmt.allocPrint(arena, "m:{s}", .{m.name}),
+                .getter => try std.fmt.allocPrint(arena, "g:{s}", .{m.name}),
+                .setter => try std.fmt.allocPrint(arena, "s:{s}", .{m.name}),
+            };
+            if (emitted.contains(key)) continue;
+            try emitted.put(arena, key, {});
+            try emitClassMethod(c.name, m, decls, arena, throw_target, switch_break_target, options);
+        }
+    }
+
+    // `super.method` copies: for each super call in the class's methods/ctor,
+    // emit a copy of the resolved ancestor method as `__super_<owner>_<name>`.
+    var super_emitted: std.StringHashMapUnmanaged(void) = .empty;
+    for (c.methods) |m| try emitSuperCopies(c, m.body, decls, arena, &super_emitted, throw_target, switch_break_target, options);
+    try emitSuperCopies(c, c.ctor_body, decls, arena, &super_emitted, throw_target, switch_break_target, options);
+
+    // `super(...)` parent-constructor helpers: emit `__superctor_<owner>` for
+    // each ancestor that has a constructor, bound to the most-derived struct so
+    // its parameters live in their own scope (no shadowing of the child ctor).
+    for (chain) |cc| {
+        if (std.mem.eql(u8, cc.name, c.name)) continue; // not the class itself
+        if (!cc.has_ctor) continue;
+        try decls.print(arena, "    fn __superctor_{s}(self: *{s}", .{ cc.name, c.name });
+        for (cc.ctor_params) |param| {
+            try decls.print(arena, ", {s}: {s}", .{ param.name, try types.zigName(arena, param.checked_type orelse return error.ParseError) });
+        }
+        try decls.appendSlice(arena, ") void {\n");
+        if (!bodyUsesThis(cc.ctor_body)) try decls.appendSlice(arena, "    _ = self;\n");
+        try emitUnusedParamDiscards(cc.ctor_params, cc.ctor_body, decls, arena);
+        for (cc.ctor_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, decls, arena, throw_target, switch_break_target, options);
+        try decls.appendSlice(arena, "    }\n");
+    }
+
+    // Static methods -> struct-scoped free functions `__static_m_<name>`,
+    // declared only on their owning class and called as `Owner.__static_m_x`.
+    {
+        const cc = c;
+        for (cc.methods) |m| {
+            if (!m.is_static) continue;
+            try decls.print(arena, "    fn __static_m_{s}(", .{m.name});
+            for (m.params, 0..) |param, i| {
+                if (i > 0) try decls.appendSlice(arena, ", ");
+                try decls.print(arena, "{s}: {s}", .{ param.name, try types.zigName(arena, param.checked_type orelse return error.ParseError) });
+            }
+            try decls.print(arena, ") {s} {{\n", .{try types.zigName(arena, m.checked_return_type orelse return error.ParseError)});
+            try emitUnusedParamDiscards(m.params, m.body, decls, arena);
+            for (m.body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, decls, arena, throw_target, switch_break_target, options);
+            try decls.appendSlice(arena, "    }\n");
+        }
+    }
+
+    try decls.appendSlice(arena, "};\n");
+}
+
+fn emitClassMethod(self_type: []const u8, m: ast.FunctionDecl, decls: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, throw_target: ?[]const u8, switch_break_target: ?[]const u8, options: CompileOptions) CompileError!void {
+    const fn_name = switch (m.accessor) {
+        .none => m.name,
+        .getter => try std.fmt.allocPrint(arena, "__get_{s}", .{m.name}),
+        .setter => try std.fmt.allocPrint(arena, "__set_{s}", .{m.name}),
+    };
+    try decls.print(arena, "    fn {s}(self: *{s}", .{ fn_name, self_type });
+    for (m.params) |param| {
+        try decls.print(arena, ", {s}: {s}", .{ param.name, try types.zigName(arena, param.checked_type orelse return error.ParseError) });
+    }
+    try decls.print(arena, ") {s} {{\n", .{try types.zigName(arena, m.checked_return_type orelse return error.ParseError)});
+    if (!bodyUsesThis(m.body)) try decls.appendSlice(arena, "    _ = self;\n");
+    try emitUnusedParamDiscards(m.params, m.body, decls, arena);
+    for (m.body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, decls, arena, throw_target, switch_break_target, options);
+    try decls.appendSlice(arena, "    }\n");
+}
+
+/// Emit `__super_<owner>_<name>` method copies for every `super.method` call
+/// referenced inside `body`, bound to the most-derived struct `c`.
+fn emitSuperCopies(c: *const ast.ClassDecl, body: []const Stmt, decls: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, seen: *std.StringHashMapUnmanaged(void), throw_target: ?[]const u8, switch_break_target: ?[]const u8, options: CompileOptions) CompileError!void {
+    for (body) |*stmt| try collectSuperInStmt(c, stmt, decls, arena, seen, throw_target, switch_break_target, options);
+}
+
+fn collectSuperInStmt(c: *const ast.ClassDecl, stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, seen: *std.StringHashMapUnmanaged(void), throw_target: ?[]const u8, switch_break_target: ?[]const u8, options: CompileOptions) CompileError!void {
+    switch (stmt.*) {
+        .expr_stmt => |x| try collectSuperInExpr(c, x.value, decls, arena, seen, throw_target, switch_break_target, options),
+        .return_stmt => |r| if (r.value) |v| try collectSuperInExpr(c, v, decls, arena, seen, throw_target, switch_break_target, options),
+        .var_decl => |v| try collectSuperInExpr(c, v.init, decls, arena, seen, throw_target, switch_break_target, options),
+        .member_assign => |ma| try collectSuperInExpr(c, ma.value, decls, arena, seen, throw_target, switch_break_target, options),
+        .console_log => |log| try collectSuperInExpr(c, log.value, decls, arena, seen, throw_target, switch_break_target, options),
+        .if_stmt => |b| {
+            try collectSuperInExpr(c, b.cond, decls, arena, seen, throw_target, switch_break_target, options);
+            try emitSuperCopies(c, b.then_body, decls, arena, seen, throw_target, switch_break_target, options);
+            if (b.else_body) |eb| try emitSuperCopies(c, eb, decls, arena, seen, throw_target, switch_break_target, options);
+        },
+        .while_stmt => |w| try emitSuperCopies(c, w.body, decls, arena, seen, throw_target, switch_break_target, options),
+        .for_stmt => |f| try emitSuperCopies(c, f.body, decls, arena, seen, throw_target, switch_break_target, options),
+        .for_of_stmt => |f| try emitSuperCopies(c, f.body, decls, arena, seen, throw_target, switch_break_target, options),
+        else => {},
+    }
+}
+
+fn collectSuperInExpr(c: *const ast.ClassDecl, e: *const Expr, decls: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, seen: *std.StringHashMapUnmanaged(void), throw_target: ?[]const u8, switch_break_target: ?[]const u8, options: CompileOptions) CompileError!void {
+    switch (e.*) {
+        .super_call => |sc| {
+            const owner = sc.parent orelse return;
+            const key = try std.fmt.allocPrint(arena, "{s}:{s}", .{ owner, sc.name });
+            for (sc.args) |a| try collectSuperInExpr(c, a, decls, arena, seen, throw_target, switch_break_target, options);
+            if (seen.contains(key)) return;
+            try seen.put(arena, key, {});
+            // Find the resolved ancestor method and emit a copy bound to `c`.
+            const oc = findClass(owner) orelse return;
+            for (oc.methods) |m| {
+                if (m.accessor == .none and !m.is_static and std.mem.eql(u8, m.name, sc.name)) {
+                    var copy = m;
+                    copy.name = try std.fmt.allocPrint(arena, "__super_{s}_{s}", .{ owner, sc.name });
+                    try emitClassMethod(c.name, copy, decls, arena, throw_target, switch_break_target, options);
+                    return;
+                }
+            }
+        },
+        .bin => |b| {
+            try collectSuperInExpr(c, b.l, decls, arena, seen, throw_target, switch_break_target, options);
+            try collectSuperInExpr(c, b.r, decls, arena, seen, throw_target, switch_break_target, options);
+        },
+        .method_call => |mc| {
+            try collectSuperInExpr(c, mc.obj, decls, arena, seen, throw_target, switch_break_target, options);
+            for (mc.args) |a| try collectSuperInExpr(c, a, decls, arena, seen, throw_target, switch_break_target, options);
+        },
+        .call => |cl| for (cl.args) |a| try collectSuperInExpr(c, a, decls, arena, seen, throw_target, switch_break_target, options),
+        .field => |f| try collectSuperInExpr(c, f.obj, decls, arena, seen, throw_target, switch_break_target, options),
+        else => {},
+    }
+}
 
 fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, options: CompileOptions) CompileError!void {
     return emitStmtWithThrow(stmt, decls, body, arena, null, null, options);
@@ -2428,6 +2832,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             .extern_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .class_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .member_assign => |ma| .{ .line = ma.line, .col = ma.col },
+            .super_ctor => |sc| .{ .line = sc.line, .col = sc.col },
             .test_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .function_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .var_decl => |decl| .{ .line = decl.line, .col = decl.col },
@@ -2487,55 +2892,57 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             }
             try decls.print(arena, ") {s};\n", .{try types.zigName(arena, decl.checked_return_type orelse return error.ParseError)});
         },
-        .class_decl => |c| {
+        .class_decl => |*c| {
             if (c.type_params.len > 0) return; // generic template: only specializations emit
-            // A class lowers to a struct with heap-allocated instances (*Name),
-            // an `__init` constructor, and methods taking `self: *Name`.
-            try decls.print(arena, "const {s} = struct {{\n", .{c.name});
-            for (c.fields) |field| {
-                try decls.print(arena, "    {s}: {s},\n", .{ field.name, try types.zigName(arena, field.checked_type orelse return error.ParseError) });
+            try emitClass(c, decls, arena, throw_target, switch_break_target, options);
+        },
+        .super_ctor => |sc| {
+            // super(args) -> self.__superctor_<Parent>(args);
+            const parent = sc.parent orelse return;
+            try body.print(arena, "    self.__superctor_{s}(", .{parent});
+            for (sc.args, 0..) |arg, i| {
+                if (i > 0) try body.appendSlice(arena, ", ");
+                try emitExpr(arg, body, arena);
             }
-            // constructor
-            try decls.print(arena, "    fn __init(", .{});
-            for (c.ctor_params, 0..) |param, i| {
-                if (i > 0) try decls.appendSlice(arena, ", ");
-                try decls.print(arena, "{s}: {s}", .{ param.name, try types.zigName(arena, param.checked_type orelse return error.ParseError) });
-            }
-            try decls.print(arena, ") *{s} {{\n", .{c.name});
-            try decls.print(arena, "    const self = std.heap.page_allocator.create({s}) catch unreachable;\n", .{c.name});
-            try emitUnusedParamDiscards(c.ctor_params, c.ctor_body, decls, arena);
-            for (c.ctor_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, decls, arena, throw_target, switch_break_target, options);
-            try decls.appendSlice(arena, "    return self;\n    }\n");
-            // methods
-            for (c.methods) |m| {
-                try decls.print(arena, "    fn {s}(self: *{s}", .{ m.name, c.name });
-                for (m.params) |param| {
-                    try decls.print(arena, ", {s}: {s}", .{ param.name, try types.zigName(arena, param.checked_type orelse return error.ParseError) });
-                }
-                try decls.print(arena, ") {s} {{\n", .{try types.zigName(arena, m.checked_return_type orelse return error.ParseError)});
-                // A method that never touches `this` still takes `self`; discard it.
-                if (!bodyUsesThis(m.body)) try decls.appendSlice(arena, "    _ = self;\n");
-                try emitUnusedParamDiscards(m.params, m.body, decls, arena);
-                for (m.body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, decls, arena, throw_target, switch_break_target, options);
-                try decls.appendSlice(arena, "    }\n");
-            }
-            try decls.appendSlice(arena, "};\n");
+            try body.appendSlice(arena, ");\n");
         },
         .member_assign => |ma| {
-            // this.field <op>= value  ->  self.field = (self.field op value);
-            try body.print(arena, "    self.{s} = ", .{ma.field});
+            // Resolve the receiver expression: `self.` (this), `Class.` (static),
+            // a setter call, or `obj.` (external instance field).
+            if (ma.is_setter) {
+                // obj.prop = value  ->  obj.__set_prop(value);
+                try body.appendSlice(arena, "    ");
+                try emitExpr(ma.obj.?, body, arena);
+                try body.print(arena, ".__set_{s}(", .{ma.field});
+                try emitExpr(ma.value, body, arena);
+                try body.appendSlice(arena, ");\n");
+                return;
+            }
+            // Build the lvalue prefix string.
+            var lv: std.ArrayListUnmanaged(u8) = .empty;
+            if (ma.is_static) {
+                const owner = ma.class_name orelse "";
+                try lv.print(arena, "{s}.__static_{s}_{s}", .{ owner, owner, ma.field });
+            } else if (ma.obj) |obj| {
+                try emitExpr(obj, &lv, arena);
+                try lv.print(arena, ".{s}", .{ma.field});
+            } else {
+                try lv.print(arena, "self.{s}", .{ma.field});
+            }
+            const lvs = lv.items;
+            try body.print(arena, "    {s} = ", .{lvs});
             if (std.mem.eql(u8, ma.op, "=")) {
                 try emitExpr(ma.value, body, arena);
             } else if (ma.op[0] == '/') {
-                try body.print(arena, "@divTrunc(self.{s}, ", .{ma.field});
+                try body.print(arena, "@divTrunc({s}, ", .{lvs});
                 try emitExpr(ma.value, body, arena);
                 try body.append(arena, ')');
             } else if (ma.op[0] == '%') {
-                try body.print(arena, "@rem(self.{s}, ", .{ma.field});
+                try body.print(arena, "@rem({s}, ", .{lvs});
                 try emitExpr(ma.value, body, arena);
                 try body.append(arena, ')');
             } else {
-                try body.print(arena, "(self.{s} {c} ", .{ ma.field, ma.op[0] });
+                try body.print(arena, "({s} {c} ", .{ lvs, ma.op[0] });
                 try emitExpr(ma.value, body, arena);
                 try body.append(arena, ')');
             }
@@ -2754,7 +3161,20 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
     }
 }
 
+/// Set during emission so the class lowering can walk the inheritance chain
+/// (the checker's class registry is not available at emit time). Single-threaded.
+var g_program: ?*const Program = null;
+
+fn findClass(name: []const u8) ?*const ast.ClassDecl {
+    const prog = g_program orelse return null;
+    for (prog.stmts) |*stmt| {
+        if (stmt.* == .class_decl and std.mem.eql(u8, stmt.class_decl.name, name)) return &stmt.class_decl;
+    }
+    return null;
+}
+
 fn emitProgram(program: *const Program, decls: *std.ArrayListUnmanaged(u8), body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, options: CompileOptions) CompileError!void {
+    g_program = program;
     for (program.stmts) |*stmt| try emitStmt(stmt, decls, body, arena, options);
 }
 

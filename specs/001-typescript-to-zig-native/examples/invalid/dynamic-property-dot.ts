@@ -1,2 +1,3 @@
-let user = { id: 1 };
+type User = { id: int };
+let user: User = { id: 1 };
 user.name = "Ada";
