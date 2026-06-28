@@ -344,6 +344,216 @@ fn readSourceWithImports(arena: std.mem.Allocator, io: std.Io, path: []const u8)
     return out.items;
 }
 
+/// Walks the LOCAL import closure of `path`, appending each resolved local file
+/// path to `set` (deduplicated). `https://` URL imports are build-time/remote and
+/// are deliberately skipped — the watcher only observes files on disk. Malformed
+/// imports or missing files are tolerated: the rebuild itself will surface the
+/// real diagnostic; the watch set just falls back to whatever resolved cleanly.
+fn collectWatchPaths(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    set: *std.StringArrayHashMapUnmanaged(void),
+    depth: u8,
+) void {
+    if (depth > 16) return;
+    if (std.mem.startsWith(u8, path, "https://")) return;
+    const key = std.fs.path.resolve(arena, &.{path}) catch return;
+    if (set.contains(key)) return;
+    set.put(arena, key, {}) catch return;
+
+    const source = std.Io.Dir.cwd().readFileAlloc(io, key, arena, .limited(16 * 1024 * 1024)) catch return;
+    const dir = std.fs.path.dirname(key) orelse ".";
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const import_spec = (parseImportSpec(arena, line) catch continue) orelse continue;
+        if (std.mem.startsWith(u8, import_spec.spec, "https://")) continue;
+        const child = std.fs.path.join(arena, &.{ dir, import_spec.spec }) catch continue;
+        collectWatchPaths(arena, io, child, set, depth + 1);
+    }
+}
+
+/// Process-global SIGINT state for `lumen watch`. A signal handler cannot take
+/// arguments or touch the arena, so the watch loop publishes the running child's
+/// process id here; the handler kills it and flips `interrupted` so the poll loop
+/// exits cleanly. On platforms without POSIX signals this stays inert and the
+/// watcher is stopped the usual way (the child is still killed between rebuilds).
+const WatchSignal = struct {
+    var interrupted: std.atomic.Value(bool) = .init(false);
+    var child_id: std.atomic.Value(i64) = .init(0);
+
+    fn handle(_: std.posix.SIG) callconv(.c) void {
+        const id = child_id.load(.seq_cst);
+        if (id != 0) {
+            std.posix.kill(@intCast(id), std.posix.SIG.TERM) catch {};
+        }
+        interrupted.store(true, .seq_cst);
+    }
+};
+
+/// Builds (and optionally runs) `path` once, returning the freshly spawned child
+/// on success when running is enabled. Reuses the exact compile path so build
+/// errors print byte-for-byte like `lumen compile`. A previous run, if any, is
+/// killed before the new binary is spawned.
+fn watchRebuild(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    mode: CompileMode,
+    run: bool,
+    prev: *?std.process.Child,
+    err: *std.Io.Writer,
+) !void {
+    // Reuse the standard compile path so diagnostics are identical to `lumen
+    // compile`. compileFile prints either the diagnostic or the success line.
+    const code = compileFile(arena, io, path, mode, .build_exe, &.{}, err) catch |e| {
+        try err.print("watch: rebuild error: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return;
+    };
+    if (code != 0) {
+        // Keep the last good run alive: a failed build leaves `prev` untouched.
+        try err.writeAll("watch: build failed; keeping previous run\n");
+        try err.flush();
+        return;
+    }
+    if (!run) {
+        try err.flush();
+        return;
+    }
+
+    // Stop the previous run before launching the rebuilt binary.
+    if (prev.*) |*child| {
+        WatchSignal.child_id.store(0, .seq_cst);
+        child.kill(io);
+        prev.* = null;
+    }
+
+    const base = std.fs.path.stem(path);
+    const exe_name = if (@import("builtin").os.tag == .windows)
+        try std.fmt.allocPrint(arena, "{s}.exe", .{base})
+    else
+        try arena.dupe(u8, base);
+    // Spawn via an explicit relative path so it resolves in cwd, not PATH.
+    const exe_rel = try std.fmt.allocPrint(arena, "./{s}", .{exe_name});
+
+    const child = std.process.spawn(io, .{
+        .argv = &.{exe_rel},
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch {
+        try err.print("watch: could not run {s}\n", .{exe_name});
+        try err.flush();
+        return;
+    };
+    if (child.id) |id| WatchSignal.child_id.store(@intCast(id), .seq_cst);
+    prev.* = child;
+    try err.print("watch: running {s}\n", .{exe_rel});
+    try err.flush();
+}
+
+/// `lumen watch <file.ts>`: rebuild whenever the entry file or any of its local
+/// imports changes, re-running the produced binary unless `run` is false.
+/// Watching is mtime polling at ~150 ms; the watch set is recomputed each rebuild
+/// so newly added/removed local imports are picked up.
+fn watchProject(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: CompileMode, run: bool, err: *std.Io.Writer) !u8 {
+    if (!std.mem.endsWith(u8, path, ".ts")) {
+        try err.print("error: expected a .ts source file, got {s}\n", .{path});
+        return 2;
+    }
+
+    // Install a SIGINT/SIGTERM handler so Ctrl-C stops the watcher and kills the
+    // running child. Best-effort: only meaningful on POSIX targets.
+    if (@import("builtin").os.tag != .windows) {
+        var act: std.posix.Sigaction = .{
+            .handler = .{ .handler = WatchSignal.handle },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &act, null);
+        std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+    }
+
+    var prev: ?std.process.Child = null;
+    // A per-poll scratch arena keeps long-running watches from leaking the
+    // memory allocated by each rebuild (source reads, watch sets, hashing).
+    var poll_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer poll_arena.deinit();
+
+    // Snapshot of (path -> content hash) for the current watch set. Content
+    // hashing is used instead of mtime because the file-stat path returns stale
+    // modification times after a `zig build-exe` child runs under this I/O, while
+    // file reads stay fresh; a 64-bit content hash is a reliable change signal.
+    var prev_hashes: std.StringArrayHashMapUnmanaged(u64) = .empty;
+
+    // Initial build.
+    try watchRebuild(arena, io, path, mode, run, &prev, err);
+    snapshotWatchSet(arena, io, path, &prev_hashes);
+    try err.print("watching {d} files (Ctrl-C to stop)\n", .{prev_hashes.count()});
+    try err.flush();
+
+    while (!WatchSignal.interrupted.load(.seq_cst)) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(150), .awake) catch break;
+        if (WatchSignal.interrupted.load(.seq_cst)) break;
+
+        // Recompute the watch set every poll so import changes are tracked.
+        _ = poll_arena.reset(.retain_capacity);
+        const pa = poll_arena.allocator();
+        var cur: std.StringArrayHashMapUnmanaged(u64) = .empty;
+        snapshotWatchSet(pa, io, path, &cur);
+
+        var changed = false;
+        // A file appeared/disappeared from the set, or its contents changed.
+        if (cur.count() != prev_hashes.count()) changed = true;
+        var it = cur.iterator();
+        while (it.next()) |entry| {
+            if (prev_hashes.get(entry.key_ptr.*)) |old| {
+                if (old != entry.value_ptr.*) changed = true;
+            } else changed = true;
+        }
+
+        if (!changed) continue;
+
+        // Rebuild, then refresh the content snapshot against the new set.
+        try watchRebuild(arena, io, path, mode, run, &prev, err);
+        prev_hashes.clearRetainingCapacity();
+        snapshotWatchSet(arena, io, path, &prev_hashes);
+    }
+
+    if (prev) |*child| {
+        WatchSignal.child_id.store(0, .seq_cst);
+        child.kill(io);
+    }
+    try err.writeAll("\nwatch: stopped\n");
+    try err.flush();
+    return 0;
+}
+
+/// Fills `out` with (resolved local path -> content hash) for the entry file and
+/// its local import closure. A file that cannot be read hashes to 0 so its later
+/// appearance registers as a change.
+fn snapshotWatchSet(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    out: *std.StringArrayHashMapUnmanaged(u64),
+) void {
+    var set: std.StringArrayHashMapUnmanaged(void) = .empty;
+    collectWatchPaths(arena, io, path, &set, 0);
+    for (set.keys()) |k| {
+        out.put(arena, k, fileHash(arena, io, k)) catch {};
+    }
+}
+
+/// 64-bit hash of a file's contents (0 when unreadable). File reads stay fresh
+/// under this I/O even after a build child runs, making content hashing a
+/// reliable change signal for the watch poll loop.
+fn fileHash(arena: std.mem.Allocator, io: std.Io, path: []const u8) u64 {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024)) catch return 0;
+    return std.hash.Wyhash.hash(0, data);
+}
+
 const Action = enum { build_exe, run_test };
 
 /// The ambient declarations that make Lumen `.ts` sources type-check under plain
@@ -620,12 +830,12 @@ pub fn main(init: std.process.Init) !void {
     const err = &err_fw.interface;
 
     if (args.len < 2) {
-        try err.writeAll("usage: lumen init [dir]\n       lumen compile [--release-fast] <file.ts>\n       lumen test <file.ts>\n");
+        try err.writeAll("usage: lumen init [dir]\n       lumen compile [--release-fast] <file.ts>\n       lumen watch [--no-run] <file.ts>\n       lumen test <file.ts>\n");
         try err.flush();
         std.process.exit(2);
     }
 
-    const usage = "usage: lumen init [dir]\n       lumen compile [--release-fast] [--link <lib>] <file.ts>\n       lumen test <file.ts>\n";
+    const usage = "usage: lumen init [dir]\n       lumen compile [--release-fast] [--link <lib>] <file.ts>\n       lumen watch [--no-run] [--release-fast] <file.ts>\n       lumen test <file.ts>\n";
     const code = if (std.mem.eql(u8, args[1], "init")) blk: {
         if (args.len > 3) {
             try err.writeAll(usage);
@@ -639,6 +849,34 @@ pub fn main(init: std.process.Init) !void {
             break :blk 2;
         }
         break :blk try compileFile(arena, io, args[2], .release_safe, .run_test, &.{}, err);
+    } else if (std.mem.eql(u8, args[1], "watch")) blk: {
+        if (args.len < 3) {
+            try err.writeAll("usage: lumen watch [--no-run] [--release-fast] <file.ts>\n");
+            break :blk 2;
+        }
+        var mode: CompileMode = .release_safe;
+        var run = true;
+        var source_arg: ?[]const u8 = null;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (std.mem.eql(u8, arg, "--no-run")) {
+                run = false;
+            } else if (std.mem.eql(u8, arg, "--release-fast")) {
+                mode = .release_fast;
+            } else if (std.mem.eql(u8, arg, "--release-safe")) {
+                mode = .release_safe;
+            } else if (source_arg == null) {
+                source_arg = arg;
+            } else {
+                try err.writeAll("usage: lumen watch [--no-run] [--release-fast] <file.ts>\n");
+                break :blk 2;
+            }
+        }
+        break :blk try watchProject(arena, io, source_arg orelse {
+            try err.writeAll("usage: lumen watch [--no-run] [--release-fast] <file.ts>\n");
+            break :blk 2;
+        }, mode, run, err);
     } else if (std.mem.eql(u8, args[1], "compile")) blk: {
         if (args.len < 3) {
             try err.writeAll(usage);

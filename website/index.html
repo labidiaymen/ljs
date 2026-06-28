@@ -303,6 +303,10 @@ lumen compile main.ts && ./main</code></pre>
   <p class="sub"><code>lumen init</code> writes a starter <code>main.ts</code> plus the ambient
   declarations and <code>tsconfig.json</code>, so the project is editor- and type-checker-clean
   from the first keystroke.</p>
+  <p class="sub">For a live edit loop, <code>lumen watch</code> rebuilds and re-runs the program
+  whenever the entry file or any of its local imports changes:</p>
+<pre><code class="lumen">lumen watch main.ts            # rebuild and re-run on change
+lumen watch --no-run main.ts   # rebuild only</code></pre>
 </section>
 
 <footer><div class="wrap">

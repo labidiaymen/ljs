@@ -38,8 +38,24 @@ Windows: download the `.zip` from the [releases page](https://github.com/lumen-l
 
 ```sh
 lumen compile app.ts      # build a native binary
+lumen watch app.ts        # rebuild + re-run on every change
 lumen test app.test.ts    # run test blocks
 ```
+
+## Watch mode: `lumen watch`
+
+Keep an edit loop running. `lumen watch app.ts` builds the program, runs it, and
+then rebuilds and re-runs it whenever the entry file or any of its local imports
+changes (the previous run is restarted automatically):
+
+```sh
+lumen watch app.ts            # rebuild and re-run on change
+lumen watch --no-run app.ts   # rebuild only, do not execute
+```
+
+A build error prints the same diagnostic as `lumen compile` and leaves the last
+good run going; fixing the error rebuilds. Press Ctrl-C to stop. Remote
+`https://` imports are not watched.
 
 ## Getting started: `lumen init`
 
