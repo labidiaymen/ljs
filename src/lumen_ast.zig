@@ -56,6 +56,14 @@ pub const FunctionParam = struct {
     is_rest: bool = false,
     // `x: T = expr` — default value used when the call omits this trailing arg.
     default: ?*Expr = null,
+    // `x: Ref<T>` — a by-reference parameter. `checked_type` holds the inner `T`
+    // (the body type-checks as `T`); the param lowers to a single Zig pointer
+    // `*T`. Scalar inner types additionally deref reads/writes in the body.
+    is_ref: bool = false,
+    // True when `is_ref` and the inner `T` is a scalar (int/i64/number/bool),
+    // which needs explicit `.*` on reads and assignments in the body. Record and
+    // tuple inner types rely on Zig's single-pointer field auto-deref instead.
+    ref_scalar: bool = false,
 };
 
 /// `extern function name(params): ret;` — an external C-ABI function. No body;
@@ -159,6 +167,9 @@ pub const Assign = struct {
     value: *Expr,
     line: u32,
     col: u32,
+    // True when the target is a scalar `Ref<T>` parameter; the assignment lowers
+    // through the pointer as `name.* = ...`.
+    deref: bool = false,
 };
 
 pub const ConsoleLog = struct {
@@ -342,7 +353,7 @@ pub const Expr = union(enum) {
     array: struct { items: []*Expr, elem_type: ?types.Type = null }, // `[a, b, ...rest]`; elem_type is filled by the checker when a spread element is present
     spread: *Expr, // `...expr` element inside an array literal or call argument list
     tuple_lit: struct { items: []*Expr, tuple_type: ?types.Type = null }, // [a, b] checked against a tuple type
-    var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null, unwrap: bool = false, is_func_ref: bool = false, capture: bool = false, func_sig: ?*const types.FuncSig = null },
+    var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null, unwrap: bool = false, is_func_ref: bool = false, capture: bool = false, func_sig: ?*const types.FuncSig = null, deref: bool = false }, // deref: a scalar `Ref<T>` parameter read, emitted as `name.*`
     neg: *Expr,
     not: *Expr,
     bnot: *Expr, // bitwise ~
@@ -361,7 +372,7 @@ pub const Expr = union(enum) {
     obj: []FieldInit,
     field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null, enum_value: ?EnumValue = null, optional_chain: bool = false, chain_field_type: ?types.Type = null, class_name: ?[]const u8 = null, is_static: bool = false, is_getter: bool = false },
     index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null, tuple_index: ?usize = null },
-    call: struct { name: []const u8, args: []*Expr, emit_name: ?[]const u8 = null, is_closure: bool = false, type_args: [][]const u8 = &.{}, ffi_string_args: []bool = &.{}, ffi_string_return: bool = false }, // builtin / user / function-value call; type_args from explicit f<T>(...). ffi_* mark a call to an `extern function` so the FFI string marshalling glue is emitted.
+    call: struct { name: []const u8, args: []*Expr, emit_name: ?[]const u8 = null, is_closure: bool = false, type_args: [][]const u8 = &.{}, ffi_string_args: []bool = &.{}, ffi_string_return: bool = false, ref_args: []bool = &.{} }, // builtin / user / function-value call; type_args from explicit f<T>(...). ffi_* mark a call to an `extern function` so the FFI string marshalling glue is emitted. ref_args[i] true emits `&arg` for a by-reference (`Ref<T>`) parameter.
     static_call: StaticCall,
     cast: struct { inner: *Expr, annotation: []const u8, checked_type: ?types.Type = null }, // `expr as T` (safe-subset assertion; erased at emit)
 };

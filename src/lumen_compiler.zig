@@ -1777,6 +1777,11 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                         try w.appendSlice(arena, "(std.fmt.allocPrintSentinel(__alloc, \"{s}\", .{");
                         try emitExpr(arg, w, arena);
                         try w.appendSlice(arena, "}, 0) catch unreachable).ptr");
+                    } else if (i < cl.ref_args.len and cl.ref_args[i]) {
+                        // A by-reference (`Ref<T>`) argument: take its address so
+                        // the callee mutates the caller's binding in place.
+                        try w.append(arena, '&');
+                        try emitExpr(arg, w, arena);
                     } else {
                         try emitExpr(arg, w, arena);
                     }
@@ -1877,6 +1882,7 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             } else {
                 if (ref.capture) try w.appendSlice(arena, "__env."); // captured outer binding
                 try w.appendSlice(arena, ref.emit_name orelse ref.name);
+                if (ref.deref) try w.appendSlice(arena, ".*"); // scalar by-reference (`Ref<T>`) param read
                 if (ref.unwrap) try w.appendSlice(arena, ".?"); // narrowed optional access
             }
         },
@@ -2938,7 +2944,9 @@ fn emitClassMethod(self_type: []const u8, m: ast.FunctionDecl, decls: *std.Array
     };
     try decls.print(arena, "    fn {s}(self: *{s}", .{ fn_name, self_type });
     for (m.params) |param| {
-        try decls.print(arena, ", {s}: {s}", .{ param.name, try types.zigName(arena, param.checked_type orelse return error.ParseError) });
+        const pt = param.checked_type orelse return error.ParseError;
+        const ztype = if (param.is_ref) try types.refZigName(arena, pt) else try types.zigName(arena, pt);
+        try decls.print(arena, ", {s}: {s}", .{ param.name, ztype });
     }
     try decls.print(arena, ") {s} {{\n", .{try types.zigName(arena, m.checked_return_type orelse return error.ParseError)});
     if (!bodyUsesThis(m.body)) try decls.appendSlice(arena, "    _ = self;\n");
@@ -3010,7 +3018,9 @@ fn emitStmt(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body: *std.Ar
 }
 
 fn emitAssignExpr(assignment: ast.Assign, body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
-    const name = assignment.emit_name orelse assignment.name;
+    const base = assignment.emit_name orelse assignment.name;
+    // A scalar by-reference (`Ref<T>`) param assigns through its pointer.
+    const name = if (assignment.deref) try std.fmt.allocPrint(arena, "{s}.*", .{base}) else base;
     try body.print(arena, "{s} = ", .{name});
     if (std.mem.eql(u8, assignment.op, "=")) {
         try emitExpr(assignment.value, body, arena);
@@ -3213,7 +3223,8 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             for (decl.params, 0..) |param, i| {
                 if (i > 0) try decls.appendSlice(arena, ", ");
                 const param_type = param.checked_type orelse types.fromAnnotation(param.annotation);
-                try decls.print(arena, "{s}: {s}", .{ param.name, try types.zigName(arena, param_type) });
+                const ztype = if (param.is_ref) try types.refZigName(arena, param_type) else try types.zigName(arena, param_type);
+                try decls.print(arena, "{s}: {s}", .{ param.name, ztype });
             }
             // An async function returns its declared `*LumenPromise(T)`; `return v`
             // statements in the body resolve the promise with `v`.

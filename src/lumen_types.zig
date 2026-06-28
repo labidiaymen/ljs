@@ -410,6 +410,32 @@ pub fn fromAnnotation(name: []const u8) Type {
     return .{ .named = name };
 }
 
+/// The Zig type for a by-reference (`Ref<T>`) parameter: a single pointer to the
+/// inner type's Zig representation. Field access and assignment go through Zig's
+/// single-pointer auto-deref (`p.x`); scalar reads/writes use explicit `.*`.
+pub fn refZigName(arena: std.mem.Allocator, inner: Type) ![]const u8 {
+    return std.fmt.allocPrint(arena, "*{s}", .{try zigName(arena, inner)});
+}
+
+/// Whether a type is a legal `Ref<T>` element: a value type the compiler can pass
+/// by single pointer. Classes (already references), arrays, and strings (already
+/// slices), maps/sets/promises (already heap pointers) are rejected for V1.
+pub fn isRefAllowed(t: Type) bool {
+    return switch (t) {
+        .i32, .i64, .f64, .bool, .named, .union_type, .enum_type, .tuple_type => true,
+        else => false,
+    };
+}
+
+/// Whether a `Ref<T>` inner type is a scalar that needs explicit `.*` deref on
+/// reads and assignments in the body.
+pub fn isRefScalar(t: Type) bool {
+    return switch (t) {
+        .i32, .i64, .f64, .bool, .enum_type => true,
+        else => false,
+    };
+}
+
 pub fn zigName(arena: std.mem.Allocator, t: Type) ![]const u8 {
     return switch (t) {
         .i32 => "i32",

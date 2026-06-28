@@ -1,0 +1,29 @@
+{
+  "feature": "024-ref-params",
+  "cases": [
+    {
+      "id": "ref.valid.record-by-ref",
+      "source": "../examples/valid/record-by-ref.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "6\n16\n1\n101" }
+    },
+    {
+      "id": "ref.valid.scalar-out-param",
+      "source": "../examples/valid/scalar-out-param.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "1\n2\n22" }
+    },
+    {
+      "id": "ref.invalid.ref-on-class",
+      "source": "../examples/invalid/ref-on-class.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_REF_TARGET" }
+    },
+    {
+      "id": "ref.invalid.ref-non-lvalue",
+      "source": "../examples/invalid/ref-non-lvalue.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_REF_ARG" }
+    }
+  ]
+}

@@ -48,6 +48,12 @@ const Binding = struct {
     mutable: bool,
     decl: ?*ast.VarDecl = null,
     emit_name: []const u8,
+    // True for a scalar `Ref<T>` parameter: reads and assignments of this name
+    // lower through the pointer (`name.*`).
+    ref_scalar: bool = false,
+    // True for any `Ref<T>` parameter. A record `Ref<T>` is mutable through its
+    // pointer, so field writes on it are allowed (unlike plain V1 records).
+    is_ref: bool = false,
 };
 
 const Scope = std.StringHashMapUnmanaged(Binding);
@@ -235,7 +241,7 @@ const Checker = struct {
         const scope = self.currentScope();
         if (scope.get(param.name) != null) return self.fail(line, col, "E_DUPLICATE_BINDING");
         const param_type = param.checked_type orelse try self.typeFromAnnotation(param.annotation, line, col);
-        scope.put(self.arena, param.name, .{ .ty = param_type, .mutable = true, .emit_name = param.name }) catch return error.OutOfMemory;
+        scope.put(self.arena, param.name, .{ .ty = param_type, .mutable = true, .emit_name = param.name, .ref_scalar = param.ref_scalar, .is_ref = param.is_ref }) catch return error.OutOfMemory;
     }
 
     fn declareCatch(self: *Checker, stmt: *ast.TryStmt) CompileError!void {
@@ -313,6 +319,49 @@ const Checker = struct {
     fn declFields(self: *Checker, type_name: []const u8) []ast.TypeField {
         if (self.type_decls.get(type_name)) |info| return info.fields;
         return &.{};
+    }
+
+    /// The declared type of one record field, or null if the type is not a known
+    /// record or lacks that field.
+    fn recordFieldType(self: *Checker, type_name: []const u8, field: []const u8) ?types.Type {
+        for (self.declFields(type_name)) |f| {
+            if (std.mem.eql(u8, f.name, field)) {
+                return f.checked_type orelse (self.typeFromAnnotation(f.annotation, 0, 0) catch null);
+            }
+        }
+        return null;
+    }
+
+    /// Force the root variable of an lvalue path to emit as a mutable (`var`)
+    /// binding so the backend can take its address for a by-reference argument.
+    fn markReassignedRoot(self: *Checker, e: *const ast.Expr) void {
+        switch (e.*) {
+            .var_ref => |r| if (self.bindingPtr(r.name)) |b| {
+                if (b.decl) |d| d.reassigned = true;
+            },
+            .field => |f| self.markReassignedRoot(f.obj),
+            else => {},
+        }
+    }
+
+    /// Whether an lvalue path's root variable is a mutable binding (a `let`/`var`
+    /// or a parameter), so it may be passed by reference.
+    fn refRootMutable(self: *Checker, e: *const ast.Expr) bool {
+        return switch (e.*) {
+            .var_ref => |r| if (self.binding(r.name)) |b| b.mutable else false,
+            .field => |f| self.refRootMutable(f.obj),
+            else => false,
+        };
+    }
+
+    /// Whether an lvalue path is rooted in a by-reference (`Ref<T>`) parameter, so
+    /// writes through it are allowed (the underlying value is mutable in place).
+    fn refRooted(self: *Checker, e: *const ast.Expr) bool {
+        return switch (e.*) {
+            .var_ref => |r| if (self.binding(r.name)) |b| b.is_ref else false,
+            .field => |f| self.refRooted(f.obj),
+            else => false,
+        };
     }
 
     fn funcSigType(self: *Checker, finfo: FunctionInfo) CompileError!types.Type {
@@ -443,13 +492,34 @@ const Checker = struct {
         return types.fromAnnotation(annotation);
     }
 
+    /// Resolve a function/method parameter annotation, intercepting the built-in
+    /// by-reference marker `Ref<T>` before the generics machinery treats `Ref` as
+    /// a user generic. A `Ref<T>` parameter type-checks as `T` (its `checked_type`
+    /// is the inner type) but is passed by single pointer; the inner type must be
+    /// a value type (record/interface, scalar, union, enum, or tuple). Classes,
+    /// arrays, strings, maps, sets, and promises are already reference-like and
+    /// are rejected. A rest `Ref<T>[]` is not supported.
+    fn resolveParam(self: *Checker, param: *ast.FunctionParam, line: u32, col: u32) CompileError!void {
+        if (refInner(param.annotation)) |inner_ann| {
+            if (param.is_rest) return self.fail(line, col, "E_REF_TARGET");
+            const inner = try self.typeFromAnnotation(inner_ann, line, col);
+            if (inner == .class_type) return self.fail(line, col, "E_REF_TARGET");
+            if (!types.isRefAllowed(inner)) return self.fail(line, col, "E_REF_TARGET");
+            param.is_ref = true;
+            param.ref_scalar = types.isRefScalar(inner);
+            param.checked_type = inner;
+            return;
+        }
+        param.checked_type = try self.typeFromAnnotation(param.annotation, line, col);
+    }
+
     fn declareFunction(self: *Checker, decl: *ast.FunctionDecl) CompileError!void {
         if (self.funcs.get(decl.name) != null) return self.fail(decl.line, decl.col, "E_DUPLICATE_BINDING");
         const return_type = try self.typeFromAnnotation(decl.return_annotation, decl.line, decl.col);
         // An async function must declare a `Promise<T>` return type.
         if (decl.is_async and return_type != .promise_type) return self.fail(decl.line, decl.col, "E_ASYNC_RETURN");
         for (decl.params) |*param| {
-            param.checked_type = try self.typeFromAnnotation(param.annotation, decl.line, decl.col);
+            try self.resolveParam(param, decl.line, decl.col);
         }
         try self.validateParamSignature(decl.params);
         decl.checked_return_type = return_type;
@@ -1097,10 +1167,13 @@ const Checker = struct {
             field.checked_type = try self.typeFromAnnotation(field.annotation, c.line, c.col);
         }
         for (c.ctor_params) |*param| {
+            // Constructor params become fields; by-reference params are not
+            // storable as fields, so reject `Ref<T>` here.
+            if (refInner(param.annotation) != null) return self.fail(c.line, c.col, "E_REF_TARGET");
             param.checked_type = try self.typeFromAnnotation(param.annotation, c.line, c.col);
         }
         for (c.methods) |*m| {
-            for (m.params) |*param| param.checked_type = try self.typeFromAnnotation(param.annotation, m.line, m.col);
+            for (m.params) |*param| try self.resolveParam(param, m.line, m.col);
             m.checked_return_type = try self.typeFromAnnotation(m.return_annotation, m.line, m.col);
         }
     }
@@ -1546,6 +1619,8 @@ const Checker = struct {
         if (!isCSafe(ret) and ret != .void) return self.fail(decl.line, decl.col, "E_FFI_TYPE");
         decl.checked_return_type = ret;
         for (decl.params) |*param| {
+            // `Ref<T>` is not part of the C ABI surface.
+            if (refInner(param.annotation) != null) return self.fail(decl.line, decl.col, "E_FFI_TYPE");
             param.checked_type = try self.typeFromAnnotation(param.annotation, decl.line, decl.col);
             if (!isCSafe(param.checked_type.?)) return self.fail(decl.line, decl.col, "E_FFI_TYPE");
         }
@@ -1685,6 +1760,14 @@ const Checker = struct {
             }
             const obj_type = self.exprType(program, obj, ma.line, ma.col) orelse
                 return self.inferenceFail(ma.line, ma.col, "cannot infer assignment target type");
+            // A record `Ref<T>` parameter is mutable through its pointer: writes to
+            // its fields (or fields of a sub-record reached from it) are allowed.
+            if (obj_type == .named and self.refRooted(obj)) {
+                const ft = self.recordFieldType(obj_type.named, ma.field) orelse
+                    return self.fail(ma.line, ma.col, "E_TYPE_MISMATCH");
+                try self.assignField(program, ft, ma);
+                return;
+            }
             // Records and other non-class shapes are immutable in V1: writing a
             // field on them is a dynamic property write.
             if (obj_type != .class_type) return self.fail(ma.line, ma.col, "E_DYNAMIC_PROPERTY_WRITE");
@@ -1864,6 +1947,7 @@ const Checker = struct {
                 }
                 if (found_binding.decl) |decl| decl.reassigned = true;
                 assignment.emit_name = found_binding.emit_name;
+                assignment.deref = found_binding.ref_scalar;
             },
             .console_log => |*log| {
                 const log_type = self.exprType(program, log.value, log.line, log.col) orelse
@@ -2224,6 +2308,7 @@ const Checker = struct {
                     return null;
                 };
                 ref.emit_name = found_binding.emit_name;
+                ref.deref = found_binding.ref_scalar;
                 // Inside an arrow body, a reference to a binding declared outside
                 // the arrow is a capture (stored in the closure's heap env).
                 if (self.current_captures) |caps| {
@@ -2913,6 +2998,28 @@ const Checker = struct {
                     _ = self.fail(line, col, "unknown function") catch {};
                     return null;
                 };
+                // A by-reference (`Ref<T>`) parameter requires an addressable
+                // lvalue argument; mark each so the emitter inserts `&arg`.
+                var any_ref = false;
+                for (func.params) |p| {
+                    if (p.is_ref) any_ref = true;
+                }
+                if (any_ref) {
+                    const flags = self.arena.alloc(bool, func.params.len) catch return null;
+                    for (func.params, 0..) |p, i| {
+                        flags[i] = p.is_ref;
+                        if (p.is_ref) {
+                            if (i >= call.args.len or !isAddressable(call.args[i]) or !self.refRootMutable(call.args[i])) {
+                                _ = self.fail(line, col, "E_REF_ARG") catch {};
+                                return null;
+                            }
+                            // Taking the address of a local requires a mutable
+                            // (`var`) binding; force one for the root variable.
+                            self.markReassignedRoot(call.args[i]);
+                        }
+                    }
+                    call.ref_args = flags;
+                }
                 call.args = self.checkCallArgs(program, func.params, call.args, line, col) orelse return null;
                 if (func.is_extern) {
                     // Mark string params/return so the emitter inserts the FFI
@@ -3145,6 +3252,29 @@ const Checker = struct {
 /// Types allowed in extern function signatures: C-ABI scalars plus `string`,
 /// which is marshalled to/from a NUL-terminated C `const char*` at the call
 /// boundary. Arrays, records, and function types remain rejected (E_FFI_TYPE).
+/// If `annotation` is the by-reference marker `Ref<T>`, returns the inner `T`
+/// annotation (trimmed); otherwise null. `Ref` is reserved as a built-in marker,
+/// so it is matched here before the generics machinery resolves type references.
+fn refInner(annotation: []const u8) ?[]const u8 {
+    const a = std.mem.trim(u8, annotation, " ");
+    if (!std.mem.startsWith(u8, a, "Ref<")) return null;
+    if (!std.mem.endsWith(u8, a, ">")) return null;
+    const inner = a["Ref<".len .. a.len - 1];
+    return std.mem.trim(u8, inner, " ");
+}
+
+/// Whether an expression is an addressable lvalue eligible to be passed to a
+/// by-reference (`Ref<T>`) parameter: a plain variable, or a field path rooted in
+/// one (`obj.field`, `obj.a.b`). Literals, temporaries, and computed expressions
+/// are rejected.
+fn isAddressable(e: *const ast.Expr) bool {
+    return switch (e.*) {
+        .var_ref => true,
+        .field => |f| f.enum_value == null and f.builtin == null and !f.is_static and !f.optional_chain and isAddressable(f.obj),
+        else => false,
+    };
+}
+
 fn isCSafe(t: types.Type) bool {
     return switch (t) {
         .i32, .i64, .f64, .bool, .string => true,
