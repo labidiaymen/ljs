@@ -2934,6 +2934,30 @@ const Checker = struct {
                     }
                     return .void;
                 }
+                // Matcher form `expect(actual).toBe(expected)` / `.toEqual(...)`:
+                // both operands must share a type; lowers to std.testing.expectEqual.
+                if (std.mem.eql(u8, call.name, "__expectToBe") or std.mem.eql(u8, call.name, "__expectToEqual")) {
+                    if (self.test_depth == 0) {
+                        _ = self.fail(line, col, "expect is only allowed inside a test block") catch {};
+                        return null;
+                    }
+                    if (call.args.len != 2) {
+                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    const actual_type = self.exprType(program, call.args[0], line, col) orelse return null;
+                    const expected_type = self.exprType(program, call.args[1], line, col) orelse return null;
+                    if (!types.same(actual_type, expected_type)) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                    // Strings compare by bytes, not slice identity, so route the
+                    // string case to a distinct lowering.
+                    if (types.same(.string, actual_type)) {
+                        call.name = "__expectStrEqual";
+                    }
+                    return .void;
+                }
                 if (std.mem.eql(u8, call.name, "argsCount")) {
                     if (call.args.len != 0) {
                         _ = self.fail(line, col, "E_ARG_COUNT") catch {};

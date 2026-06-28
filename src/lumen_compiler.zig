@@ -1650,26 +1650,93 @@ const Parser = struct {
             return .{ .try_stmt = .{ .try_body = try_body, .catch_name = catch_name, .catch_body = catch_body, .finally_body = finally_body, .line = line, .col = col } };
         }
 
-        // `test "name" { ... }` — only when a string follows, so `test` stays
-        // usable as an ordinary identifier elsewhere.
+        // Test declarations. Two surfaces lower to the same `test_decl`:
+        //   * `test "name" { ... }`              — the original block form.
+        //   * `test("name", () => { ... });`     — the conventional function form
+        //                                          (Jest/Vitest/node:test style),
+        //                                          which is valid TypeScript.
+        // Both are recognised only by lookahead, so `test` stays usable as an
+        // ordinary identifier everywhere else.
         if (eq(u8, kw, "test")) {
             const save_lex = self.lex;
             const save_cur = self.cur;
             const save_line = self.cur_line;
             const save_col = self.cur_col;
             self.advance() catch {};
-            const is_test = self.cur == .str;
+            const after_test = self.cur;
             self.lex = save_lex;
             self.cur = save_cur;
             self.cur_line = save_line;
             self.cur_col = save_col;
-            if (is_test) {
+            if (after_test == .str) {
+                // `test "name" { ... }`
                 try self.advance(); // 'test'
                 const name = self.cur.str;
                 try self.advance(); // name string
                 const tbody = try self.parseBlock();
                 return .{ .test_decl = .{ .name = name, .body = tbody, .line = line, .col = col } };
             }
+            if (after_test == .op and after_test.op == '(') {
+                // `test("name", () => { ... });`
+                try self.advance(); // 'test'
+                try self.expectOp('(');
+                if (self.cur != .str) return error.ParseError;
+                const name = self.cur.str;
+                try self.advance(); // name string
+                try self.expectOp(',');
+                // Callback `() => { ... }`: no params, block body.
+                try self.expectOp('(');
+                try self.expectOp(')');
+                if (!self.isOp2("=>")) return error.ParseError;
+                try self.advance(); // '=>'
+                const tbody = try self.parseBlock();
+                try self.expectOp(')');
+                try self.expectOp(';');
+                return .{ .test_decl = .{ .name = name, .body = tbody, .line = line, .col = col } };
+            }
+        }
+
+        // `expect(...)` assertions. The boolean form `expect(cond);` and the
+        // matcher form `expect(actual).toBe(expected);` (and `.toEqual`) both
+        // lower to a single `expect` call node; the matcher carries the expected
+        // value as a second argument and a marker name. Recognised only when an
+        // open paren follows, so `expect` stays usable as an identifier.
+        if (eq(u8, kw, "expect") and self.peekIsOpenParen()) {
+            try self.advance(); // 'expect'
+            try self.expectOp('(');
+            const actual = try self.parseExpr();
+            try self.expectOp(')');
+            if (self.isOp('.')) {
+                try self.advance(); // '.'
+                if (self.cur != .ident) return error.ParseError;
+                const matcher = self.cur.ident;
+                const matcher_name: ?[]const u8 = if (eq(u8, matcher, "toBe"))
+                    "__expectToBe"
+                else if (eq(u8, matcher, "toEqual"))
+                    "__expectToEqual"
+                else
+                    null;
+                if (matcher_name == null) {
+                    self.last_err = "E_UNKNOWN_MATCHER";
+                    return error.ParseError;
+                }
+                try self.advance(); // matcher name
+                try self.expectOp('(');
+                const expected = try self.parseExpr();
+                try self.expectOp(')');
+                try self.expectOp(';');
+                const args = try self.arena.alloc(*Expr, 2);
+                args[0] = actual;
+                args[1] = expected;
+                const value = try self.node(.{ .call = .{ .name = matcher_name.?, .args = args } });
+                return .{ .expr_stmt = .{ .value = value, .line = line, .col = col } };
+            }
+            // Boolean form: `expect(cond);`.
+            try self.expectOp(';');
+            const args = try self.arena.alloc(*Expr, 1);
+            args[0] = actual;
+            const value = try self.node(.{ .call = .{ .name = "expect", .args = args } });
+            return .{ .expr_stmt = .{ .value = value, .line = line, .col = col } };
         }
 
         if (isBuiltin(kw)) {
@@ -1822,6 +1889,20 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
             } else if (std.mem.eql(u8, cl.name, "expect")) {
                 try w.appendSlice(arena, "try std.testing.expect(");
+                if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.name, "__expectToBe") or std.mem.eql(u8, cl.name, "__expectToEqual") or std.mem.eql(u8, cl.name, "__expectStrEqual")) {
+                // `expect(actual).toBe(expected)` lowers to a std.testing helper
+                // taking (expected, actual). `.toEqual` is currently a
+                // strict-equality alias of `.toBe` for V1 scalar/string values.
+                // Strings compare by bytes via expectEqualStrings.
+                const helper = if (std.mem.eql(u8, cl.name, "__expectStrEqual"))
+                    "try std.testing.expectEqualStrings("
+                else
+                    "try std.testing.expectEqual(";
+                try w.appendSlice(arena, helper);
+                if (cl.args.len > 1) try emitExpr(cl.args[1], w, arena);
+                try w.appendSlice(arena, ", ");
                 if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
                 try w.append(arena, ')');
             } else if (std.mem.eql(u8, cl.name, "argsCount")) {

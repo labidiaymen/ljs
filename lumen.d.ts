@@ -42,3 +42,17 @@ interface Disposable {
 // deferred cleanup is `using _ = defer(() => /* cleanup */);`, which runs `fn`
 // when the enclosing scope exits.
 declare function defer(fn: () => void): Disposable;
+
+// Testing. `test("name", () => { ... })` declares a test run by `lumen test`
+// (Jest/Vitest/node:test-style). Inside a test body, `expect` asserts either a
+// boolean condition or a matcher on a value:
+//   expect(cond);                       // boolean assertion
+//   expect(actual).toBe(expected);      // strict equality
+//   expect(actual).toEqual(expected);   // strict equality (V1 alias of toBe)
+declare function test(name: string, fn: () => void): void;
+interface Matchers<T> {
+  toBe(expected: T): void;
+  toEqual(expected: T): void;
+}
+declare function expect(condition: boolean): void;
+declare function expect<T>(actual: T): Matchers<T>;

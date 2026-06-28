@@ -190,6 +190,11 @@ pub fn build(b: *std.Build) void {
     conformance_cmd_027.addArg("specs/027-using-disposables/conformance/manifest.json");
     conformance_cmd_027.addArg("zig-out/bin/lumen");
 
+    const conformance_cmd_028 = b.addRunArtifact(conformance_runner);
+    conformance_cmd_028.step.dependOn(b.getInstallStep());
+    conformance_cmd_028.addArg("specs/028-test-fn/conformance/manifest.json");
+    conformance_cmd_028.addArg("zig-out/bin/lumen");
+
     const conformance_step = b.step("conformance", "Run Lumen manifest conformance cases");
     conformance_step.dependOn(&conformance_cmd.step);
     conformance_step.dependOn(&conformance_cmd_010.step);
@@ -207,6 +212,7 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&conformance_cmd_024.step);
     conformance_step.dependOn(&conformance_cmd_025.step);
     conformance_step.dependOn(&conformance_cmd_027.step);
+    conformance_step.dependOn(&conformance_cmd_028.step);
     conformance_step.dependOn(&conformance_cmd_002.step);
     conformance_step.dependOn(&conformance_cmd_003.step);
     conformance_step.dependOn(&conformance_cmd_004.step);

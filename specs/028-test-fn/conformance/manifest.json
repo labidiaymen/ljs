@@ -1,0 +1,17 @@
+{
+  "feature": "028-test-fn",
+  "cases": [
+    {
+      "id": "test-fn.valid.tests",
+      "source": "../examples/valid/test-fn.ts",
+      "phase": "test-run",
+      "expect": {}
+    },
+    {
+      "id": "test-fn.invalid.tobe-mismatch",
+      "source": "../examples/invalid/tobe-mismatch.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    }
+  ]
+}
