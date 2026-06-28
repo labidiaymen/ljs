@@ -340,6 +340,47 @@ evalNumber("globalThis.greeting = 'hi ' + base");
 console.log(getString("greeting"));                    // hi 21</code></pre>
   </div>
 
+  <div class="example">
+    <h3>wordstats.ts <span class="meta">a real CLI · args · fs.readFileSync · Map · Set · classes</span></h3>
+<pre><code class="lumen">// A command-line tool: counts words in a file and prints the most frequent.
+// Build with `lumen compile wordstats.ts`, then run `./wordstats sample.txt`.
+let text = fs.readFileSync(arg(1), "utf8");
+
+let counts: Map&lt;string, int&gt; = new Map&lt;string, int&gt;();
+let word = "";
+for (const ch of text.toLowerCase().split("")) {
+  let code = ch.charCodeAt(0);
+  let isLetter = code &gt;= 97 &amp;&amp; code &lt;= 122;
+  if (isLetter) {
+    word = word + ch;
+  } else if (word != "") {
+    counts.set(word, (counts.get(word) ?? 0) + 1);
+    word = "";
+  }
+}
+
+console.log(`unique words: ${counts.size}`);</code></pre>
+  </div>
+
+  <div class="example">
+    <h3>sqlite.ts <span class="meta">talk to SQLite over FFI · links libsqlite3 · built locally</span></h3>
+<pre><code class="lumen">// A typed wrapper over SQLite through the C FFI. A small C shim hides the
+// library's out-pointers behind plain functions; the pragmas below link it.
+// @link ./sqlite_shim.o
+// @link /opt/homebrew/opt/sqlite/lib/libsqlite3.dylib
+declare function db_open(path: string): int;
+declare function db_exec(sql: string): int;
+declare function db_query_int(sql: string): int;
+declare function db_query_text(sql: string): string;
+
+db_open(":memory:");
+db_exec("CREATE TABLE books (title TEXT, year INT)");
+db_exec("INSERT INTO books VALUES ('Crafting Interpreters', 2021)");
+
+console.log(db_query_int("SELECT COUNT(*) FROM books"));               // 1
+console.log(db_query_text("SELECT title FROM books LIMIT 1"));         // Crafting Interpreters</code></pre>
+  </div>
+
 </section>
 
 <footer><div class="wrap">
