@@ -27,6 +27,7 @@ const NarrowedVariant = struct { name: []const u8, variant: []const u8 };
 const FunctionInfo = struct {
     params: []ast.FunctionParam,
     return_type: types.Type,
+    is_extern: bool = false,
 };
 
 const EnumInfo = struct {
@@ -1548,7 +1549,7 @@ const Checker = struct {
             param.checked_type = try self.typeFromAnnotation(param.annotation, decl.line, decl.col);
             if (!isCSafe(param.checked_type.?)) return self.fail(decl.line, decl.col, "E_FFI_TYPE");
         }
-        self.funcs.put(self.arena, decl.name, .{ .params = decl.params, .return_type = ret }) catch return error.OutOfMemory;
+        self.funcs.put(self.arena, decl.name, .{ .params = decl.params, .return_type = ret, .is_extern = true }) catch return error.OutOfMemory;
     }
 
     fn checkBlock(self: *Checker, program: *ast.Program, body: []ast.Stmt) CompileError!void {
@@ -2913,6 +2914,21 @@ const Checker = struct {
                     return null;
                 };
                 call.args = self.checkCallArgs(program, func.params, call.args, line, col) orelse return null;
+                if (func.is_extern) {
+                    // Mark string params/return so the emitter inserts the FFI
+                    // marshalling glue (NUL-terminate in, copy out).
+                    const flags = self.arena.alloc(bool, func.params.len) catch return null;
+                    var any_string = func.return_type == .string;
+                    for (func.params, 0..) |p, i| {
+                        flags[i] = (p.checked_type orelse types.Type.void) == .string;
+                        if (flags[i]) any_string = true;
+                    }
+                    call.ffi_string_args = flags;
+                    call.ffi_string_return = func.return_type == .string;
+                    // The marshalling glue uses the shared `__alloc`, which is
+                    // only emitted when the program uses I/O plumbing.
+                    if (any_string) program.uses_io = true;
+                }
                 return func.return_type;
             },
             .static_call => |*call| {
@@ -3126,10 +3142,12 @@ const Checker = struct {
     }
 };
 
-/// C-ABI-safe scalar types allowed in extern function signatures.
+/// Types allowed in extern function signatures: C-ABI scalars plus `string`,
+/// which is marshalled to/from a NUL-terminated C `const char*` at the call
+/// boundary. Arrays, records, and function types remain rejected (E_FFI_TYPE).
 fn isCSafe(t: types.Type) bool {
     return switch (t) {
-        .i32, .i64, .f64, .bool => true,
+        .i32, .i64, .f64, .bool, .string => true,
         else => false,
     };
 }

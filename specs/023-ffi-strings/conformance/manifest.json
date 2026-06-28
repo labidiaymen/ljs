@@ -1,0 +1,17 @@
+{
+  "feature": "023-ffi-strings",
+  "cases": [
+    {
+      "id": "ffi-strings.invalid.array-param",
+      "source": "../examples/invalid/ffi-array-param.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_FFI_TYPE" }
+    },
+    {
+      "id": "ffi-strings.invalid.record-param",
+      "source": "../examples/invalid/ffi-record-param.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_FFI_TYPE" }
+    }
+  ]
+}

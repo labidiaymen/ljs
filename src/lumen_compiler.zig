@@ -1654,6 +1654,17 @@ const Parser = struct {
 };
 
 // ── emit ─────────────────────────────────────────────────────────────────────
+
+/// Zig type for an extern (C-ABI) signature slot. Identical to `types.zigName`
+/// except a Lumen `string` maps to `[*:0]const u8` (a NUL-terminated C string)
+/// rather than the slice `[]const u8`.
+fn externZigName(t: types.Type, arena: std.mem.Allocator) []const u8 {
+    return switch (t) {
+        .string => "[*:0]const u8",
+        else => types.zigName(arena, t) catch "void",
+    };
+}
+
 fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
     switch (e.*) {
         .num => |v| try w.print(arena, "{d}", .{v}),
@@ -1754,12 +1765,24 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 }
                 try w.append(arena, ')');
             } else {
+                // A `string` return from an extern function arrives as a raw
+                // `[*:0]const u8`; copy it once into an owned Lumen string so the
+                // value outlives the C buffer.
+                if (cl.ffi_string_return) try w.appendSlice(arena, "(__alloc.dupe(u8, std.mem.span(");
                 try w.print(arena, "{s}(", .{cl.emit_name orelse cl.name});
                 for (cl.args, 0..) |arg, i| {
                     if (i > 0) try w.appendSlice(arena, ", ");
-                    try emitExpr(arg, w, arena);
+                    // A `string` argument crosses as a NUL-terminated C string.
+                    if (i < cl.ffi_string_args.len and cl.ffi_string_args[i]) {
+                        try w.appendSlice(arena, "(std.fmt.allocPrintSentinel(__alloc, \"{s}\", .{");
+                        try emitExpr(arg, w, arena);
+                        try w.appendSlice(arena, "}, 0) catch unreachable).ptr");
+                    } else {
+                        try emitExpr(arg, w, arena);
+                    }
                 }
                 try w.append(arena, ')');
+                if (cl.ffi_string_return) try w.appendSlice(arena, ")) catch unreachable)");
             }
         },
         .static_call => |cl| {
@@ -3106,12 +3129,15 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
         .enum_decl => {}, // members are inlined as constants at each use site
         .extern_decl => |decl| {
             // extern fn name(p0: T, ...) Ret;  -- resolved at link time.
+            // A `string` parameter/return crosses the C ABI as a NUL-terminated
+            // `const char*`, i.e. Zig `[*:0]const u8`; the call site marshals
+            // between that and the Lumen `[]const u8` string.
             try decls.print(arena, "extern fn {s}(", .{decl.name});
             for (decl.params, 0..) |param, i| {
                 if (i > 0) try decls.appendSlice(arena, ", ");
-                try decls.print(arena, "{s}: {s}", .{ param.name, try types.zigName(arena, param.checked_type orelse return error.ParseError) });
+                try decls.print(arena, "{s}: {s}", .{ param.name, externZigName(param.checked_type orelse return error.ParseError, arena) });
             }
-            try decls.print(arena, ") {s};\n", .{try types.zigName(arena, decl.checked_return_type orelse return error.ParseError)});
+            try decls.print(arena, ") {s};\n", .{externZigName(decl.checked_return_type orelse return error.ParseError, arena)});
         },
         .class_decl => |*c| {
             if (c.type_params.len > 0) return; // generic template: only specializations emit
