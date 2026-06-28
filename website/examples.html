@@ -18,6 +18,7 @@
     <a href="/#features">Features</a>
     <a href="/examples">Examples</a>
     <a href="/stdlib">Stdlib</a>
+    <a href="/packages">Packages</a>
     <a href="/#quickstart">Install</a>
     <a href="https://github.com/lumen-lang-org/lumen">GitHub</a>
   </span>
@@ -308,10 +309,26 @@ console.log(await total(5));      // 15
 console.log(await total(32));     // 42</code></pre>
   </div>
 
+  <div class="example">
+    <h3>quickjs.ts <span class="meta">embed a JavaScript sandbox via FFI · community package</span></h3>
+<pre><code class="lumen">// The quickjs package runs JavaScript inside a native Lumen binary and passes
+// values both ways. It links a C library, so it is built locally.
+import { open, close, setInt, evalNumber, getString } from "./quickjs.ts";
+
+open();
+defer close();
+
+setInt("base", 21);
+console.log(evalNumber("base * 2 + Math.sqrt(16)"));   // 46
+
+evalNumber("globalThis.greeting = 'hi ' + base");
+console.log(getString("greeting"));                    // hi 21</code></pre>
+  </div>
+
 </section>
 
 <footer><div class="wrap">
-  <a href="/">← Back to home</a> · <a href="/stdlib">Standard library</a>
+  <a href="/">← Back to home</a> · <a href="/stdlib">Standard library</a> · <a href="/packages">Packages</a>
 </div></footer>
 
 <script src="highlight.js"></script>

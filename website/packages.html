@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Packages — Lumen</title>
+<meta name="description" content="Lumen community packages from the std-contrib catalog — imported by URL, statically typed, tested.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav><div class="wrap">
+  <a class="brand" href="/">Lumen<span class="dot">.</span></a>
+  <input type="checkbox" id="nav" class="nav-toggle" hidden>
+  <label for="nav" class="nav-burger" aria-label="Menu"></label>
+  <span class="links">
+    <a href="/#features">Features</a>
+    <a href="/examples">Examples</a>
+    <a href="/stdlib">Stdlib</a>
+    <a href="/packages">Packages</a>
+    <a href="/#quickstart">Install</a>
+    <a href="https://github.com/lumen-lang-org/lumen">GitHub</a>
+  </span>
+</div></nav>
+
+<section class="wrap">
+  <h2>Packages</h2>
+  <p class="sub">Community packages live in the
+  <a href="https://github.com/lumen-lang-org/std-contrib">std-contrib</a> catalog.
+  A package is just a URL: it is fetched over HTTPS and inlined at compile time —
+  no package manager, no install step, no lockfile. Every package is plain Lumen,
+  statically typed, and tested.</p>
+
+  <h3>Using a package</h3>
+  <p class="sub">Import a package's export straight from its URL and build as usual.</p>
+<pre><code class="lumen">import greet from "https://lumen-lang.org/package/std-contrib/hello/hello.ts";
+
+console.log(greet("world"));   // Hello, world!</code></pre>
+  <p class="sub"><code>lumen-lang.org/package/std-contrib/&lt;name&gt;/&lt;file&gt;.ts</code>
+  redirects to the package's repository; the raw GitHub URL works too.</p>
+
+  <h3>Catalog</h3>
+  <table>
+    <tr><th>Package</th><th>What it does</th></tr>
+    <tr>
+      <td><a href="https://github.com/lumen-lang-org/std-contrib/tree/main/packages/hello">hello</a></td>
+      <td>Minimal <code>greet</code> function; the canonical URL-import example.</td>
+    </tr>
+    <tr>
+      <td><a href="https://github.com/lumen-lang-org/std-contrib/tree/main/packages/greeter">greeter</a></td>
+      <td>Two-file package; demonstrates recursive URL-relative imports.</td>
+    </tr>
+    <tr>
+      <td><a href="https://github.com/lumen-lang-org/std-contrib/tree/main/packages/args">args</a></td>
+      <td>Command-line flag and option parsing — <code>hasFlag</code>, <code>optionValue</code>, positional arguments.</td>
+    </tr>
+    <tr>
+      <td><a href="https://github.com/lumen-lang-org/std-contrib/tree/main/packages/mathx">mathx</a></td>
+      <td>Integer math helpers — <code>gcd</code>, <code>lcm</code>, <code>ipow</code>, <code>isPrime</code>, <code>clampInt</code>.</td>
+    </tr>
+    <tr>
+      <td><a href="https://github.com/lumen-lang-org/std-contrib/tree/main/packages/geo">geo</a></td>
+      <td>2D point helpers — <code>distanceSq</code>, <code>manhattan</code>.</td>
+    </tr>
+    <tr>
+      <td><a href="https://github.com/lumen-lang-org/std-contrib/tree/main/packages/quickjs">quickjs</a></td>
+      <td>Embed a JavaScript sandbox via FFI; set, eval, and read values across the boundary.</td>
+    </tr>
+  </table>
+  <p class="note"><code>quickjs</code> links a native library through the C FFI, so it is
+  built locally (copy its files and link the engine) rather than fetched purely by URL.
+  Its page documents the build.</p>
+
+  <h3>Contributing</h3>
+  <p class="sub">One package per directory, statically typed, tested, current-language
+  features only, with an entry in the catalog. See
+  <a href="https://github.com/lumen-lang-org/std-contrib/blob/main/CONTRIBUTING.md">CONTRIBUTING</a>
+  in the <a href="https://github.com/lumen-lang-org/std-contrib">std-contrib</a> repository.</p>
+</section>
+
+<footer><div class="wrap">
+  <a href="/">← Back to home</a> · <a href="/stdlib">Standard library</a>
+</div></footer>
+
+<script src="highlight.js"></script>
+</body>
+</html>
