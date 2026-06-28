@@ -28,3 +28,17 @@ declare const console: {
   log(...args: any[]): void;
   error(...args: any[]): void;
 };
+
+// `using` resource management (TypeScript 5.2). A `using x = value;` declaration
+// disposes `value` at the end of the enclosing scope; multiple declarations
+// dispose in reverse (LIFO) order. The ESNext lib already defines `Disposable`
+// with `[Symbol.dispose]`; this interface-merge documents the `dispose()` method
+// Lumen calls on a class instance bound by `using`.
+interface Disposable {
+  dispose(): void;
+}
+
+// `defer(fn)` is Lumen's built-in scope-exit helper: the tsc-clean spelling of a
+// deferred cleanup is `using _ = defer(() => /* cleanup */);`, which runs `fn`
+// when the enclosing scope exits.
+declare function defer(fn: () => void): Disposable;

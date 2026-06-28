@@ -158,6 +158,20 @@ const Parser = struct {
     fn isKw(self: *Parser, kw: []const u8) bool {
         return self.cur == .ident and std.mem.eql(u8, self.cur.ident, kw);
     }
+    /// True when the token after `cur` is `(`. Restores parser state afterwards.
+    fn peekIsOpenParen(self: *Parser) bool {
+        const save_lex = self.lex;
+        const save_cur = self.cur;
+        const save_line = self.cur_line;
+        const save_col = self.cur_col;
+        self.advance() catch {};
+        const result = self.isOp('(');
+        self.lex = save_lex;
+        self.cur = save_cur;
+        self.cur_line = save_line;
+        self.cur_col = save_col;
+        return result;
+    }
     fn node(self: *Parser, e: Expr) CompileError!*Expr {
         const p = try self.arena.create(Expr);
         p.* = e;
@@ -598,6 +612,33 @@ const Parser = struct {
         const arrow = try self.arena.create(ast.ArrowExpr);
         arrow.* = .{ .params = try params.toOwnedSlice(self.arena), .return_annotation = ret_annotation, .body_expr = body_expr };
         return self.node(.{ .arrow = arrow });
+    }
+
+    /// Parse the single-expression body of a `defer(() => BODY)` helper. Unlike a
+    /// normal statement, the body is followed by `)` (not `;`), so no trailing
+    /// semicolon is consumed. `console.log(...)`/`console.error(...)` are
+    /// recognized as console_log statements (they have no expression form); any
+    /// other expression becomes an expression statement.
+    fn parseDeferHelperBodyStmt(self: *Parser) CompileError!Stmt {
+        const line = self.cur_line;
+        const col = self.cur_col;
+        if (self.isKw("console")) {
+            try self.advance();
+            try self.expectOp('.');
+            if (self.cur != .ident) return error.ParseError;
+            const method = self.cur.ident;
+            if (!std.mem.eql(u8, method, "log") and !std.mem.eql(u8, method, "error")) {
+                self.last_err = "E_UNSUPPORTED_STD";
+                return error.ParseError;
+            }
+            try self.advance();
+            try self.expectOp('(');
+            const value = try self.parseExpr();
+            try self.expectOp(')');
+            return .{ .console_log = .{ .method = method, .value = value, .line = line, .col = col } };
+        }
+        const value = try self.parseExpr();
+        return .{ .expr_stmt = .{ .value = value, .line = line, .col = col } };
     }
 
     fn parsePrimary(self: *Parser) CompileError!*Expr {
@@ -1389,6 +1430,53 @@ const Parser = struct {
             const initial_value = try self.parseExpr();
             try self.expectOp(';');
             return .{ .var_decl = .{ .mutable = mutable, .name = name, .annotation = annotation, .init = initial_value, .line = line, .col = col } };
+        }
+
+        // `using NAME = EXPR;` — TypeScript 5.2 scope-exit disposal. Reuses the
+        // same scope-exit (LIFO) lowering as `defer`. Disposes the bound value at
+        // block/function exit; see ast.UsingDecl.
+        if (eq(u8, kw, "using")) {
+            try self.advance();
+            if (self.cur != .ident) return error.ParseError;
+            const name = self.cur.ident;
+            try self.advance();
+            var annotation: ?[]const u8 = null;
+            if (self.isOp(':')) {
+                try self.advance();
+                annotation = try self.parseTypeAnnotation();
+            }
+            try self.expectOp('=');
+            // `using x = defer(() => BODY);` — the built-in scope-exit helper. The
+            // body is parsed as statements (so `console.log(...)` works) and run
+            // at scope exit, exactly like the `defer` statement. We still build an
+            // `init` call node for the checker to validate the helper shape.
+            if (self.isKw("defer") and self.peekIsOpenParen()) {
+                try self.advance(); // 'defer'
+                try self.expectOp('(');
+                if (!self.isOp('(')) return error.ParseError; // require `() =>`
+                try self.advance();
+                try self.expectOp(')');
+                if (!self.isOp2("=>")) return error.ParseError;
+                try self.advance();
+                var defer_body: []Stmt = undefined;
+                if (self.isOp('{')) {
+                    // Block-bodied arrow: `defer(() => { ...; ... })`.
+                    defer_body = try self.parseBlock();
+                } else {
+                    // Single-expression arrow body, followed by the `)` that closes
+                    // the `defer(` call (so no trailing `;` to consume here).
+                    const single = try self.arena.alloc(Stmt, 1);
+                    single[0] = try self.parseDeferHelperBodyStmt();
+                    defer_body = single;
+                }
+                try self.expectOp(')');
+                try self.expectOp(';');
+                const init_call = try self.node(.{ .call = .{ .name = "defer", .args = &.{} } });
+                return .{ .using_decl = .{ .name = name, .annotation = annotation, .init = init_call, .defer_body = defer_body, .line = line, .col = col } };
+            }
+            const initial_value = try self.parseExpr();
+            try self.expectOp(';');
+            return .{ .using_decl = .{ .name = name, .annotation = annotation, .init = initial_value, .line = line, .col = col } };
         }
 
         if (eq(u8, kw, "console")) {
@@ -2614,6 +2702,11 @@ fn stmtUsesName(stmt: *const Stmt, name: []const u8) bool {
         },
         .try_stmt => |t| bodyUsesName(t.try_body, name) or bodyUsesName(t.catch_body, name) or (t.finally_body != null and bodyUsesName(t.finally_body.?, name)),
         .defer_stmt => |d| bodyUsesName(d.body, name),
+        .using_decl => |u| blk: {
+            if (u.defer_body) |b| if (bodyUsesName(b, name)) break :blk true;
+            if (u.dispose_call) |d| if (exprUsesName(d, name)) break :blk true;
+            break :blk exprUsesName(u.init, name);
+        },
         else => false,
     };
 }
@@ -2636,6 +2729,7 @@ fn stmtCanThrow(stmt: *const Stmt) bool {
             break :blk false;
         },
         .defer_stmt => |d| bodyCanThrow(d.body),
+        .using_decl => |u| if (u.defer_body) |b| bodyCanThrow(b) else false,
         // A nested try swallows throws from its own try body via its own slot;
         // it propagates to the outer slot only if its catch or finally throws.
         .try_stmt => |t| bodyCanThrow(t.catch_body) or (t.finally_body != null and bodyCanThrow(t.finally_body.?)),
@@ -2759,6 +2853,11 @@ fn stmtUsesThis(stmt: *const Stmt) bool {
         },
         .try_stmt => |t| bodyUsesThis(t.try_body) or bodyUsesThis(t.catch_body) or (t.finally_body != null and bodyUsesThis(t.finally_body.?)),
         .defer_stmt => |d| bodyUsesThis(d.body),
+        .using_decl => |u| blk: {
+            if (u.defer_body) |b| if (bodyUsesThis(b)) break :blk true;
+            if (u.dispose_call) |d| if (exprUsesThis(d)) break :blk true;
+            break :blk exprUsesThis(u.init);
+        },
         else => false,
     };
 }
@@ -3096,6 +3195,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             .test_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .function_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .var_decl => |decl| .{ .line = decl.line, .col = decl.col },
+            .using_decl => |decl| .{ .line = decl.line, .col = decl.col },
             .destructure_decl => |d| .{ .line = d.line, .col = d.col },
             .assign => |assignment| .{ .line = assignment.line, .col = assignment.col },
             .console_log => |log| .{ .line = log.line, .col = log.col },
@@ -3258,6 +3358,26 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             try body.print(arena, "    {s} {s}: {s} = ", .{ if (decl.mutable and decl.reassigned) "var" else "const", decl.emit_name orelse decl.name, try types.zigName(arena, final_zty) });
             try emitExpr(decl.init, body, arena);
             try body.appendSlice(arena, ";\n");
+        },
+        .using_decl => |decl| {
+            // `using` lowers to Zig `defer`, which already runs LIFO at scope
+            // exit and interleaves correctly with `defer`-statement blocks.
+            if (decl.defer_body) |defer_body| {
+                // `using x = defer(() => BODY);` — run BODY at scope exit.
+                try body.appendSlice(arena, "    defer {\n");
+                for (defer_body) |*defer_stmt| try emitStmtWithThrow(defer_stmt, decls, body, arena, throw_target, switch_break_target, options);
+                try body.appendSlice(arena, "    }\n");
+            } else {
+                // `using r = EXPR;` — bind the value, then `defer r.dispose();`.
+                const final_zty = decl.checked_type orelse return error.ParseError;
+                try body.print(arena, "    const {s}: {s} = ", .{ decl.emit_name orelse decl.name, try types.zigName(arena, final_zty) });
+                try emitExpr(decl.init, body, arena);
+                try body.appendSlice(arena, ";\n");
+                const dispose = decl.dispose_call orelse return error.ParseError;
+                try body.appendSlice(arena, "    defer {\n        _ = ");
+                try emitExpr(dispose, body, arena);
+                try body.appendSlice(arena, ";\n    }\n");
+            }
         },
         .destructure_decl => |d| {
             // Bind a temp to the source, then one const per element/field. No

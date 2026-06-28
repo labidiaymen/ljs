@@ -1891,6 +1891,45 @@ const Checker = struct {
                 decl.checked_type = final_type;
                 try self.declare(decl.name, decl, final_type, decl.line, decl.col);
             },
+            .using_decl => |*decl| {
+                if (decl.defer_body) |body| {
+                    // `using x = defer(() => BODY);` — the helper body runs at scope
+                    // exit. Check it like a defer block; no value binding is made
+                    // (the bound name is an opaque Disposable).
+                    try self.checkBlock(program, body);
+                } else {
+                    // `using r = EXPR;` — the value must be a class instance that
+                    // exposes `dispose(): void`. Bind `r`, then synthesize and check
+                    // a `r.dispose()` call to run at scope exit.
+                    const final_type = if (decl.annotation) |ann|
+                        try self.typeFromAnnotation(ann, decl.line, decl.col)
+                    else
+                        self.exprType(program, decl.init, decl.line, decl.col) orelse
+                            return self.inferenceFail(decl.line, decl.col, "cannot infer using-declaration type");
+                    if (final_type != .class_type) return self.fail(decl.line, decl.col, "E_NOT_DISPOSABLE");
+                    try self.ensureAssignable(program, final_type, decl.init, decl.line, decl.col);
+                    decl.checked_type = final_type;
+
+                    const cls = final_type.class_type;
+                    const rm = self.resolveMethod(cls, "dispose") orelse return self.fail(decl.line, decl.col, "E_NOT_DISPOSABLE");
+                    if (rm.method.params.len != 0) return self.fail(decl.line, decl.col, "E_NOT_DISPOSABLE");
+
+                    // Declare the binding in the current scope.
+                    const scope = self.currentScope();
+                    if (scope.get(decl.name) != null) return self.fail(decl.line, decl.col, "E_DUPLICATE_BINDING");
+                    const emit_name = try self.freshEmitName(decl.name);
+                    decl.emit_name = emit_name;
+                    scope.put(self.arena, decl.name, .{ .ty = final_type, .mutable = false, .emit_name = emit_name }) catch return error.OutOfMemory;
+
+                    // Synthesize `name.dispose()` and check it so class_name/emit_name fill in.
+                    const recv = try self.arena.create(ast.Expr);
+                    recv.* = .{ .var_ref = .{ .name = decl.name } };
+                    const call = try self.arena.create(ast.Expr);
+                    call.* = .{ .method_call = .{ .obj = recv, .name = "dispose", .args = &.{} } };
+                    _ = self.exprType(program, call, decl.line, decl.col);
+                    decl.dispose_call = call;
+                }
+            },
             .destructure_decl => |*d| {
                 const src_type = self.exprType(program, d.source, d.line, d.col) orelse
                     return self.inferenceFail(d.line, d.col, "cannot infer destructured source type");

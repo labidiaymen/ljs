@@ -145,6 +145,31 @@ pub const VarDecl = struct {
     col: u32,
 };
 
+/// `using NAME = EXPR;` — a TypeScript 5.2 resource declaration. The bound value
+/// is disposed at the end of the enclosing block/function scope; multiple `using`
+/// declarations dispose in reverse (LIFO) order, lowering to Zig `defer`.
+///
+/// Two disposal shapes are recognized by the checker:
+///   * `using x = defer(() => EXPR)` — the built-in `defer` helper. `defer_body`
+///     holds the arrow's expression body, run verbatim at scope exit.
+///   * `using r = make()` where the value is a class instance exposing
+///     `dispose(): void` — `dispose_call` holds the `r.dispose()` call expr.
+pub const UsingDecl = struct {
+    name: []const u8,
+    emit_name: ?[]const u8 = null,
+    annotation: ?[]const u8 = null,
+    checked_type: ?types.Type = null,
+    init: *Expr,
+    // `defer(() => BODY)`: the helper body, lowered to statements that run at
+    // scope exit (LIFO). When set, there is no value binding — the bound name is
+    // an opaque `Disposable` that is never read.
+    defer_body: ?[]Stmt = null,
+    // Object/class dispose: the `name.dispose()` call run at scope exit.
+    dispose_call: ?*Expr = null,
+    line: u32,
+    col: u32,
+};
+
 pub const DestructBinding = struct {
     name: []const u8,
     emit_name: ?[]const u8 = null,
@@ -311,6 +336,7 @@ pub const Stmt = union(enum) {
     class_decl: ClassDecl,
     function_decl: FunctionDecl,
     var_decl: VarDecl,
+    using_decl: UsingDecl,
     destructure_decl: DestructureDecl,
     member_assign: MemberAssign,
     super_ctor: SuperCtor,

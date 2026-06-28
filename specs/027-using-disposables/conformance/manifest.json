@@ -1,0 +1,23 @@
+{
+  "feature": "027-using-disposables",
+  "cases": [
+    {
+      "id": "using.valid.defer-helper",
+      "source": "../examples/valid/using-defer.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "work\nb\na\nbody\nlegacy2\nusing1\nlegacy1\nblockbody\nx1\nx2\nstart\ninside\ninner\nend" }
+    },
+    {
+      "id": "using.valid.dispose-method",
+      "source": "../examples/valid/using-dispose.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "using db and file\nclosing file\nclosing db" }
+    },
+    {
+      "id": "using.invalid.non-disposable",
+      "source": "../examples/invalid/using-non-disposable.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_NOT_DISPOSABLE" }
+    }
+  ]
+}
