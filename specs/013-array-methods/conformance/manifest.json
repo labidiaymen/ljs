@@ -1,0 +1,53 @@
+{
+  "feature": "013-array-methods",
+  "cases": [
+    {
+      "id": "array.valid.map-filter-foreach",
+      "source": "../examples/valid/map-filter-foreach.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "2\n10\n5\n2\n2\n1\n2\n3\n4\n5" }
+    },
+    {
+      "id": "array.valid.reduce-find-some-every",
+      "source": "../examples/valid/reduce-find-some-every.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "15\n120\n4\nnull\ntrue\nfalse\ntrue\nfalse" }
+    },
+    {
+      "id": "array.valid.indexof-includes-join",
+      "source": "../examples/valid/indexof-includes-join.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "2\n-1\ntrue\nfalse\n10,20,30,40\n10 - 20 - 30 - 40\n1\nfalse\nalpha, beta, gamma" }
+    },
+    {
+      "id": "array.invalid.map-callback-param-type",
+      "source": "../examples/invalid/map-callback-param-type.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "array.invalid.filter-callback-return-type",
+      "source": "../examples/invalid/filter-callback-return-type.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "array.invalid.indexof-arg-type",
+      "source": "../examples/invalid/indexof-arg-type.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "array.invalid.reduce-arg-count",
+      "source": "../examples/invalid/reduce-arg-count.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_ARG_COUNT" }
+    },
+    {
+      "id": "array.invalid.unknown-method",
+      "source": "../examples/invalid/unknown-method.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    }
+  ]
+}

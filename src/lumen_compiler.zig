@@ -1527,13 +1527,17 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try w.append(arena, ')');
         },
         .method_call => |mc| {
-            try emitExpr(mc.obj, w, arena);
-            try w.print(arena, ".{s}(", .{mc.name});
-            for (mc.args, 0..) |arg, i| {
-                if (i > 0) try w.appendSlice(arena, ", ");
-                try emitExpr(arg, w, arena);
+            if (mc.array_result_type != null) {
+                try emitArrayMethod(mc, w, arena);
+            } else {
+                try emitExpr(mc.obj, w, arena);
+                try w.print(arena, ".{s}(", .{mc.name});
+                for (mc.args, 0..) |arg, i| {
+                    if (i > 0) try w.appendSlice(arena, ", ");
+                    try emitExpr(arg, w, arena);
+                }
+                try w.append(arena, ')');
             }
-            try w.append(arena, ')');
         },
         .arrow => |arrow| {
             const ret = arrow.checked_return_type orelse return error.ParseError;
@@ -1650,6 +1654,145 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try w.appendSlice(arena, "))]");
         },
     }
+}
+
+/// Emit value equality between a slice element `__e` and the (already-emitted)
+/// needle expression for a given element type. Strings compare by bytes.
+fn emitElemEq(elem: types.Type, needle: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
+    if (types.isStringLike(elem)) {
+        try w.appendSlice(arena, "std.mem.eql(u8, __e, ");
+        try emitExpr(needle, w, arena);
+        try w.append(arena, ')');
+    } else {
+        try w.appendSlice(arena, "(__e == ");
+        try emitExpr(needle, w, arena);
+        try w.append(arena, ')');
+    }
+}
+
+/// Monotonic counter giving each emitted array-method block a unique label so
+/// chained/nested calls (`xs.map(...).filter(...)`) don't collide on `blk`.
+var g_array_method_seq: usize = 0;
+
+/// Lower an array higher-order / value method `arr.m(args)` to an inline Zig
+/// expression block over the underlying slice. Callbacks are invoked through the
+/// uniform function-value representation (`__cb.call(__cb.ctx, ...)`).
+fn emitArrayMethod(mc: anytype, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
+    const elem = mc.array_elem_type orelse return error.ParseError;
+    const result = mc.array_result_type orelse return error.ParseError;
+    const elem_zig = try types.zigName(arena, elem);
+    const eq = std.mem.eql;
+    const name = mc.name;
+    g_array_method_seq += 1;
+    const lbl = try std.fmt.allocPrint(arena, "__am{d}", .{g_array_method_seq});
+
+    if (eq(u8, name, "map")) {
+        const u = types.arrayElem(result) orelse return error.ParseError;
+        const u_zig = try types.zigName(arena, u);
+        try w.print(arena, "({s}: {{ const __arr = ", .{lbl});
+        try emitExpr(mc.obj, w, arena);
+        try w.appendSlice(arena, "; const __cb = ");
+        try emitExpr(mc.args[0], w, arena);
+        try w.print(arena, "; const __r = std.heap.page_allocator.alloc({s}, __arr.len) catch unreachable; for (__arr, 0..) |__e, __i| {{ __r[__i] = __cb.call(__cb.ctx, __e); }} break :{s} @as([]const {s}, __r); }})", .{ u_zig, lbl, u_zig });
+        return;
+    }
+
+    if (eq(u8, name, "filter")) {
+        try w.print(arena, "({s}: {{ const __arr = ", .{lbl});
+        try emitExpr(mc.obj, w, arena);
+        try w.appendSlice(arena, "; const __cb = ");
+        try emitExpr(mc.args[0], w, arena);
+        try w.print(arena, "; var __r: std.ArrayListUnmanaged({s}) = .empty; for (__arr) |__e| {{ if (__cb.call(__cb.ctx, __e)) __r.append(std.heap.page_allocator, __e) catch unreachable; }} break :{s} @as([]const {s}, __r.items); }})", .{ elem_zig, lbl, elem_zig });
+        return;
+    }
+
+    if (eq(u8, name, "forEach")) {
+        try w.print(arena, "({s}: {{ const __arr = ", .{lbl});
+        try emitExpr(mc.obj, w, arena);
+        try w.appendSlice(arena, "; const __cb = ");
+        try emitExpr(mc.args[0], w, arena);
+        try w.print(arena, "; for (__arr) |__e| {{ __cb.call(__cb.ctx, __e); }} break :{s} {{}}; }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "reduce")) {
+        const acc = mc.array_acc_type orelse return error.ParseError;
+        const acc_zig = try types.zigName(arena, acc);
+        try w.print(arena, "({s}: {{ const __arr = ", .{lbl});
+        try emitExpr(mc.obj, w, arena);
+        try w.appendSlice(arena, "; const __cb = ");
+        try emitExpr(mc.args[0], w, arena);
+        try w.print(arena, "; var __acc: {s} = ", .{acc_zig});
+        try emitExpr(mc.args[1], w, arena);
+        try w.print(arena, "; for (__arr) |__e| {{ __acc = __cb.call(__cb.ctx, __acc, __e); }} break :{s} __acc; }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "find")) {
+        try w.print(arena, "({s}: {{ const __arr = ", .{lbl});
+        try emitExpr(mc.obj, w, arena);
+        try w.appendSlice(arena, "; const __cb = ");
+        try emitExpr(mc.args[0], w, arena);
+        try w.print(arena, "; var __found: ?{s} = null; for (__arr) |__e| {{ if (__cb.call(__cb.ctx, __e)) {{ __found = __e; break; }} }} break :{s} __found; }})", .{ elem_zig, lbl });
+        return;
+    }
+
+    if (eq(u8, name, "some")) {
+        try w.print(arena, "({s}: {{ const __arr = ", .{lbl});
+        try emitExpr(mc.obj, w, arena);
+        try w.appendSlice(arena, "; const __cb = ");
+        try emitExpr(mc.args[0], w, arena);
+        try w.print(arena, "; var __r = false; for (__arr) |__e| {{ if (__cb.call(__cb.ctx, __e)) {{ __r = true; break; }} }} break :{s} __r; }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "every")) {
+        try w.print(arena, "({s}: {{ const __arr = ", .{lbl});
+        try emitExpr(mc.obj, w, arena);
+        try w.appendSlice(arena, "; const __cb = ");
+        try emitExpr(mc.args[0], w, arena);
+        try w.print(arena, "; var __r = true; for (__arr) |__e| {{ if (!__cb.call(__cb.ctx, __e)) {{ __r = false; break; }} }} break :{s} __r; }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "indexOf")) {
+        try w.print(arena, "({s}: {{ const __arr = ", .{lbl});
+        try emitExpr(mc.obj, w, arena);
+        try w.appendSlice(arena, "; var __idx: i32 = -1; for (__arr, 0..) |__e, __i| { if (");
+        try emitElemEq(elem, mc.args[0], w, arena);
+        try w.print(arena, ") {{ __idx = @as(i32, @intCast(__i)); break; }} }} break :{s} __idx; }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "includes")) {
+        try w.print(arena, "({s}: {{ const __arr = ", .{lbl});
+        try emitExpr(mc.obj, w, arena);
+        try w.appendSlice(arena, "; var __r = false; for (__arr) |__e| { if (");
+        try emitElemEq(elem, mc.args[0], w, arena);
+        try w.print(arena, ") {{ __r = true; break; }} }} break :{s} __r; }})", .{lbl});
+        return;
+    }
+
+    if (eq(u8, name, "join")) {
+        const spec = switch (elem) {
+            .string, .string_literal_union => "{s}",
+            .bool => "{}",
+            else => "{d}",
+        };
+        try w.print(arena, "({s}: {{ const __arr = ", .{lbl});
+        try emitExpr(mc.obj, w, arena);
+        try w.appendSlice(arena, "; const __sep: []const u8 = ");
+        if (mc.args.len == 1) {
+            try emitExpr(mc.args[0], w, arena);
+        } else {
+            try w.appendSlice(arena, "\",\"");
+        }
+        try w.appendSlice(arena, "; var __buf: std.ArrayListUnmanaged(u8) = .empty; for (__arr, 0..) |__e, __i| { if (__i > 0) __buf.appendSlice(std.heap.page_allocator, __sep) catch unreachable; ");
+        try w.print(arena, "__buf.appendSlice(std.heap.page_allocator, std.fmt.allocPrint(std.heap.page_allocator, \"{s}\", .{{__e}}) catch unreachable) catch unreachable; }} break :{s} @as([]const u8, __buf.items); }})", .{ spec, lbl });
+        return;
+    }
+
+    return error.ParseError;
 }
 
 /// Escapes template literal text for embedding inside a Zig `std.fmt` format

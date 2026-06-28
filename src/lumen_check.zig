@@ -304,6 +304,143 @@ const Checker = struct {
         return null;
     }
 
+    /// Build a function type `(params...) => ret` for callback validation.
+    fn makeFuncType(self: *Checker, params: []const types.Type, ret: types.Type) ?types.Type {
+        const ps = self.arena.alloc(types.Type, params.len) catch return null;
+        for (params, 0..) |p, i| ps[i] = p;
+        const ret_p = self.arena.create(types.Type) catch return null;
+        ret_p.* = ret;
+        const sig = self.arena.create(types.FuncSig) catch return null;
+        sig.* = .{ .params = ps, .ret = ret_p };
+        return .{ .func_type = sig };
+    }
+
+    /// Type-check a higher-order / value array method `arr.m(args)` on an array
+    /// receiver and return its result type, recording resolved element/result
+    /// types on the node for emission.
+    fn arrayMethod(self: *Checker, program: *ast.Program, mc: anytype, obj_type: types.Type, line: u32, col: u32) ?types.Type {
+        const elem = types.arrayElem(obj_type) orelse {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        };
+        mc.array_elem_type = elem;
+        const name = mc.name;
+        const eq = std.mem.eql;
+
+        // Methods taking a single `(T) => bool` predicate.
+        if (eq(u8, name, "filter") or eq(u8, name, "find") or eq(u8, name, "some") or eq(u8, name, "every")) {
+            if (mc.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const want = self.makeFuncType(&.{elem}, .bool) orelse return null;
+            self.ensureAssignable(program, want, mc.args[0], line, col) catch {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            if (eq(u8, name, "some") or eq(u8, name, "every")) {
+                mc.array_result_type = .bool;
+                return .bool;
+            }
+            if (eq(u8, name, "filter")) {
+                mc.array_result_type = obj_type;
+                return obj_type;
+            }
+            // find -> T | null
+            const inner = self.arena.create(types.Type) catch return null;
+            inner.* = elem;
+            const res = types.Type{ .optional = inner };
+            mc.array_result_type = res;
+            return res;
+        }
+
+        // map((T) => U): U[]  — result element type is the callback return type.
+        if (eq(u8, name, "map")) {
+            if (mc.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const cb_type = self.exprType(program, mc.args[0], line, col) orelse return null;
+            if (cb_type != .func_type or cb_type.func_type.params.len != 1 or !types.same(cb_type.func_type.params[0], elem)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            const u = cb_type.func_type.ret.*;
+            const res = types.arrayOf(u) orelse {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            mc.array_result_type = res;
+            return res;
+        }
+
+        // forEach((T) => void): void
+        if (eq(u8, name, "forEach")) {
+            if (mc.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const want = self.makeFuncType(&.{elem}, .void) orelse return null;
+            self.ensureAssignable(program, want, mc.args[0], line, col) catch {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            mc.array_result_type = .void;
+            return .void;
+        }
+
+        // reduce((U, T) => U, init: U): U  — init fixes the accumulator type.
+        if (eq(u8, name, "reduce")) {
+            if (mc.args.len != 2) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const acc = self.exprType(program, mc.args[1], line, col) orelse return null;
+            const want = self.makeFuncType(&.{ acc, elem }, acc) orelse return null;
+            self.ensureAssignable(program, want, mc.args[0], line, col) catch {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            mc.array_acc_type = acc;
+            mc.array_result_type = acc;
+            return acc;
+        }
+
+        // indexOf(x: T): int  /  includes(x: T): bool
+        if (eq(u8, name, "indexOf") or eq(u8, name, "includes")) {
+            if (mc.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            self.ensureAssignable(program, elem, mc.args[0], line, col) catch {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            };
+            const res: types.Type = if (eq(u8, name, "includes")) .bool else .i32;
+            mc.array_result_type = res;
+            return res;
+        }
+
+        // join(sep?: string): string
+        if (eq(u8, name, "join")) {
+            if (mc.args.len > 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            if (mc.args.len == 1) {
+                self.ensureAssignable(program, .string, mc.args[0], line, col) catch {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                };
+            }
+            mc.array_result_type = .string;
+            return .string;
+        }
+
+        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+        return null;
+    }
+
     fn declareExtern(self: *Checker, decl: *ast.ExternDecl) CompileError!void {
         if (self.funcs.get(decl.name) != null) return self.fail(decl.line, decl.col, "E_DUPLICATE_BINDING");
         const ret = try self.typeFromAnnotation(decl.return_annotation, decl.line, decl.col);
@@ -1013,6 +1150,9 @@ const Checker = struct {
             },
             .method_call => |*mc| {
                 const obj_type = self.exprType(program, mc.obj, line, col) orelse return null;
+                if (types.isArray(obj_type)) {
+                    return self.arrayMethod(program, mc, obj_type, line, col);
+                }
                 if (obj_type != .class_type) {
                     _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                     return null;
