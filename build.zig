@@ -12,6 +12,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // The canonical ambient declarations live at the repo root (`/lumen.d.ts`)
+    // so editors/tsc pick them up. `lumen init` embeds them via this anonymous
+    // import, keeping a single source of truth (the file is outside `src/`, so a
+    // bare `@embedFile("../lumen.d.ts")` is rejected by the package boundary).
+    exe.root_module.addAnonymousImport("lumen.d.ts", .{
+        .root_source_file = b.path("lumen.d.ts"),
+    });
     b.installArtifact(exe);
 
     const conformance_runner = b.addExecutable(.{

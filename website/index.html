@@ -278,6 +278,13 @@ console.log(greet("world"));   // Hello, world!</code></pre>
   <p class="sub">Windows: download the <code>.zip</code> from the
   <a href="https://github.com/lumen-lang-org/lumen/releases">releases page</a>. Self-contained —
   no other toolchain required.</p>
+  <p class="sub">Then scaffold a project and run it:</p>
+<pre><code class="lumen">lumen init my-app
+cd my-app
+lumen compile main.ts && ./main</code></pre>
+  <p class="sub"><code>lumen init</code> writes a starter <code>main.ts</code> plus the ambient
+  declarations and <code>tsconfig.json</code>, so the project is editor- and type-checker-clean
+  from the first keystroke.</p>
 </section>
 
 <footer><div class="wrap">

@@ -346,6 +346,115 @@ fn readSourceWithImports(arena: std.mem.Allocator, io: std.Io, path: []const u8)
 
 const Action = enum { build_exe, run_test };
 
+/// The ambient declarations that make Lumen `.ts` sources type-check under plain
+/// tsc/editors. Embedded from the repo's canonical `/lumen.d.ts` so `lumen init`
+/// and the editor experience stay in sync with a single source of truth.
+const lumen_dts = @embedFile("lumen.d.ts");
+
+/// Minimal tsconfig that keeps a fresh project tsc-clean: ESNext target/lib (so
+/// Math/Array resolve but no DOM globals collide with our ambient `console`),
+/// lenient checking, and `noEmit` since Lumen — not tsc — produces the binary.
+const tsconfig_json =
+    \\{
+    \\  "compilerOptions": {
+    \\    "target": "ESNext",
+    \\    "lib": ["ESNext"],
+    \\    "module": "ESNext",
+    \\    "moduleResolution": "Bundler",
+    \\    "strict": false,
+    \\    "noEmit": true,
+    \\    "skipLibCheck": true
+    \\  },
+    \\  "include": ["**/*.ts"]
+    \\}
+    \\
+;
+
+/// Starter program. Compiles and runs with Lumen and type-checks under tsc with
+/// the generated `lumen.d.ts`/`tsconfig.json`.
+const main_ts =
+    \\// A fresh Lumen project. Build and run it with:
+    \\//
+    \\//   lumen compile main.ts && ./main
+    \\//
+    \\// This file also type-checks under plain tsc (see lumen.d.ts / tsconfig.json).
+    \\
+    \\function greet(name: string): string {
+    \\  return `Hello, ${name}!`;
+    \\}
+    \\
+    \\const who: string = "Lumen";
+    \\console.log(greet(who));
+    \\
+;
+
+const gitignore_txt =
+    \\# Native binaries produced by `lumen compile`
+    \\main
+    \\*.exe
+    \\.lumen-*.zig
+    \\
+;
+
+const InitFile = struct {
+    name: []const u8,
+    contents: []const u8,
+};
+
+const init_files = [_]InitFile{
+    .{ .name = "lumen.d.ts", .contents = lumen_dts },
+    .{ .name = "tsconfig.json", .contents = tsconfig_json },
+    .{ .name = "main.ts", .contents = main_ts },
+    .{ .name = ".gitignore", .contents = gitignore_txt },
+};
+
+/// Scaffolds a ready-to-edit Lumen project under `dir` (the current directory
+/// when null). Existing files are never overwritten: each is skipped with a
+/// notice. Prints a summary and a next-steps line.
+fn initProject(io: std.Io, dir: ?[]const u8, out: *std.Io.Writer) !u8 {
+    const cwd = std.Io.Dir.cwd();
+    if (dir) |d| {
+        cwd.createDirPath(io, d) catch {
+            try out.print("error: could not create directory {s}\n", .{d});
+            return 2;
+        };
+    }
+    var target = if (dir) |d|
+        cwd.openDir(io, d, .{}) catch {
+            try out.print("error: could not open directory {s}\n", .{d});
+            return 2;
+        }
+    else
+        cwd;
+    defer if (dir != null) target.close(io);
+
+    const where = dir orelse ".";
+    var created: usize = 0;
+    var skipped: usize = 0;
+    for (init_files) |f| {
+        // Skip without clobbering when the file already exists.
+        if (target.access(io, f.name, .{})) |_| {
+            try out.print("skip {s} (exists)\n", .{f.name});
+            skipped += 1;
+            continue;
+        } else |_| {}
+        target.writeFile(io, .{ .sub_path = f.name, .data = f.contents }) catch {
+            try out.print("error: could not write {s}\n", .{f.name});
+            return 2;
+        };
+        try out.print("create {s}\n", .{f.name});
+        created += 1;
+    }
+
+    try out.print("\nInitialized Lumen project in {s} ({d} created, {d} skipped).\n", .{ where, created, skipped });
+    if (dir) |d| {
+        try out.print("Next: cd {s} && lumen compile main.ts && ./main\n", .{d});
+    } else {
+        try out.writeAll("Next: lumen compile main.ts && ./main\n");
+    }
+    return 0;
+}
+
 /// Turns a link token into a zig build-exe argument: a bare name `m` becomes
 /// `-lm`; a path-like token (`./libfoo.a`, `foo.o`) is passed through verbatim
 /// so custom C/C++ objects and archives can be linked.
@@ -511,13 +620,20 @@ pub fn main(init: std.process.Init) !void {
     const err = &err_fw.interface;
 
     if (args.len < 2) {
-        try err.writeAll("usage: lumen compile [--release-fast] <file.ts>\n       lumen test <file.ts>\n");
+        try err.writeAll("usage: lumen init [dir]\n       lumen compile [--release-fast] <file.ts>\n       lumen test <file.ts>\n");
         try err.flush();
         std.process.exit(2);
     }
 
-    const usage = "usage: lumen compile [--release-fast] [--link <lib>] <file.ts>\n       lumen test <file.ts>\n";
-    const code = if (std.mem.eql(u8, args[1], "test")) blk: {
+    const usage = "usage: lumen init [dir]\n       lumen compile [--release-fast] [--link <lib>] <file.ts>\n       lumen test <file.ts>\n";
+    const code = if (std.mem.eql(u8, args[1], "init")) blk: {
+        if (args.len > 3) {
+            try err.writeAll(usage);
+            break :blk 2;
+        }
+        const dir: ?[]const u8 = if (args.len == 3) args[2] else null;
+        break :blk try initProject(io, dir, err);
+    } else if (std.mem.eql(u8, args[1], "test")) blk: {
         if (args.len < 3) {
             try err.writeAll("usage: lumen test <file.ts>\n");
             break :blk 2;

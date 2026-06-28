@@ -19,3 +19,12 @@ type bool = boolean;
 // `Ref<T>` is a by-reference parameter in Lumen; to TypeScript it is just an
 // identity alias.
 type Ref<T> = T;
+
+// Runtime globals Lumen provides. Declared here (rather than relying on the DOM
+// lib) so tooling type-checks `console.log(...)` without pulling in browser
+// globals — the generated tsconfig keeps `lib` to `ESNext` only, so there is no
+// duplicate-`console` clash.
+declare const console: {
+  log(...args: any[]): void;
+  error(...args: any[]): void;
+};

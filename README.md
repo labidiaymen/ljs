@@ -41,6 +41,21 @@ lumen compile app.ts      # build a native binary
 lumen test app.test.ts    # run test blocks
 ```
 
+## Getting started: `lumen init`
+
+Scaffold a ready-to-edit project in the current directory (or a new one):
+
+```sh
+lumen init my-app
+cd my-app
+lumen compile main.ts && ./main
+```
+
+`lumen init` writes a starter `main.ts`, plus `lumen.d.ts` and `tsconfig.json`
+so the project is editor- and `tsc`-clean from the first keystroke — you never
+hand-write the ambient declarations. Existing files are never overwritten;
+each is skipped with a notice.
+
 ## Imports
 
 Import a default export from a relative file or straight from a URL:
