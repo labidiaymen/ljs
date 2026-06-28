@@ -164,7 +164,7 @@ const Parser = struct {
         return p;
     }
     fn isStdNamespace(name: []const u8) bool {
-        return std.mem.eql(u8, name, "Math") or std.mem.eql(u8, name, "String") or std.mem.eql(u8, name, "Array") or std.mem.eql(u8, name, "fs");
+        return std.mem.eql(u8, name, "Math") or std.mem.eql(u8, name, "String") or std.mem.eql(u8, name, "Array") or std.mem.eql(u8, name, "fs") or std.mem.eql(u8, name, "Promise");
     }
     fn parseTypeMember(self: *Parser) CompileError![]const u8 {
         // A string-literal member type, e.g. a discriminant field `kind: "circle"`.
@@ -480,6 +480,11 @@ const Parser = struct {
         return left;
     }
     fn parseUnary(self: *Parser) CompileError!*Expr {
+        // `await <expr>` — the operand is a Promise; yields the resolved value.
+        if (self.isKw("await")) {
+            try self.advance();
+            return self.node(.{ .await_expr = try self.parseUnary() });
+        }
         if (self.isOp('-')) {
             try self.advance();
             return self.node(.{ .neg = try self.parseUnary() });
@@ -946,7 +951,7 @@ const Parser = struct {
         return .{ .enum_decl = .{ .name = ename, .is_string = is_string, .members = try members.toOwnedSlice(self.arena), .line = line, .col = col } };
     }
 
-    fn parseFunctionDecl(self: *Parser, line: u32, col: u32) CompileError!Stmt {
+    fn parseFunctionDecl(self: *Parser, line: u32, col: u32, is_async: bool) CompileError!Stmt {
         try self.advance();
         if (self.cur != .ident) return error.ParseError;
         const name = self.cur.ident;
@@ -962,6 +967,7 @@ const Parser = struct {
             .return_annotation = return_annotation,
             .body = body,
             .type_params = type_params,
+            .is_async = is_async,
             .line = line,
             .col = col,
         } };
@@ -1261,11 +1267,24 @@ const Parser = struct {
         if (self.cur != .ident) return error.ParseError;
         const kw = self.cur.ident;
 
+        // `await <expr>;` as a statement (the resolved value is discarded).
+        if (eq(u8, kw, "await")) {
+            const value = try self.parseExpr();
+            try self.expectOp(';');
+            return .{ .expr_stmt = .{ .value = value, .line = line, .col = col } };
+        }
+
         if (eq(u8, kw, "type")) return self.parseTypeDecl(line, col);
         if (eq(u8, kw, "interface")) return self.parseInterfaceDecl(line, col);
         if (eq(u8, kw, "enum")) return self.parseEnumDecl(line, col);
         if (eq(u8, kw, "extern")) return self.parseExternDecl(line, col);
-        if (eq(u8, kw, "function")) return self.parseFunctionDecl(line, col);
+        if (eq(u8, kw, "function")) return self.parseFunctionDecl(line, col, false);
+        // `async function ...` — an asynchronous function returning a Promise<T>.
+        if (eq(u8, kw, "async")) {
+            try self.advance(); // 'async'
+            if (!self.isKw("function")) return error.ParseError;
+            return self.parseFunctionDecl(line, col, true);
+        }
         if (eq(u8, kw, "switch")) return self.parseSwitch(line, col);
         if (eq(u8, kw, "class")) return self.parseClassDecl(line, col);
 
@@ -1718,6 +1737,13 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try w.appendSlice(arena, ", ");
                 if (cl.args.len > 1) try emitExpr(cl.args[1], w, arena);
                 try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.name, "setTimeout")) {
+                // setTimeout(cb, ms) -> __setTimeout(cb, @intCast(ms)).
+                try w.appendSlice(arena, "__setTimeout(");
+                if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", @intCast(");
+                if (cl.args.len > 1) try emitExpr(cl.args[1], w, arena);
+                try w.appendSlice(arena, "))");
             } else if (cl.is_closure) {
                 // Function-value call through the fat pointer: f.call(f.ctx, args).
                 const fname = cl.emit_name orelse cl.name;
@@ -1803,6 +1829,12 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try w.appendSlice(arena, "__readFileSync(__io, __alloc, ");
                 try emitExpr(cl.args[0], w, arena);
                 try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "Promise") and std.mem.eql(u8, cl.name, "resolve")) {
+                // Promise.resolve(v) -> an already-resolved promise of v's type.
+                const inner = cl.checked_arg_type orelse return error.ParseError;
+                try w.print(arena, "__promiseResolved({s}, ", .{try types.zigName(arena, inner)});
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
             } else return error.ParseError;
         },
         .var_ref => |ref| {
@@ -1839,6 +1871,13 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try w.appendSlice(arena, "~(");
             try emitExpr(inner, w, arena);
             try w.append(arena, ')');
+        },
+        .await_expr => |inner| {
+            // Drive the event loop until the awaited promise resolves, then read
+            // its value: (<promise>).await_().
+            try w.append(arena, '(');
+            try emitExpr(inner, w, arena);
+            try w.appendSlice(arena, ").await_()");
         },
         .bin => |b| {
             if (b.op == '+' and b.checked_type != null and b.checked_type.? == .string) {
@@ -2463,7 +2502,7 @@ fn exprUsesName(e: *const Expr, name: []const u8) bool {
             break :blk false;
         },
         .spread => |inner| exprUsesName(inner, name),
-        .neg, .not, .bnot => |inner| exprUsesName(inner, name),
+        .neg, .not, .bnot, .await_expr => |inner| exprUsesName(inner, name),
         .bin => |b| exprUsesName(b.l, name) or exprUsesName(b.r, name),
         .bool_bin => |b| exprUsesName(b.l, name) or exprUsesName(b.r, name),
         .cmp => |b| exprUsesName(b.l, name) or exprUsesName(b.r, name),
@@ -2590,6 +2629,22 @@ fn bodyAlwaysThrows(body: []const Stmt) bool {
     return stmtAlwaysThrows(&body[body.len - 1]);
 }
 
+/// Whether a statement unconditionally diverts control via `return` or `throw`
+/// (used to decide whether an async `Promise<void>` body needs a trailing
+/// resolved-promise return, which would otherwise be unreachable code).
+fn stmtAlwaysReturns(stmt: *const Stmt) bool {
+    return switch (stmt.*) {
+        .return_stmt, .throw_stmt => true,
+        .if_stmt => |b| b.else_body != null and bodyAlwaysReturns(b.then_body) and bodyAlwaysReturns(b.else_body.?),
+        else => false,
+    };
+}
+
+fn bodyAlwaysReturns(body: []const Stmt) bool {
+    for (body) |*stmt| if (stmtAlwaysReturns(stmt)) return true;
+    return false;
+}
+
 /// Whether an expression reads `this` (so the enclosing method needs `self`).
 fn exprUsesThis(e: *const Expr) bool {
     return switch (e.*) {
@@ -2604,7 +2659,7 @@ fn exprUsesThis(e: *const Expr) bool {
             break :blk false;
         },
         .spread => |inner| exprUsesThis(inner),
-        .neg, .not, .bnot => |inner| exprUsesThis(inner),
+        .neg, .not, .bnot, .await_expr => |inner| exprUsesThis(inner),
         .bin => |b| exprUsesThis(b.l) or exprUsesThis(b.r),
         .bool_bin => |b| exprUsesThis(b.l) or exprUsesThis(b.r),
         .cmp => |b| exprUsesThis(b.l) or exprUsesThis(b.r),
@@ -3134,9 +3189,25 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
                 const param_type = param.checked_type orelse types.fromAnnotation(param.annotation);
                 try decls.print(arena, "{s}: {s}", .{ param.name, try types.zigName(arena, param_type) });
             }
+            // An async function returns its declared `*LumenPromise(T)`; `return v`
+            // statements in the body resolve the promise with `v`.
             try decls.print(arena, ") {s} {{\n", .{try types.zigName(arena, return_type)});
+            const prev_async_inner = g_async_inner;
+            if (decl.is_async and return_type == .promise_type) {
+                g_async_inner = try types.zigName(arena, return_type.promise_type.*);
+            } else {
+                g_async_inner = null;
+            }
+            defer g_async_inner = prev_async_inner;
             try emitUnusedParamDiscards(decl.params, decl.body, decls, arena);
             for (decl.body) |*body_stmt| try emitStmt(body_stmt, decls, decls, arena, options);
+            // An async `Promise<void>` body may legally fall through without a
+            // `return`; emit a trailing resolved promise so the Promise-returning
+            // function still returns a value. Skip it when the body already
+            // returns on every path (the trailing return would be dead code).
+            if (decl.is_async and return_type == .promise_type and return_type.promise_type.* == .void and !bodyAlwaysReturns(decl.body)) {
+                try decls.appendSlice(arena, "    return __promiseResolved(void, {});\n");
+            }
             try decls.appendSlice(arena, "}\n");
         },
         .var_decl => |decl| {
@@ -3268,9 +3339,19 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
         },
         .return_stmt => |ret| {
             if (ret.value) |value| {
-                try body.appendSlice(arena, "    return ");
-                try emitExpr(value, body, arena);
-                try body.appendSlice(arena, ";\n");
+                if (g_async_inner) |inner_zig| {
+                    // Inside an async body: resolve the promise with the value.
+                    try body.print(arena, "    return __promiseResolved({s}, ", .{inner_zig});
+                    try emitExpr(value, body, arena);
+                    try body.appendSlice(arena, ");\n");
+                } else {
+                    try body.appendSlice(arena, "    return ");
+                    try emitExpr(value, body, arena);
+                    try body.appendSlice(arena, ";\n");
+                }
+            } else if (g_async_inner) |inner_zig| {
+                // `return;` in an async `Promise<void>` body resolves with void {}.
+                try body.print(arena, "    return __promiseResolved({s}, {{}});\n", .{inner_zig});
             } else {
                 try body.appendSlice(arena, "    return;\n");
             }
@@ -3363,6 +3444,11 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
 /// (the checker's class registry is not available at emit time). Single-threaded.
 var g_program: ?*const Program = null;
 
+// The Zig spelling of an async function's resolved value type while emitting its
+// body, so a `return v;` lowers to `return __promiseResolved(<T>, v);`. Null
+// outside an async body (and for plain functions).
+var g_async_inner: ?[]const u8 = null;
+
 fn findClass(name: []const u8) ?*const ast.ClassDecl {
     const prog = g_program orelse return null;
     for (prog.stmts) |*stmt| {
@@ -3411,6 +3497,10 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
     }
 
     try emitProgram(&program, &decls, &body, arena, options);
+
+    // The async event loop reads `__io`/`__alloc`, so async programs use I/O
+    // plumbing and the `main(__init)` shape even if they never touch other I/O.
+    if (program.needs_async) program.uses_io = true;
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.appendSlice(arena, "const std = @import(\"std\");\n");
@@ -3582,6 +3672,89 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_async) {
+        // A single-threaded event loop with a timer list and a ready (microtask)
+        // queue, plus a Promise<T> heap object. `await` drives the loop until the
+        // awaited promise resolves, then reads its value. This supports the sound
+        // subset: awaiting an already-resolved promise or a timer-resolved one.
+        try out.appendSlice(arena,
+            \\const LumenTimer = struct { deadline_ns: i96, ctx: *const anyopaque, run: *const fn (*const anyopaque) void };
+            \\const LumenReady = struct { ctx: *const anyopaque, run: *const fn (*const anyopaque) void };
+            \\const LumenLoop = struct {
+            \\    timers: std.ArrayListUnmanaged(LumenTimer) = .empty,
+            \\    ready: std.ArrayListUnmanaged(LumenReady) = .empty,
+            \\    fn nowNs() i96 { return std.Io.Timestamp.now(__io, .awake).nanoseconds; }
+            \\    fn addTimer(self: *LumenLoop, delay_ms: i64, ctx: *const anyopaque, run: *const fn (*const anyopaque) void) void {
+            \\        const d: i96 = if (delay_ms > 0) @as(i96, delay_ms) * std.time.ns_per_ms else 0;
+            \\        self.timers.append(__alloc, .{ .deadline_ns = nowNs() + d, .ctx = ctx, .run = run }) catch unreachable;
+            \\    }
+            \\    fn tick(self: *LumenLoop) bool {
+            \\        if (self.ready.items.len > 0) {
+            \\            const job = self.ready.orderedRemove(0);
+            \\            job.run(job.ctx);
+            \\            return true;
+            \\        }
+            \\        if (self.timers.items.len > 0) {
+            \\            var best: usize = 0;
+            \\            for (self.timers.items, 0..) |t, i| { if (t.deadline_ns < self.timers.items[best].deadline_ns) best = i; }
+            \\            const t = self.timers.orderedRemove(best);
+            \\            const now = nowNs();
+            \\            if (t.deadline_ns > now) {
+            \\                std.Io.Clock.Duration.sleep(.{ .raw = .fromNanoseconds(t.deadline_ns - now), .clock = .awake }, __io) catch {};
+            \\            }
+            \\            t.run(t.ctx);
+            \\            return true;
+            \\        }
+            \\        return false;
+            \\    }
+            \\    fn driveUntil(self: *LumenLoop, ctx: *const anyopaque, done: *const fn (*const anyopaque) bool) void {
+            \\        while (!done(ctx)) { if (!self.tick()) break; }
+            \\    }
+            \\    fn drain(self: *LumenLoop) void { while (self.tick()) {} }
+            \\};
+            \\var __lumen_loop: LumenLoop = .{};
+            \\fn LumenPromise(comptime T: type) type {
+            \\    return struct {
+            \\        const Self = @This();
+            \\        resolved: bool = false,
+            \\        value: T = undefined,
+            \\        fn create() *Self {
+            \\            const p = __alloc.create(Self) catch unreachable;
+            \\            p.* = .{};
+            \\            return p;
+            \\        }
+            \\        fn resolve(self: *Self, v: T) void { self.resolved = true; self.value = v; }
+            \\        fn isResolved(ctx: *const anyopaque) bool {
+            \\            const self: *const Self = @ptrCast(@alignCast(ctx));
+            \\            return self.resolved;
+            \\        }
+            \\        fn await_(self: *Self) T {
+            \\            __lumen_loop.driveUntil(self, isResolved);
+            \\            return self.value;
+            \\        }
+            \\    };
+            \\}
+            \\fn __promiseResolved(comptime T: type, v: T) *LumenPromise(T) {
+            \\    const p = LumenPromise(T).create();
+            \\    p.resolve(v);
+            \\    return p;
+            \\}
+            \\fn __setTimeout(cb: anytype, ms: i64) void {
+            \\    const Cb = @TypeOf(cb);
+            \\    const Holder = struct {
+            \\        f: Cb,
+            \\        fn run(ctx: *const anyopaque) void {
+            \\            const h: *const @This() = @ptrCast(@alignCast(ctx));
+            \\            h.f.call(h.f.ctx);
+            \\        }
+            \\    };
+            \\    const h = __alloc.create(Holder) catch unreachable;
+            \\    h.* = .{ .f = cb };
+            \\    __lumen_loop.addTimer(ms, h, Holder.run);
+            \\}
+            \\
+        );
+    }
     try out.appendSlice(arena, decls.items);
 
     if (program.needs_read_file_sync) {
@@ -3637,6 +3810,9 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
         try out.appendSlice(arena, "pub fn main() void {\n");
     }
     try out.appendSlice(arena, body.items);
+    // Drain any remaining timers/microtasks so fire-and-forget setTimeout
+    // callbacks run before the program exits.
+    if (program.needs_async) try out.appendSlice(arena, "    __lumen_loop.drain();\n");
     try out.appendSlice(arena, "}\n");
     return out.items;
 }

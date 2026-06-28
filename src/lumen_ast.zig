@@ -115,6 +115,9 @@ pub const FunctionDecl = struct {
     visibility: Visibility = .public,
     is_static: bool = false,
     accessor: Accessor = .none,
+    // `async function ...` — the declared return type must be `Promise<T>`; a
+    // `return v;` resolves the promise with `v`.
+    is_async: bool = false,
     // Type parameters for a generic function, e.g. `f<T, U>`. When non-empty the
     // function is a template; concrete copies are generated per call instance.
     type_params: [][]const u8 = &.{},
@@ -326,6 +329,8 @@ pub const Program = struct {
     needs_serve: bool = false,
     needs_map: bool = false,
     needs_set: bool = false,
+    // Async/await: emit the event-loop + Promise runtime and drain the loop in main.
+    needs_async: bool = false,
 };
 
 pub const Expr = union(enum) {
@@ -341,6 +346,7 @@ pub const Expr = union(enum) {
     neg: *Expr,
     not: *Expr,
     bnot: *Expr, // bitwise ~
+    await_expr: *Expr, // `await <expr>` — operand is a Promise<T>; yields T
     bin: struct { op: u8, l: *Expr, r: *Expr, checked_type: ?types.Type = null }, // + - * / % & | ^ and L=<< R=>> P=**
     bool_bin: struct { op: []const u8, l: *Expr, r: *Expr }, // && ||
     cmp: struct { op: []const u8, l: *Expr, r: *Expr, checked_operand_type: ?types.Type = null }, // < > <= >= == !=

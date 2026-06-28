@@ -1,0 +1,53 @@
+{
+  "feature": "022-async-await",
+  "cases": [
+    {
+      "id": "async.valid.resolved-promises",
+      "source": "../examples/valid/resolved-promises.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "42\n7\nlumen\n42" }
+    },
+    {
+      "id": "async.valid.async-chain",
+      "source": "../examples/valid/async-chain.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "10\n15\n23\n20" }
+    },
+    {
+      "id": "async.valid.timers",
+      "source": "../examples/valid/timers.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "start\nscheduled\nfast\n2\nslow\n1" }
+    },
+    {
+      "id": "async.invalid.await-non-promise",
+      "source": "../examples/invalid/await-non-promise.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_AWAIT_NOT_PROMISE" }
+    },
+    {
+      "id": "async.invalid.await-outside-async",
+      "source": "../examples/invalid/await-outside-async.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_AWAIT_OUTSIDE_ASYNC" }
+    },
+    {
+      "id": "async.invalid.async-return-not-promise",
+      "source": "../examples/invalid/async-return-not-promise.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_ASYNC_RETURN" }
+    },
+    {
+      "id": "async.invalid.settimeout-arg-type",
+      "source": "../examples/invalid/settimeout-arg-type.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "async.invalid.settimeout-arg-count",
+      "source": "../examples/invalid/settimeout-arg-count.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_ARG_COUNT" }
+    }
+  ]
+}

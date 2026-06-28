@@ -29,6 +29,7 @@ pub const Type = union(enum) {
     map_type: *const MapType, // Map<K, V>  ->  *LumenMap_<k>_<v> (heap pointer)
     set_type: *const Type, // Set<T>  ->  *LumenSet_<t> (heap pointer)
     tuple_type: []const Type, // [A, B, ...]  ->  struct { @"0": A, @"1": B, ... }
+    promise_type: *const Type, // Promise<T>  ->  *LumenPromise(T) (heap pointer)
 };
 
 pub const MapType = struct { key: *const Type, value: *const Type };
@@ -102,6 +103,7 @@ fn mangle(arena: std.mem.Allocator, t: Type) error{OutOfMemory}![]const u8 {
         .class_type => |n| try std.fmt.allocPrint(arena, "cls_{s}", .{n}),
         .map_type => |m| try std.fmt.allocPrint(arena, "map_{s}_{s}", .{ try mangle(arena, m.key.*), try mangle(arena, m.value.*) }),
         .set_type => |elem| try std.fmt.allocPrint(arena, "set_{s}", .{try mangle(arena, elem.*)}),
+        .promise_type => |inner| try std.fmt.allocPrint(arena, "prom_{s}", .{try mangle(arena, inner.*)}),
         .tuple_type => |elems| blk2: {
             var buf2: std.ArrayListUnmanaged(u8) = .empty;
             try buf2.appendSlice(arena, "tup");
@@ -175,6 +177,7 @@ pub fn inferExprType(e: *const ast.Expr) ?Type {
             return if (same(then_type, else_type)) then_type else null;
         },
         .template => .string,
+        .await_expr => null, // resolved type comes from the checker (Promise<T> -> T)
         .array, .spread, .tuple_lit, .var_ref, .obj, .field, .index, .call, .static_call, .coalesce, .arrow, .this_expr, .new_expr, .method_call, .super_call, .cast => null,
     };
 }
@@ -242,6 +245,10 @@ pub fn same(a: Type, b: Type) bool {
         },
         .set_type => |a_e| switch (b) {
             .set_type => |b_e| same(a_e.*, b_e.*),
+            else => false,
+        },
+        .promise_type => |a_e| switch (b) {
+            .promise_type => |b_e| same(a_e.*, b_e.*),
             else => false,
         },
         .tuple_type => |a_t| switch (b) {
@@ -367,6 +374,10 @@ pub fn toAnnotation(arena: std.mem.Allocator, t: Type) error{OutOfMemory}!?[]con
             const e = (try toAnnotation(arena, elem.*)) orelse break :blk null;
             break :blk try std.fmt.allocPrint(arena, "Set<{s}>", .{e});
         },
+        .promise_type => |inner| blk: {
+            const e = (try toAnnotation(arena, inner.*)) orelse break :blk null;
+            break :blk try std.fmt.allocPrint(arena, "Promise<{s}>", .{e});
+        },
         .tuple_type => |elems| blk: {
             var buf: std.ArrayListUnmanaged(u8) = .empty;
             try buf.append(arena, '[');
@@ -425,6 +436,7 @@ pub fn zigName(arena: std.mem.Allocator, t: Type) ![]const u8 {
         .class_type => |name| try std.fmt.allocPrint(arena, "*{s}", .{name}),
         .map_type => |m| try std.fmt.allocPrint(arena, "*LumenMap({s}, {s})", .{ try zigName(arena, m.key.*), try zigName(arena, m.value.*) }),
         .set_type => |elem| try std.fmt.allocPrint(arena, "*LumenSet({s})", .{try zigName(arena, elem.*)}),
+        .promise_type => |inner| try std.fmt.allocPrint(arena, "*LumenPromise({s})", .{try zigName(arena, inner.*)}),
         .tuple_type => |elems| try tupleStructName(arena, elems),
     };
 }

@@ -81,6 +81,11 @@ const Checker = struct {
     in_constructor: bool = false,
     next_binding_id: u32 = 0,
     current_return_type: ?types.Type = null,
+    // True while checking the body of an `async function` (gates `await`).
+    in_async: bool = false,
+    // True while checking inside any function/method body (top-level `await` is
+    // allowed; `await` inside a non-async function body is rejected).
+    in_function: bool = false,
     nested_stmt_depth: u32 = 0,
     loop_depth: u32 = 0,
     switch_depth: u32 = 0,
@@ -405,6 +410,12 @@ const Checker = struct {
                     e.* = try self.typeFromAnnotation(args[0], line, col);
                     return .{ .set_type = e };
                 }
+                if (std.mem.eql(u8, base, "Promise")) {
+                    if (args.len != 1) return self.fail(line, col, "E_TYPE_ARG_COUNT");
+                    const e = self.arena.create(types.Type) catch return error.OutOfMemory;
+                    e.* = try self.typeFromAnnotation(args[0], line, col);
+                    return .{ .promise_type = e };
+                }
                 if (self.generic_types.get(base)) |gt| {
                     if (args.len != gt.type_params.len) return self.fail(line, col, "E_TYPE_ARG_COUNT");
                     const mname = try self.specializeType(gt, args, line, col);
@@ -434,6 +445,8 @@ const Checker = struct {
     fn declareFunction(self: *Checker, decl: *ast.FunctionDecl) CompileError!void {
         if (self.funcs.get(decl.name) != null) return self.fail(decl.line, decl.col, "E_DUPLICATE_BINDING");
         const return_type = try self.typeFromAnnotation(decl.return_annotation, decl.line, decl.col);
+        // An async function must declare a `Promise<T>` return type.
+        if (decl.is_async and return_type != .promise_type) return self.fail(decl.line, decl.col, "E_ASYNC_RETURN");
         for (decl.params) |*param| {
             param.checked_type = try self.typeFromAnnotation(param.annotation, decl.line, decl.col);
         }
@@ -974,6 +987,7 @@ const Checker = struct {
             .neg => |inner| .{ .neg = try self.cloneExpr(inner) },
             .not => |inner| .{ .not = try self.cloneExpr(inner) },
             .bnot => |inner| .{ .bnot = try self.cloneExpr(inner) },
+            .await_expr => |inner| .{ .await_expr = try self.cloneExpr(inner) },
             .bin => |b| .{ .bin = .{ .op = b.op, .l = try self.cloneExpr(b.l), .r = try self.cloneExpr(b.r) } },
             .bool_bin => |b| .{ .bool_bin = .{ .op = b.op, .l = try self.cloneExpr(b.l), .r = try self.cloneExpr(b.r) } },
             .cmp => |b| .{ .cmp = .{ .op = b.op, .l = try self.cloneExpr(b.l), .r = try self.cloneExpr(b.r) } },
@@ -1547,8 +1561,24 @@ const Checker = struct {
 
     fn checkFunctionBody(self: *Checker, program: *ast.Program, decl: *ast.FunctionDecl) CompileError!void {
         const previous_return_type = self.current_return_type;
-        self.current_return_type = decl.checked_return_type;
+        // Inside an async body, a `return v;` resolves the promise with `v`, so the
+        // return value is checked against the promise's inner type `T`.
+        self.current_return_type = if (decl.is_async and decl.checked_return_type != null and decl.checked_return_type.? == .promise_type)
+            decl.checked_return_type.?.promise_type.*
+        else
+            decl.checked_return_type;
         defer self.current_return_type = previous_return_type;
+        const previous_in_async = self.in_async;
+        const previous_in_function = self.in_function;
+        self.in_async = decl.is_async;
+        self.in_function = true;
+        // An async function lowers to a Promise-returning function, so the runtime
+        // is required even when the body never awaits.
+        if (decl.is_async) program.needs_async = true;
+        defer {
+            self.in_async = previous_in_async;
+            self.in_function = previous_in_function;
+        }
 
         // A default value must be assignable to its parameter's declared type.
         for (decl.params) |param| {
@@ -1566,7 +1596,9 @@ const Checker = struct {
         defer self.nested_stmt_depth -= 1;
         for (decl.body) |*body_stmt| try self.checkStmt(program, body_stmt);
 
-        const return_type = decl.checked_return_type orelse try self.typeFromAnnotation(decl.return_annotation, decl.line, decl.col);
+        // The effective return type: for an async function this is the promise's
+        // inner type (`Promise<void>` need not return), set in current_return_type.
+        const return_type = self.current_return_type orelse decl.checked_return_type orelse try self.typeFromAnnotation(decl.return_annotation, decl.line, decl.col);
         if (return_type != .void and !blockReturns(decl.body)) {
             return self.fail(decl.line, decl.col, "E_MISSING_RETURN");
         }
@@ -2229,6 +2261,21 @@ const Checker = struct {
                 }
                 return inner_type;
             },
+            .await_expr => |inner| {
+                // `await` is only valid inside an async function body or at the
+                // top level of the program (not inside a non-async function).
+                if (self.in_function and !self.in_async) {
+                    _ = self.fail(line, col, "E_AWAIT_OUTSIDE_ASYNC") catch {};
+                    return null;
+                }
+                const operand_type = self.exprType(program, inner, line, col) orelse return null;
+                if (operand_type != .promise_type) {
+                    _ = self.fail(line, col, "E_AWAIT_NOT_PROMISE") catch {};
+                    return null;
+                }
+                program.needs_async = true;
+                return operand_type.promise_type.*;
+            },
             .bin => |*bin| {
                 const left_type = self.exprType(program, bin.l, line, col) orelse return null;
                 const right_type = self.exprType(program, bin.r, line, col) orelse return null;
@@ -2331,7 +2378,15 @@ const Checker = struct {
                 for (arrow.params) |p| {
                     self.currentScope().put(self.arena, p.name, .{ .ty = p.checked_type.?, .mutable = true, .emit_name = p.name }) catch return null;
                 }
+                // Arrow functions are not async in this subset, so `await` inside an
+                // arrow body is rejected (it is not on an awaiting code path).
+                const saved_in_async = self.in_async;
+                const saved_in_function = self.in_function;
+                self.in_async = false;
+                self.in_function = true;
                 const body_type = self.exprType(program, arrow.body_expr, line, col);
+                self.in_async = saved_in_async;
+                self.in_function = saved_in_function;
                 self.popScope();
                 self.arrow_base = saved_base;
                 self.current_captures = saved_caps;
@@ -2789,6 +2844,28 @@ const Checker = struct {
                     program.needs_serve = true;
                     return .void;
                 }
+                if (std.mem.eql(u8, call.name, "setTimeout")) {
+                    if (call.args.len != 2) {
+                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    // First arg: a `() => void` callback function value.
+                    const cb_type = self.exprType(program, call.args[0], line, col) orelse return null;
+                    const cb_ok = cb_type == .func_type and cb_type.func_type.params.len == 0 and cb_type.func_type.ret.* == .void;
+                    if (!cb_ok) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                    // Second arg: an integer millisecond delay.
+                    const ms_type = self.exprType(program, call.args[1], line, col) orelse return null;
+                    if (!types.isInteger(ms_type)) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                    program.uses_io = true;
+                    program.needs_async = true;
+                    return .void;
+                }
                 // A call to a generic function: resolve type arguments
                 // (explicit or inferred), specialize, and retarget the call.
                 if (self.generic_funcs.get(call.name)) |gdecl| {
@@ -2894,6 +2971,7 @@ const Checker = struct {
         if (std.mem.eql(u8, call.namespace, "String")) return self.stringCallType(program, call, line, col);
         if (std.mem.eql(u8, call.namespace, "Array")) return self.arrayCallType(program, call, line, col);
         if (std.mem.eql(u8, call.namespace, "fs")) return self.fsCallType(program, call, line, col);
+        if (std.mem.eql(u8, call.namespace, "Promise")) return self.promiseCallType(program, call, line, col);
         _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
         return null;
     }
@@ -2920,6 +2998,28 @@ const Checker = struct {
             program.needs_read_file_sync = true;
             call.checked_type = .string;
             return .string;
+        }
+        _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+        return null;
+    }
+
+    fn promiseCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
+        // `Promise.resolve(v)` -> an already-resolved `Promise<typeof v>`.
+        if (std.mem.eql(u8, call.name, "resolve")) {
+            if (call.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const inner = self.exprType(program, call.args[0], line, col) orelse return null;
+            const p = self.arena.create(types.Type) catch return null;
+            p.* = inner;
+            const result = types.Type{ .promise_type = p };
+            // Inner type drives `__promiseResolved(T, v)`; result is `Promise<T>`.
+            call.checked_arg_type = inner;
+            call.checked_type = result;
+            program.uses_io = true;
+            program.needs_async = true;
+            return result;
         }
         _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
         return null;
