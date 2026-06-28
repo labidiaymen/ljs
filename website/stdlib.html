@@ -49,20 +49,64 @@
     <tr><td><code>Math.sqrt(n)</code></td><td>number → number</td></tr>
   </table>
 
-  <h4>String</h4>
+  <h4>String methods</h4>
+  <p class="sub">Called directly on any <code>string</code> value.</p>
   <table>
     <tr><th>API</th><th>Type</th></tr>
     <tr><td><code>s.length</code> · <code>s + t</code></td><td>int · concatenation</td></tr>
-    <tr><td><code>String.isEmpty(s)</code></td><td>string → bool</td></tr>
-    <tr><td><code>String.contains(s, sub)</code></td><td>(string, string) → bool</td></tr>
-    <tr><td><code>String.startsWith(s, prefix)</code></td><td>(string, string) → bool</td></tr>
+    <tr><td><code>s.split(sep)</code></td><td>string → string[]</td></tr>
+    <tr><td><code>s.slice(start, end?)</code> · <code>s.substring(start, end)</code></td><td>→ string</td></tr>
+    <tr><td><code>s.indexOf(sub)</code> · <code>s.includes(sub)</code></td><td>→ int · bool</td></tr>
+    <tr><td><code>s.startsWith(prefix)</code> · <code>s.endsWith(suffix)</code></td><td>→ bool</td></tr>
+    <tr><td><code>s.toUpperCase()</code> · <code>s.toLowerCase()</code> · <code>s.trim()</code></td><td>→ string</td></tr>
+    <tr><td><code>s.repeat(n)</code> · <code>s.padStart(len, pad)</code></td><td>→ string</td></tr>
+    <tr><td><code>s.replace(from, to)</code></td><td>→ string</td></tr>
+    <tr><td><code>s.charAt(i)</code> · <code>s.charCodeAt(i)</code></td><td>→ string · int</td></tr>
+    <tr><td><code>String.isEmpty(s)</code> · <code>String.contains(s, sub)</code></td><td>→ bool</td></tr>
   </table>
 
-  <h4>Array</h4>
+  <h4>Array methods</h4>
+  <p class="sub">Called directly on any <code>T[]</code> value; callbacks are
+  written as typed arrow functions.</p>
   <table>
     <tr><th>API</th><th>Type</th></tr>
     <tr><td><code>a[i]</code> · <code>a.length</code></td><td>element access · int</td></tr>
+    <tr><td><code>a.map(fn)</code></td><td>((T) =&gt; U) → U[]</td></tr>
+    <tr><td><code>a.filter(fn)</code></td><td>((T) =&gt; bool) → T[]</td></tr>
+    <tr><td><code>a.reduce(fn, init)</code></td><td>(((U, T) =&gt; U), U) → U</td></tr>
+    <tr><td><code>a.forEach(fn)</code></td><td>((T) =&gt; void) → void</td></tr>
+    <tr><td><code>a.find(fn)</code> · <code>a.some(fn)</code> · <code>a.every(fn)</code></td><td>predicate → T · bool · bool</td></tr>
+    <tr><td><code>a.indexOf(x)</code> · <code>a.includes(x)</code></td><td>→ int · bool</td></tr>
+    <tr><td><code>a.join(sep)</code></td><td>(string[], string) → string</td></tr>
     <tr><td><code>Array.isEmpty(a)</code></td><td>T[] → bool</td></tr>
+  </table>
+
+  <h4>Collections</h4>
+  <p class="sub">Typed, generic containers — no dynamic shapes.</p>
+  <table>
+    <tr><th>API</th><th>Notes</th></tr>
+    <tr><td><code>Map&lt;K, V&gt;</code></td><td><code>get</code> · <code>set</code> · <code>has</code> · <code>delete</code> · <code>size</code> · <code>keys</code> · <code>values</code> · <code>entries</code> · <code>forEach</code></td></tr>
+    <tr><td><code>Set&lt;T&gt;</code></td><td><code>add</code> · <code>has</code> · <code>delete</code> · <code>size</code> · <code>values</code> · <code>forEach</code></td></tr>
+    <tr><td><code>[A, B]</code> tuple types</td><td>fixed-length, per-slot types; <code>t[0]</code>, <code>t[1]</code></td></tr>
+  </table>
+
+  <h4>async · await</h4>
+  <p class="sub">Asynchronous code runs on a native event loop. The program
+  drains pending callbacks and promises before it exits.</p>
+  <table>
+    <tr><th>API</th><th>Notes</th></tr>
+    <tr><td><code>async function f(): Promise&lt;T&gt; { … }</code></td><td>declares an async function</td></tr>
+    <tr><td><code>await expr</code></td><td>awaits a <code>Promise&lt;T&gt;</code>, yields <code>T</code></td></tr>
+    <tr><td><code>Promise.resolve(x)</code></td><td>T → Promise&lt;T&gt;</td></tr>
+    <tr><td><code>setTimeout(fn, ms)</code></td><td>schedules a callback after a delay</td></tr>
+  </table>
+
+  <h4>C FFI</h4>
+  <table>
+    <tr><th>API</th><th>Notes</th></tr>
+    <tr><td><code>extern function name(args): T;</code></td><td>calls a C function directly</td></tr>
+    <tr><td><code>// @link m</code> · <code>// @link ./shim.o</code></td><td>link a library or object</td></tr>
+    <tr><td>string &amp; scalar marshaling</td><td>string params/returns and numeric scalars cross the boundary</td></tr>
   </table>
 
   <h4>Errors</h4>
@@ -123,13 +167,10 @@
     <tr><td><code>os.cpus()</code> · <code>os.hostname()</code></td><td></td></tr>
   </table>
 
-  <h4>Math · String · Array (more)</h4>
+  <h4>Math · Array (more)</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
     <tr><td><code>Math.floor/ceil/round/trunc/pow/log/sin/cos</code> · <code>Math.PI</code></td><td></td></tr>
-    <tr><td><code>s.toUpperCase/toLowerCase/trim/replace/indexOf/slice</code></td><td></td></tr>
-    <tr><td><code>s.split(sep)</code> → <code>string[]</code></td><td>needs growable arrays</td></tr>
-    <tr><td><code>a.map/filter/reduce/forEach(fn)</code></td><td>uses closures</td></tr>
     <tr><td><code>a.push/pop/sort</code></td><td>needs growable arrays</td></tr>
   </table>
 
@@ -138,14 +179,19 @@
     <tr><th>API</th><th>Notes</th></tr>
     <tr><td><code>time.now()</code> · <code>time.monotonic()</code></td><td>milliseconds</td></tr>
     <tr><td><code>crypto.sha256(data)</code> · <code>crypto.sha1(data)</code></td><td>→ hex string</td></tr>
-    <tr><td><code>http.get(url)</code> → <code>{ status, body }</code></td><td>record return</td></tr>
-    <tr><td>async <code>fs</code> / <code>http</code> / timers</td><td>needs the async runtime</td></tr>
+    <tr><td><code>http.get(url)</code> → <code>{ status, body }</code></td><td>record return; async on the event loop</td></tr>
   </table>
 
+  <h3>Community packages</h3>
+  <p class="sub">Beyond the built-in surface, curated packages live in the
+  <a href="https://github.com/lumen-lang-org/std-contrib">std-contrib</a> repo and
+  are imported by URL. They include <code>quickjs</code>, which embeds a
+  JavaScript sandbox through the C FFI for running untrusted scripts from Lumen.</p>
+
   <p class="note">Lumen is statically typed and has no dynamic <code>JSON</code> value —
-  <code>JSON.parse&lt;T&gt;</code> and generic containers (<code>Map</code>,
-  <code>Set</code>) arrive with generics. This is not a package manager; the
-  library is a fixed, contracted surface.</p>
+  <code>JSON.parse&lt;T&gt;</code> arrives later. The built-in library is a fixed,
+  contracted surface; everything else ships as explicit
+  <a href="https://github.com/lumen-lang-org/std-contrib">community packages</a>.</p>
 </section>
 
 <footer><div class="wrap">

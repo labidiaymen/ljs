@@ -81,11 +81,19 @@ console.log(`distance² = ${distanceSq(origin, p)}`);  // distance² = 25</code>
     <div class="card"><h3>Full control flow</h3><p><code>if</code>/<code>else if</code>, <code>while</code>, <code>do</code>, C&#8209;style <code>for</code>, <code>for…of</code>, <code>switch</code>, ternary.</p></div>
     <div class="card"><h3>Null safety</h3><p><code>T | null</code>, optional <code>?</code> fields, <code>??</code>, <code>?.</code>, and <code>if (x != null)</code> narrowing.</p></div>
     <div class="card"><h3>First-class functions</h3><p>Function types, arrow functions, and capturing closures.</p></div>
-    <div class="card"><h3>Classes</h3><p>Fields, constructor, <code>this</code>, and methods — instances lower to heap structs.</p></div>
+    <div class="card"><h3>Classes &amp; inheritance</h3><p><code>extends</code>, <code>super</code>, <code>public</code>/<code>private</code>/<code>protected</code>, <code>static</code>, <code>readonly</code>, and <code>get</code>/<code>set</code>.</p></div>
     <div class="card"><h3>Template literals</h3><p><code>`hi ${name}`</code> with string &amp; numeric interpolation.</p></div>
     <div class="card"><h3>defer</h3><p>Scope&#8209;exit cleanup, last&#8209;in&#8209;first&#8209;out.</p></div>
     <div class="card"><h3>Built-in tests</h3><p><code>test "…" { expect(…); }</code> run with <code>lumen test</code>.</p></div>
-    <div class="card"><h3>C FFI</h3><p><code>extern function</code> + <code>// @link</code> call native C libraries — and C++ via an <code>extern "C"</code> shim.</p></div>
+    <div class="card"><h3>C FFI</h3><p><code>extern function</code> + <code>// @link</code> call native C libraries — scalars and strings marshal across the boundary.</p></div>
+    <div class="card"><h3>String methods</h3><p><code>split</code>, <code>slice</code>, <code>trim</code>, <code>includes</code>, <code>indexOf</code>, <code>replace</code>, <code>repeat</code>, <code>padStart</code>, <code>toUpperCase</code>, and more.</p></div>
+    <div class="card"><h3>Array methods</h3><p><code>map</code>, <code>filter</code>, <code>reduce</code>, <code>forEach</code>, <code>find</code>, <code>some</code>, <code>every</code>, <code>includes</code>, <code>indexOf</code>, <code>join</code>.</p></div>
+    <div class="card"><h3>Generics</h3><p>Generic functions, classes, and interfaces with <code>Array&lt;T&gt;</code> — monomorphized at compile time, no boxing.</p></div>
+    <div class="card"><h3>Type aliases &amp; unions</h3><p><code>type</code> aliases, discriminated unions narrowed by a literal tag, and <code>as</code> assertions.</p></div>
+    <div class="card"><h3>Error handling</h3><p><code>try</code>/<code>catch</code>/<code>finally</code> and <code>throw</code>, with a readable <code>.message</code> on the caught error.</p></div>
+    <div class="card"><h3>Maps, Sets &amp; tuples</h3><p><code>Map&lt;K, V&gt;</code>, <code>Set&lt;T&gt;</code>, and fixed-shape tuple types like <code>[int, string]</code>.</p></div>
+    <div class="card"><h3>async / await</h3><p><code>async</code> functions return <code>Promise&lt;T&gt;</code> and <code>await</code> resolves them on a fast native event loop.</p></div>
+    <div class="card"><h3>Flexible parameters</h3><p>Default values, rest parameters, and spread — checked statically, no <code>arguments</code> object.</p></div>
     <div class="card"><h3>URL imports</h3><p>Import a default export from a relative file or an <code>https://</code> URL — a package is just a URL.</p></div>
     <div class="card"><h3>Native output</h3><p>Compiles to a small, fast, dependency&#8209;free native binary.</p></div>
   </div>
@@ -129,6 +137,102 @@ c.increment();
 console.log(c.get());   // 6</code></pre>
 </section>
 
+<section class="wrap" id="methods">
+  <h2>Methods on strings and arrays</h2>
+  <p class="sub">The familiar collection and string methods, statically typed and compiled.</p>
+<pre><code class="lumen">let nums: int[] = [1, 2, 3, 4, 5];
+let doubled = nums.map((n: int) => n * 2);
+let evens = nums.filter((n: int) => n % 2 == 0);
+let total = nums.reduce((acc: int, n: int) => acc + n, 0);
+
+console.log(doubled.join(", "));   // 2, 4, 6, 8, 10
+console.log(evens.join(", "));     // 2, 4
+console.log(total);                // 15
+
+let s = "  Hello, World  ";
+console.log(s.trim().toUpperCase());   // HELLO, WORLD
+console.log(s.trim().split(", ")[1]);  // World</code></pre>
+</section>
+
+<section class="wrap" id="generics">
+  <h2>Generics, monomorphized</h2>
+  <p class="sub">Write once over a type parameter; each instantiation compiles to specialized code — no boxing.</p>
+<pre><code class="lumen">function identity&lt;T&gt;(x: T): T {
+  return x;
+}
+
+class Box&lt;T&gt; {
+  value: T;
+  constructor(v: T) {
+    this.value = v;
+  }
+  get(): T {
+    return this.value;
+  }
+}
+
+console.log(identity&lt;int&gt;(42));      // 42
+console.log(identity&lt;string&gt;("hi"));  // hi
+let b = new Box&lt;int&gt;(7);
+console.log(b.get());                 // 7</code></pre>
+</section>
+
+<section class="wrap" id="collections">
+  <h2>Maps, Sets, and tuples</h2>
+  <p class="sub">Typed keyed collections and fixed-shape tuples, with the methods you expect.</p>
+<pre><code class="lumen">let counts: Map&lt;string, int&gt; = new Map&lt;string, int&gt;();
+counts.set("apples", 3);
+counts.set("pears", 5);
+console.log(counts.get("apples"));   // 3
+console.log(counts.has("pears"));    // true
+
+let tags: Set&lt;string&gt; = new Set&lt;string&gt;();
+tags.add("red");
+tags.add("red");
+tags.add("blue");
+console.log(tags.size);   // 2
+
+let pair: [string, int] = ["age", 30];
+console.log(pair[0]);   // age
+console.log(pair[1]);   // 30</code></pre>
+</section>
+
+<section class="wrap" id="async">
+  <h2>async / await</h2>
+  <p class="sub">Async functions return a <code>Promise&lt;T&gt;</code>; <code>await</code> resolves it on a fast native event loop.</p>
+<pre><code class="lumen">async function fetchValue(n: int): Promise&lt;int&gt; {
+  return n * 2;
+}
+
+async function total(): Promise&lt;int&gt; {
+  let a: int = await fetchValue(10);
+  let b: int = await fetchValue(11);
+  return a + b;
+}
+
+console.log(await total());   // 42</code></pre>
+</section>
+
+<section class="wrap" id="errors">
+  <h2>Errors with try / catch / finally</h2>
+  <p class="sub">Throw an error, catch it with a readable message, and run cleanup on every path.</p>
+<pre><code class="lumen">function checkAge(n: int): void {
+  try {
+    if (n &lt; 0) {
+      throw Error("age cannot be negative");
+    }
+    console.log("age ok");
+  } catch (e) {
+    console.log("error: " + e.message);
+  } finally {
+    console.log("checked");
+  }
+}
+
+checkAge(30);   // age ok / checked
+checkAge(-1);   // error: age cannot be negative / checked</code></pre>
+</section>
+
 <section class="wrap" id="ffi">
   <h2>Call native libraries</h2>
   <p class="sub">Declare an <code>extern function</code> and link a C library — no bindings generator, no runtime.</p>
@@ -147,7 +251,13 @@ extern "C" int rectangle_area(int w, int h) { return w * h; }</code></pre>
 // @link ./geometry.o
 extern function rectangle_area(w: int, h: int): int;
 console.log(rectangle_area(6, 7));   // 42</code></pre>
-  <p class="note">V1 FFI passes scalar arguments (<code>int</code>, <code>i64</code>, <code>number</code>, <code>bool</code>).
+  <h3>Strings across the boundary</h3>
+  <p class="sub">Strings marshal too: pass a Lumen string to a C function and copy the returned C string back.</p>
+<pre><code class="lumen">// @link ./shim.o
+extern function shout(s: string): string;   // C: const char* shout(const char*)
+
+console.log(shout("hi there"));   // HI THERE</code></pre>
+  <p class="note">FFI marshals scalars (<code>int</code>, <code>i64</code>, <code>number</code>, <code>bool</code>) and strings.
   This links local/system libraries — it is not a package manager.</p>
 </section>
 

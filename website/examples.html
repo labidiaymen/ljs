@@ -139,6 +139,175 @@ import greet from "https://lumen-lang.org/package/std-contrib/hello/hello.ts";
 console.log(greet("world"));   // Hello, world!</code></pre>
   </div>
 
+  <div class="example">
+    <h3>pipeline.ts <span class="meta">array methods · map · filter · reduce · join</span></h3>
+<pre><code class="lumen">let nums: int[] = [1, 2, 3, 4, 5, 6];
+
+let evens = nums.filter((n: int) => n % 2 == 0);
+let doubled = evens.map((n: int) => n * 2);
+let total = doubled.reduce((acc: int, n: int) => acc + n, 0);
+
+console.log(doubled.join(", "));   // 4, 8, 12
+console.log(total);                // 24</code></pre>
+  </div>
+
+  <div class="example">
+    <h3>strings.ts <span class="meta">string methods · split · toUpperCase · includes · for…of</span></h3>
+<pre><code class="lumen">let csv = "ada,grace,linus";
+let names = csv.split(",");
+
+for (const name of names) {
+  console.log(name.toUpperCase());   // ADA / GRACE / LINUS
+}
+
+console.log(names.length);                       // 3
+console.log("grace,hopper".includes("grace"));   // true</code></pre>
+  </div>
+
+  <div class="example">
+    <h3>generics.ts <span class="meta">generic function · generic class · type arguments</span></h3>
+<pre><code class="lumen">function firstOf&lt;T&gt;(xs: T[]): T {
+  return xs[0];
+}
+
+class Box&lt;T&gt; {
+  value: T;
+  constructor(v: T) {
+    this.value = v;
+  }
+  get(): T {
+    return this.value;
+  }
+}
+
+console.log(firstOf&lt;int&gt;([10, 20, 30]));      // 10
+console.log(firstOf&lt;string&gt;(["a", "b"]));     // a
+
+let boxed = new Box&lt;string&gt;("hello");
+console.log(boxed.get());                     // hello</code></pre>
+  </div>
+
+  <div class="example">
+    <h3>shapes.ts <span class="meta">discriminated union · type alias · switch on tag</span></h3>
+<pre><code class="lumen">type Circle = { kind: "circle", radius: int };
+type Square = { kind: "square", side: int };
+type Shape = Circle | Square;
+
+function area(s: Shape): int {
+  switch (s.kind) {
+    case "circle":
+      return s.radius * s.radius * 3;
+    case "square":
+      return s.side * s.side;
+  }
+  return 0;
+}
+
+console.log(area({ kind: "circle", radius: 4 }));   // 48
+console.log(area({ kind: "square", side: 5 }));     // 25</code></pre>
+  </div>
+
+  <div class="example">
+    <h3>inherit.ts <span class="meta">classes · extends · super · method override</span></h3>
+<pre><code class="lumen">class Animal {
+  protected name: string;
+  constructor(name: string) {
+    this.name = name;
+  }
+  speak(): string {
+    return this.name + " makes a sound";
+  }
+}
+
+class Dog extends Animal {
+  constructor(name: string) {
+    super(name);
+  }
+  speak(): string {
+    return super.speak() + " (woof)";
+  }
+}
+
+let a = new Animal("Cat");
+let d = new Dog("Rex");
+console.log(a.speak());   // Cat makes a sound
+console.log(d.speak());   // Rex makes a sound (woof)</code></pre>
+  </div>
+
+  <div class="example">
+    <h3>errors.ts <span class="meta">error handling · throw · try / catch / finally</span></h3>
+<pre><code class="lumen">try {
+  console.log("parsing");
+  throw Error("empty port");
+  console.log("unreached");
+} catch (e) {
+  console.log("caught");
+  console.log(e.message);
+} finally {
+  console.log("done");
+}
+// parsing
+// caught
+// empty port
+// done</code></pre>
+  </div>
+
+  <div class="example">
+    <h3>collections.ts <span class="meta">Map · Set · typed keys and values</span></h3>
+<pre><code class="lumen">let scores: Map&lt;string, int&gt; = new Map&lt;string, int&gt;();
+scores.set("ada", 90);
+scores.set("linus", 85);
+scores.set("ada", 95);
+
+console.log(scores.size);          // 2
+console.log(scores.get("ada"));    // 95
+console.log(scores.has("linus"));  // true
+
+let tags: Set&lt;string&gt; = new Set&lt;string&gt;();
+tags.add("red");
+tags.add("blue");
+tags.add("red");
+console.log(tags.size);            // 2
+console.log(tags.has("blue"));     // true</code></pre>
+  </div>
+
+  <div class="example">
+    <h3>varargs.ts <span class="meta">rest parameters · spread call · default params</span></h3>
+<pre><code class="lumen">function sum(...nums: int[]): int {
+  let total: int = 0;
+  for (const n of nums) {
+    total = total + n;
+  }
+  return total;
+}
+
+function greet(name: string, greeting: string = "Hello"): string {
+  return greeting + ", " + name;
+}
+
+let extra: int[] = [4, 5, 6];
+console.log(sum(1, 2, 3));          // 6
+console.log(sum(1, ...extra));      // 16
+console.log(greet("World"));        // Hello, World
+console.log(greet("World", "Hi"));  // Hi, World</code></pre>
+  </div>
+
+  <div class="example">
+    <h3>async.ts <span class="meta">async / await · Promise — runs on a native event loop</span></h3>
+<pre><code class="lumen">async function fetchBase(): Promise&lt;int&gt; {
+  return 10;
+}
+
+async function total(n: int): Promise&lt;int&gt; {
+  let base: int = await fetchBase();
+  return base + n;
+}
+
+console.log(await fetchBase());   // 10
+console.log(await total(5));      // 15
+console.log(await total(32));     // 42</code></pre>
+  </div>
+
 </section>
 
 <footer><div class="wrap">
