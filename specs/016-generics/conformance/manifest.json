@@ -1,0 +1,59 @@
+{
+  "feature": "016-generics",
+  "cases": [
+    {
+      "id": "generics.valid.identity",
+      "source": "../examples/valid/identity.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "42\nhello\ntrue\n7" }
+    },
+    {
+      "id": "generics.valid.multi-param",
+      "source": "../examples/valid/multi-param.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "10\nalpha\nx\n99" }
+    },
+    {
+      "id": "generics.valid.generic-class",
+      "source": "../examples/valid/generic-class.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "5\n42\n42\nhi" }
+    },
+    {
+      "id": "generics.valid.generic-interface",
+      "source": "../examples/valid/generic-interface.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "7\nseven\non\ntrue" }
+    },
+    {
+      "id": "generics.valid.array-sugar",
+      "source": "../examples/valid/array-sugar.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "3\n3\nx\n3" }
+    },
+    {
+      "id": "generics.invalid.type-arg-count",
+      "source": "../examples/invalid/type-arg-count.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_ARG_COUNT" }
+    },
+    {
+      "id": "generics.invalid.inference-conflict",
+      "source": "../examples/invalid/inference-conflict.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "generics.invalid.explicit-type-arg-mismatch",
+      "source": "../examples/invalid/explicit-type-arg-mismatch.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "generics.invalid.cannot-infer",
+      "source": "../examples/invalid/cannot-infer.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_INFER" }
+    }
+  ]
+}

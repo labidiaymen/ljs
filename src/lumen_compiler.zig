@@ -172,14 +172,56 @@ const Parser = struct {
     }
     fn parseTypeMember(self: *Parser) CompileError![]const u8 {
         if (self.cur != .ident) return error.ParseError;
-        const base = self.cur.ident;
+        var base = self.cur.ident;
         try self.advance();
+        // Generic type reference `Name<arg, ...>`. `Array<X>` is sugar for `X[]`;
+        // any other `Name<...>` is recorded canonically for the checker to
+        // specialize. (Nested `Name<Inner<...>>` is supported via recursion.)
+        if (self.isCmp("<")) {
+            try self.advance(); // '<'
+            var args: std.ArrayListUnmanaged([]const u8) = .empty;
+            while (!self.isCmp(">")) {
+                try args.append(self.arena, try self.parseTypeAnnotation());
+                if (self.isOp(',')) try self.advance() else break;
+            }
+            try self.consumeTypeArgClose();
+            if (std.mem.eql(u8, base, "Array")) {
+                if (args.items.len != 1) return error.ParseError;
+                base = std.fmt.allocPrint(self.arena, "{s}[]", .{args.items[0]}) catch return error.OutOfMemory;
+            } else {
+                var buf: std.ArrayListUnmanaged(u8) = .empty;
+                try buf.appendSlice(self.arena, base);
+                try buf.append(self.arena, '<');
+                for (args.items, 0..) |a, i| {
+                    if (i > 0) try buf.append(self.arena, ',');
+                    try buf.appendSlice(self.arena, a);
+                }
+                try buf.append(self.arena, '>');
+                base = buf.items;
+            }
+        }
         if (self.isOp('[')) {
             try self.advance();
             try self.expectOp(']');
             return std.fmt.allocPrint(self.arena, "{s}[]", .{base}) catch error.OutOfMemory;
         }
         return base;
+    }
+
+    /// Consumes the `>` (or one level of a `>>` produced by nested type args)
+    /// that closes a type-argument list inside an annotation.
+    fn consumeTypeArgClose(self: *Parser) CompileError!void {
+        if (self.isCmp(">")) {
+            try self.advance();
+            return;
+        }
+        // A trailing `>>` from `Outer<Inner<X>>` lexes as one op2 token; rewrite
+        // it to a single `>` so the enclosing level can consume its own close.
+        if (self.isOp2(">>")) {
+            self.cur = .{ .cmp = ">" };
+            return;
+        }
+        return error.ParseError;
     }
 
     /// Parses a type annotation. `T | null` / `T | undefined` (in either order)
@@ -539,6 +581,8 @@ const Parser = struct {
             if (self.cur != .ident) return error.ParseError;
             const class_name = self.cur.ident;
             try self.advance();
+            var type_args: [][]const u8 = &.{};
+            if (self.isCmp("<")) type_args = try self.parseTypeArgs();
             try self.expectOp('(');
             var args: std.ArrayListUnmanaged(*Expr) = .empty;
             while (!self.isOp(')')) {
@@ -546,7 +590,7 @@ const Parser = struct {
                 if (self.isOp(',')) try self.advance() else break;
             }
             try self.expectOp(')');
-            return self.node(.{ .new_expr = .{ .class_name = class_name, .args = try args.toOwnedSlice(self.arena) } });
+            return self.node(.{ .new_expr = .{ .class_name = class_name, .args = try args.toOwnedSlice(self.arena), .type_args = type_args } });
         }
         if (self.cur == .template) {
             const raw = self.cur.template;
@@ -561,6 +605,12 @@ const Parser = struct {
         if (self.cur == .ident) {
             const name = self.cur.ident;
             try self.advance();
+            // Explicit generic call `f<T, ...>(...)`. Only treated as type
+            // arguments when a `(` provably follows the matching `>`.
+            var type_args: [][]const u8 = &.{};
+            if (self.isCmp("<") and self.looksLikeTypeArgs()) {
+                type_args = try self.parseTypeArgs();
+            }
             if (self.isOp('(')) {
                 try self.expectOp('(');
                 var args: std.ArrayListUnmanaged(*Expr) = .empty;
@@ -569,7 +619,7 @@ const Parser = struct {
                     if (self.isOp(',')) try self.advance() else break;
                 }
                 try self.expectOp(')');
-                return self.node(.{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.arena) } });
+                return self.node(.{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.arena), .type_args = type_args } });
             }
             return self.node(.{ .var_ref = .{ .name = name } });
         }
@@ -738,6 +788,7 @@ const Parser = struct {
         if (self.cur != .ident) return error.ParseError;
         const tname = self.cur.ident;
         try self.advance();
+        const type_params = try self.parseTypeParams();
         try self.expectOp('{');
         var fields: std.ArrayListUnmanaged(ast.TypeField) = .empty;
         while (!self.isOp('}')) {
@@ -750,7 +801,7 @@ const Parser = struct {
         }
         try self.expectOp('}');
         if (self.isOp(';')) try self.advance();
-        return .{ .type_decl = .{ .name = tname, .fields = try fields.toOwnedSlice(self.arena), .line = line, .col = col } };
+        return .{ .type_decl = .{ .name = tname, .fields = try fields.toOwnedSlice(self.arena), .type_params = type_params, .line = line, .col = col } };
     }
 
     /// `enum Name { A, B = 2, C }` (numeric) or `enum Name { Up = "up" }` (string).
@@ -796,6 +847,7 @@ const Parser = struct {
         if (self.cur != .ident) return error.ParseError;
         const name = self.cur.ident;
         try self.advance();
+        const type_params = try self.parseTypeParams();
         try self.expectOp('(');
         var params: std.ArrayListUnmanaged(ast.FunctionParam) = .empty;
         while (!self.isOp(')')) {
@@ -815,6 +867,7 @@ const Parser = struct {
             .params = try params.toOwnedSlice(self.arena),
             .return_annotation = return_annotation,
             .body = body,
+            .type_params = type_params,
             .line = line,
             .col = col,
         } };
@@ -835,12 +888,85 @@ const Parser = struct {
         return params.toOwnedSlice(self.arena);
     }
 
+    /// Optional generic type-parameter list `<T, U, ...>` after a declaration
+    /// name. Returns an empty slice when no `<` is present.
+    fn parseTypeParams(self: *Parser) CompileError![][]const u8 {
+        if (!self.isCmp("<")) return &.{};
+        try self.advance(); // '<'
+        var params: std.ArrayListUnmanaged([]const u8) = .empty;
+        while (!self.isCmp(">")) {
+            if (self.cur != .ident) return error.ParseError;
+            try params.append(self.arena, self.cur.ident);
+            try self.advance();
+            if (self.isOp(',')) try self.advance() else break;
+        }
+        if (!self.isCmp(">")) return error.ParseError;
+        try self.advance(); // '>'
+        return params.toOwnedSlice(self.arena);
+    }
+
+    /// Generic type-argument list `<T, U, ...>` (concrete type annotations). The
+    /// caller has confirmed (via lookahead) that `cur` is the opening `<`.
+    fn parseTypeArgs(self: *Parser) CompileError![][]const u8 {
+        try self.advance(); // '<'
+        var args: std.ArrayListUnmanaged([]const u8) = .empty;
+        while (!self.isCmp(">")) {
+            const ann = try self.parseTypeAnnotation();
+            try args.append(self.arena, ann);
+            if (self.isOp(',')) try self.advance() else break;
+        }
+        if (!self.isCmp(">")) return error.ParseError;
+        try self.advance(); // '>'
+        return args.toOwnedSlice(self.arena);
+    }
+
+    /// Lookahead: starting at a `<` (cmp), is this an explicit type-argument list
+    /// immediately followed by a `(` call? Scans `< ... >` (allowing nested `<`
+    /// and `[]`) and checks for a following `(`. Restores parser state.
+    fn looksLikeTypeArgs(self: *Parser) bool {
+        const save_lex = self.lex;
+        const save_cur = self.cur;
+        const save_line = self.cur_line;
+        const save_col = self.cur_col;
+        defer {
+            self.lex = save_lex;
+            self.cur = save_cur;
+            self.cur_line = save_line;
+            self.cur_col = save_col;
+        }
+        self.advance() catch return false; // consume '<'
+        var depth: u32 = 1;
+        while (depth > 0) {
+            if (self.cur == .eof) return false;
+            // Only type-annotation tokens may appear inside a type-argument list.
+            switch (self.cur) {
+                .ident => {},
+                .op => |c| if (c != ',' and c != '[' and c != ']' and c != '.') return false,
+                .cmp => |s| {
+                    if (std.mem.eql(u8, s, "<")) {
+                        depth += 1;
+                    } else if (std.mem.eql(u8, s, ">")) {
+                        depth -= 1;
+                    } else return false;
+                },
+                .op2 => |s| if (!std.mem.eql(u8, s, ">>")) return false else {
+                    // `>>` closes two nested type-argument levels at once.
+                    if (depth >= 2) depth -= 2 else return false;
+                },
+                else => return false,
+            }
+            self.advance() catch return false;
+        }
+        return self.isOp('(');
+    }
+
     /// `class Name { field: T; constructor(p: T) { ... } method(p: T): R { ... } }`
     fn parseClassDecl(self: *Parser, line: u32, col: u32) CompileError!Stmt {
         try self.advance(); // 'class'
         if (self.cur != .ident) return error.ParseError;
         const name = self.cur.ident;
         try self.advance();
+        const type_params = try self.parseTypeParams();
         try self.expectOp('{');
         var fields: std.ArrayListUnmanaged(ast.TypeField) = .empty;
         var methods: std.ArrayListUnmanaged(ast.FunctionDecl) = .empty;
@@ -880,6 +1006,7 @@ const Parser = struct {
             .ctor_params = ctor_params,
             .ctor_body = ctor_body,
             .methods = try methods.toOwnedSlice(self.arena),
+            .type_params = type_params,
             .line = line,
             .col = col,
         } };
@@ -1961,6 +2088,180 @@ fn emitTemplateText(text: []const u8, w: *std.ArrayListUnmanaged(u8), arena: std
     }
 }
 
+/// Whether `name` is referenced anywhere in an expression (as a variable read
+/// or a function-value call target). Used to discard unused parameters so the
+/// emitted Zig compiles (Zig forbids unused parameters/locals).
+fn exprUsesName(e: *const Expr, name: []const u8) bool {
+    return switch (e.*) {
+        .num, .float, .bool, .str, .null_lit, .this_expr => false,
+        .var_ref => |r| std.mem.eql(u8, r.name, name),
+        .array => |items| blk: {
+            for (items) |it| if (exprUsesName(it, name)) break :blk true;
+            break :blk false;
+        },
+        .neg, .not, .bnot => |inner| exprUsesName(inner, name),
+        .bin => |b| exprUsesName(b.l, name) or exprUsesName(b.r, name),
+        .bool_bin => |b| exprUsesName(b.l, name) or exprUsesName(b.r, name),
+        .cmp => |b| exprUsesName(b.l, name) or exprUsesName(b.r, name),
+        .ternary => |t| exprUsesName(t.cond, name) or exprUsesName(t.then_expr, name) or exprUsesName(t.else_expr, name),
+        .coalesce => |c| exprUsesName(c.l, name) or exprUsesName(c.r, name),
+        .arrow => |a| exprUsesName(a.body_expr, name),
+        .new_expr => |ne| blk: {
+            for (ne.args) |it| if (exprUsesName(it, name)) break :blk true;
+            break :blk false;
+        },
+        .method_call => |mc| blk: {
+            if (exprUsesName(mc.obj, name)) break :blk true;
+            for (mc.args) |it| if (exprUsesName(it, name)) break :blk true;
+            break :blk false;
+        },
+        .template => |parts| blk: {
+            for (parts) |pt| if (pt.expr) |x| {
+                if (exprUsesName(x, name)) break :blk true;
+            };
+            break :blk false;
+        },
+        .obj => |fields| blk: {
+            for (fields) |f| if (exprUsesName(f.value, name)) break :blk true;
+            break :blk false;
+        },
+        .field => |f| exprUsesName(f.obj, name),
+        .index => |idx| exprUsesName(idx.obj, name) or exprUsesName(idx.value, name),
+        .call => |cl| blk: {
+            if (cl.is_closure and std.mem.eql(u8, cl.name, name)) break :blk true;
+            for (cl.args) |it| if (exprUsesName(it, name)) break :blk true;
+            break :blk false;
+        },
+        .static_call => |sc| blk: {
+            for (sc.args) |it| if (exprUsesName(it, name)) break :blk true;
+            break :blk false;
+        },
+    };
+}
+
+fn bodyUsesName(body: []const Stmt, name: []const u8) bool {
+    for (body) |*s| if (stmtUsesName(s, name)) return true;
+    return false;
+}
+
+fn stmtUsesName(stmt: *const Stmt, name: []const u8) bool {
+    return switch (stmt.*) {
+        .var_decl => |d| exprUsesName(d.init, name),
+        .destructure_decl => |d| exprUsesName(d.source, name),
+        .assign => |a| std.mem.eql(u8, a.name, name) or exprUsesName(a.value, name),
+        .member_assign => |ma| exprUsesName(ma.value, name),
+        .console_log => |log| exprUsesName(log.value, name),
+        .return_stmt => |r| if (r.value) |x| exprUsesName(x, name) else false,
+        .throw_stmt => |t| exprUsesName(t.value, name),
+        .expr_stmt => |x| exprUsesName(x.value, name),
+        .while_stmt => |w| exprUsesName(w.cond, name) or bodyUsesName(w.body, name),
+        .do_while_stmt => |w| exprUsesName(w.cond, name) or bodyUsesName(w.body, name),
+        .for_stmt => |f| exprUsesName(f.init.init, name) or exprUsesName(f.cond, name) or exprUsesName(f.update.value, name) or bodyUsesName(f.body, name),
+        .for_of_stmt => |f| exprUsesName(f.iterable, name) or bodyUsesName(f.body, name),
+        .if_stmt => |b| exprUsesName(b.cond, name) or bodyUsesName(b.then_body, name) or (b.else_body != null and bodyUsesName(b.else_body.?, name)),
+        .switch_stmt => |sw| blk: {
+            if (exprUsesName(sw.value, name)) break :blk true;
+            for (sw.cases) |cse| if (exprUsesName(cse.value, name) or bodyUsesName(cse.body, name)) break :blk true;
+            if (sw.default_body) |db| if (bodyUsesName(db, name)) break :blk true;
+            break :blk false;
+        },
+        .try_stmt => |t| bodyUsesName(t.try_body, name) or bodyUsesName(t.catch_body, name) or (t.finally_body != null and bodyUsesName(t.finally_body.?, name)),
+        .defer_stmt => |d| bodyUsesName(d.body, name),
+        else => false,
+    };
+}
+
+/// Whether an expression reads `this` (so the enclosing method needs `self`).
+fn exprUsesThis(e: *const Expr) bool {
+    return switch (e.*) {
+        .this_expr => true,
+        .num, .float, .bool, .str, .null_lit, .var_ref => false,
+        .array => |items| blk: {
+            for (items) |it| if (exprUsesThis(it)) break :blk true;
+            break :blk false;
+        },
+        .neg, .not, .bnot => |inner| exprUsesThis(inner),
+        .bin => |b| exprUsesThis(b.l) or exprUsesThis(b.r),
+        .bool_bin => |b| exprUsesThis(b.l) or exprUsesThis(b.r),
+        .cmp => |b| exprUsesThis(b.l) or exprUsesThis(b.r),
+        .ternary => |t| exprUsesThis(t.cond) or exprUsesThis(t.then_expr) or exprUsesThis(t.else_expr),
+        .coalesce => |c| exprUsesThis(c.l) or exprUsesThis(c.r),
+        .arrow => |a| exprUsesThis(a.body_expr),
+        .new_expr => |ne| blk: {
+            for (ne.args) |it| if (exprUsesThis(it)) break :blk true;
+            break :blk false;
+        },
+        .method_call => |mc| blk: {
+            if (exprUsesThis(mc.obj)) break :blk true;
+            for (mc.args) |it| if (exprUsesThis(it)) break :blk true;
+            break :blk false;
+        },
+        .template => |parts| blk: {
+            for (parts) |pt| if (pt.expr) |x| {
+                if (exprUsesThis(x)) break :blk true;
+            };
+            break :blk false;
+        },
+        .obj => |fields| blk: {
+            for (fields) |f| if (exprUsesThis(f.value)) break :blk true;
+            break :blk false;
+        },
+        .field => |f| exprUsesThis(f.obj),
+        .index => |idx| exprUsesThis(idx.obj) or exprUsesThis(idx.value),
+        .call => |cl| blk: {
+            for (cl.args) |it| if (exprUsesThis(it)) break :blk true;
+            break :blk false;
+        },
+        .static_call => |sc| blk: {
+            for (sc.args) |it| if (exprUsesThis(it)) break :blk true;
+            break :blk false;
+        },
+    };
+}
+
+fn stmtUsesThis(stmt: *const Stmt) bool {
+    return switch (stmt.*) {
+        .member_assign => true, // `this.field = ...` requires self
+        .var_decl => |d| exprUsesThis(d.init),
+        .destructure_decl => |d| exprUsesThis(d.source),
+        .assign => |a| exprUsesThis(a.value),
+        .console_log => |log| exprUsesThis(log.value),
+        .return_stmt => |r| if (r.value) |x| exprUsesThis(x) else false,
+        .throw_stmt => |t| exprUsesThis(t.value),
+        .expr_stmt => |x| exprUsesThis(x.value),
+        .while_stmt => |w| exprUsesThis(w.cond) or bodyUsesThis(w.body),
+        .do_while_stmt => |w| exprUsesThis(w.cond) or bodyUsesThis(w.body),
+        .for_stmt => |f| exprUsesThis(f.init.init) or exprUsesThis(f.cond) or exprUsesThis(f.update.value) or bodyUsesThis(f.body),
+        .for_of_stmt => |f| exprUsesThis(f.iterable) or bodyUsesThis(f.body),
+        .if_stmt => |b| exprUsesThis(b.cond) or bodyUsesThis(b.then_body) or (b.else_body != null and bodyUsesThis(b.else_body.?)),
+        .switch_stmt => |sw| blk: {
+            if (exprUsesThis(sw.value)) break :blk true;
+            for (sw.cases) |cse| if (exprUsesThis(cse.value) or bodyUsesThis(cse.body)) break :blk true;
+            if (sw.default_body) |db| if (bodyUsesThis(db)) break :blk true;
+            break :blk false;
+        },
+        .try_stmt => |t| bodyUsesThis(t.try_body) or bodyUsesThis(t.catch_body) or (t.finally_body != null and bodyUsesThis(t.finally_body.?)),
+        .defer_stmt => |d| bodyUsesThis(d.body),
+        else => false,
+    };
+}
+
+fn bodyUsesThis(body: []const Stmt) bool {
+    for (body) |*s| if (stmtUsesThis(s)) return true;
+    return false;
+}
+
+/// Emit `_ = name;` discards for any parameters the body never references, so
+/// the generated Zig function compiles. (A no-op for fully-used parameter lists,
+/// so non-generic functions are unaffected.)
+fn emitUnusedParamDiscards(params: []const ast.FunctionParam, body: []const Stmt, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
+    for (params) |param| {
+        if (!bodyUsesName(body, param.name)) {
+            try w.print(arena, "    _ = {s};\n", .{param.name});
+        }
+    }
+}
+
 fn printFormat(t: types.Type) []const u8 {
     return switch (t) {
         .string, .string_literal_union => "{s}",
@@ -2053,6 +2354,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
     switch (stmt.*) {
         .type_decl => |decl| {
             if (decl.string_literals != null) return;
+            if (decl.type_params.len > 0) return; // generic template: only specializations emit
             try decls.print(arena, "const {s} = struct {{\n", .{decl.name});
             for (decl.fields) |field| {
                 const field_type = field.checked_type orelse return error.ParseError;
@@ -2071,6 +2373,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             try decls.print(arena, ") {s};\n", .{try types.zigName(arena, decl.checked_return_type orelse return error.ParseError)});
         },
         .class_decl => |c| {
+            if (c.type_params.len > 0) return; // generic template: only specializations emit
             // A class lowers to a struct with heap-allocated instances (*Name),
             // an `__init` constructor, and methods taking `self: *Name`.
             try decls.print(arena, "const {s} = struct {{\n", .{c.name});
@@ -2085,6 +2388,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             }
             try decls.print(arena, ") *{s} {{\n", .{c.name});
             try decls.print(arena, "    const self = std.heap.page_allocator.create({s}) catch unreachable;\n", .{c.name});
+            try emitUnusedParamDiscards(c.ctor_params, c.ctor_body, decls, arena);
             for (c.ctor_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, decls, arena, throw_target, switch_break_target, options);
             try decls.appendSlice(arena, "    return self;\n    }\n");
             // methods
@@ -2094,6 +2398,9 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
                     try decls.print(arena, ", {s}: {s}", .{ param.name, try types.zigName(arena, param.checked_type orelse return error.ParseError) });
                 }
                 try decls.print(arena, ") {s} {{\n", .{try types.zigName(arena, m.checked_return_type orelse return error.ParseError)});
+                // A method that never touches `this` still takes `self`; discard it.
+                if (!bodyUsesThis(m.body)) try decls.appendSlice(arena, "    _ = self;\n");
+                try emitUnusedParamDiscards(m.params, m.body, decls, arena);
                 for (m.body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, decls, arena, throw_target, switch_break_target, options);
                 try decls.appendSlice(arena, "    }\n");
             }
@@ -2131,6 +2438,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             try decls.appendSlice(arena, "}\n");
         },
         .function_decl => |decl| {
+            if (decl.type_params.len > 0) return; // generic template: only specializations emit
             const return_type = decl.checked_return_type orelse types.fromAnnotation(decl.return_annotation);
             try decls.print(arena, "fn {s}(", .{decl.name});
             for (decl.params, 0..) |param, i| {
@@ -2139,6 +2447,7 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
                 try decls.print(arena, "{s}: {s}", .{ param.name, try types.zigName(arena, param_type) });
             }
             try decls.print(arena, ") {s} {{\n", .{try types.zigName(arena, return_type)});
+            try emitUnusedParamDiscards(decl.params, decl.body, decls, arena);
             for (decl.body) |*body_stmt| try emitStmt(body_stmt, decls, decls, arena, options);
             try decls.appendSlice(arena, "}\n");
         },

@@ -247,6 +247,37 @@ pub fn arrayOf(t: Type) ?Type {
     };
 }
 
+/// Render a resolved type back to a canonical source annotation string. The
+/// inverse of `fromAnnotation` for the V1 type surface; used when a generic type
+/// argument inferred as a `Type` must be substituted back into a template's
+/// annotations. Returns null for types with no annotation spelling.
+pub fn toAnnotation(arena: std.mem.Allocator, t: Type) error{OutOfMemory}!?[]const u8 {
+    return switch (t) {
+        .i32 => "int",
+        .i64 => "i64",
+        .f64 => "number",
+        .bool => "bool",
+        .string => "string",
+        .void => "void",
+        .i32_array => "int[]",
+        .i64_array => "i64[]",
+        .f64_array => "number[]",
+        .bool_array => "bool[]",
+        .string_array => "string[]",
+        .named => |n| n,
+        .named_array => |n| try std.fmt.allocPrint(arena, "{s}[]", .{n}),
+        .class_type => |n| n,
+        .enum_type => |e| e.name,
+        .string_literal_union => |n| n,
+        .int_literal_union => |n| n,
+        .optional => |inner| blk: {
+            const inner_ann = (try toAnnotation(arena, inner.*)) orelse break :blk null;
+            break :blk try std.fmt.allocPrint(arena, "{s}?", .{inner_ann});
+        },
+        else => null,
+    };
+}
+
 /// Parse a source type annotation. Unknown names are preserved as named types.
 pub fn fromAnnotation(name: []const u8) Type {
     const eq = std.mem.eql;

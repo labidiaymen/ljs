@@ -25,6 +25,9 @@ pub const TypeDecl = struct {
     fields: []TypeField = &.{},
     string_literals: ?[][]const u8 = null,
     int_literals: ?[]i64 = null,
+    // Type parameters for a generic interface/type alias, e.g. `Pair<A, B>`.
+    // When non-empty the declaration is a template specialized on use.
+    type_params: [][]const u8 = &.{},
     line: u32,
     col: u32,
 };
@@ -53,6 +56,9 @@ pub const ClassDecl = struct {
     ctor_params: []FunctionParam = &.{},
     ctor_body: []Stmt = &.{},
     methods: []FunctionDecl = &.{},
+    // Type parameters for a generic class, e.g. `Box<T>`. When non-empty the
+    // class is a template; concrete copies are generated per `new C<...>`.
+    type_params: [][]const u8 = &.{},
     line: u32,
     col: u32,
 };
@@ -72,6 +78,9 @@ pub const FunctionDecl = struct {
     return_annotation: []const u8,
     checked_return_type: ?types.Type = null,
     body: []Stmt,
+    // Type parameters for a generic function, e.g. `f<T, U>`. When non-empty the
+    // function is a template; concrete copies are generated per call instance.
+    type_params: [][]const u8 = &.{},
     line: u32,
     col: u32,
 };
@@ -288,13 +297,13 @@ pub const Expr = union(enum) {
     coalesce: struct { l: *Expr, r: *Expr }, // a ?? b
     arrow: *ArrowExpr, // (x: T) => expr
     this_expr, // `this` inside a method/constructor
-    new_expr: struct { class_name: []const u8, args: []*Expr }, // new C(args)
+    new_expr: struct { class_name: []const u8, args: []*Expr, type_args: [][]const u8 = &.{} }, // new C(args) / new C<T>(args)
     method_call: struct { obj: *Expr, name: []const u8, args: []*Expr, class_name: ?[]const u8 = null, array_elem_type: ?types.Type = null, array_acc_type: ?types.Type = null, array_result_type: ?types.Type = null, string_method: bool = false }, // obj.m(args)
     template: []TemplatePart, // `text ${expr} ...`
     obj: []FieldInit,
     field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null, enum_value: ?EnumValue = null, optional_chain: bool = false, chain_field_type: ?types.Type = null },
     index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null },
-    call: struct { name: []const u8, args: []*Expr, emit_name: ?[]const u8 = null, is_closure: bool = false }, // builtin / user / function-value call
+    call: struct { name: []const u8, args: []*Expr, emit_name: ?[]const u8 = null, is_closure: bool = false, type_args: [][]const u8 = &.{} }, // builtin / user / function-value call; type_args from explicit f<T>(...)
     static_call: StaticCall,
 };
 
