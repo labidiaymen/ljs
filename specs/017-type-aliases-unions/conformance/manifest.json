@@ -1,0 +1,35 @@
+{
+  "feature": "017-type-aliases-unions",
+  "cases": [
+    {
+      "id": "alias.valid.aliases",
+      "source": "../examples/valid/aliases.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "42\nlumen\n6\nlumen" }
+    },
+    {
+      "id": "union.valid.discriminated-union",
+      "source": "../examples/valid/discriminated-union.ts",
+      "phase": "compile-run",
+      "expect": { "stdout": "48\n25\ncircle\nsquare" }
+    },
+    {
+      "id": "union.invalid.field-not-narrowed",
+      "source": "../examples/invalid/union-field-not-narrowed.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "union.invalid.bad-narrowing-case",
+      "source": "../examples/invalid/bad-narrowing-case.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    },
+    {
+      "id": "cast.invalid.illegal-cast",
+      "source": "../examples/invalid/illegal-cast.ts",
+      "phase": "diagnostics",
+      "expect": { "diagnostic": "E_TYPE_MISMATCH" }
+    }
+  ]
+}

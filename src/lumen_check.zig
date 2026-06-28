@@ -12,6 +12,18 @@ const TypeDeclInfo = struct {
     int_literals: ?[]i64 = null,
 };
 
+/// One variant of a discriminated union: its record name and the discriminant
+/// literal value that selects it.
+const UnionVariant = struct { name: []const u8, disc_value: []const u8 };
+
+const UnionInfo = struct {
+    variants: []UnionVariant,
+    discriminant: []const u8, // shared discriminant field name
+};
+
+/// A union binding narrowed (inside a switch case / if branch) to one variant.
+const NarrowedVariant = struct { name: []const u8, variant: []const u8 };
+
 const FunctionInfo = struct {
     params: []ast.FunctionParam,
     return_type: types.Type,
@@ -42,6 +54,10 @@ const Checker = struct {
     arena: std.mem.Allocator,
     scopes: std.ArrayListUnmanaged(Scope) = .empty,
     type_decls: std.StringHashMapUnmanaged(TypeDeclInfo) = .empty,
+    // `type X = <annotation>;` aliases, resolved transitively in typeFromAnnotation.
+    aliases: std.StringHashMapUnmanaged([]const u8) = .empty,
+    // Discriminated unions keyed by union name.
+    unions: std.StringHashMapUnmanaged(UnionInfo) = .empty,
     enums: std.StringHashMapUnmanaged(EnumInfo) = .empty,
     classes: std.StringHashMapUnmanaged(ClassInfo) = .empty,
     funcs: std.StringHashMapUnmanaged(FunctionInfo) = .empty,
@@ -68,6 +84,7 @@ const Checker = struct {
     switch_depth: u32 = 0,
     test_depth: u32 = 0,
     narrowed: std.ArrayListUnmanaged([]const u8) = .empty,
+    narrowed_variants: std.ArrayListUnmanaged(NarrowedVariant) = .empty,
     arrow_base: usize = 0, // scope index at which the current arrow's params start
     current_captures: ?*std.ArrayListUnmanaged(ast.Capture) = null,
     last_line: u32 = 1,
@@ -106,6 +123,18 @@ const Checker = struct {
         return false;
     }
 
+    /// The variant a union binding is currently narrowed to (innermost wins), or
+    /// null if it is not narrowed.
+    fn narrowedVariant(self: *Checker, name: []const u8) ?[]const u8 {
+        var i = self.narrowed_variants.items.len;
+        while (i > 0) {
+            i -= 1;
+            const nv = self.narrowed_variants.items[i];
+            if (std.mem.eql(u8, nv.name, name)) return nv.variant;
+        }
+        return null;
+    }
+
     /// If `cond` is `x != null` / `x !== null` (or undefined) returns the binding
     /// narrowed in the then-branch; `x == null` returns it for the else-branch.
     /// `in_then` says which branch the non-optional narrowing applies to.
@@ -120,6 +149,29 @@ const Checker = struct {
         if (c.r.* == .var_ref and c.l.* == .null_lit) name = c.r.var_ref.name;
         const n = name orelse return null;
         return .{ .name = n, .in_then = is_ne };
+    }
+
+    /// If `expr` is `s.disc` where `s` is a union binding and `disc` is that
+    /// union's discriminant field, returns the binding name and union name.
+    fn discriminantAccess(self: *Checker, expr: *ast.Expr) ?struct { name: []const u8, union_name: []const u8 } {
+        if (expr.* != .field) return null;
+        const fa = expr.field;
+        if (fa.obj.* != .var_ref) return null;
+        const var_name = fa.obj.var_ref.name;
+        const b = self.binding(var_name) orelse return null;
+        if (b.ty != .union_type) return null;
+        const uinfo = self.unions.get(b.ty.union_type) orelse return null;
+        if (!std.mem.eql(u8, fa.name, uinfo.discriminant)) return null;
+        return .{ .name = var_name, .union_name = b.ty.union_type };
+    }
+
+    /// The variant of `union_name` selected by discriminant literal `value`.
+    fn variantForValue(self: *Checker, union_name: []const u8, value: []const u8) ?[]const u8 {
+        const uinfo = self.unions.get(union_name) orelse return null;
+        for (uinfo.variants) |v| {
+            if (std.mem.eql(u8, v.disc_value, value)) return v.name;
+        }
+        return null;
     }
 
     fn pushScope(self: *Checker) CompileError!void {
@@ -191,6 +243,70 @@ const Checker = struct {
         self.type_decls.put(self.arena, name, .{ .fields = fields, .string_literals = string_literals, .int_literals = int_literals }) catch return error.OutOfMemory;
     }
 
+    /// Resolve an alias target annotation, following nested aliases up to a depth
+    /// bound (cycles fail rather than loop).
+    fn resolveAlias(self: *Checker, annotation: []const u8, line: u32, col: u32) CompileError!types.Type {
+        var current = annotation;
+        var depth: u32 = 0;
+        while (self.aliases.get(current)) |next| {
+            depth += 1;
+            if (depth > 32) return self.fail(line, col, "E_TYPE_MISMATCH"); // alias cycle
+            current = next;
+        }
+        return self.typeFromAnnotation(current, line, col);
+    }
+
+    /// Validate a discriminated union: every variant is a declared record sharing
+    /// one string-literal discriminant field, and record the variant map plus the
+    /// merged flat-struct field set written back onto the declaration.
+    fn declareUnion(self: *Checker, decl: *ast.TypeDecl) CompileError!void {
+        if (self.type_decls.get(decl.name) != null or self.aliases.get(decl.name) != null or self.unions.get(decl.name) != null) {
+            return self.fail(decl.line, decl.col, "E_DUPLICATE_BINDING");
+        }
+        const variant_names = decl.union_variants orelse return error.ParseError;
+        if (variant_names.len < 2) return self.fail(decl.line, decl.col, "E_TYPE_MISMATCH");
+        var discriminant: ?[]const u8 = null;
+        var variants: std.ArrayListUnmanaged(UnionVariant) = .empty;
+        var merged: std.ArrayListUnmanaged(ast.TypeField) = .empty;
+        for (variant_names) |vname| {
+            const vinfo = self.type_decls.get(vname) orelse return self.fail(decl.line, decl.col, "E_TYPE_MISMATCH");
+            if (vinfo.string_literals != null or vinfo.int_literals != null) return self.fail(decl.line, decl.col, "E_TYPE_MISMATCH");
+            // Find this variant's discriminant: a field with a string-literal type.
+            var disc_field: ?[]const u8 = null;
+            var disc_value: ?[]const u8 = null;
+            for (self.declFields(vname)) |f| {
+                if (f.annotation.len >= 2 and f.annotation[0] == '"' and f.annotation[f.annotation.len - 1] == '"') {
+                    if (disc_field != null) return self.fail(decl.line, decl.col, "E_TYPE_MISMATCH"); // ambiguous: two literal fields
+                    disc_field = f.name;
+                    disc_value = f.annotation[1 .. f.annotation.len - 1];
+                }
+            }
+            const df = disc_field orelse return self.fail(decl.line, decl.col, "E_TYPE_MISMATCH"); // no discriminant
+            if (discriminant) |d| {
+                if (!std.mem.eql(u8, d, df)) return self.fail(decl.line, decl.col, "E_TYPE_MISMATCH"); // mismatched discriminant field
+            } else discriminant = df;
+            try variants.append(self.arena, .{ .name = vname, .disc_value = disc_value.? });
+            // Merge fields (dedup by name) into the flat struct.
+            for (self.declFields(vname)) |f| {
+                var present = false;
+                for (merged.items) |m| {
+                    if (std.mem.eql(u8, m.name, f.name)) present = true;
+                }
+                if (!present) {
+                    try merged.append(self.arena, .{ .name = f.name, .annotation = f.annotation, .checked_type = try self.typeFromAnnotation(f.annotation, decl.line, decl.col) });
+                }
+            }
+        }
+        decl.fields = try merged.toOwnedSlice(self.arena);
+        self.unions.put(self.arena, decl.name, .{ .variants = try variants.toOwnedSlice(self.arena), .discriminant = discriminant.? }) catch return error.OutOfMemory;
+    }
+
+    /// The declared fields of a record type by name (empty if not a record).
+    fn declFields(self: *Checker, type_name: []const u8) []ast.TypeField {
+        if (self.type_decls.get(type_name)) |info| return info.fields;
+        return &.{};
+    }
+
     fn funcSigType(self: *Checker, finfo: FunctionInfo) CompileError!types.Type {
         const params = self.arena.alloc(types.Type, finfo.params.len) catch return error.OutOfMemory;
         for (finfo.params, 0..) |p, i| params[i] = p.checked_type orelse return error.ParseError;
@@ -202,6 +318,17 @@ const Checker = struct {
     }
 
     fn typeFromAnnotation(self: *Checker, annotation: []const u8, line: u32, col: u32) CompileError!types.Type {
+        // A string-literal member type `"value"` (e.g. a discriminant field) is
+        // a single-value string; it erases to `string` for storage and emission.
+        if (annotation.len >= 2 and annotation[0] == '"' and annotation[annotation.len - 1] == '"') {
+            return .string;
+        }
+        // Resolve `type X = <annotation>;` aliases transitively (bounded depth).
+        if (self.aliases.get(annotation)) |target| {
+            return self.resolveAlias(target, line, col);
+        }
+        // A discriminated union name resolves to its union type.
+        if (self.unions.get(annotation) != null) return .{ .union_type = annotation };
         // Function type: `(T,...)=>R`
         if (annotation.len > 0 and annotation[0] == '(') {
             var depth: u32 = 0;
@@ -293,7 +420,20 @@ const Checker = struct {
                     self.generic_types.put(self.arena, stmt.type_decl.name, &stmt.type_decl) catch return error.OutOfMemory;
                     continue;
                 }
+                if (stmt.type_decl.alias) |target| {
+                    if (self.aliases.get(stmt.type_decl.name) != null or self.type_decls.get(stmt.type_decl.name) != null) return self.fail(stmt.type_decl.line, stmt.type_decl.col, "E_DUPLICATE_BINDING");
+                    self.aliases.put(self.arena, stmt.type_decl.name, target) catch return error.OutOfMemory;
+                    continue;
+                }
+                if (stmt.type_decl.union_variants != null) continue; // validated in the union pass below
                 try self.declareType(stmt.type_decl.name, stmt.type_decl.fields, stmt.type_decl.string_literals, stmt.type_decl.int_literals, stmt.type_decl.line, stmt.type_decl.col);
+            }
+        }
+        // Union pass: variants must already be declared records sharing a single
+        // string-literal discriminant field. Build the merged flat-struct fields.
+        for (program.stmts) |*stmt| {
+            if (stmt.* == .type_decl and stmt.type_decl.union_variants != null) {
+                try self.declareUnion(&stmt.type_decl);
             }
         }
         for (program.stmts) |*stmt| {
@@ -729,6 +869,7 @@ const Checker = struct {
                 for (sc.args, 0..) |it, i| c[i] = try self.cloneExpr(it);
                 break :blk .{ .static_call = .{ .namespace = sc.namespace, .name = sc.name, .args = c } };
             },
+            .cast => |c| .{ .cast = .{ .inner = try self.cloneExpr(c.inner), .annotation = try self.substCur(c.annotation) } },
         };
         return p;
     }
@@ -1144,7 +1285,7 @@ const Checker = struct {
                 const expected_type = found_binding.ty;
                 if (std.mem.eql(u8, assignment.op, "=")) {
                     switch (expected_type) {
-                        .named, .named_array, .string_literal_union, .int_literal_union, .optional => {},
+                        .named, .named_array, .union_type, .string_literal_union, .int_literal_union, .optional => {},
                         else => if (self.exprType(program, assignment.value, assignment.line, assignment.col)) |actual_type| {
                             if (!types.same(expected_type, actual_type)) {
                                 return self.fail(assignment.line, assignment.col, "E_TYPE_MISMATCH");
@@ -1226,11 +1367,38 @@ const Checker = struct {
                     return self.inferenceFail(branch.line, branch.col, "cannot infer if condition type");
                 if (!types.same(.bool, cond_type)) return self.fail(branch.line, branch.col, "E_TYPE_MISMATCH");
                 const narrow = narrowTarget(branch.cond);
+                // Discriminant narrowing: `if (s.kind === "circle")` narrows `s` to
+                // the matching variant in the then-branch.
+                var var_narrowed = false;
+                if (branch.cond.* == .cmp) {
+                    const c = branch.cond.cmp;
+                    if (std.mem.eql(u8, c.op, "==") or std.mem.eql(u8, c.op, "===")) {
+                        var disc_expr: ?*ast.Expr = null;
+                        var lit: ?[]const u8 = null;
+                        if (c.r.* == .str) {
+                            disc_expr = c.l;
+                            lit = c.r.str;
+                        } else if (c.l.* == .str) {
+                            disc_expr = c.r;
+                            lit = c.l.str;
+                        }
+                        if (disc_expr) |de| {
+                            if (self.discriminantAccess(de)) |d| {
+                                const variant = self.variantForValue(d.union_name, lit.?) orelse return self.fail(branch.line, branch.col, "E_TYPE_MISMATCH");
+                                self.narrowed_variants.append(self.arena, .{ .name = d.name, .variant = variant }) catch return error.OutOfMemory;
+                                var_narrowed = true;
+                            }
+                        }
+                    }
+                }
                 {
                     const active = narrow != null and narrow.?.in_then;
                     if (active) self.narrowed.append(self.arena, narrow.?.name) catch return error.OutOfMemory;
                     defer if (active) {
                         self.narrowed.items.len -= 1;
+                    };
+                    defer if (var_narrowed) {
+                        self.narrowed_variants.items.len -= 1;
                     };
                     try self.checkBlock(program, branch.then_body);
                 }
@@ -1244,6 +1412,9 @@ const Checker = struct {
                 }
             },
             .switch_stmt => |*switch_stmt| {
+                // A `switch (s.kind)` over a union discriminant narrows `s` to the
+                // matching variant inside each case body.
+                const disc = self.discriminantAccess(switch_stmt.value);
                 const switch_type = self.exprType(program, switch_stmt.value, switch_stmt.line, switch_stmt.col) orelse
                     return self.inferenceFail(switch_stmt.line, switch_stmt.col, "cannot infer switch value type");
                 switch_stmt.checked_type = switch_type;
@@ -1258,6 +1429,17 @@ const Checker = struct {
                             if (!types.same(switch_type, case_type)) return self.fail(case.line, case.col, "E_TYPE_MISMATCH");
                         },
                     }
+                    var narrowed = false;
+                    if (disc) |d| {
+                        if (case.value.* == .str) {
+                            const variant = self.variantForValue(d.union_name, case.value.str) orelse return self.fail(case.line, case.col, "E_TYPE_MISMATCH");
+                            self.narrowed_variants.append(self.arena, .{ .name = d.name, .variant = variant }) catch return error.OutOfMemory;
+                            narrowed = true;
+                        }
+                    }
+                    defer if (narrowed) {
+                        self.narrowed_variants.items.len -= 1;
+                    };
                     try self.checkBlock(program, case.body);
                 }
                 if (switch_stmt.default_body) |default_body| try self.checkBlock(program, default_body);
@@ -1368,6 +1550,32 @@ const Checker = struct {
                     }
                 }
                 value.* = .{ .obj = ordered };
+            },
+            .union_type => |union_name| {
+                const uinfo = self.unions.get(union_name) orelse return self.fail(line, col, "unknown type name");
+                // A union value flows through (same union, narrowed variant, or a
+                // value already typed as one of the variants).
+                if (value.* != .obj) {
+                    const actual_type = self.exprType(program, value, line, col) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
+                    if (types.same(expected, actual_type)) return;
+                    if (actual_type == .named) {
+                        for (uinfo.variants) |v| {
+                            if (std.mem.eql(u8, v.name, actual_type.named)) return;
+                        }
+                    }
+                    return self.fail(line, col, "E_TYPE_MISMATCH");
+                }
+                // An object literal must match exactly one variant. Match on the
+                // discriminant field's literal value, then validate as that record.
+                const disc_field = findField(value.obj, uinfo.discriminant) orelse return self.fail(line, col, "E_TYPE_MISMATCH");
+                if (disc_field.value.* != .str) return self.fail(line, col, "E_TYPE_MISMATCH");
+                const tag = disc_field.value.str;
+                for (uinfo.variants) |v| {
+                    if (std.mem.eql(u8, v.disc_value, tag)) {
+                        return self.ensureAssignable(program, .{ .named = v.name }, value, line, col);
+                    }
+                }
+                return self.fail(line, col, "E_TYPE_MISMATCH");
             },
             .optional => |inner| {
                 if (value.* == .null_lit) return; // absent is always assignable
@@ -1659,6 +1867,19 @@ const Checker = struct {
                 }
                 return switch (obj_type) {
                     .named => |type_name| self.fieldType(type_name, field.name, line, col),
+                    .union_type => |union_name| blk2: {
+                        // If the union binding is narrowed to a variant, read that
+                        // variant's fields; otherwise only the discriminant field.
+                        if (field.obj.* == .var_ref) {
+                            if (self.narrowedVariant(field.obj.var_ref.name)) |variant| {
+                                break :blk2 self.fieldType(variant, field.name, line, col);
+                            }
+                        }
+                        const uinfo = self.unions.get(union_name) orelse return null;
+                        if (std.mem.eql(u8, field.name, uinfo.discriminant)) break :blk2 .string;
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    },
                     .class_type => |class_name| self.classField(class_name, field.name) orelse {
                         _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                         return null;
@@ -1886,8 +2107,35 @@ const Checker = struct {
             .static_call => |*call| {
                 return self.staticCallType(program, call, line, col);
             },
+            .cast => |*c| {
+                const target = self.typeFromAnnotation(c.annotation, line, col) catch return null;
+                const source = self.exprType(program, c.inner, line, col) orelse return null;
+                if (!self.castAllowed(source, target)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+                c.checked_type = target;
+                return target;
+            },
             else => types.inferExprType(e),
         };
+    }
+
+    /// Whether `expr as T` is in the safe, representation-preserving subset: the
+    /// assertion is erased to the operand, so source and target must share the
+    /// same emitted layout. This covers identity, alias <-> underlying type, and
+    /// literal-union widening (`"a" | "b"` -> string, `1 | 2` -> int).
+    fn castAllowed(self: *Checker, source: types.Type, target: types.Type) bool {
+        if (types.same(source, target)) return true;
+        // A string-literal-union value may be asserted to/from string.
+        if (source == .string_literal_union and target == .string) return true;
+        if (source == .string and target == .string_literal_union) return true;
+        if (source == .int_literal_union and target == .i32) return true;
+        if (source == .i32 and target == .int_literal_union) return true;
+        // Otherwise require an identical emitted layout so erasure stays sound.
+        const sn = types.zigName(self.arena, source) catch return false;
+        const tn = types.zigName(self.arena, target) catch return false;
+        return std.mem.eql(u8, sn, tn);
     }
 
     fn fieldType(self: *Checker, type_name: []const u8, field_name: []const u8, line: u32, col: u32) ?types.Type {

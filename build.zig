@@ -133,6 +133,11 @@ pub fn build(b: *std.Build) void {
     conformance_cmd_016.addArg("specs/016-generics/conformance/manifest.json");
     conformance_cmd_016.addArg("zig-out/bin/lumen");
 
+    const conformance_cmd_017 = b.addRunArtifact(conformance_runner);
+    conformance_cmd_017.step.dependOn(b.getInstallStep());
+    conformance_cmd_017.addArg("specs/017-type-aliases-unions/conformance/manifest.json");
+    conformance_cmd_017.addArg("zig-out/bin/lumen");
+
     const conformance_step = b.step("conformance", "Run Lumen manifest conformance cases");
     conformance_step.dependOn(&conformance_cmd.step);
     conformance_step.dependOn(&conformance_cmd_010.step);
@@ -140,6 +145,7 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&conformance_cmd_014.step);
     conformance_step.dependOn(&conformance_cmd_015.step);
     conformance_step.dependOn(&conformance_cmd_016.step);
+    conformance_step.dependOn(&conformance_cmd_017.step);
     conformance_step.dependOn(&conformance_cmd_002.step);
     conformance_step.dependOn(&conformance_cmd_003.step);
     conformance_step.dependOn(&conformance_cmd_004.step);

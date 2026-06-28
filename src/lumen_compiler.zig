@@ -171,6 +171,14 @@ const Parser = struct {
         return std.mem.eql(u8, name, "Math") or std.mem.eql(u8, name, "String") or std.mem.eql(u8, name, "Array") or std.mem.eql(u8, name, "fs");
     }
     fn parseTypeMember(self: *Parser) CompileError![]const u8 {
+        // A string-literal member type, e.g. a discriminant field `kind: "circle"`.
+        // The annotation is recorded with quotes preserved so the checker can
+        // recognize and compare the literal value.
+        if (self.cur == .str) {
+            const lit = std.fmt.allocPrint(self.arena, "\"{s}\"", .{self.cur.str}) catch return error.OutOfMemory;
+            try self.advance();
+            return lit;
+        }
         if (self.cur != .ident) return error.ParseError;
         var base = self.cur.ident;
         try self.advance();
@@ -456,7 +464,14 @@ const Parser = struct {
             try self.advance();
             return self.node(.{ .bnot = try self.parseUnary() });
         }
-        return self.parsePostfix();
+        var e = try self.parsePostfix();
+        // Postfix `as T` type assertion (erased at emit; checked for safety).
+        while (self.isKw("as")) {
+            try self.advance();
+            const annotation = try self.parseTypeAnnotation();
+            e = try self.node(.{ .cast = .{ .inner = e, .annotation = annotation } });
+        }
+        return e;
     }
     fn parsePostfix(self: *Parser) CompileError!*Expr {
         return self.parsePostfixFrom(try self.parsePrimary());
@@ -724,19 +739,57 @@ const Parser = struct {
             try self.expectOp(';');
             return .{ .type_decl = .{ .name = tname, .int_literals = try int_literals.toOwnedSlice(self.arena), .line = line, .col = col } };
         }
-        try self.expectOp('{');
-        var fields: std.ArrayListUnmanaged(ast.TypeField) = .empty;
-        while (!self.isOp('}')) {
-            if (self.cur != .ident) return error.ParseError;
-            const fname = self.cur.ident;
+        // Object record body: `type T = { ... }`.
+        if (self.isOp('{')) {
             try self.advance();
-            const annotation = try self.parseOptionalMember();
-            try fields.append(self.arena, .{ .name = fname, .annotation = annotation });
-            if (self.isOp(',')) try self.advance() else break;
+            var fields: std.ArrayListUnmanaged(ast.TypeField) = .empty;
+            while (!self.isOp('}')) {
+                if (self.cur != .ident) return error.ParseError;
+                const fname = self.cur.ident;
+                try self.advance();
+                const annotation = try self.parseOptionalMember();
+                try fields.append(self.arena, .{ .name = fname, .annotation = annotation });
+                if (self.isOp(',')) try self.advance() else break;
+            }
+            try self.expectOp('}');
+            if (self.isOp(';')) try self.advance();
+            return .{ .type_decl = .{ .name = tname, .fields = try fields.toOwnedSlice(self.arena), .line = line, .col = col } };
         }
-        try self.expectOp('}');
-        if (self.isOp(';')) try self.advance();
-        return .{ .type_decl = .{ .name = tname, .fields = try fields.toOwnedSlice(self.arena), .line = line, .col = col } };
+        // A function-type alias `type F = (a: T) => R;`.
+        if (self.isOp('(')) {
+            const fn_ann = try self.parseFunctionType();
+            try self.expectOp(';');
+            return .{ .type_decl = .{ .name = tname, .alias = fn_ann, .line = line, .col = col } };
+        }
+        // Otherwise an alias `type X = <member>;`, an optional alias
+        // `type X = T | null;`, or a discriminated union `type U = A | B | C;`
+        // over named record variants. Collect `|`-separated members first.
+        var members: std.ArrayListUnmanaged([]const u8) = .empty;
+        try members.append(self.arena, try self.parseTypeMember());
+        while (self.isCmp("|")) {
+            try self.advance();
+            try members.append(self.arena, try self.parseTypeMember());
+        }
+        try self.expectOp(';');
+        const items = try members.toOwnedSlice(self.arena);
+        if (items.len == 1) {
+            return .{ .type_decl = .{ .name = tname, .alias = items[0], .line = line, .col = col } };
+        }
+        // `T | null` / `T | undefined` -> optional alias.
+        var nulls: usize = 0;
+        var non_null: ?[]const u8 = null;
+        for (items) |m| {
+            if (std.mem.eql(u8, m, "null") or std.mem.eql(u8, m, "undefined")) {
+                nulls += 1;
+            } else {
+                non_null = m;
+            }
+        }
+        if (items.len == 2 and nulls == 1) {
+            const opt = std.fmt.allocPrint(self.arena, "{s}?", .{non_null.?}) catch return error.OutOfMemory;
+            return .{ .type_decl = .{ .name = tname, .alias = opt, .line = line, .col = col } };
+        }
+        return .{ .type_decl = .{ .name = tname, .union_variants = items, .line = line, .col = col } };
     }
 
     /// Parses `[?] : Type` after a field/param name, returning the annotation with
@@ -1782,7 +1835,29 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try emitExpr(idx.value, w, arena);
             try w.appendSlice(arena, "))]");
         },
+        .cast => |c| {
+            // `expr as T` is a checker-only assertion; the runtime value is the
+            // same flat struct / scalar, so emit the operand unchanged.
+            try emitExpr(c.inner, w, arena);
+        },
     }
+}
+
+/// A neutral default value for a flat union-struct field, used so a single
+/// variant's object literal can omit the other variants' fields.
+fn zigZeroValue(arena: std.mem.Allocator, t: types.Type) CompileError![]const u8 {
+    _ = arena;
+    return switch (t) {
+        .i32, .i64, .int_literal_union => "0",
+        .f64 => "0",
+        .bool => "false",
+        .enum_type => |e| if (e.is_string) "\"\"" else "0",
+        .string, .string_literal_union, .error_obj => "\"\"",
+        .i32_array, .i64_array, .f64_array, .bool_array, .string_array => "&.{}",
+        .named_array => "&.{}",
+        .optional, .none => "null",
+        else => "undefined",
+    };
 }
 
 /// Emit value equality between a slice element `__e` and the (already-emitted)
@@ -2136,6 +2211,7 @@ fn exprUsesName(e: *const Expr, name: []const u8) bool {
             for (sc.args) |it| if (exprUsesName(it, name)) break :blk true;
             break :blk false;
         },
+        .cast => |c| exprUsesName(c.inner, name),
     };
 }
 
@@ -2216,6 +2292,7 @@ fn exprUsesThis(e: *const Expr) bool {
             for (sc.args) |it| if (exprUsesThis(it)) break :blk true;
             break :blk false;
         },
+        .cast => |c| exprUsesThis(c.inner),
     };
 }
 
@@ -2304,6 +2381,29 @@ fn emitAssignExpr(assignment: ast.Assign, body: *std.ArrayListUnmanaged(u8), are
     }
 }
 
+/// Whether a switch case/default body contains a `break` that targets the switch
+/// itself. Descends through `if`/`try`/`defer` blocks but not into nested loops
+/// or switches, whose own `break` binds to that inner construct.
+fn bodyHasSwitchBreak(body: []const Stmt) bool {
+    for (body) |*s| {
+        switch (s.*) {
+            .break_stmt => return true,
+            .if_stmt => |b| {
+                if (bodyHasSwitchBreak(b.then_body)) return true;
+                if (b.else_body) |eb| if (bodyHasSwitchBreak(eb)) return true;
+            },
+            .try_stmt => |t| {
+                if (bodyHasSwitchBreak(t.try_body)) return true;
+                if (bodyHasSwitchBreak(t.catch_body)) return true;
+                if (t.finally_body) |fb| if (bodyHasSwitchBreak(fb)) return true;
+            },
+            .defer_stmt => |d| if (bodyHasSwitchBreak(d.body)) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
 fn emitSwitchCaseMatch(switch_type: types.Type, switch_value: *const Expr, case_value: *const Expr, body: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
     if (types.isStringLike(switch_type)) {
         try body.appendSlice(arena, "std.mem.eql(u8, ");
@@ -2354,6 +2454,21 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
     switch (stmt.*) {
         .type_decl => |decl| {
             if (decl.string_literals != null) return;
+            if (decl.int_literals != null) return;
+            if (decl.alias != null) return; // aliases are erased: resolve to target
+            if (decl.union_variants != null) {
+                // A discriminated union lowers to a flat struct holding the union
+                // of every variant's fields, each with a default so a single
+                // variant's object literal initializes cleanly.
+                try decls.print(arena, "const {s} = struct {{\n", .{decl.name});
+                for (decl.fields) |field| {
+                    const field_type = field.checked_type orelse return error.ParseError;
+                    const zty = try types.zigName(arena, field_type);
+                    try decls.print(arena, "    {s}: {s} = {s},\n", .{ field.name, zty, try zigZeroValue(arena, field_type) });
+                }
+                try decls.appendSlice(arena, "};\n");
+                return;
+            }
             if (decl.type_params.len > 0) return; // generic template: only specializations emit
             try decls.print(arena, "const {s} = struct {{\n", .{decl.name});
             for (decl.fields) |field| {
@@ -2551,18 +2666,29 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
         },
         .switch_stmt => |switch_stmt| {
             const switch_type = switch_stmt.checked_type orelse return error.ParseError;
+            // The break-target label is only emitted when a case actually breaks;
+            // a switch whose cases all `return` (e.g. discriminated-union
+            // dispatch) needs no label, which Zig would reject as unused.
+            var needs_label = false;
+            for (switch_stmt.cases) |case| {
+                if (bodyHasSwitchBreak(case.body)) needs_label = true;
+            }
+            if (switch_stmt.default_body) |db| {
+                if (bodyHasSwitchBreak(db)) needs_label = true;
+            }
             const label = try std.fmt.allocPrint(arena, "__lumen_switch_{d}_{d}", .{ switch_stmt.line, switch_stmt.col });
-            try body.print(arena, "    {s}: {{\n", .{label});
+            const label_target: ?[]const u8 = if (needs_label) label else null;
+            if (needs_label) try body.print(arena, "    {s}: {{\n", .{label}) else try body.appendSlice(arena, "    {\n");
             for (switch_stmt.cases, 0..) |case, i| {
                 try body.appendSlice(arena, if (i == 0) "    if (" else "    else if (");
                 try emitSwitchCaseMatch(switch_type, switch_stmt.value, case.value, body, arena);
                 try body.appendSlice(arena, ") {\n");
-                for (case.body) |*case_stmt| try emitStmtWithThrow(case_stmt, decls, body, arena, throw_target, label, options);
+                for (case.body) |*case_stmt| try emitStmtWithThrow(case_stmt, decls, body, arena, throw_target, label_target, options);
                 try body.appendSlice(arena, "    }\n");
             }
             if (switch_stmt.default_body) |default_body| {
                 try body.appendSlice(arena, if (switch_stmt.cases.len == 0) "    {\n" else "    else {\n");
-                for (default_body) |*default_stmt| try emitStmtWithThrow(default_stmt, decls, body, arena, throw_target, label, options);
+                for (default_body) |*default_stmt| try emitStmtWithThrow(default_stmt, decls, body, arena, throw_target, label_target, options);
                 try body.appendSlice(arena, "    }\n");
             }
             try body.appendSlice(arena, "    }\n");

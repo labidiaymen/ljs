@@ -18,6 +18,9 @@ pub const Type = union(enum) {
     int_literal_union: []const u8,
     named: []const u8,
     named_array: []const u8,
+    // A discriminated union over named record variants, identified by the union's
+    // declared name. Lowers to a flat Zig struct (union of all variant fields).
+    union_type: []const u8,
     enum_type: EnumType,
     optional: *const Type, // T | null / T | undefined  ->  Zig ?T
     none, // the bare null/undefined literal, assignable to any optional
@@ -55,6 +58,7 @@ fn mangle(arena: std.mem.Allocator, t: Type) error{OutOfMemory}![]const u8 {
         .int_literal_union => |n| try std.fmt.allocPrint(arena, "ilu_{s}", .{n}),
         .named => |n| n,
         .named_array => |n| try std.fmt.allocPrint(arena, "ar_{s}", .{n}),
+        .union_type => |n| try std.fmt.allocPrint(arena, "un_{s}", .{n}),
         .enum_type => |e| try std.fmt.allocPrint(arena, "enum_{s}", .{e.name}),
         .optional => |inner| try std.fmt.allocPrint(arena, "opt_{s}", .{try mangle(arena, inner.*)}),
         .class_type => |n| try std.fmt.allocPrint(arena, "cls_{s}", .{n}),
@@ -122,7 +126,7 @@ pub fn inferExprType(e: *const ast.Expr) ?Type {
             return if (same(then_type, else_type)) then_type else null;
         },
         .template => .string,
-        .array, .var_ref, .obj, .field, .index, .call, .static_call, .coalesce, .arrow, .this_expr, .new_expr, .method_call => null,
+        .array, .var_ref, .obj, .field, .index, .call, .static_call, .coalesce, .arrow, .this_expr, .new_expr, .method_call, .cast => null,
     };
 }
 
@@ -154,6 +158,10 @@ pub fn same(a: Type, b: Type) bool {
         },
         .named_array => |a_name| switch (b) {
             .named_array => |b_name| std.mem.eql(u8, a_name, b_name),
+            else => false,
+        },
+        .union_type => |a_name| switch (b) {
+            .union_type => |b_name| std.mem.eql(u8, a_name, b_name),
             else => false,
         },
         .enum_type => |a_enum| switch (b) {
@@ -266,6 +274,7 @@ pub fn toAnnotation(arena: std.mem.Allocator, t: Type) error{OutOfMemory}!?[]con
         .string_array => "string[]",
         .named => |n| n,
         .named_array => |n| try std.fmt.allocPrint(arena, "{s}[]", .{n}),
+        .union_type => |n| n,
         .class_type => |n| n,
         .enum_type => |e| e.name,
         .string_literal_union => |n| n,
@@ -313,6 +322,7 @@ pub fn zigName(arena: std.mem.Allocator, t: Type) ![]const u8 {
         .int_literal_union => "i32",
         .named => |name| name,
         .named_array => |name| try std.fmt.allocPrint(arena, "[]const {s}", .{name}),
+        .union_type => |name| name,
         .enum_type => |e| if (e.is_string) "[]const u8" else "i32",
         .optional => |inner| try std.fmt.allocPrint(arena, "?{s}", .{try zigName(arena, inner.*)}),
         .none => "?u8", // defensive; a bare null is only valid in an optional context

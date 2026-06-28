@@ -25,6 +25,10 @@ pub const TypeDecl = struct {
     fields: []TypeField = &.{},
     string_literals: ?[][]const u8 = null,
     int_literals: ?[]i64 = null,
+    // `type X = <annotation>;` — an alias over an existing spellable type.
+    alias: ?[]const u8 = null,
+    // `type U = A | B | C;` — a discriminated union over named record variants.
+    union_variants: ?[][]const u8 = null,
     // Type parameters for a generic interface/type alias, e.g. `Pair<A, B>`.
     // When non-empty the declaration is a template specialized on use.
     type_params: [][]const u8 = &.{},
@@ -305,6 +309,7 @@ pub const Expr = union(enum) {
     index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null },
     call: struct { name: []const u8, args: []*Expr, emit_name: ?[]const u8 = null, is_closure: bool = false, type_args: [][]const u8 = &.{} }, // builtin / user / function-value call; type_args from explicit f<T>(...)
     static_call: StaticCall,
+    cast: struct { inner: *Expr, annotation: []const u8, checked_type: ?types.Type = null }, // `expr as T` (safe-subset assertion; erased at emit)
 };
 
 pub const FieldBuiltin = enum {
