@@ -3504,6 +3504,12 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.appendSlice(arena, "const std = @import(\"std\");\n");
+    // Async programs run their event loop on libuv. The CLI auto-injects libuv's
+    // include/link flags into the native build whenever a program uses async, so
+    // this C import resolves without any user configuration.
+    if (program.needs_async) {
+        try out.appendSlice(arena, "const uv = @cImport(@cInclude(\"uv.h\"));\n");
+    }
 
     // I/O plumbing is hoisted to file scope so builtins (arg, fs, httpGet, …)
     // work inside functions, not just at the top level. `main` assigns these.
@@ -3673,46 +3679,24 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
         );
     }
     if (program.needs_async) {
-        // A single-threaded event loop with a timer list and a ready (microtask)
-        // queue, plus a Promise<T> heap object. `await` drives the loop until the
-        // awaited promise resolves, then reads its value. This supports the sound
-        // subset: awaiting an already-resolved promise or a timer-resolved one.
+        // The event loop is libuv. `setTimeout` schedules a `uv_timer_t`; `await`
+        // drives the loop one event at a time (`uv_run(..., UV_RUN_ONCE)`) until
+        // the awaited promise resolves, then reads its value; the program ends by
+        // draining remaining work with `uv_run(..., UV_RUN_DEFAULT)`. This is
+        // sound for the supported subset (already-resolved and timer-resolved
+        // promises) and keeps timer ordering deterministic, because libuv fires
+        // equal-deadline timers in start order.
         try out.appendSlice(arena,
-            \\const LumenTimer = struct { deadline_ns: i96, ctx: *const anyopaque, run: *const fn (*const anyopaque) void };
-            \\const LumenReady = struct { ctx: *const anyopaque, run: *const fn (*const anyopaque) void };
+            \\var __uv_loop: *uv.uv_loop_t = undefined;
             \\const LumenLoop = struct {
-            \\    timers: std.ArrayListUnmanaged(LumenTimer) = .empty,
-            \\    ready: std.ArrayListUnmanaged(LumenReady) = .empty,
-            \\    fn nowNs() i96 { return std.Io.Timestamp.now(__io, .awake).nanoseconds; }
-            \\    fn addTimer(self: *LumenLoop, delay_ms: i64, ctx: *const anyopaque, run: *const fn (*const anyopaque) void) void {
-            \\        const d: i96 = if (delay_ms > 0) @as(i96, delay_ms) * std.time.ns_per_ms else 0;
-            \\        self.timers.append(__alloc, .{ .deadline_ns = nowNs() + d, .ctx = ctx, .run = run }) catch unreachable;
-            \\    }
-            \\    fn tick(self: *LumenLoop) bool {
-            \\        if (self.ready.items.len > 0) {
-            \\            const job = self.ready.orderedRemove(0);
-            \\            job.run(job.ctx);
-            \\            return true;
+            \\    fn init() void { __uv_loop = uv.uv_default_loop().?; }
+            \\    fn driveUntil(ctx: *const anyopaque, done: *const fn (*const anyopaque) bool) void {
+            \\        while (!done(ctx)) {
+            \\            if (uv.uv_run(__uv_loop, uv.UV_RUN_ONCE) == 0) break;
             \\        }
-            \\        if (self.timers.items.len > 0) {
-            \\            var best: usize = 0;
-            \\            for (self.timers.items, 0..) |t, i| { if (t.deadline_ns < self.timers.items[best].deadline_ns) best = i; }
-            \\            const t = self.timers.orderedRemove(best);
-            \\            const now = nowNs();
-            \\            if (t.deadline_ns > now) {
-            \\                std.Io.Clock.Duration.sleep(.{ .raw = .fromNanoseconds(t.deadline_ns - now), .clock = .awake }, __io) catch {};
-            \\            }
-            \\            t.run(t.ctx);
-            \\            return true;
-            \\        }
-            \\        return false;
             \\    }
-            \\    fn driveUntil(self: *LumenLoop, ctx: *const anyopaque, done: *const fn (*const anyopaque) bool) void {
-            \\        while (!done(ctx)) { if (!self.tick()) break; }
-            \\    }
-            \\    fn drain(self: *LumenLoop) void { while (self.tick()) {} }
+            \\    fn drain() void { _ = uv.uv_run(__uv_loop, uv.UV_RUN_DEFAULT); }
             \\};
-            \\var __lumen_loop: LumenLoop = .{};
             \\fn LumenPromise(comptime T: type) type {
             \\    return struct {
             \\        const Self = @This();
@@ -3729,7 +3713,7 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\            return self.resolved;
             \\        }
             \\        fn await_(self: *Self) T {
-            \\            __lumen_loop.driveUntil(self, isResolved);
+            \\            LumenLoop.driveUntil(self, isResolved);
             \\            return self.value;
             \\        }
             \\    };
@@ -3743,14 +3727,19 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\    const Cb = @TypeOf(cb);
             \\    const Holder = struct {
             \\        f: Cb,
-            \\        fn run(ctx: *const anyopaque) void {
-            \\            const h: *const @This() = @ptrCast(@alignCast(ctx));
+            \\        timer: uv.uv_timer_t,
+            \\        fn onTimer(t: [*c]uv.uv_timer_t) callconv(.c) void {
+            \\            const h: *@This() = @fieldParentPtr("timer", @as(*uv.uv_timer_t, @ptrCast(t)));
             \\            h.f.call(h.f.ctx);
+            \\            _ = uv.uv_timer_stop(t);
+            \\            uv.uv_close(@ptrCast(t), null);
             \\        }
             \\    };
             \\    const h = __alloc.create(Holder) catch unreachable;
-            \\    h.* = .{ .f = cb };
-            \\    __lumen_loop.addTimer(ms, h, Holder.run);
+            \\    h.* = .{ .f = cb, .timer = undefined };
+            \\    _ = uv.uv_timer_init(__uv_loop, &h.timer);
+            \\    const delay: u64 = if (ms > 0) @intCast(ms) else 0;
+            \\    _ = uv.uv_timer_start(&h.timer, Holder.onTimer, delay, 0);
             \\}
             \\
         );
@@ -3806,13 +3795,16 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
         if (program.needs_args) {
             try out.appendSlice(arena, "    __args = __init.minimal.args.toSlice(__alloc) catch std.process.exit(1);\n");
         }
+        if (program.needs_async) {
+            try out.appendSlice(arena, "    LumenLoop.init();\n");
+        }
     } else {
         try out.appendSlice(arena, "pub fn main() void {\n");
     }
     try out.appendSlice(arena, body.items);
     // Drain any remaining timers/microtasks so fire-and-forget setTimeout
     // callbacks run before the program exits.
-    if (program.needs_async) try out.appendSlice(arena, "    __lumen_loop.drain();\n");
+    if (program.needs_async) try out.appendSlice(arena, "    LumenLoop.drain();\n");
     try out.appendSlice(arena, "}\n");
     return out.items;
 }

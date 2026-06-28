@@ -357,6 +357,41 @@ fn appendLink(arena: std.mem.Allocator, argv: *std.ArrayListUnmanaged([]const u8
     }
 }
 
+/// Auto-links libuv when a program uses async/await. libuv is the async event
+/// loop, so it is a built-in language dependency rather than a user `// @link`.
+/// Flags are discovered with `pkg-config --cflags --libs libuv`; if pkg-config
+/// is unavailable we fall back to the conventional Homebrew install location.
+/// Each whitespace-separated token (e.g. `-I/...`, `-L/...`, `-luv`) becomes its
+/// own argv element, and `zig build-exe` is told to link libc so libuv resolves.
+fn collectAsyncRuntimeLibs(arena: std.mem.Allocator, io: std.Io, argv: *std.ArrayListUnmanaged([]const u8)) !void {
+    try argv.append(arena, "-lc");
+    if (pkgConfigFlags(arena, io)) |flags| {
+        var it = std.mem.tokenizeAny(u8, flags, " \t\r\n");
+        while (it.next()) |tok| try argv.append(arena, try arena.dupe(u8, tok));
+        return;
+    }
+    // Fallback: the documented Homebrew libuv prefix on this platform.
+    const prefix = "/opt/homebrew/opt/libuv";
+    try argv.append(arena, try std.fmt.allocPrint(arena, "-I{s}/include", .{prefix}));
+    try argv.append(arena, try std.fmt.allocPrint(arena, "-L{s}/lib", .{prefix}));
+    try argv.append(arena, "-luv");
+}
+
+/// Runs `pkg-config --cflags --libs libuv` and returns its trimmed stdout, or
+/// null if pkg-config is missing or reports failure.
+fn pkgConfigFlags(arena: std.mem.Allocator, io: std.Io) ?[]const u8 {
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "pkg-config", "--cflags", "--libs", "libuv" },
+    }) catch return null;
+    switch (res.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+    const out = std.mem.trim(u8, res.stdout, " \t\r\n");
+    if (out.len == 0) return null;
+    return out;
+}
+
 /// Links from each `// @link <lib>` pragma line in the source.
 fn collectLinkLibs(arena: std.mem.Allocator, source: []const u8, argv: *std.ArrayListUnmanaged([]const u8)) !void {
     const marker = "// @link ";
@@ -416,6 +451,12 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
     switch (action) {
         .build_exe => try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-O", mode.zigName(), emit }),
         .run_test => try argv.appendSlice(arena, &.{ "zig", "test", gen_path }),
+    }
+    // The async event loop is libuv: when the program uses async/await, the
+    // generated backend imports `uv.h`, so auto-inject libuv's include/link
+    // flags (this is a language feature, not a user `// @link`).
+    if (std.mem.indexOf(u8, zig_src, "@cInclude(\"uv.h\")") != null) {
+        try collectAsyncRuntimeLibs(arena, io, &argv);
     }
     // Link C libraries: from `// @link <lib>` source pragmas and `--link` flags.
     try collectLinkLibs(arena, source, &argv);
