@@ -22,7 +22,7 @@ const std = @import("std");
 const max_body_size: usize = 512 * 1024;
 
 /// Per-compile wall-clock timeout, in seconds. Enforced via coreutils `timeout`.
-const compile_timeout_secs: u32 = 20;
+const compile_timeout_secs: u32 = 40;
 
 /// Working directory the compiler runs in. The compiler writes `play.wasm` next
 /// to its input, so each compile happens inside this directory.
