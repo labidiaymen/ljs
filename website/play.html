@@ -40,10 +40,12 @@
 
 <section class="wrap">
   <h2>Playground</h2>
-  <p class="sub">Write Lumen, compile it to WebAssembly, and run it right here. The
-  code is compiled by the toolchain and the resulting module runs in your browser.
-  Pick an example to see a feature, or edit freely. (FFI and async aren't available
-  in the in-browser target.)</p>
+  <p class="sub">Write Lumen &mdash; TypeScript syntax that compiles to a single
+  WebAssembly module &mdash; and run it right here in your browser. Import packages
+  straight from a URL; some embed real C libraries (QuickJS, SQLite) into the wasm.
+  Try the <strong>Markdown &rarr; HTML</strong> or <strong>Embed JavaScript</strong>
+  examples below, or edit freely. (Async isn&rsquo;t available in the in-browser
+  target yet.)</p>
 
   <div class="play-bar">
     <label for="examples" class="play-label">Example</label>
@@ -60,6 +62,15 @@
 <div id="examples-data" hidden>
 <script type="text/x-lumen" data-title="Hello, Lumen">const name: string = "Lumen";
 console.log(`Hello, ${name}!`);</script>
+<script type="text/x-lumen" data-title="Markdown &rarr; HTML (on npm)">// A Markdown renderer written in Lumen -- TypeScript syntax, no runtime. The very
+// same code is published on npm as @lumen-lang/markdown (zero dependencies): it
+// compiles to wasm and renders faster than the popular pure-JS libraries.
+//
+//   npm install @lumen-lang/markdown
+//
+import { render } from "https://lumen-lang.org/package/std-contrib/markdown/markdown.ts";
+
+console.log(render("# Lumen\n\nWrite **TypeScript syntax**, ship a fast `wasm` library.\n\n- no runtime\n- zero dependencies\n\n> Imported straight from a URL."));</script>
 <script type="text/x-lumen" data-title="Generics">function firstOf<T>(xs: T[]): T {
   return xs[0];
 }
