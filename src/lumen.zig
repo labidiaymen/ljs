@@ -406,7 +406,7 @@ fn watchRebuild(
 ) !void {
     // Reuse the standard compile path so diagnostics are identical to `lumen
     // compile`. compileFile prints either the diagnostic or the success line.
-    const code = compileFile(arena, io, path, mode, .build_exe, &.{}, err) catch |e| {
+    const code = compileFile(arena, io, path, mode, .build_exe, &.{}, false, err) catch |e| {
         try err.print("watch: rebuild error: {s}\n", .{@errorName(e)});
         try err.flush();
         return;
@@ -724,7 +724,7 @@ fn collectLinkLibs(arena: std.mem.Allocator, source: []const u8, argv: *std.Arra
     }
 }
 
-fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: CompileMode, action: Action, cli_libs: []const []const u8, err: *std.Io.Writer) !u8 {
+fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: CompileMode, action: Action, cli_libs: []const []const u8, wasm: bool, err: *std.Io.Writer) !u8 {
     if (!std.mem.endsWith(u8, path, ".ts")) {
         try err.print("error: expected a .ts source file, got {s}\n", .{path});
         return 2;
@@ -750,11 +750,20 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
         return 1;
     };
 
+    // The wasm target runs in a sandbox (e.g. the playground) with no C ABI and
+    // no event loop, so C FFI and async are not available there yet.
+    if (wasm and (std.mem.indexOf(u8, source, "// @link") != null or std.mem.indexOf(u8, zig_src, "@cInclude(\"uv.h\")") != null)) {
+        try err.print("{s}:1:1: error: the wasm target does not support C FFI or async yet\n", .{path});
+        return 1;
+    }
+
     const base = std.fs.path.stem(path);
     // The generated backend source is an internal artifact: write it to a hidden
     // temp file and remove it after building, so the user never sees it.
     const gen_path = try std.fmt.allocPrint(arena, ".lumen-{s}.zig", .{base});
-    const exe_name = if (@import("builtin").os.tag == .windows)
+    const exe_name = if (wasm)
+        try std.fmt.allocPrint(arena, "{s}.wasm", .{base})
+    else if (@import("builtin").os.tag == .windows)
         try std.fmt.allocPrint(arena, "{s}.exe", .{base})
     else
         try arena.dupe(u8, base);
@@ -768,18 +777,25 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
     // downloaded build is self-contained without exposing zig in the user's shell.
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     switch (action) {
-        .build_exe => try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-O", mode.zigName(), emit }),
+        .build_exe => if (wasm)
+            try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-target", "wasm32-wasi", "-O", "ReleaseSmall", emit })
+        else
+            try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-O", mode.zigName(), emit }),
         .run_test => try argv.appendSlice(arena, &.{ "zig", "test", gen_path }),
     }
-    // The async event loop is libuv: when the program uses async/await, the
-    // generated backend imports `uv.h`, so auto-inject libuv's include/link
-    // flags (this is a language feature, not a user `// @link`).
-    if (std.mem.indexOf(u8, zig_src, "@cInclude(\"uv.h\")") != null) {
-        try collectAsyncRuntimeLibs(arena, io, &argv);
+    // Native builds link C libraries; the wasm target has none (FFI/async were
+    // rejected above), so skip link collection entirely for wasm.
+    if (!wasm) {
+        // The async event loop is libuv: when the program uses async/await, the
+        // generated backend imports `uv.h`, so auto-inject libuv's include/link
+        // flags (this is a language feature, not a user `// @link`).
+        if (std.mem.indexOf(u8, zig_src, "@cInclude(\"uv.h\")") != null) {
+            try collectAsyncRuntimeLibs(arena, io, &argv);
+        }
+        // Link C libraries: from `// @link <lib>` source pragmas and `--link` flags.
+        try collectLinkLibs(arena, source, &argv);
+        for (cli_libs) |lib| try appendLink(arena, &argv, lib);
     }
-    // Link C libraries: from `// @link <lib>` source pragmas and `--link` flags.
-    try collectLinkLibs(arena, source, &argv);
-    for (cli_libs) |lib| try appendLink(arena, &argv, lib);
     // Build mode: hide the backend's output entirely (a backend failure on valid
     // Lumen is an internal error). Test mode: show test results.
     const show_backend = action == .run_test;
@@ -835,7 +851,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
-    const usage = "usage: lumen init [dir]\n       lumen compile [--release-fast] [--link <lib>] <file.ts>\n       lumen watch [--no-run] [--release-fast] <file.ts>\n       lumen test <file.ts>\n";
+    const usage = "usage: lumen init [dir]\n       lumen compile [--release-fast] [--wasm] [--link <lib>] <file.ts>\n       lumen watch [--no-run] [--release-fast] <file.ts>\n       lumen test <file.ts>\n";
     const code = if (std.mem.eql(u8, args[1], "init")) blk: {
         if (args.len > 3) {
             try err.writeAll(usage);
@@ -848,7 +864,7 @@ pub fn main(init: std.process.Init) !void {
             try err.writeAll("usage: lumen test <file.ts>\n");
             break :blk 2;
         }
-        break :blk try compileFile(arena, io, args[2], .release_safe, .run_test, &.{}, err);
+        break :blk try compileFile(arena, io, args[2], .release_safe, .run_test, &.{}, false, err);
     } else if (std.mem.eql(u8, args[1], "watch")) blk: {
         if (args.len < 3) {
             try err.writeAll("usage: lumen watch [--no-run] [--release-fast] <file.ts>\n");
@@ -885,6 +901,7 @@ pub fn main(init: std.process.Init) !void {
         var mode: CompileMode = .release_safe;
         var source_arg: ?[]const u8 = null;
         var libs: std.ArrayListUnmanaged([]const u8) = .empty;
+        var wasm = false;
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             const arg = args[i];
@@ -892,6 +909,8 @@ pub fn main(init: std.process.Init) !void {
                 mode = .release_fast;
             } else if (std.mem.eql(u8, arg, "--release-safe")) {
                 mode = .release_safe;
+            } else if (std.mem.eql(u8, arg, "--wasm")) {
+                wasm = true;
             } else if (std.mem.eql(u8, arg, "--link")) {
                 i += 1;
                 if (i >= args.len) {
@@ -909,9 +928,9 @@ pub fn main(init: std.process.Init) !void {
         break :blk try compileFile(arena, io, source_arg orelse {
             try err.writeAll(usage);
             break :blk 2;
-        }, mode, .build_exe, libs.items, err);
+        }, mode, .build_exe, libs.items, wasm, err);
     } else blk: {
-        break :blk try compileFile(arena, io, args[1], .release_safe, .build_exe, &.{}, err);
+        break :blk try compileFile(arena, io, args[1], .release_safe, .build_exe, &.{}, false, err);
     };
 
     try err.flush();
