@@ -46,16 +46,35 @@
   but statically typed and compiled to native code. Every member is type- and
   arity-checked before it lowers.</p>
 
+  <div class="docs">
+  <aside class="docs-nav"><nav>
+    <p class="docs-nav-title">Available now</p>
+    <a href="#console">console</a>
+    <a href="#math">Math</a>
+    <a href="#strings">String methods</a>
+    <a href="#arrays">Array methods</a>
+    <a href="#collections">Collections</a>
+    <a href="#async">async / await</a>
+    <a href="#ffi">C FFI</a>
+    <a href="#errors">Errors</a>
+    <a href="#fs">fs / process</a>
+    <p class="docs-nav-title">Planned</p>
+    <a href="#planned">Roadmap</a>
+    <p class="docs-nav-title">Packages</p>
+    <a href="#community">Community</a>
+  </nav></aside>
+  <div class="docs-main">
+
   <h3>Available now</h3>
 
-  <h4>console</h4>
+  <h4 id="console">console</h4>
   <table>
     <tr><th>API</th><th>Type</th></tr>
     <tr><td><code>console.log(x)</code></td><td>any → void</td></tr>
     <tr><td><code>console.error(x)</code></td><td>any → void</td></tr>
   </table>
 
-  <h4>Math</h4>
+  <h4 id="math">Math</h4>
   <table>
     <tr><th>API</th><th>Type</th></tr>
     <tr><td><code>Math.abs(n)</code></td><td>number → number</td></tr>
@@ -65,7 +84,7 @@
     <tr><td><code>Math.sqrt(n)</code></td><td>number → number</td></tr>
   </table>
 
-  <h4>String methods</h4>
+  <h4 id="strings">String methods</h4>
   <p class="sub">Called directly on any <code>string</code> value.</p>
   <table>
     <tr><th>API</th><th>Type</th></tr>
@@ -81,7 +100,7 @@
     <tr><td><code>String.isEmpty(s)</code> · <code>String.contains(s, sub)</code></td><td>→ bool</td></tr>
   </table>
 
-  <h4>Array methods</h4>
+  <h4 id="arrays">Array methods</h4>
   <p class="sub">Called directly on any <code>T[]</code> value; callbacks are
   written as typed arrow functions.</p>
   <table>
@@ -97,7 +116,7 @@
     <tr><td><code>Array.isEmpty(a)</code></td><td>T[] → bool</td></tr>
   </table>
 
-  <h4>Collections</h4>
+  <h4 id="collections">Collections</h4>
   <p class="sub">Typed, generic containers — no dynamic shapes.</p>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
@@ -106,7 +125,7 @@
     <tr><td><code>[A, B]</code> tuple types</td><td>fixed-length, per-slot types; <code>t[0]</code>, <code>t[1]</code></td></tr>
   </table>
 
-  <h4>async · await</h4>
+  <h4 id="async">async · await</h4>
   <p class="sub">Asynchronous code runs on a native event loop. The program
   drains pending callbacks and promises before it exits.</p>
   <table>
@@ -117,7 +136,7 @@
     <tr><td><code>setTimeout(fn, ms)</code></td><td>schedules a callback after a delay</td></tr>
   </table>
 
-  <h4>C FFI</h4>
+  <h4 id="ffi">C FFI</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
     <tr><td><code>declare function name(args): T;</code></td><td>calls a C function directly (<code>extern function</code> also works)</td></tr>
@@ -125,21 +144,21 @@
     <tr><td>string &amp; scalar marshaling</td><td>string params/returns and numeric scalars cross the boundary</td></tr>
   </table>
 
-  <h4>Errors</h4>
+  <h4 id="errors">Errors</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
     <tr><td><code>Error("message")</code> · <code>throw e</code></td><td>throw an error value</td></tr>
     <tr><td><code>try { … } catch (e) { … } finally { … }</code></td><td><code>e.message</code> holds the message</td></tr>
   </table>
 
-  <h4>fs · process</h4>
+  <h4 id="fs">fs · process</h4>
   <table>
     <tr><th>API</th><th>Type</th><th>Notes</th></tr>
     <tr><td><code>fs.readFileSync(path, encoding?)</code></td><td>(string, string?) → string</td><td>UTF-8 text; "" if unreadable</td></tr>
     <tr><td><code>argsCount()</code> · <code>arg(i)</code></td><td>→ int · int → string</td><td>process arguments</td></tr>
   </table>
 
-  <h3>Planned</h3>
+  <h3 id="planned">Planned</h3>
   <p class="sub">The surface grows in explicit, conformance-backed slices. These
   modules use the same conventional names; some depend on upcoming language
   features (noted below).</p>
@@ -198,7 +217,7 @@
     <tr><td><code>http.get(url)</code> → <code>{ status, body }</code></td><td>record return; async on the event loop</td></tr>
   </table>
 
-  <h3>Community packages</h3>
+  <h3 id="community">Community packages</h3>
   <p class="sub">Beyond the built-in surface, curated packages live in the
   <a href="https://github.com/lumen-lang-org/std-contrib">std-contrib</a> repo and
   are imported by URL. They include <code>quickjs</code>, which embeds a
@@ -208,6 +227,9 @@
   <code>JSON.parse&lt;T&gt;</code> arrives later. The built-in library is a fixed,
   contracted surface; everything else ships as explicit
   <a href="https://github.com/lumen-lang-org/std-contrib">community packages</a>.</p>
+
+  </div>
+  </div>
 </section>
 
 <footer><div class="wrap">
