@@ -143,6 +143,7 @@ pub const VarDecl = struct {
     init: *Expr,
     line: u32,
     col: u32,
+    is_accumulator: bool = false, // string-builder local: emitted as a growable ArrayList(u8)
 };
 
 /// `using NAME = EXPR;` — a TypeScript 5.2 resource declaration. The bound value
@@ -195,6 +196,7 @@ pub const Assign = struct {
     // True when the target is a scalar `Ref<T>` parameter; the assignment lowers
     // through the pointer as `name.* = ...`.
     deref: bool = false,
+    is_accumulator: bool = false, // `v = v + ...` append into a string-builder local
 };
 
 pub const ConsoleLog = struct {
@@ -379,7 +381,7 @@ pub const Expr = union(enum) {
     array: struct { items: []*Expr, elem_type: ?types.Type = null }, // `[a, b, ...rest]`; elem_type is filled by the checker when a spread element is present
     spread: *Expr, // `...expr` element inside an array literal or call argument list
     tuple_lit: struct { items: []*Expr, tuple_type: ?types.Type = null }, // [a, b] checked against a tuple type
-    var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null, unwrap: bool = false, is_func_ref: bool = false, capture: bool = false, func_sig: ?*const types.FuncSig = null, deref: bool = false }, // deref: a scalar `Ref<T>` parameter read, emitted as `name.*`
+    var_ref: struct { name: []const u8, emit_name: ?[]const u8 = null, unwrap: bool = false, is_func_ref: bool = false, capture: bool = false, func_sig: ?*const types.FuncSig = null, deref: bool = false, is_accumulator: bool = false }, // deref: a scalar `Ref<T>` parameter read, emitted as `name.*`; is_accumulator: read of a string-builder local, emitted as `name.items`
     neg: *Expr,
     not: *Expr,
     bnot: *Expr, // bitwise ~
@@ -398,7 +400,7 @@ pub const Expr = union(enum) {
     obj: []FieldInit,
     field: struct { obj: *Expr, name: []const u8, builtin: ?FieldBuiltin = null, enum_value: ?EnumValue = null, optional_chain: bool = false, chain_field_type: ?types.Type = null, class_name: ?[]const u8 = null, is_static: bool = false, is_getter: bool = false },
     index: struct { obj: *Expr, value: *Expr, checked_element_type: ?types.Type = null, tuple_index: ?usize = null },
-    call: struct { name: []const u8, args: []*Expr, emit_name: ?[]const u8 = null, is_closure: bool = false, type_args: [][]const u8 = &.{}, ffi_string_args: []bool = &.{}, ffi_string_return: bool = false, ref_args: []bool = &.{} }, // builtin / user / function-value call; type_args from explicit f<T>(...). ffi_* mark a call to an `extern function` so the FFI string marshalling glue is emitted. ref_args[i] true emits `&arg` for a by-reference (`Ref<T>`) parameter.
+    call: struct { name: []const u8, args: []*Expr, emit_name: ?[]const u8 = null, is_closure: bool = false, type_args: [][]const u8 = &.{}, ffi_string_args: []bool = &.{}, ffi_string_return: bool = false, ref_args: []bool = &.{}, is_into_call: bool = false }, // builtin / user / function-value call; type_args from explicit f<T>(...). ffi_* mark a call to an `extern function` so the FFI string marshalling glue is emitted. ref_args[i] true emits `&arg` for a by-reference (`Ref<T>`) parameter. is_into_call: a builder call appended into an accumulator -> emit `f__into(dest, args)`.
     static_call: StaticCall,
     cast: struct { inner: *Expr, annotation: []const u8, checked_type: ?types.Type = null }, // `expr as T` (safe-subset assertion; erased at emit)
 };

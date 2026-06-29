@@ -2650,7 +2650,10 @@ const Checker = struct {
                 }
                 if ((types.isStringLike(obj_type) or types.isArray(obj_type)) and std.mem.eql(u8, field.name, "length")) {
                     field.builtin = .length;
-                    return .i64;
+                    // `int` (i32) is the language's integer; typing length as i32
+                    // lets the common `for`/`while (i < x.length)` index idiom and
+                    // `charAt(i)`/`substring(...)` compose without an unusable i64.
+                    return .i32;
                 }
                 if ((types.isMap(obj_type) or types.isSet(obj_type)) and std.mem.eql(u8, field.name, "size")) {
                     field.builtin = .container_size;

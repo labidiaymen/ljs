@@ -1826,27 +1826,388 @@ fn externZigName(t: types.Type, arena: std.mem.Allocator) []const u8 {
     };
 }
 
+/// Emits a Zig string literal whose value is the Lumen source string `s` with
+/// its escape sequences decoded. The lexer keeps `.str` raw (escapes verbatim),
+/// so `\n` `\t` `\r` `\0` `\\` `\"` `\'` are interpreted here and the resulting
+/// bytes are re-escaped for the Zig literal.
+fn emitStrLit(w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, s: []const u8) CompileError!void {
+    try w.append(arena, '"');
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        var ch = s[i];
+        if (ch == '\\' and i + 1 < s.len) {
+            i += 1;
+            ch = switch (s[i]) {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                '0' => 0,
+                else => s[i], // \\ \" \' \` and any other: the literal character
+            };
+        }
+        switch (ch) {
+            '"' => try w.appendSlice(arena, "\\\""),
+            '\\' => try w.appendSlice(arena, "\\\\"),
+            '\n' => try w.appendSlice(arena, "\\n"),
+            '\t' => try w.appendSlice(arena, "\\t"),
+            '\r' => try w.appendSlice(arena, "\\r"),
+            else => if (ch < 0x20) try w.print(arena, "\\x{x:0>2}", .{ch}) else try w.append(arena, ch),
+        }
+    }
+    try w.append(arena, '"');
+}
+
+/// Flattens a left-associated string-concat chain (`a + b + c + …`) into its leaf
+/// parts so it can be emitted as a single `std.mem.concat(&.{…})` instead of
+/// nested concats — one allocation and one copy of each part, rather than
+/// reallocating and recopying the growing left operand at every `+`.
+fn collectStrConcat(e: *const Expr, parts: *std.ArrayListUnmanaged(*const Expr), arena: std.mem.Allocator) CompileError!void {
+    switch (e.*) {
+        .bin => |b| {
+            if (b.op == '+' and b.checked_type != null and b.checked_type.? == .string) {
+                try collectStrConcat(b.l, parts, arena);
+                try collectStrConcat(b.r, parts, arena);
+                return;
+            }
+        },
+        else => {},
+    }
+    try parts.append(arena, e);
+}
+
+// ---- destination-passing for string-builder functions ------------------------
+fn collectReturns(body: []const Stmt, list: *std.ArrayListUnmanaged(*const Expr), arena: std.mem.Allocator) CompileError!void {
+    for (body) |*s| try collectReturnsStmt(s, list, arena);
+}
+fn collectReturnsStmt(s: *const Stmt, list: *std.ArrayListUnmanaged(*const Expr), arena: std.mem.Allocator) CompileError!void {
+    switch (s.*) {
+        .return_stmt => |r| { if (r.value) |v| try list.append(arena, v); },
+        .while_stmt => |w| try collectReturns(w.body, list, arena),
+        .do_while_stmt => |w| try collectReturns(w.body, list, arena),
+        .for_stmt => |f| try collectReturns(f.body, list, arena),
+        .for_of_stmt => |f| try collectReturns(f.body, list, arena),
+        .if_stmt => |b| { try collectReturns(b.then_body, list, arena); if (b.else_body) |eb| try collectReturns(eb, list, arena); },
+        .switch_stmt => |sw| { for (sw.cases) |cse| try collectReturns(cse.body, list, arena); if (sw.default_body) |db| try collectReturns(db, list, arena); },
+        .try_stmt => |t| { try collectReturns(t.try_body, list, arena); try collectReturns(t.catch_body, list, arena); if (t.finally_body) |fb| try collectReturns(fb, list, arena); },
+        .defer_stmt => |d| try collectReturns(d.body, list, arena),
+        else => {},
+    }
+}
+
+/// The accumulator a string-builder function returns (so it can be retargeted to
+/// a caller buffer), or null. Eligible when it returns `string` and every return
+/// is `return <acc>` (one accumulator) or `return E` with E not using that acc.
+fn destPassableAcc(fd: *const ast.FunctionDecl, arena: std.mem.Allocator) CompileError!?[]const u8 {
+    const ret = fd.checked_return_type orelse return null;
+    if (ret != .string) return null;
+    if (fd.is_async) return null;
+    var rets: std.ArrayListUnmanaged(*const Expr) = .empty;
+    try collectReturns(fd.body, &rets, arena);
+    var acc_name: ?[]const u8 = null; // source name (for analysis)
+    var acc_emit: ?[]const u8 = null; // emit name (for codegen)
+    for (rets.items) |v| {
+        if (v.* == .var_ref and v.var_ref.is_accumulator) {
+            if (acc_name) |a| {
+                if (!std.mem.eql(u8, a, v.var_ref.name)) return null;
+            } else {
+                acc_name = v.var_ref.name;
+                acc_emit = v.var_ref.emit_name orelse v.var_ref.name;
+            }
+        }
+    }
+    const an = acc_name orelse return null;
+    for (rets.items) |v| {
+        const is_acc = v.* == .var_ref and v.var_ref.is_accumulator and std.mem.eql(u8, v.var_ref.name, an);
+        if (!is_acc and exprUsesName(v, an)) return null;
+    }
+    return acc_emit;
+}
+
+fn collectDestPassable(stmts: []Stmt, map: *std.StringHashMapUnmanaged([]const u8), arena: std.mem.Allocator) CompileError!void {
+    for (stmts) |*s| switch (s.*) {
+        .function_decl => |*fd| { if (try destPassableAcc(fd, arena)) |acc| try map.put(arena, fd.name, acc); try collectDestPassable(fd.body, map, arena); },
+        .class_decl => |*cd| for (cd.methods) |*m| { if (try destPassableAcc(m, arena)) |acc| try map.put(arena, m.name, acc); try collectDestPassable(m.body, map, arena); },
+        .while_stmt => |*w| try collectDestPassable(w.body, map, arena),
+        .do_while_stmt => |*w| try collectDestPassable(w.body, map, arena),
+        .for_stmt => |*f| try collectDestPassable(f.body, map, arena),
+        .for_of_stmt => |*f| try collectDestPassable(f.body, map, arena),
+        .if_stmt => |*b| { try collectDestPassable(b.then_body, map, arena); if (b.else_body) |eb| try collectDestPassable(eb, map, arena); },
+        else => {},
+    };
+}
+
+fn collectStrConcatMut(e: *Expr, parts: *std.ArrayListUnmanaged(*Expr), arena: std.mem.Allocator) CompileError!void {
+    switch (e.*) {
+        .bin => |b| if (b.op == '+' and b.checked_type != null and b.checked_type.? == .string) {
+            try collectStrConcatMut(b.l, parts, arena);
+            try collectStrConcatMut(b.r, parts, arena);
+            return;
+        },
+        else => {},
+    }
+    try parts.append(arena, e);
+}
+
+fn markBuilderParts(stmts: []Stmt, map: *const std.StringHashMapUnmanaged([]const u8), arena: std.mem.Allocator) CompileError!void {
+    for (stmts) |*s| try markBuilderPartsStmt(s, map, arena);
+}
+fn markBuilderPartsStmt(s: *Stmt, map: *const std.StringHashMapUnmanaged([]const u8), arena: std.mem.Allocator) CompileError!void {
+    switch (s.*) {
+        .assign => |*a| if (a.is_accumulator) {
+            var parts: std.ArrayListUnmanaged(*Expr) = .empty;
+            try collectStrConcatMut(a.value, &parts, arena);
+            for (parts.items) |p| if (p.* == .call and !p.call.is_closure and map.contains(p.call.name)) { p.call.is_into_call = true; };
+        },
+        .while_stmt => |*w| try markBuilderParts(w.body, map, arena),
+        .do_while_stmt => |*w| try markBuilderParts(w.body, map, arena),
+        .for_stmt => |*f| try markBuilderParts(f.body, map, arena),
+        .for_of_stmt => |*f| try markBuilderParts(f.body, map, arena),
+        .if_stmt => |*b| { try markBuilderParts(b.then_body, map, arena); if (b.else_body) |eb| try markBuilderParts(eb, map, arena); },
+        .switch_stmt => |*sw| { for (sw.cases) |*cse| try markBuilderParts(cse.body, map, arena); if (sw.default_body) |db| try markBuilderParts(db, map, arena); },
+        .try_stmt => |*t| { try markBuilderParts(t.try_body, map, arena); try markBuilderParts(t.catch_body, map, arena); if (t.finally_body) |fb| try markBuilderParts(fb, map, arena); },
+        .defer_stmt => |*d| try markBuilderParts(d.body, map, arena),
+        .function_decl => |*fd| try markBuilderParts(fd.body, map, arena),
+        .class_decl => |*cd| for (cd.methods) |*m| try markBuilderParts(m.body, map, arena),
+        else => {},
+    }
+}
+
+// ---- string-builder (accumulator) optimization -------------------------------
+// A string local that is only ever appended to (`v = v + …`) is compiled to a
+// growable `ArrayListUnmanaged(u8)` instead of an immutable slice, so the build
+// is O(n) (append) rather than O(n²) (realloc+recopy on every `+`). The analysis
+// is conservative: a variable qualifies only when EVERY use is a provable append
+// or a plain read; anything unusual (reset, `+=`, capture, Ref, shadowing) bails.
+
+fn accIsEmptyStr(e: *const Expr) bool {
+    return e.* == .str and e.str.len == 0;
+}
+
+/// `value` is an append into `name`: a string-concat chain whose first leaf reads
+/// `name` and where `name` appears nowhere else (so the source slices stay valid
+/// across the in-place append).
+fn accIsAppend(value: *const Expr, name: []const u8, arena: std.mem.Allocator) CompileError!bool {
+    var parts: std.ArrayListUnmanaged(*const Expr) = .empty;
+    try collectStrConcat(value, &parts, arena);
+    if (parts.items.len == 0) return false;
+    const first = parts.items[0];
+    if (!(first.* == .var_ref and std.mem.eql(u8, first.var_ref.name, name))) return false;
+    for (parts.items[1..]) |p| if (exprUsesName(p, name)) return false;
+    return true;
+}
+
+/// True if any read of `name` in `e` is a closure capture or a `Ref` deref.
+fn accBadRef(e: *const Expr, name: []const u8) bool {
+    return switch (e.*) {
+        .var_ref => |r| std.mem.eql(u8, r.name, name) and (r.capture or r.deref),
+        .array => |a| blk: { for (a.items) |it| if (accBadRef(it, name)) break :blk true; break :blk false; },
+        .tuple_lit => |t| blk: { for (t.items) |it| if (accBadRef(it, name)) break :blk true; break :blk false; },
+        .spread => |inner| accBadRef(inner, name),
+        .neg, .not, .bnot, .await_expr => |inner| accBadRef(inner, name),
+        .bin => |b| accBadRef(b.l, name) or accBadRef(b.r, name),
+        .bool_bin => |b| accBadRef(b.l, name) or accBadRef(b.r, name),
+        .cmp => |b| accBadRef(b.l, name) or accBadRef(b.r, name),
+        .ternary => |t| accBadRef(t.cond, name) or accBadRef(t.then_expr, name) or accBadRef(t.else_expr, name),
+        .coalesce => |c| accBadRef(c.l, name) or accBadRef(c.r, name),
+        .arrow => |a| accBadRef(a.body_expr, name),
+        .new_expr => |ne| blk: { for (ne.args) |it| if (accBadRef(it, name)) break :blk true; break :blk false; },
+        .method_call => |mc| blk: { if (accBadRef(mc.obj, name)) break :blk true; for (mc.args) |it| if (accBadRef(it, name)) break :blk true; break :blk false; },
+        .super_call => |sc| blk: { for (sc.args) |it| if (accBadRef(it, name)) break :blk true; break :blk false; },
+        .template => |parts| blk: { for (parts) |pt| if (pt.expr) |x| { if (accBadRef(x, name)) break :blk true; }; break :blk false; },
+        .obj => |fields| blk: { for (fields) |f| if (accBadRef(f.value, name)) break :blk true; break :blk false; },
+        .field => |f| accBadRef(f.obj, name),
+        .index => |idx| accBadRef(idx.obj, name) or accBadRef(idx.value, name),
+        .call => |cl| blk: { for (cl.args) |it| if (accBadRef(it, name)) break :blk true; break :blk false; },
+        .static_call => |sc| blk: { for (sc.args) |it| if (accBadRef(it, name)) break :blk true; break :blk false; },
+        .cast => |c| accBadRef(c.inner, name),
+        else => false,
+    };
+}
+
+fn accDisqBody(body: []const Stmt, name: []const u8, arena: std.mem.Allocator) CompileError!bool {
+    for (body) |*s| if (try accDisqStmt(s, name, arena)) return true;
+    return false;
+}
+
+/// Disqualify `name` from the accumulator transform if it is mutated by anything
+/// other than an append, captured, deref'd, or rebound.
+fn accDisqStmt(stmt: *const Stmt, name: []const u8, arena: std.mem.Allocator) CompileError!bool {
+    switch (stmt.*) {
+        .var_decl => |d| return accBadRef(d.init, name),
+        .assign => |a| {
+            if (std.mem.eql(u8, a.name, name)) {
+                if (!std.mem.eql(u8, a.op, "=")) return true;
+                return !(try accIsAppend(a.value, name, arena));
+            }
+            return accBadRef(a.value, name);
+        },
+        .member_assign => |ma| return accBadRef(ma.value, name) or (ma.obj != null and accBadRef(ma.obj.?, name)),
+        .console_log => |log| return accBadRef(log.value, name),
+        .return_stmt => |r| return if (r.value) |x| accBadRef(x, name) else false,
+        .throw_stmt => |t| return accBadRef(t.value, name),
+        .expr_stmt => |x| return accBadRef(x.value, name),
+        .while_stmt => |w| return accBadRef(w.cond, name) or (try accDisqBody(w.body, name, arena)),
+        .do_while_stmt => |w| return accBadRef(w.cond, name) or (try accDisqBody(w.body, name, arena)),
+        .for_stmt => |f| {
+            if (std.mem.eql(u8, f.update.name, name)) return true;
+            return accBadRef(f.init.init, name) or accBadRef(f.cond, name) or accBadRef(f.update.value, name) or (try accDisqBody(f.body, name, arena));
+        },
+        .for_of_stmt => |f| {
+            if (std.mem.eql(u8, f.binding, name)) return true;
+            return accBadRef(f.iterable, name) or (try accDisqBody(f.body, name, arena));
+        },
+        .if_stmt => |b| return accBadRef(b.cond, name) or (try accDisqBody(b.then_body, name, arena)) or (b.else_body != null and (try accDisqBody(b.else_body.?, name, arena))),
+        .switch_stmt => |sw| {
+            if (accBadRef(sw.value, name)) return true;
+            for (sw.cases) |cse| { if (accBadRef(cse.value, name)) return true; if (try accDisqBody(cse.body, name, arena)) return true; }
+            if (sw.default_body) |db| if (try accDisqBody(db, name, arena)) return true;
+            return false;
+        },
+        .try_stmt => |t| return (try accDisqBody(t.try_body, name, arena)) or (try accDisqBody(t.catch_body, name, arena)) or (t.finally_body != null and (try accDisqBody(t.finally_body.?, name, arena))),
+        .defer_stmt => |d| return accDisqBody(d.body, name, arena),
+        .destructure_decl => |d| {
+            for (d.bindings) |b| if (std.mem.eql(u8, b.name, name)) return true;
+            return accBadRef(d.source, name);
+        },
+        .using_decl => |u| {
+            if (u.defer_body) |b| if (try accDisqBody(b, name, arena)) return true;
+            if (u.dispose_call) |dc| if (accBadRef(dc, name)) return true;
+            return accBadRef(u.init, name);
+        },
+        .function_decl => |fd| return bodyUsesName(fd.body, name),
+        else => return false,
+    }
+}
+
+fn accCountDecls(body: []const Stmt, name: []const u8) usize {
+    var n: usize = 0;
+    for (body) |*s| n += accCountDeclsStmt(s, name);
+    return n;
+}
+fn accCountDeclsStmt(stmt: *const Stmt, name: []const u8) usize {
+    return switch (stmt.*) {
+        .var_decl => |d| @as(usize, if (std.mem.eql(u8, d.name, name)) 1 else 0),
+        .while_stmt => |w| accCountDecls(w.body, name),
+        .do_while_stmt => |w| accCountDecls(w.body, name),
+        .for_stmt => |f| accCountDecls(f.body, name),
+        .for_of_stmt => |f| accCountDecls(f.body, name),
+        .if_stmt => |b| accCountDecls(b.then_body, name) + (if (b.else_body) |eb| accCountDecls(eb, name) else 0),
+        .switch_stmt => |sw| blk: {
+            var c: usize = 0;
+            for (sw.cases) |cse| c += accCountDecls(cse.body, name);
+            if (sw.default_body) |db| c += accCountDecls(db, name);
+            break :blk c;
+        },
+        .try_stmt => |t| accCountDecls(t.try_body, name) + accCountDecls(t.catch_body, name) + (if (t.finally_body) |fb| accCountDecls(fb, name) else 0),
+        .defer_stmt => |d| accCountDecls(d.body, name),
+        else => 0,
+    };
+}
+
+fn markAccBody(body: []Stmt, name: []const u8) void {
+    for (body) |*s| markAccStmt(s, name);
+}
+fn markAccStmt(stmt: *Stmt, name: []const u8) void {
+    switch (stmt.*) {
+        .var_decl => |*d| markAccExpr(d.init, name),
+        .assign => |*a| { if (std.mem.eql(u8, a.name, name)) a.is_accumulator = true; markAccExpr(a.value, name); },
+        .member_assign => |*ma| { markAccExpr(ma.value, name); if (ma.obj) |o| markAccExpr(o, name); },
+        .console_log => |*log| markAccExpr(log.value, name),
+        .return_stmt => |*r| { if (r.value) |x| markAccExpr(x, name); },
+        .throw_stmt => |*t| markAccExpr(t.value, name),
+        .expr_stmt => |*x| markAccExpr(x.value, name),
+        .while_stmt => |*w| { markAccExpr(w.cond, name); markAccBody(w.body, name); },
+        .do_while_stmt => |*w| { markAccExpr(w.cond, name); markAccBody(w.body, name); },
+        .for_stmt => |*f| { markAccExpr(f.init.init, name); markAccExpr(f.cond, name); markAccExpr(f.update.value, name); markAccBody(f.body, name); },
+        .for_of_stmt => |*f| { markAccExpr(f.iterable, name); markAccBody(f.body, name); },
+        .if_stmt => |*b| { markAccExpr(b.cond, name); markAccBody(b.then_body, name); if (b.else_body) |eb| markAccBody(eb, name); },
+        .switch_stmt => |*sw| { markAccExpr(sw.value, name); for (sw.cases) |*cse| { markAccExpr(cse.value, name); markAccBody(cse.body, name); } if (sw.default_body) |db| markAccBody(db, name); },
+        .try_stmt => |*t| { markAccBody(t.try_body, name); markAccBody(t.catch_body, name); if (t.finally_body) |fb| markAccBody(fb, name); },
+        .defer_stmt => |*d| markAccBody(d.body, name),
+        .using_decl => |*u| { if (u.defer_body) |b| markAccBody(b, name); if (u.dispose_call) |dc| markAccExpr(dc, name); markAccExpr(u.init, name); },
+        .destructure_decl => |*d| markAccExpr(d.source, name),
+        else => {},
+    }
+}
+fn markAccExpr(e: *Expr, name: []const u8) void {
+    switch (e.*) {
+        .var_ref => |*r| { if (std.mem.eql(u8, r.name, name)) r.is_accumulator = true; },
+        .array => |a| for (a.items) |it| markAccExpr(it, name),
+        .tuple_lit => |t| for (t.items) |it| markAccExpr(it, name),
+        .spread => |inner| markAccExpr(inner, name),
+        .neg, .not, .bnot, .await_expr => |inner| markAccExpr(inner, name),
+        .bin => |b| { markAccExpr(b.l, name); markAccExpr(b.r, name); },
+        .bool_bin => |b| { markAccExpr(b.l, name); markAccExpr(b.r, name); },
+        .cmp => |b| { markAccExpr(b.l, name); markAccExpr(b.r, name); },
+        .ternary => |t| { markAccExpr(t.cond, name); markAccExpr(t.then_expr, name); markAccExpr(t.else_expr, name); },
+        .coalesce => |c| { markAccExpr(c.l, name); markAccExpr(c.r, name); },
+        .arrow => |a| markAccExpr(a.body_expr, name),
+        .new_expr => |ne| for (ne.args) |it| markAccExpr(it, name),
+        .method_call => |mc| { markAccExpr(mc.obj, name); for (mc.args) |it| markAccExpr(it, name); },
+        .super_call => |sc| for (sc.args) |it| markAccExpr(it, name),
+        .template => |parts| for (parts) |pt| { if (pt.expr) |x| markAccExpr(x, name); },
+        .obj => |fields| for (fields) |f| markAccExpr(f.value, name),
+        .field => |f| markAccExpr(f.obj, name),
+        .index => |idx| { markAccExpr(idx.obj, name); markAccExpr(idx.value, name); },
+        .call => |cl| for (cl.args) |it| markAccExpr(it, name),
+        .static_call => |sc| for (sc.args) |it| markAccExpr(it, name),
+        .cast => |c| markAccExpr(c.inner, name),
+        else => {},
+    }
+}
+
+/// Marks string-builder accumulators in one function-body scope, then recurses
+/// into nested function scopes.
+fn markAccumulators(stmts: []Stmt, params: []const ast.FunctionParam, arena: std.mem.Allocator) CompileError!void {
+    for (stmts) |*s| {
+        if (s.* == .var_decl) {
+            const d = s.var_decl;
+            if (d.mutable and d.reassigned and d.checked_type != null and d.checked_type.? == .string and accIsEmptyStr(d.init) and
+                accCountDecls(stmts, d.name) == 1 and !accParamHas(params, d.name) and !(try accDisqBody(stmts, d.name, arena)))
+            {
+                s.var_decl.is_accumulator = true;
+                markAccBody(stmts, d.name);
+            }
+        }
+    }
+    for (stmts) |*s| try accRecurseFns(s, arena);
+}
+fn accParamHas(params: []const ast.FunctionParam, name: []const u8) bool {
+    for (params) |p| if (std.mem.eql(u8, p.name, name)) return true;
+    return false;
+}
+fn accRecurseFns(stmt: *Stmt, arena: std.mem.Allocator) CompileError!void {
+    switch (stmt.*) {
+        .function_decl => |*fd| try markAccumulators(fd.body, fd.params, arena),
+        .class_decl => |*cd| {
+            for (cd.methods) |*m| try markAccumulators(m.body, m.params, arena);
+            try markAccumulators(cd.ctor_body, cd.ctor_params, arena);
+        },
+        .while_stmt => |*w| for (w.body) |*b| try accRecurseFns(b, arena),
+        .do_while_stmt => |*w| for (w.body) |*b| try accRecurseFns(b, arena),
+        .for_stmt => |*f| for (f.body) |*b| try accRecurseFns(b, arena),
+        .for_of_stmt => |*f| for (f.body) |*b| try accRecurseFns(b, arena),
+        .if_stmt => |*b| { for (b.then_body) |*x| try accRecurseFns(x, arena); if (b.else_body) |eb| for (eb) |*x| try accRecurseFns(x, arena); },
+        .try_stmt => |*t| { for (t.try_body) |*x| try accRecurseFns(x, arena); for (t.catch_body) |*x| try accRecurseFns(x, arena); if (t.finally_body) |fb| for (fb) |*x| try accRecurseFns(x, arena); },
+        .defer_stmt => |*d| for (d.body) |*b| try accRecurseFns(b, arena),
+        else => {},
+    }
+}
+
 fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
     switch (e.*) {
         .num => |v| try w.print(arena, "{d}", .{v}),
         .float => |v| try w.print(arena, "{d}", .{v}),
         .null_lit => try w.appendSlice(arena, "null"),
         .bool => |v| try w.appendSlice(arena, if (v) "true" else "false"),
-        .str => |s| {
-            try w.append(arena, '"');
-            for (s) |ch| {
-                if (ch == '"' or ch == '\\') try w.append(arena, '\\');
-                try w.append(arena, ch);
-            }
-            try w.append(arena, '"');
-        },
+        .str => |s| try emitStrLit(w, arena, s),
         .array => |arr| {
             if (arr.elem_type) |elem| {
                 // Array literal with `...spread` entries → runtime concatenation.
                 // Each plain entry becomes a one-element slice; each spread emits
                 // its source slice directly.
                 const ez = try types.zigName(arena, elem);
-                try w.print(arena, "(std.mem.concat(std.heap.page_allocator, {s}, &.{{ ", .{ez});
+                try w.print(arena, "(std.mem.concat(__sa(), {s}, &.{{ ", .{ez});
                 for (arr.items, 0..) |item, i| {
                     if (i > 0) try w.appendSlice(arena, ", ");
                     if (item.* == .spread) {
@@ -2057,6 +2418,7 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             } else {
                 if (ref.capture) try w.appendSlice(arena, "__env."); // captured outer binding
                 try w.appendSlice(arena, ref.emit_name orelse ref.name);
+                if (ref.is_accumulator) try w.appendSlice(arena, ".items"); // string-builder read
                 if (ref.deref) try w.appendSlice(arena, ".*"); // scalar by-reference (`Ref<T>`) param read
                 if (ref.unwrap) try w.appendSlice(arena, ".?"); // narrowed optional access
             }
@@ -2085,10 +2447,13 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
         },
         .bin => |b| {
             if (b.op == '+' and b.checked_type != null and b.checked_type.? == .string) {
-                try w.appendSlice(arena, "(std.mem.concat(std.heap.page_allocator, u8, &.{ ");
-                try emitExpr(b.l, w, arena);
-                try w.appendSlice(arena, ", ");
-                try emitExpr(b.r, w, arena);
+                var parts: std.ArrayListUnmanaged(*const Expr) = .empty;
+                try collectStrConcat(e, &parts, arena);
+                try w.appendSlice(arena, "(std.mem.concat(__sa(), u8, &.{ ");
+                for (parts.items, 0..) |p, idx| {
+                    if (idx > 0) try w.appendSlice(arena, ", ");
+                    try emitExpr(p, w, arena);
+                }
                 try w.appendSlice(arena, " }) catch std.process.exit(1))");
             } else if (b.op == '/') {
                 try w.appendSlice(arena, "@divTrunc(");
@@ -2266,7 +2631,7 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 //         break :blk Fn{ .ctx = __e, .call = struct {...}.__a }; })
                 try w.appendSlice(arena, "(blk: { const Env = struct { ");
                 for (arrow.captures) |c| try w.print(arena, "{s}: {s}, ", .{ c.emit_name, try types.zigName(arena, c.ty) });
-                try w.appendSlice(arena, "}; const __e = std.heap.page_allocator.create(Env) catch unreachable; __e.* = .{ ");
+                try w.appendSlice(arena, "}; const __e = __sa().create(Env) catch unreachable; __e.* = .{ ");
                 for (arrow.captures) |c| try w.print(arena, ".{s} = {s}, ", .{ c.emit_name, c.emit_name });
                 try w.print(arena, "}}; break :blk {s}{{ .ctx = __e, .call = ", .{sname});
                 try Local.emitCallFn(arena, w, arrow, ret_zig, true);
@@ -2275,7 +2640,7 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
         },
         .template => |parts| {
             // `a${e}b` -> (std.fmt.allocPrint(page, "a{s}b", .{ e }) catch unreachable)
-            try w.appendSlice(arena, "(std.fmt.allocPrint(std.heap.page_allocator, \"");
+            try w.appendSlice(arena, "(std.fmt.allocPrint(__sa(), \"");
             for (parts) |part| {
                 if (part.text) |t| {
                     try emitTemplateText(t, w, arena);
@@ -2319,17 +2684,10 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             } else if (fa.enum_value) |ev| {
                 switch (ev) {
                     .int => |n| try w.print(arena, "{d}", .{n}),
-                    .str => |s| {
-                        try w.append(arena, '"');
-                        for (s) |ch| {
-                            if (ch == '"' or ch == '\\') try w.append(arena, '\\');
-                            try w.append(arena, ch);
-                        }
-                        try w.append(arena, '"');
-                    },
+                    .str => |s| try emitStrLit(w, arena, s),
                 }
             } else if (fa.builtin == .length) {
-                try w.appendSlice(arena, "@as(i64, @intCast(");
+                try w.appendSlice(arena, "@as(i32, @intCast(");
                 try emitExpr(fa.obj, w, arena);
                 try w.appendSlice(arena, ".len))");
             } else if (fa.builtin == .container_size) {
@@ -2424,7 +2782,7 @@ fn emitArrayMethod(mc: anytype, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
         try emitExpr(mc.obj, w, arena);
         try w.appendSlice(arena, "; const __cb = ");
         try emitExpr(mc.args[0], w, arena);
-        try w.print(arena, "; const __r = std.heap.page_allocator.alloc({s}, __arr.len) catch unreachable; for (__arr, 0..) |__e, __i| {{ __r[__i] = __cb.call(__cb.ctx, __e); }} break :{s} @as([]const {s}, __r); }})", .{ u_zig, lbl, u_zig });
+        try w.print(arena, "; const __r = __sa().alloc({s}, __arr.len) catch unreachable; for (__arr, 0..) |__e, __i| {{ __r[__i] = __cb.call(__cb.ctx, __e); }} break :{s} @as([]const {s}, __r); }})", .{ u_zig, lbl, u_zig });
         return;
     }
 
@@ -2433,7 +2791,7 @@ fn emitArrayMethod(mc: anytype, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
         try emitExpr(mc.obj, w, arena);
         try w.appendSlice(arena, "; const __cb = ");
         try emitExpr(mc.args[0], w, arena);
-        try w.print(arena, "; var __r: std.ArrayListUnmanaged({s}) = .empty; for (__arr) |__e| {{ if (__cb.call(__cb.ctx, __e)) __r.append(std.heap.page_allocator, __e) catch unreachable; }} break :{s} @as([]const {s}, __r.items); }})", .{ elem_zig, lbl, elem_zig });
+        try w.print(arena, "; var __r: std.ArrayListUnmanaged({s}) = .empty; for (__arr) |__e| {{ if (__cb.call(__cb.ctx, __e)) __r.append(__sa(), __e) catch unreachable; }} break :{s} @as([]const {s}, __r.items); }})", .{ elem_zig, lbl, elem_zig });
         return;
     }
 
@@ -2518,8 +2876,8 @@ fn emitArrayMethod(mc: anytype, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
         } else {
             try w.appendSlice(arena, "\",\"");
         }
-        try w.appendSlice(arena, "; var __buf: std.ArrayListUnmanaged(u8) = .empty; for (__arr, 0..) |__e, __i| { if (__i > 0) __buf.appendSlice(std.heap.page_allocator, __sep) catch unreachable; ");
-        try w.print(arena, "__buf.appendSlice(std.heap.page_allocator, std.fmt.allocPrint(std.heap.page_allocator, \"{s}\", .{{__e}}) catch unreachable) catch unreachable; }} break :{s} @as([]const u8, __buf.items); }})", .{ spec, lbl });
+        try w.appendSlice(arena, "; var __buf: std.ArrayListUnmanaged(u8) = .empty; for (__arr, 0..) |__e, __i| { if (__i > 0) __buf.appendSlice(__sa(), __sep) catch unreachable; ");
+        try w.print(arena, "__buf.appendSlice(__sa(), std.fmt.allocPrint(__sa(), \"{s}\", .{{__e}}) catch unreachable) catch unreachable; }} break :{s} @as([]const u8, __buf.items); }})", .{ spec, lbl });
         return;
     }
 
@@ -2616,12 +2974,12 @@ fn emitStringMethod(mc: anytype, w: *std.ArrayListUnmanaged(u8), arena: std.mem.
     }
 
     if (eq(u8, name, "toUpperCase")) {
-        try w.print(arena, "const __r = std.heap.page_allocator.alloc(u8, __s.len) catch unreachable; for (__s, 0..) |__c, __i| {{ __r[__i] = std.ascii.toUpper(__c); }} break :{s} @as([]const u8, __r); }})", .{lbl});
+        try w.print(arena, "const __r = __sa().alloc(u8, __s.len) catch unreachable; for (__s, 0..) |__c, __i| {{ __r[__i] = std.ascii.toUpper(__c); }} break :{s} @as([]const u8, __r); }})", .{lbl});
         return;
     }
 
     if (eq(u8, name, "toLowerCase")) {
-        try w.print(arena, "const __r = std.heap.page_allocator.alloc(u8, __s.len) catch unreachable; for (__s, 0..) |__c, __i| {{ __r[__i] = std.ascii.toLower(__c); }} break :{s} @as([]const u8, __r); }})", .{lbl});
+        try w.print(arena, "const __r = __sa().alloc(u8, __s.len) catch unreachable; for (__s, 0..) |__c, __i| {{ __r[__i] = std.ascii.toLower(__c); }} break :{s} @as([]const u8, __r); }})", .{lbl});
         return;
     }
 
@@ -2633,7 +2991,7 @@ fn emitStringMethod(mc: anytype, w: *std.ArrayListUnmanaged(u8), arena: std.mem.
     if (eq(u8, name, "repeat")) {
         try A.idx("__n", mc.args[0], w, arena);
         try w.appendSlice(arena, "const __count: usize = if (__n < 0) 0 else @intCast(__n); ");
-        try w.appendSlice(arena, "var __buf: std.ArrayListUnmanaged(u8) = .empty; var __k: usize = 0; while (__k < __count) : (__k += 1) { __buf.appendSlice(std.heap.page_allocator, __s) catch unreachable; } ");
+        try w.appendSlice(arena, "var __buf: std.ArrayListUnmanaged(u8) = .empty; var __k: usize = 0; while (__k < __count) : (__k += 1) { __buf.appendSlice(__sa(), __s) catch unreachable; } ");
         try w.print(arena, "break :{s} @as([]const u8, __buf.items); }})", .{lbl});
         return;
     }
@@ -2643,8 +3001,8 @@ fn emitStringMethod(mc: anytype, w: *std.ArrayListUnmanaged(u8), arena: std.mem.
         try w.appendSlice(arena, "const __pad: []const u8 = ");
         try emitExpr(mc.args[1], w, arena);
         try w.appendSlice(arena, "; const __goal: usize = if (__target < 0) 0 else @intCast(__target); ");
-        try w.appendSlice(arena, "var __buf: std.ArrayListUnmanaged(u8) = .empty; if (__goal > __s.len and __pad.len > 0) { var __need: usize = __goal - __s.len; while (__need > 0) { const __take = if (__need < __pad.len) __need else __pad.len; __buf.appendSlice(std.heap.page_allocator, __pad[0..__take]) catch unreachable; __need -= __take; } } ");
-        try w.appendSlice(arena, "__buf.appendSlice(std.heap.page_allocator, __s) catch unreachable; ");
+        try w.appendSlice(arena, "var __buf: std.ArrayListUnmanaged(u8) = .empty; if (__goal > __s.len and __pad.len > 0) { var __need: usize = __goal - __s.len; while (__need > 0) { const __take = if (__need < __pad.len) __need else __pad.len; __buf.appendSlice(__sa(), __pad[0..__take]) catch unreachable; __need -= __take; } } ");
+        try w.appendSlice(arena, "__buf.appendSlice(__sa(), __s) catch unreachable; ");
         try w.print(arena, "break :{s} @as([]const u8, __buf.items); }})", .{lbl});
         return;
     }
@@ -2654,7 +3012,7 @@ fn emitStringMethod(mc: anytype, w: *std.ArrayListUnmanaged(u8), arena: std.mem.
         try emitExpr(mc.args[0], w, arena);
         try w.appendSlice(arena, "; const __to: []const u8 = ");
         try emitExpr(mc.args[1], w, arena);
-        try w.appendSlice(arena, "; var __buf: std.ArrayListUnmanaged(u8) = .empty; if (__from.len > 0) { if (std.mem.indexOf(u8, __s, __from)) |__p| { __buf.appendSlice(std.heap.page_allocator, __s[0..__p]) catch unreachable; __buf.appendSlice(std.heap.page_allocator, __to) catch unreachable; __buf.appendSlice(std.heap.page_allocator, __s[__p + __from.len ..]) catch unreachable; } else { __buf.appendSlice(std.heap.page_allocator, __s) catch unreachable; } } else { __buf.appendSlice(std.heap.page_allocator, __s) catch unreachable; } ");
+        try w.appendSlice(arena, "; var __buf: std.ArrayListUnmanaged(u8) = .empty; if (__from.len > 0) { if (std.mem.indexOf(u8, __s, __from)) |__p| { __buf.appendSlice(__sa(), __s[0..__p]) catch unreachable; __buf.appendSlice(__sa(), __to) catch unreachable; __buf.appendSlice(__sa(), __s[__p + __from.len ..]) catch unreachable; } else { __buf.appendSlice(__sa(), __s) catch unreachable; } } else { __buf.appendSlice(__sa(), __s) catch unreachable; } ");
         try w.print(arena, "break :{s} @as([]const u8, __buf.items); }})", .{lbl});
         return;
     }
@@ -2663,8 +3021,8 @@ fn emitStringMethod(mc: anytype, w: *std.ArrayListUnmanaged(u8), arena: std.mem.
         try w.appendSlice(arena, "const __sep: []const u8 = ");
         try emitExpr(mc.args[0], w, arena);
         try w.appendSlice(arena, "; var __parts: std.ArrayListUnmanaged([]const u8) = .empty; ");
-        try w.appendSlice(arena, "if (__sep.len == 0) { for (__s) |*__cp| __parts.append(std.heap.page_allocator, __cp[0..1]) catch unreachable; } ");
-        try w.appendSlice(arena, "else { var __it = std.mem.splitSequence(u8, __s, __sep); while (__it.next()) |__seg| __parts.append(std.heap.page_allocator, __seg) catch unreachable; } ");
+        try w.appendSlice(arena, "if (__sep.len == 0) { for (__s) |*__cp| __parts.append(__sa(), __cp[0..1]) catch unreachable; } ");
+        try w.appendSlice(arena, "else { var __it = std.mem.splitSequence(u8, __s, __sep); while (__it.next()) |__seg| __parts.append(__sa(), __seg) catch unreachable; } ");
         try w.print(arena, "break :{s} @as([]const []const u8, __parts.items); }})", .{lbl});
         return;
     }
@@ -3052,7 +3410,7 @@ fn emitClass(c: *const ast.ClassDecl, decls: *std.ArrayListUnmanaged(u8), arena:
         try decls.print(arena, "{s}: {s}", .{ param.name, try types.zigName(arena, param.checked_type orelse return error.ParseError) });
     }
     try decls.print(arena, ") *{s} {{\n", .{c.name});
-    try decls.print(arena, "    const self = std.heap.page_allocator.create({s}) catch unreachable;\n", .{c.name});
+    try decls.print(arena, "    const self = __sa().create({s}) catch unreachable;\n", .{c.name});
     try emitUnusedParamDiscards(ctor_owner.ctor_params, ctor_owner.ctor_body, decls, arena);
     for (ctor_owner.ctor_body) |*body_stmt| try emitStmtWithThrow(body_stmt, decls, decls, arena, throw_target, switch_break_target, options);
     try decls.appendSlice(arena, "    return self;\n    }\n");
@@ -3433,12 +3791,37 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
                 try decls.appendSlice(arena, "    return __promiseResolved(void, {});\n");
             }
             try decls.appendSlice(arena, "}\n");
+            // Destination-passing twin: appends straight into a caller buffer.
+            if (g_dest_acc) |dm| if (dm.get(decl.name)) |accname| {
+                try decls.print(arena, "fn {s}__into({s}: *std.ArrayListUnmanaged(u8)", .{ decl.name, accname });
+                for (decl.params) |param| {
+                    const param_type = param.checked_type orelse types.fromAnnotation(param.annotation);
+                    const ztype = if (param.is_ref) try types.refZigName(arena, param_type) else try types.zigName(arena, param_type);
+                    try decls.print(arena, ", {s}: {s}", .{ param.name, ztype });
+                }
+                try decls.appendSlice(arena, ") void {\n");
+                const prev = g_cur_into_acc;
+                g_cur_into_acc = accname;
+                try emitUnusedParamDiscards(decl.params, decl.body, decls, arena);
+                for (decl.body) |*body_stmt| try emitStmt(body_stmt, decls, decls, arena, options);
+                g_cur_into_acc = prev;
+                try decls.appendSlice(arena, "}\n");
+            };
         },
         .var_decl => |decl| {
-            const final_zty = decl.checked_type orelse return error.ParseError;
-            try body.print(arena, "    {s} {s}: {s} = ", .{ if (decl.mutable and decl.reassigned) "var" else "const", decl.emit_name orelse decl.name, try types.zigName(arena, final_zty) });
-            try emitExpr(decl.init, body, arena);
-            try body.appendSlice(arena, ";\n");
+            // In an `__into` body the returned accumulator is the dest parameter,
+            // so its local declaration is dropped.
+            if (g_cur_into_acc != null and decl.is_accumulator and std.mem.eql(u8, decl.emit_name orelse decl.name, g_cur_into_acc.?)) return;
+            if (decl.is_accumulator) {
+                // String-builder: a growable buffer instead of an immutable slice.
+                // The init is always `""`, so it starts empty.
+                try body.print(arena, "    var {s}: std.ArrayListUnmanaged(u8) = .empty;\n", .{decl.emit_name orelse decl.name});
+            } else {
+                const final_zty = decl.checked_type orelse return error.ParseError;
+                try body.print(arena, "    {s} {s}: {s} = ", .{ if (decl.mutable and decl.reassigned) "var" else "const", decl.emit_name orelse decl.name, try types.zigName(arena, final_zty) });
+                try emitExpr(decl.init, body, arena);
+                try body.appendSlice(arena, ";\n");
+            }
         },
         .using_decl => |decl| {
             // `using` lowers to Zig `defer`, which already runs LIFO at scope
@@ -3478,9 +3861,36 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             }
         },
         .assign => |assignment| {
-            try body.appendSlice(arena, "    ");
-            try emitAssignExpr(assignment, body, arena);
-            try body.appendSlice(arena, ";\n");
+            if (assignment.is_accumulator) {
+                // `v = v + a + b` -> append a, b in place (skip the leading `v`).
+                var parts: std.ArrayListUnmanaged(*const Expr) = .empty;
+                try collectStrConcat(assignment.value, &parts, arena);
+                const vname = assignment.emit_name orelse assignment.name;
+                // The buffer to pass to an `__into` call: the dest itself when this
+                // accumulator IS the enclosing `__into` dest (already a pointer),
+                // otherwise its address.
+                const accptr = if (g_cur_into_acc != null and std.mem.eql(u8, g_cur_into_acc.?, vname)) vname else try std.fmt.allocPrint(arena, "&{s}", .{vname});
+                if (parts.items.len >= 1) {
+                    for (parts.items[1..]) |p| {
+                        if (p.* == .call and p.call.is_into_call) {
+                            try body.print(arena, "    {s}__into({s}", .{ p.call.name, accptr });
+                            for (p.call.args) |arg| {
+                                try body.appendSlice(arena, ", ");
+                                try emitExpr(arg, body, arena);
+                            }
+                            try body.appendSlice(arena, ");\n");
+                        } else {
+                            try body.print(arena, "    {s}.appendSlice(__sa(), ", .{vname});
+                            try emitExpr(p, body, arena);
+                            try body.appendSlice(arena, ") catch std.process.exit(1);\n");
+                        }
+                    }
+                }
+            } else {
+                try body.appendSlice(arena, "    ");
+                try emitAssignExpr(assignment, body, arena);
+                try body.appendSlice(arena, ";\n");
+            }
         },
         .console_log => |log| {
             const log_type = log.checked_type orelse return error.ParseError;
@@ -3582,6 +3992,20 @@ fn emitStmtWithThrow(stmt: *const Stmt, decls: *std.ArrayListUnmanaged(u8), body
             try body.appendSlice(arena, "    }\n");
         },
         .return_stmt => |ret| {
+            // In an `__into` body, `return <acc>` is already appended into dest -> bare
+            // return; any other returned string is appended into dest, then return.
+            if (g_cur_into_acc) |dest| {
+                if (ret.value) |v| {
+                    if (v.* == .var_ref and v.var_ref.is_accumulator and std.mem.eql(u8, v.var_ref.emit_name orelse v.var_ref.name, dest)) {
+                        try body.appendSlice(arena, "    return;\n");
+                    } else {
+                        try body.print(arena, "    {s}.appendSlice(__sa(), ", .{dest});
+                        try emitExpr(v, body, arena);
+                        try body.appendSlice(arena, ") catch std.process.exit(1);\n    return;\n");
+                    }
+                } else try body.appendSlice(arena, "    return;\n");
+                return;
+            }
             if (ret.value) |value| {
                 if (g_async_inner) |inner_zig| {
                     // Inside an async body: resolve the promise with the value.
@@ -3693,6 +4117,13 @@ var g_program: ?*const Program = null;
 // outside an async body (and for plain functions).
 var g_async_inner: ?[]const u8 = null;
 
+// Destination-passing: string-builder functions (build an accumulator, return it)
+// also get an `f__into(dest, …)` form that appends straight into a caller buffer,
+// avoiding the intermediate build+copy. `g_dest_acc` maps such a function name to
+// its accumulator's name; `g_cur_into_acc` is set while emitting an `__into` body.
+var g_dest_acc: ?*std.StringHashMapUnmanaged([]const u8) = null;
+var g_cur_into_acc: ?[]const u8 = null;
+
 fn findClass(name: []const u8) ?*const ast.ClassDecl {
     const prog = g_program orelse return null;
     for (prog.stmts) |*stmt| {
@@ -3724,6 +4155,17 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
 
     try check.checkProgram(arena, &program, diag);
 
+    // Compile append-only string locals into growable buffers (O(n) builds).
+    try markAccumulators(program.stmts, &.{}, arena);
+
+    // Destination-passing: builder functions also get an `f__into(dest,…)` form;
+    // mark builder calls appended into accumulators so they call it directly.
+    var dest_map: std.StringHashMapUnmanaged([]const u8) = .empty;
+    try collectDestPassable(program.stmts, &dest_map, arena);
+    try markBuilderParts(program.stmts, &dest_map, arena);
+    g_dest_acc = &dest_map;
+    defer g_dest_acc = null;
+
     var decls: std.ArrayListUnmanaged(u8) = .empty; // top-level struct type definitions
     var body: std.ArrayListUnmanaged(u8) = .empty;
 
@@ -3748,6 +4190,7 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.appendSlice(arena, "const std = @import(\"std\");\n");
+    try out.appendSlice(arena, "var __sa_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);\nfn __sa() std.mem.Allocator { return __sa_arena.allocator(); }\n");
     // Async programs run their event loop on libuv. The CLI auto-injects libuv's
     // include/link flags into the native build whenever a program uses async, so
     // this C import resolves without any user configuration.
@@ -3850,7 +4293,7 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\        keys_: std.ArrayListUnmanaged(K) = .empty,
             \\        values_: std.ArrayListUnmanaged(V) = .empty,
             \\        fn __init() *Self {
-            \\            const p = std.heap.page_allocator.create(Self) catch unreachable;
+            \\            const p = __sa().create(Self) catch unreachable;
             \\            p.* = .{};
             \\            return p;
             \\        }
@@ -3860,8 +4303,8 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\        }
             \\        fn set(self: *Self, key: K, value: V) void {
             \\            if (self.__find(key)) |i| { self.values_.items[i] = value; return; }
-            \\            self.keys_.append(std.heap.page_allocator, key) catch unreachable;
-            \\            self.values_.append(std.heap.page_allocator, value) catch unreachable;
+            \\            self.keys_.append(__sa(), key) catch unreachable;
+            \\            self.values_.append(__sa(), value) catch unreachable;
             \\        }
             \\        fn get(self: *Self, key: K) ?V {
             \\            if (self.__find(key)) |i| return self.values_.items[i];
@@ -3895,7 +4338,7 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\        const Self = @This();
             \\        items_: std.ArrayListUnmanaged(T) = .empty,
             \\        fn __init() *Self {
-            \\            const p = std.heap.page_allocator.create(Self) catch unreachable;
+            \\            const p = __sa().create(Self) catch unreachable;
             \\            p.* = .{};
             \\            return p;
             \\        }
@@ -3905,7 +4348,7 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\        }
             \\        fn add(self: *Self, value: T) void {
             \\            if (self.__find(value) != null) return;
-            \\            self.items_.append(std.heap.page_allocator, value) catch unreachable;
+            \\            self.items_.append(__sa(), value) catch unreachable;
             \\        }
             \\        fn has(self: *Self, value: T) bool { return self.__find(value) != null; }
             \\        fn delete(self: *Self, value: T) bool {
