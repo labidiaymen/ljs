@@ -186,6 +186,10 @@ th { color: var(--muted); font-weight: 600; }
 #output { background: var(--code-bg); color: var(--code-fg); border: 1px solid var(--code-border); border-radius: var(--radius); padding: 15px 17px; margin: 14px 0 0; min-height: 44px; white-space: pre-wrap; overflow-x: auto; font: 13.5px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 #output.err { color: #ff9b9b; }
 #run[disabled] { opacity: 0.6; cursor: default; }
+/* CodeMirror editor — match the site's dark code blocks */
+.CodeMirror { height: auto; min-height: 320px; border: 1px solid var(--code-border); border-radius: var(--radius); font: 13.5px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.cm-s-material-darker.CodeMirror { background: var(--code-bg); }
+.cm-s-material-darker .CodeMirror-gutters { background: var(--code-bg); border-right: 1px solid var(--code-border); }
 
 footer { padding: 48px 0 64px; color: var(--muted); font-size: 14px; text-align: center; }
 footer .brand { font-size: 17px; }

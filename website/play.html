@@ -7,6 +7,8 @@
 <title>Playground — Lumen</title>
 <meta name="description" content="Write Lumen in the browser, compile it to WebAssembly, and run it live.">
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css">
 <link rel="canonical" href="https://lumen-lang.org/play">
 <meta property="og:url" content="https://lumen-lang.org/play">
 <meta property="og:title" content="Playground — Lumen">
@@ -126,11 +128,16 @@ console.log(add10(5));</script>
   <a href="/">← Back to home</a> · <a href="/examples">Examples</a> · <a href="/stdlib">Standard library</a>
 </div></footer>
 
+<!-- CodeMirror 5 (classic global build) for syntax highlighting. Loads before the
+     module below, so `window.CodeMirror` is defined when the module runs. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
+
 <script type="module">
 import { WASI, OpenFile, File, ConsoleStdout } from "https://cdn.jsdelivr.net/npm/@bjorn3/browser_wasi_shim@0.3.0/+esm";
 
 const ENDPOINT = "https://lumen-playground.fly.dev/compile";
-const editor = document.getElementById("editor");
+const editorEl = document.getElementById("editor");
 const out = document.getElementById("output");
 const statusEl = document.getElementById("status");
 const select = document.getElementById("examples");
@@ -139,18 +146,40 @@ const runBtn = document.getElementById("run");
 // Load the prefilled examples.
 const examples = {};
 document.querySelectorAll("#examples-data script").forEach((b) => {
-  const title = b.dataset.title;
-  examples[title] = b.textContent.replace(/^\n/, "").replace(/\n$/, "");
+  examples[b.dataset.title] = b.textContent.replace(/^\n/, "").replace(/\n$/, "");
   const opt = document.createElement("option");
-  opt.value = title;
-  opt.textContent = title;
+  opt.value = b.dataset.title;
+  opt.textContent = b.dataset.title;
   select.appendChild(opt);
 });
 const titles = Object.keys(examples);
-editor.value = examples[titles[0]];
+
+// Set up the editor. Use CodeMirror if it loaded; otherwise fall back to the
+// plain textarea so the playground still works.
+let getDoc, setDoc;
+if (window.CodeMirror) {
+  const cm = window.CodeMirror.fromTextArea(editorEl, {
+    mode: "text/typescript",
+    theme: "material-darker",
+    lineNumbers: true,
+    indentUnit: 2,
+    tabSize: 2,
+    extraKeys: {
+      "Cmd-Enter": () => compileAndRun(),
+      "Ctrl-Enter": () => compileAndRun(),
+    },
+  });
+  getDoc = () => cm.getValue();
+  setDoc = (v) => cm.setValue(v);
+} else {
+  getDoc = () => editorEl.value;
+  setDoc = (v) => { editorEl.value = v; };
+}
+
+setDoc(examples[titles[0]]);
 select.value = titles[0];
 select.addEventListener("change", () => {
-  editor.value = examples[select.value];
+  setDoc(examples[select.value]);
   out.textContent = "";
   out.classList.remove("err");
 });
@@ -180,7 +209,7 @@ async function compileAndRun() {
   setStatus("Compiling… (the service may take a few seconds to wake)");
   let res;
   try {
-    res = await fetch(ENDPOINT, { method: "POST", body: editor.value });
+    res = await fetch(ENDPOINT, { method: "POST", body: getDoc() });
   } catch (e) {
     setStatus("");
     show("Could not reach the compile service. Please try again.", true);
@@ -208,10 +237,6 @@ async function compileAndRun() {
 }
 
 runBtn.addEventListener("click", compileAndRun);
-// Ctrl/Cmd+Enter to run.
-editor.addEventListener("keydown", (e) => {
-  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); compileAndRun(); }
-});
 </script>
 </body>
 </html>
