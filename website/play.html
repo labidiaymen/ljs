@@ -127,9 +127,10 @@ console.log(add10(5));</script>
 import greet from "https://lumen-lang.org/package/std-contrib/hello/hello.ts";
 
 console.log(greet("playground"));</script>
-<script type="text/x-lumen" data-title="Embed JavaScript (QuickJS)">// The quickjs package embeds a QuickJS sandbox through Lumen's FFI. In the
-// browser the playground backs that FFI with a wasm build of QuickJS, so you
-// can evaluate JavaScript from Lumen right here. Values cross both ways.
+<script type="text/x-lumen" data-title="Embed JavaScript (QuickJS)">// The quickjs package embeds a QuickJS sandbox through Lumen's FFI. On the wasm
+// target the engine is linked straight into the compiled module, so this whole
+// program is one self-contained wasm -- the playground just runs it. Values
+// cross both ways.
 import { open, close, setInt, evalNumber, getString } from "https://lumen-lang.org/package/std-contrib/quickjs/quickjs.ts";
 
 open();
@@ -140,6 +141,21 @@ console.log(evalNumber("base * 2 + Math.sqrt(16)"));   // 46
 // compute a value inside the JS sandbox and read it back out:
 evalNumber("globalThis.greeting = 'hi ' + base");
 console.log(getString("greeting"));                    // hi 21
+
+close();</script>
+<script type="text/x-lumen" data-title="SQLite (in-memory)">// The sqlite package embeds SQLite through Lumen's FFI. As with quickjs, on the
+// wasm target SQLite is linked into the compiled module -- one self-contained
+// wasm, no database server, no install. Use an in-memory database.
+import { open, exec, queryInt, queryText, close } from "https://lumen-lang.org/package/std-contrib/sqlite/sqlite.ts";
+
+open(":memory:");
+
+exec("CREATE TABLE books (title TEXT, year INT)");
+exec("INSERT INTO books VALUES ('Crafting Interpreters', 2021)");
+exec("INSERT INTO books VALUES ('The Dragon Book', 1986)");
+
+console.log(queryInt("SELECT COUNT(*) FROM books"));            // 2
+console.log(queryText("SELECT title FROM books ORDER BY year")); // The Dragon Book
 
 close();</script>
 </div>
