@@ -21,8 +21,8 @@
 ---
 
 Lumen takes the TypeScript syntax you already know and compiles it ahead-of-time
-to a native executable or **one self-contained WebAssembly module** — statically
-typed, with no interpreter shipped alongside it.
+to a native executable or **one self-contained WebAssembly module**. It is
+statically typed, with no interpreter shipped alongside it.
 
 ```ts
 // hello.ts
@@ -38,10 +38,10 @@ lumen compile hello.ts && ./hello                   # native binary
 lumen compile --wasm hello.ts                       # one .wasm file
 ```
 
-### Packages are just URLs — and they can be *real*
+### Packages are just URLs, and they can be *real*
 
 Import straight from a URL (no package manager, no lockfile). Some packages even
-embed a C library — QuickJS, SQLite — into the wasm, so the whole program is one
+embed a C library (QuickJS, SQLite) into the wasm, so the whole program is one
 file whose only imports are WASI:
 
 ```ts
@@ -52,7 +52,7 @@ console.log(qjs.evalNumber("21 * 2 + Math.sqrt(16)"));   // 46
 
 ### Write a library in Lumen, ship it to npm
 
-The Markdown renderer in `std-contrib` is written entirely in Lumen — then
+The Markdown renderer in `std-contrib` is written entirely in Lumen, then
 compiled to a zero-dependency wasm package on npm that **outpaces the popular
 pure-JS libraries**:
 
@@ -65,7 +65,7 @@ import { render } from "@lumen-lang/markdown";   // 0 dependencies
 render("# Hi\n\n**bold**");                       // "<h1>Hi</h1>\n<p>…"
 ```
 
-> ~6,700 renders/sec — ~2.4× markdown-it, ~5× marked — from TypeScript syntax.
+> ~6,700 renders/sec: ~2.4× markdown-it, ~5× marked, from TypeScript syntax.
 
 ## Language
 
