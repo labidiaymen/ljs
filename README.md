@@ -69,7 +69,7 @@ render("# Hi\n\n**bold**");                       // "<h1>Hi</h1>\n<p>…"
 
 ## Language
 
-Compiled static semantics — not a JavaScript runtime:
+Compiled static semantics, not a JavaScript runtime:
 
 - `.ts` source, fixed static types with local inference
 - `number`/`float`/`f64` floats, `int`/`i32`/`i64` integers; decimal, float,
@@ -130,7 +130,7 @@ lumen compile main.ts && ./main
 ```
 
 `lumen init` writes a starter `main.ts`, plus `lumen.d.ts` and `tsconfig.json`
-so the project is editor- and `tsc`-clean from the first keystroke — you never
+so the project is editor- and `tsc`-clean from the first keystroke, you never
 hand-write the ambient declarations. Existing files are never overwritten;
 each is skipped with a notice.
 

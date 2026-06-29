@@ -4,15 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>Standard library — Lumen</title>
-<meta name="description" content="The Lumen standard library: console, Math, String, Array, fs, path, process, os and more — familiar APIs, statically typed, compiled.">
+<title>Standard library · Lumen</title>
+<meta name="description" content="The Lumen standard library: console, Math, String, Array, fs, path, process, os and more, familiar APIs, statically typed, compiled.">
 <link rel="stylesheet" href="style.css">
 <link rel="canonical" href="https://lumen-lang.org/stdlib">
 <meta property="og:url" content="https://lumen-lang.org/stdlib">
-<meta property="og:title" content="Standard library — Lumen">
-<meta property="og:description" content="The Lumen standard library: strings, arrays, collections, async, math, and C FFI — statically typed, compiled.">
-<meta name="twitter:title" content="Standard library — Lumen">
-<meta name="twitter:description" content="The Lumen standard library: strings, arrays, collections, async, math, and C FFI — statically typed, compiled.">
+<meta property="og:title" content="Standard library · Lumen">
+<meta property="og:description" content="The Lumen standard library: strings, arrays, collections, async, math, and C FFI, statically typed, compiled.">
+<meta name="twitter:title" content="Standard library · Lumen">
+<meta name="twitter:description" content="The Lumen standard library: strings, arrays, collections, async, math, and C FFI, statically typed, compiled.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <meta name="theme-color" content="#ea580c">
 <meta property="og:type" content="website">
@@ -42,8 +42,8 @@
 
 <section class="wrap">
   <h2>Standard library</h2>
-  <p class="sub">Familiar, conventional APIs — the names you already know
-  (<code>fs.readFileSync</code>, <code>path.join</code>, <code>process.cwd</code>) —
+  <p class="sub">Familiar, conventional APIs, the names you already know
+  (<code>fs.readFileSync</code>, <code>path.join</code>, <code>process.cwd</code>),
   but statically typed and compiled to native code. Every member is type- and
   arity-checked before it lowers.</p>
 
@@ -118,7 +118,7 @@
   </table>
 
   <h4 id="collections">Collections</h4>
-  <p class="sub">Typed, generic containers — no dynamic shapes.</p>
+  <p class="sub">Typed, generic containers, no dynamic shapes.</p>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
     <tr><td><code>Map&lt;K, V&gt;</code></td><td><code>get</code> · <code>set</code> · <code>has</code> · <code>delete</code> · <code>size</code> · <code>keys</code> · <code>values</code> · <code>entries</code> · <code>forEach</code></td></tr>
@@ -224,7 +224,7 @@
   are imported by URL. They include <code>quickjs</code>, which embeds a
   JavaScript sandbox through the C FFI for running untrusted scripts from Lumen.</p>
 
-  <p class="note">Lumen is statically typed and has no dynamic <code>JSON</code> value —
+  <p class="note">Lumen is statically typed and has no dynamic <code>JSON</code> value,
   <code>JSON.parse&lt;T&gt;</code> arrives later. The built-in library is a fixed,
   contracted surface; everything else ships as explicit
   <a href="https://github.com/lumen-lang-org/std-contrib">community packages</a>.</p>

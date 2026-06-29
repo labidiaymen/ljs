@@ -4,14 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>Lumen — TypeScript syntax, native speed</title>
+<title>Lumen: TypeScript syntax, native speed</title>
 <meta name="description" content="Lumen is a statically typed, compiled language with TypeScript syntax that builds a fast native binary.">
 <link rel="stylesheet" href="style.css">
 <link rel="canonical" href="https://lumen-lang.org/">
 <meta property="og:url" content="https://lumen-lang.org/">
-<meta property="og:title" content="Lumen — TypeScript syntax, native speed">
+<meta property="og:title" content="Lumen: TypeScript syntax, native speed">
 <meta property="og:description" content="A statically typed, compiled language with TypeScript syntax that builds a fast native binary.">
-<meta name="twitter:title" content="Lumen — TypeScript syntax, native speed">
+<meta name="twitter:title" content="Lumen: TypeScript syntax, native speed">
 <meta name="twitter:description" content="A statically typed, compiled language with TypeScript syntax that builds a fast native binary.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <meta name="theme-color" content="#ea580c">
@@ -75,7 +75,7 @@ console.log(hypot(3.0, 4.0));   // computed → 5</code></pre>
 
 <section class="wrap" id="hello">
   <h2>Hello, Lumen</h2>
-  <p class="sub">Familiar syntax, fixed static types, no runtime — just a native executable.</p>
+  <p class="sub">Familiar syntax, fixed static types, no runtime, just a native executable.</p>
 <pre><code class="lumen">interface Point {
   x: int;
   y: int;
@@ -94,7 +94,7 @@ console.log(`distance² = ${distanceSq(origin, p)}`);  // distance² = 25</code>
 
 <section class="wrap" id="features">
   <h2>What's in the language</h2>
-  <p class="sub">A predictable static subset of TypeScript — no prototypes, no <code>eval</code>, no dynamic shapes.</p>
+  <p class="sub">A predictable static subset of TypeScript, no prototypes, no <code>eval</code>, no dynamic shapes.</p>
   <div class="grid">
     <div class="card"><h3>Static types</h3><p>Local inference, <code>int</code>/<code>i64</code>/<code>number</code>/<code>bool</code>/<code>string</code>, float &amp; hex/binary literals.</p></div>
     <div class="card"><h3>Records &amp; interfaces</h3><p>Closed object shapes, nested records, arrays of records, <code>enum</code>s.</p></div>
@@ -105,23 +105,23 @@ console.log(`distance² = ${distanceSq(origin, p)}`);  // distance² = 25</code>
     <div class="card"><h3>Template literals</h3><p><code>`hi ${name}`</code> with string &amp; numeric interpolation.</p></div>
     <div class="card"><h3>defer</h3><p>Scope&#8209;exit cleanup, last&#8209;in&#8209;first&#8209;out.</p></div>
     <div class="card"><h3>Built-in tests</h3><p><code>test "…" { expect(…); }</code> run with <code>lumen test</code>.</p></div>
-    <div class="card"><h3>C FFI</h3><p><code>declare function</code> + <code>// @link</code> call native C libraries — scalars and strings marshal across the boundary.</p></div>
+    <div class="card"><h3>C FFI</h3><p><code>declare function</code> + <code>// @link</code> call native C libraries, scalars and strings marshal across the boundary.</p></div>
     <div class="card"><h3>String methods</h3><p><code>split</code>, <code>slice</code>, <code>trim</code>, <code>includes</code>, <code>indexOf</code>, <code>replace</code>, <code>repeat</code>, <code>padStart</code>, <code>toUpperCase</code>, and more.</p></div>
     <div class="card"><h3>Array methods</h3><p><code>map</code>, <code>filter</code>, <code>reduce</code>, <code>forEach</code>, <code>find</code>, <code>some</code>, <code>every</code>, <code>includes</code>, <code>indexOf</code>, <code>join</code>.</p></div>
-    <div class="card"><h3>Generics</h3><p>Generic functions, classes, and interfaces with <code>Array&lt;T&gt;</code> — monomorphized at compile time, no boxing.</p></div>
+    <div class="card"><h3>Generics</h3><p>Generic functions, classes, and interfaces with <code>Array&lt;T&gt;</code>, monomorphized at compile time, no boxing.</p></div>
     <div class="card"><h3>Type aliases &amp; unions</h3><p><code>type</code> aliases, discriminated unions narrowed by a literal tag, and <code>as</code> assertions.</p></div>
     <div class="card"><h3>Error handling</h3><p><code>try</code>/<code>catch</code>/<code>finally</code> and <code>throw</code>, with a readable <code>.message</code> on the caught error.</p></div>
     <div class="card"><h3>Maps, Sets &amp; tuples</h3><p><code>Map&lt;K, V&gt;</code>, <code>Set&lt;T&gt;</code>, and fixed-shape tuple types like <code>[int, string]</code>.</p></div>
     <div class="card"><h3>async / await</h3><p><code>async</code> functions return <code>Promise&lt;T&gt;</code> and <code>await</code> resolves them on a fast native event loop.</p></div>
-    <div class="card"><h3>Flexible parameters</h3><p>Default values, rest parameters, and spread — checked statically, no <code>arguments</code> object.</p></div>
-    <div class="card"><h3>URL imports</h3><p>Import a default export from a relative file or an <code>https://</code> URL — a package is just a URL.</p></div>
+    <div class="card"><h3>Flexible parameters</h3><p>Default values, rest parameters, and spread, checked statically, no <code>arguments</code> object.</p></div>
+    <div class="card"><h3>URL imports</h3><p>Import a default export from a relative file or an <code>https://</code> URL, a package is just a URL.</p></div>
     <div class="card"><h3>Native output</h3><p>Compiles to a small, fast, dependency&#8209;free native binary.</p></div>
   </div>
 </section>
 
 <section class="wrap" id="closures">
   <h2>Closures that compile</h2>
-  <p class="sub">Capture locals by value — lowered to a heap environment, no GC.</p>
+  <p class="sub">Capture locals by value, lowered to a heap environment, no GC.</p>
 <pre><code class="lumen">function makeAdder(n: int): (x: int) => int {
   return (x: int) => x + n;
 }
@@ -138,7 +138,7 @@ for (const v of nums) {
 
 <section class="wrap" id="classes">
   <h2>Classes</h2>
-  <p class="sub">Fields, a constructor, <code>this</code>, and methods — instances are heap structs.</p>
+  <p class="sub">Fields, a constructor, <code>this</code>, and methods, instances are heap structs.</p>
 <pre><code class="lumen">class Counter {
   count: int;
   constructor(start: int) {
@@ -176,7 +176,7 @@ console.log(s.trim().split(", ")[1]);  // World</code></pre>
 
 <section class="wrap" id="generics">
   <h2>Generics, monomorphized</h2>
-  <p class="sub">Write once over a type parameter; each instantiation compiles to specialized code — no boxing.</p>
+  <p class="sub">Write once over a type parameter; each instantiation compiles to specialized code, no boxing.</p>
 <pre><code class="lumen">function identity&lt;T&gt;(x: T): T {
   return x;
 }
@@ -255,7 +255,7 @@ checkAge(-1);   // error: age cannot be negative / checked</code></pre>
 
 <section class="wrap" id="ffi">
   <h2>Call native libraries</h2>
-  <p class="sub">Write a <code>declare function</code> and link a C library — no bindings generator, no runtime. (<code>extern function</code> works too.)</p>
+  <p class="sub">Write a <code>declare function</code> and link a C library, no bindings generator, no runtime. (<code>extern function</code> works too.)</p>
 <pre><code class="lumen">// @link m
 declare function pow(base: number, exp: number): number;
 declare function sqrt(x: number): number;
@@ -278,12 +278,12 @@ declare function shout(s: string): string;   // C: const char* shout(const char*
 
 console.log(shout("hi there"));   // HI THERE</code></pre>
   <p class="note">FFI marshals scalars (<code>int</code>, <code>i64</code>, <code>number</code>, <code>bool</code>) and strings.
-  This links local/system libraries — it is not a package manager.</p>
+  This links local/system libraries, it is not a package manager.</p>
 </section>
 
 <section class="wrap" id="imports">
   <h2>Import from a URL</h2>
-  <p class="sub">A package is just a URL. The <code>.ts</code> is fetched over HTTPS and inlined at compile time — no package manager, no install step.</p>
+  <p class="sub">A package is just a URL. The <code>.ts</code> is fetched over HTTPS and inlined at compile time, no package manager, no install step.</p>
 <pre><code class="lumen">import greet from "https://lumen-lang.org/package/std-contrib/hello/hello.ts";
 
 console.log(greet("world"));   // Hello, world!</code></pre>
@@ -295,7 +295,7 @@ console.log(greet("world"));   // Hello, world!</code></pre>
   <h2>Install</h2>
 <pre><code class="lumen">curl -fsSL https://lumen-lang.org/install.sh | sh</code></pre>
   <p class="sub">Windows: download the <code>.zip</code> from the
-  <a href="https://github.com/lumen-lang-org/lumen/releases">releases page</a>. Self-contained —
+  <a href="https://github.com/lumen-lang-org/lumen/releases">releases page</a>. Self-contained,
   no other toolchain required.</p>
   <p class="sub">Then scaffold a project and run it:</p>
 <pre><code class="lumen">lumen init my-app

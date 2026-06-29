@@ -4,14 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>Examples — Lumen</title>
+<title>Examples · Lumen</title>
 <meta name="description" content="Lumen example programs: records, enums, closures, null-safety, defer, and tests.">
 <link rel="stylesheet" href="style.css">
 <link rel="canonical" href="https://lumen-lang.org/examples">
 <meta property="og:url" content="https://lumen-lang.org/examples">
-<meta property="og:title" content="Examples — Lumen">
+<meta property="og:title" content="Examples · Lumen">
 <meta property="og:description" content="Lumen example programs: methods, generics, unions, classes, error handling, collections, async.">
-<meta name="twitter:title" content="Examples — Lumen">
+<meta name="twitter:title" content="Examples · Lumen">
 <meta name="twitter:description" content="Lumen example programs: methods, generics, unions, classes, error handling, collections, async.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <meta name="theme-color" content="#ea580c">
@@ -118,7 +118,7 @@ console.log(label(null));                         // anonymous</code></pre>
   </div>
 
   <div class="example">
-    <h3>math.test.ts <span class="meta">test blocks · expect — run with <code>lumen test</code></span></h3>
+    <h3>math.test.ts <span class="meta">test blocks · expect, run with <code>lumen test</code></span></h3>
 <pre><code class="lumen">function gcd(a: int, b: int): int {
   let x = a;
   let y = b;
@@ -137,7 +137,7 @@ test "gcd computes greatest common divisor" {
   </div>
 
   <div class="example">
-    <h3>ffi-math.ts <span class="meta">declare functions · linking libm — <code>lumen compile</code></span></h3>
+    <h3>ffi-math.ts <span class="meta">declare functions · linking libm, <code>lumen compile</code></span></h3>
 <pre><code class="lumen">// @link m
 declare function pow(base: number, exp: number): number;
 declare function sqrt(x: number): number;
@@ -310,7 +310,7 @@ console.log(greet("World", "Hi"));  // Hi, World</code></pre>
   </div>
 
   <div class="example">
-    <h3>async.ts <span class="meta">async / await · Promise — runs on a native event loop</span></h3>
+    <h3>async.ts <span class="meta">async / await · Promise, runs on a native event loop</span></h3>
 <pre><code class="lumen">async function fetchBase(): Promise&lt;int&gt; {
   return 10;
 }
