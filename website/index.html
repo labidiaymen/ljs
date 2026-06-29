@@ -63,7 +63,7 @@
 declare function sqrt(x: number): number;
 
 function hypot(a: number, b: number): number {
-  defer console.log("computed");   // runs at scope exit
+  using _ = defer(() => console.log("computed"));   // runs at scope exit
   return sqrt(a * a + b * b);
 }
 

@@ -6,7 +6,7 @@ interface Settings {
 }
 
 function connect(s: Settings): void {
-  defer console.log("connection closed");
+  using _ = defer(() => console.log("connection closed"));
   let port = s.port ?? 8080;
   console.log(`connecting to ${s.host}:${port}`);
 }

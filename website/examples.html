@@ -98,7 +98,7 @@ console.log(clamp(42));    // 42</code></pre>
 }
 
 function connect(s: Settings): void {
-  defer console.log("connection closed");
+  using _ = defer(() => console.log("connection closed"));
   let port = s.port ?? 8080;
   console.log(`connecting to ${s.host}:${port}`);
 }
@@ -331,7 +331,7 @@ console.log(await total(32));     // 42</code></pre>
 import { open, close, setInt, evalNumber, getString } from "./quickjs.ts";
 
 open();
-defer close();
+using _ = defer(() => close());
 
 setInt("base", 21);
 console.log(evalNumber("base * 2 + Math.sqrt(16)"));   // 46
