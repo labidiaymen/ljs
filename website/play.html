@@ -131,18 +131,17 @@ console.log(greet("playground"));</script>
 // target the engine is linked straight into the compiled module, so this whole
 // program is one self-contained wasm -- the playground just runs it. Values
 // cross both ways.
-import { open, close, setInt, evalNumber, getString } from "https://lumen-lang.org/package/std-contrib/quickjs/quickjs.ts";
+import * as qjs from "https://lumen-lang.org/package/std-contrib/quickjs/quickjs.ts";
 
-open();
+qjs.open();
+using _ = defer(() => qjs.close());   // closed automatically at scope exit
 
-setInt("base", 21);
-console.log(evalNumber("base * 2 + Math.sqrt(16)"));   // 46
+qjs.setInt("base", 21);
+console.log(qjs.evalNumber("base * 2 + Math.sqrt(16)"));   // 46
 
 // compute a value inside the JS sandbox and read it back out:
-evalNumber("globalThis.greeting = 'hi ' + base");
-console.log(getString("greeting"));                    // hi 21
-
-close();</script>
+qjs.evalNumber("globalThis.greeting = 'hi ' + base");
+console.log(qjs.getString("greeting"));                    // hi 21</script>
 <script type="text/x-lumen" data-title="SQLite (in-memory)">// The sqlite package embeds SQLite through Lumen's FFI. As with quickjs, on the
 // wasm target SQLite is linked into the compiled module -- one self-contained
 // wasm, no database server, no install. Use an in-memory database.

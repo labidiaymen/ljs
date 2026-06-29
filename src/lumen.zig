@@ -50,6 +50,9 @@ const ImportSpec = struct {
         default: []const u8,
         /// `import { a, b } from "..."` — binds the listed named exports.
         named: []const []const u8,
+        /// `import * as ns from "..."` — binds every export under a namespace; the
+        /// module is inlined and `ns.member` accesses are rewritten to `member`.
+        namespace: []const u8,
     };
 };
 
@@ -89,6 +92,13 @@ fn parseImportSpec(arena: std.mem.Allocator, line: []const u8) !?ImportSpec {
         const inner = clause[1 .. clause.len - 1];
         const names = try parseNamedBindings(arena, inner);
         return .{ .kind = .{ .named = names }, .spec = spec };
+    }
+
+    // `import * as ns from "..."` — namespace import.
+    if (std.mem.startsWith(u8, clause, "* as ")) {
+        const ns = std.mem.trim(u8, clause["* as ".len..], " \t");
+        if (ns.len == 0 or std.mem.indexOfAny(u8, ns, " \t{},.*") != null) return error.InvalidImport;
+        return .{ .kind = .{ .namespace = ns }, .spec = spec };
     }
 
     if (clause.len == 0 or std.mem.indexOfAny(u8, clause, " \t{},*") != null) return error.InvalidImport;
@@ -227,6 +237,7 @@ fn validateNamedImport(
     const names = switch (kind) {
         .named => |n| n,
         .default => return,
+        .namespace => return,
     };
     const source = if (is_url)
         fetchUrl(arena, io, path) catch return error.ImportReadFailed
@@ -235,6 +246,65 @@ fn validateNamedImport(
     var exports: std.StringHashMapUnmanaged(void) = .empty;
     try collectExports(arena, source, &exports);
     for (names) |n| if (exports.get(n) == null) return error.MissingExport;
+}
+
+fn isIdentCh(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '$';
+}
+fn isIdentStartCh(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$';
+}
+
+/// Appends `line` to `out`, rewriting `ns.member` -> `member` for each namespace
+/// alias in `namespaces` (the module was inlined, so its exports are top-level).
+/// Skips string literals and line comments so only real member accesses change.
+fn appendNsRewritten(arena: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), line: []const u8, namespaces: []const []const u8) !void {
+    if (namespaces.len == 0) return out.appendSlice(arena, line);
+    var i: usize = 0;
+    var in_str: u8 = 0;
+    while (i < line.len) {
+        const c = line[i];
+        if (in_str != 0) {
+            try out.append(arena, c);
+            if (c == '\\' and i + 1 < line.len) {
+                try out.append(arena, line[i + 1]);
+                i += 2;
+                continue;
+            }
+            if (c == in_str) in_str = 0;
+            i += 1;
+            continue;
+        }
+        if (c == '"' or c == '\'' or c == '`') {
+            in_str = c;
+            try out.append(arena, c);
+            i += 1;
+            continue;
+        }
+        if (c == '/' and i + 1 < line.len and line[i + 1] == '/') return out.appendSlice(arena, line[i..]);
+        const boundary = i == 0 or !isIdentCh(line[i - 1]);
+        if (boundary and isIdentStartCh(c)) {
+            var j = i;
+            while (j < line.len and isIdentCh(line[j])) j += 1;
+            const ident = line[i..j];
+            var is_ns = false;
+            if (j < line.len and line[j] == '.') {
+                for (namespaces) |ns| if (std.mem.eql(u8, ns, ident)) {
+                    is_ns = true;
+                    break;
+                };
+            }
+            if (is_ns) {
+                i = j + 1; // drop `ns.`
+            } else {
+                try out.appendSlice(arena, ident);
+                i = j;
+            }
+            continue;
+        }
+        try out.append(arena, c);
+        i += 1;
+    }
 }
 
 fn appendExpandedSource(
@@ -275,10 +345,12 @@ fn appendExpandedSource(
             for (names) |n| if (exports.get(n) == null) return error.MissingExport;
         },
         .default => {},
+        .namespace => {}, // binds all exports; nothing to validate
     };
     const default_name: ?[]const u8 = if (import_kind) |kind| switch (kind) {
         .default => |b| b,
         .named => null,
+        .namespace => null,
     } else null;
     // Base directory for resolving relative child imports: for a URL it is the
     // URL up to its last `/`; for a local file it is the file's directory.
@@ -288,6 +360,7 @@ fn appendExpandedSource(
     } else (std.fs.path.dirname(key) orelse ".");
 
     var local_imports: std.StringHashMapUnmanaged(void) = .empty;
+    var file_namespaces: std.ArrayListUnmanaged([]const u8) = .empty; // `import * as ns` aliases in this file
     // Tests belong to the module under test, not to importers: strip `test "…"`
     // blocks from imported modules (depth > 0) so they don't leak into the build.
     var test_skip: i32 = 0;
@@ -300,6 +373,7 @@ fn appendExpandedSource(
         if (try parseImportSpec(arena, line)) |import_spec| {
             if (local_imports.get(import_spec.spec) != null) return error.DuplicateImport;
             try local_imports.put(arena, import_spec.spec, {});
+            if (import_spec.kind == .namespace) try file_namespaces.append(arena, import_spec.kind.namespace);
             const child_is_url = std.mem.startsWith(u8, import_spec.spec, "https://");
             // Resolve relative imports against the base dir — a URL base for a
             // remote module (recursive remote packages), a local path otherwise.
@@ -325,12 +399,12 @@ fn appendExpandedSource(
         // keyword and emit the plain declaration into the shared program.
         if (parseNamedExportDecl(trimmed)) |ne| {
             // Preserve original indentation by emitting onto its own line.
-            try out.appendSlice(arena, ne.decl);
+            try appendNsRewritten(arena, out, ne.decl, file_namespaces.items);
             try out.append(arena, '\n');
             continue;
         }
         if (std.mem.startsWith(u8, trimmed, "export ")) return error.InvalidImport;
-        try out.appendSlice(arena, line);
+        try appendNsRewritten(arena, out, line, file_namespaces.items);
         try out.append(arena, '\n');
     }
     try emitted.put(arena, key, {});
