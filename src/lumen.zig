@@ -724,6 +724,26 @@ fn collectLinkLibs(arena: std.mem.Allocator, source: []const u8, argv: *std.Arra
     }
 }
 
+/// Top-level Zig appended to a wasm build that uses C FFI. Exposes a fixed
+/// scratch buffer in linear memory so host functions that return a `string`
+/// (lowered to `[*:0]const u8`) have somewhere to write the bytes the generated
+/// glue then reads back with `std.mem.span`. The embedder reads the buffer
+/// address/length via the two exported accessors. A single shared buffer means a
+/// returned string is only valid until the next FFI call — the same contract the
+/// native quickjs shim documents.
+const ffi_wasm_scratch =
+    \\
+    \\// --- wasm C-FFI host scratch buffer (string returns) ---
+    \\var __lumen_ffi_buf: [65536]u8 = undefined;
+    \\export fn __lumen_ffi_buf_ptr() u32 {
+    \\    return @intCast(@intFromPtr(&__lumen_ffi_buf));
+    \\}
+    \\export fn __lumen_ffi_buf_len() u32 {
+    \\    return @intCast(__lumen_ffi_buf.len);
+    \\}
+    \\
+;
+
 fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: CompileMode, action: Action, cli_libs: []const []const u8, wasm: bool, err: *std.Io.Writer) !u8 {
     if (!std.mem.endsWith(u8, path, ".ts")) {
         try err.print("error: expected a .ts source file, got {s}\n", .{path});
@@ -743,18 +763,29 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
     };
 
     var diag: compiler.Diag = .{};
-    const zig_src = compiler.compileToZigWithOptions(arena, source, path, &diag, .{
+    var zig_src = compiler.compileToZigWithOptions(arena, source, path, &diag, .{
         .runtime_locations = mode.runtimeLocations(),
     }) catch {
         try printDiag(err, source, path, diag);
         return 1;
     };
 
-    // The wasm target runs in a sandbox (e.g. the playground) with no C ABI and
-    // no event loop, so C FFI and async are not available there yet.
-    if (wasm and (std.mem.indexOf(u8, source, "// @link") != null or std.mem.indexOf(u8, zig_src, "@cInclude(\"uv.h\")") != null)) {
-        try err.print("{s}:1:1: error: the wasm target does not support C FFI or async yet\n", .{path});
+    // The wasm target has no event loop, so async is still unavailable there.
+    if (wasm and std.mem.indexOf(u8, zig_src, "@cInclude(\"uv.h\")") != null) {
+        try err.print("{s}:1:1: error: the wasm target does not support async yet\n", .{path});
         return 1;
+    }
+
+    // C FFI on wasm: an `extern fn` lowers to a wasm import the embedder must
+    // supply (e.g. the playground host backs the quickjs package with a wasm
+    // QuickJS). Native `// @link` pragmas are ignored on wasm (link collection
+    // is skipped below). For host functions that return a `string`, the embedder
+    // needs a place in linear memory to write the result; expose a fixed scratch
+    // buffer it can fill, matching the FFI string convention "valid until the
+    // next call". Only emitted when the program actually has externs.
+    const wasm_ffi = wasm and std.mem.indexOf(u8, zig_src, "extern fn ") != null;
+    if (wasm_ffi) {
+        zig_src = try std.mem.concat(arena, u8, &.{ zig_src, ffi_wasm_scratch });
     }
 
     const base = std.fs.path.stem(path);
@@ -777,10 +808,13 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
     // downloaded build is self-contained without exposing zig in the user's shell.
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     switch (action) {
-        .build_exe => if (wasm)
-            try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-target", "wasm32-wasi", "-O", "ReleaseSmall", emit })
-        else
-            try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-O", mode.zigName(), emit }),
+        .build_exe => if (wasm) {
+            try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-target", "wasm32-wasi", "-O", "ReleaseSmall", emit });
+            // A wasm executable exports only `_start` by default; explicitly
+            // export the FFI scratch accessors so the embedder can locate the
+            // return-string buffer.
+            if (wasm_ffi) try argv.appendSlice(arena, &.{ "--export=__lumen_ffi_buf_ptr", "--export=__lumen_ffi_buf_len" });
+        } else try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-O", mode.zigName(), emit }),
         .run_test => try argv.appendSlice(arena, &.{ "zig", "test", gen_path }),
     }
     // Native builds link C libraries; the wasm target has none (FFI/async were

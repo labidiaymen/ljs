@@ -127,6 +127,21 @@ console.log(add10(5));</script>
 import greet from "https://lumen-lang.org/package/std-contrib/hello/hello.ts";
 
 console.log(greet("playground"));</script>
+<script type="text/x-lumen" data-title="Embed JavaScript (QuickJS)">// The quickjs package embeds a QuickJS sandbox through Lumen's FFI. In the
+// browser the playground backs that FFI with a wasm build of QuickJS, so you
+// can evaluate JavaScript from Lumen right here. Values cross both ways.
+import { open, close, setInt, evalNumber, getString } from "https://lumen-lang.org/package/std-contrib/quickjs/quickjs.ts";
+
+open();
+
+setInt("base", 21);
+console.log(evalNumber("base * 2 + Math.sqrt(16)"));   // 46
+
+// compute a value inside the JS sandbox and read it back out:
+evalNumber("globalThis.greeting = 'hi ' + base");
+console.log(getString("greeting"));                    // hi 21
+
+close();</script>
 </div>
 
 <footer><div class="wrap">
@@ -140,6 +155,7 @@ console.log(greet("playground"));</script>
 
 <script type="module">
 import { WASI, OpenFile, File, ConsoleStdout } from "https://cdn.jsdelivr.net/npm/@bjorn3/browser_wasi_shim@0.3.0/+esm";
+import { getQuickJS } from "https://esm.sh/quickjs-emscripten@0.29.2";
 
 const ENDPOINT = "https://play-api.lumen-lang.org/compile";
 const editorEl = document.getElementById("editor");
@@ -195,6 +211,67 @@ function show(text, isErr) {
   out.classList.toggle("err", !!isErr);
 }
 
+// QuickJS (wasm) is loaded lazily on the first Run and reused thereafter, so the
+// ~1 MB engine is only fetched if you actually run something.
+let _quickjs = null;
+async function ensureQuickJS() {
+  if (!_quickjs) _quickjs = await getQuickJS();
+  return _quickjs;
+}
+
+// Back the quickjs package's FFI imports (env.qjs_*) with a wasm QuickJS engine.
+// `getInstance` is read lazily: the host functions are only called while the
+// Lumen module runs, by which point the instance (and its memory + the exported
+// FFI scratch buffer) exists. Strings cross via linear memory: arguments are
+// NUL-terminated bytes the module wrote; returns are written into the module's
+// __lumen_ffi_buf scratch buffer (valid until the next FFI call).
+function makeQjsHost(QuickJS, getInstance) {
+  let vm = null;
+  let lastError = "";
+  let scratchPtr = 0, scratchLen = 0;
+  const exps = () => getInstance().exports;
+  const mem = () => new Uint8Array(exps().memory.buffer);
+  const scratch = () => {
+    if (!scratchPtr) { scratchPtr = exps().__lumen_ffi_buf_ptr(); scratchLen = exps().__lumen_ffi_buf_len(); }
+    return [scratchPtr, scratchLen];
+  };
+  const readStr = (ptr) => {
+    const m = mem(); let end = ptr; while (m[end] !== 0) end++;
+    return new TextDecoder().decode(m.subarray(ptr, end));
+  };
+  const retStr = (s) => {
+    const [ptr, len] = scratch();
+    const bytes = new TextEncoder().encode(s);
+    const n = Math.min(bytes.length, len - 1);
+    const m = mem(); m.set(bytes.subarray(0, n), ptr); m[ptr + n] = 0;
+    return ptr;
+  };
+  const evalCode = (src) => {
+    const r = vm.evalCode(src);
+    if (r.error) { lastError = String(vm.dump(r.error)); r.error.dispose(); return undefined; }
+    const v = vm.dump(r.value); r.value.dispose(); lastError = ""; return v;
+  };
+  const setGlobal = (name, handle) => { vm.setProp(vm.global, name, handle); handle.dispose(); };
+  const getGlobal = (name) => { const h = vm.getProp(vm.global, name); const v = vm.dump(h); h.dispose(); return v; };
+  return {
+    qjs_open:  () => { vm = QuickJS.newContext(); lastError = ""; },
+    qjs_close: () => { if (vm) { vm.dispose(); vm = null; } },
+    qjs_set_int:    (np, v) => setGlobal(readStr(np), vm.newNumber(v)),
+    qjs_set_number: (np, v) => setGlobal(readStr(np), vm.newNumber(v)),
+    qjs_set_bool:   (np, v) => setGlobal(readStr(np), v ? vm.true : vm.false),
+    qjs_set_string: (np, vp) => setGlobal(readStr(np), vm.newString(readStr(vp))),
+    qjs_eval_int:    (sp) => (evalCode(readStr(sp)) | 0),
+    qjs_eval_number: (sp) => (Number(evalCode(readStr(sp))) || 0),
+    qjs_eval_bool:   (sp) => (evalCode(readStr(sp)) ? 1 : 0),
+    qjs_eval_string: (sp) => retStr(String(evalCode(readStr(sp)) ?? "")),
+    qjs_get_int:    (np) => (getGlobal(readStr(np)) | 0),
+    qjs_get_number: (np) => (Number(getGlobal(readStr(np))) || 0),
+    qjs_get_bool:   (np) => (getGlobal(readStr(np)) ? 1 : 0),
+    qjs_get_string: (np) => retStr(String(getGlobal(readStr(np)) ?? "")),
+    qjs_last_error: () => retStr(lastError),
+  };
+}
+
 async function runWasm(bytes) {
   let text = "";
   const wasi = new WASI([], [], [
@@ -202,7 +279,11 @@ async function runWasm(bytes) {
     ConsoleStdout.lineBuffered((s) => { text += s + "\n"; }),
     ConsoleStdout.lineBuffered((s) => { text += s + "\n"; }),
   ]);
-  const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi.wasiImport });
+  const QuickJS = await ensureQuickJS();
+  let instance;
+  const env = makeQjsHost(QuickJS, () => instance);
+  const res = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi.wasiImport, env });
+  instance = res.instance;
   try { wasi.start(instance); } catch (e) { /* proc_exit throws to unwind */ }
   return text;
 }
