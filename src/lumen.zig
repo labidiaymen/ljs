@@ -48,28 +48,41 @@ const ImportSpec = struct {
     const Kind = union(enum) {
         /// `import <binding> from "..."` — binds the module's default export.
         default: []const u8,
-        /// `import { a, b } from "..."` — binds the listed named exports.
-        named: []const []const u8,
+        /// `import { a, b as c } from "..."` — binds the listed named exports,
+        /// optionally renamed (`as`). The module is inlined and each aliased
+        /// export is renamed to its alias.
+        named: []const NamedBinding,
         /// `import * as ns from "..."` — binds every export under a namespace; the
         /// module is inlined and `ns.member` accesses are rewritten to `member`.
         namespace: []const u8,
     };
 };
 
-/// Splits a comma-separated `{ a, b, c }` binding list into trimmed names.
-/// Rejects empty entries, modifiers (`* as`, `as`), and stray punctuation so the
-/// import surface stays the simple TypeScript named-import form.
-fn parseNamedBindings(arena: std.mem.Allocator, inner: []const u8) ![]const []const u8 {
-    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+/// One `{ name }` or `{ name as alias }` entry of a named import.
+const NamedBinding = struct { name: []const u8, alias: []const u8 };
+
+/// Splits a comma-separated `{ a, b as c }` binding list into name/alias pairs.
+/// Each entry is `name` (alias == name) or `name as alias`. Rejects empty entries
+/// and stray punctuation so the import surface stays the TypeScript named form.
+fn parseNamedBindings(arena: std.mem.Allocator, inner: []const u8) ![]const NamedBinding {
+    var binds: std.ArrayListUnmanaged(NamedBinding) = .empty;
     var it = std.mem.splitScalar(u8, inner, ',');
     while (it.next()) |raw| {
-        const name = std.mem.trim(u8, raw, " \t");
-        if (name.len == 0) return error.InvalidImport;
-        if (std.mem.indexOfAny(u8, name, " \t{}*") != null) return error.InvalidImport;
-        try names.append(arena, name);
+        const entry = std.mem.trim(u8, raw, " \t");
+        if (entry.len == 0) return error.InvalidImport;
+        if (std.mem.indexOf(u8, entry, " as ")) |pos| {
+            const name = std.mem.trim(u8, entry[0..pos], " \t");
+            const alias = std.mem.trim(u8, entry[pos + 4 ..], " \t");
+            if (name.len == 0 or alias.len == 0) return error.InvalidImport;
+            if (std.mem.indexOfAny(u8, name, " \t{}*,.") != null or std.mem.indexOfAny(u8, alias, " \t{}*,.") != null) return error.InvalidImport;
+            try binds.append(arena, .{ .name = name, .alias = alias });
+        } else {
+            if (std.mem.indexOfAny(u8, entry, " \t{}*") != null) return error.InvalidImport;
+            try binds.append(arena, .{ .name = entry, .alias = entry });
+        }
     }
-    if (names.items.len == 0) return error.InvalidImport;
-    return names.items;
+    if (binds.items.len == 0) return error.InvalidImport;
+    return binds.items;
 }
 
 fn parseImportSpec(arena: std.mem.Allocator, line: []const u8) !?ImportSpec {
@@ -146,7 +159,7 @@ fn parseNamedExportDecl(trimmed: []const u8) ?NamedExport {
 
 /// Parses an `export { a, b }` re-export list into its names. Returns null when
 /// the line is not such a statement.
-fn parseExportList(arena: std.mem.Allocator, trimmed: []const u8) !?[]const []const u8 {
+fn parseExportList(arena: std.mem.Allocator, trimmed: []const u8) !?[]const NamedBinding {
     if (!std.mem.startsWith(u8, trimmed, "export {")) return null;
     const close = std.mem.indexOfScalar(u8, trimmed, '}') orelse return error.InvalidImport;
     const inner = trimmed["export {".len..close];
@@ -162,8 +175,8 @@ fn collectExports(arena: std.mem.Allocator, source: []const u8, set: *std.String
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (parseNamedExportDecl(trimmed)) |ne| {
             try set.put(arena, ne.name, {});
-        } else if (try parseExportList(arena, trimmed)) |names| {
-            for (names) |n| try set.put(arena, n, {});
+        } else if (try parseExportList(arena, trimmed)) |binds| {
+            for (binds) |b| try set.put(arena, b.alias, {});
         }
     }
 }
@@ -234,8 +247,8 @@ fn validateNamedImport(
     import_kind: ?ImportSpec.Kind,
 ) !void {
     const kind = import_kind orelse return;
-    const names = switch (kind) {
-        .named => |n| n,
+    const binds = switch (kind) {
+        .named => |b| b,
         .default => return,
         .namespace => return,
     };
@@ -245,7 +258,7 @@ fn validateNamedImport(
         std.Io.Dir.cwd().readFileAlloc(io, key, arena, .limited(16 * 1024 * 1024)) catch return error.ImportReadFailed;
     var exports: std.StringHashMapUnmanaged(void) = .empty;
     try collectExports(arena, source, &exports);
-    for (names) |n| if (exports.get(n) == null) return error.MissingExport;
+    for (binds) |b| if (exports.get(b.name) == null) return error.MissingExport;
 }
 
 fn isIdentCh(c: u8) bool {
@@ -255,11 +268,12 @@ fn isIdentStartCh(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$';
 }
 
-/// Appends `line` to `out`, rewriting `ns.member` -> `member` for each namespace
-/// alias in `namespaces` (the module was inlined, so its exports are top-level).
-/// Skips string literals and line comments so only real member accesses change.
-fn appendNsRewritten(arena: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), line: []const u8, namespaces: []const []const u8) !void {
-    if (namespaces.len == 0) return out.appendSlice(arena, line);
+/// Appends `line` to `out`, identifier-aware (skips string literals and line
+/// comments): rewrites `ns.member` -> `member` for each namespace alias, and
+/// renames any bare identifier matching a `renames` entry to its alias (used to
+/// rename an aliased named import in the inlined module).
+fn appendTransformed(arena: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), line: []const u8, namespaces: []const []const u8, renames: []const NamedBinding) !void {
+    if (namespaces.len == 0 and renames.len == 0) return out.appendSlice(arena, line);
     var i: usize = 0;
     var in_str: u8 = 0;
     while (i < line.len) {
@@ -287,19 +301,24 @@ fn appendNsRewritten(arena: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8),
             var j = i;
             while (j < line.len and isIdentCh(line[j])) j += 1;
             const ident = line[i..j];
-            var is_ns = false;
             if (j < line.len and line[j] == '.') {
+                var is_ns = false;
                 for (namespaces) |ns| if (std.mem.eql(u8, ns, ident)) {
                     is_ns = true;
                     break;
                 };
+                if (is_ns) {
+                    i = j + 1; // drop `ns.`
+                    continue;
+                }
             }
-            if (is_ns) {
-                i = j + 1; // drop `ns.`
-            } else {
-                try out.appendSlice(arena, ident);
-                i = j;
-            }
+            var renamed: ?[]const u8 = null;
+            for (renames) |r| if (std.mem.eql(u8, r.name, ident)) {
+                renamed = r.alias;
+                break;
+            };
+            try out.appendSlice(arena, renamed orelse ident);
+            i = j;
             continue;
         }
         try out.append(arena, c);
@@ -339,13 +358,23 @@ fn appendExpandedSource(
     // Named imports must name real exports. Default import of the module's
     // default export needs no name check (the rename happens during emit).
     if (import_kind) |kind| switch (kind) {
-        .named => |names| {
+        .named => |binds| {
             var exports: std.StringHashMapUnmanaged(void) = .empty;
             try collectExports(arena, source, &exports);
-            for (names) |n| if (exports.get(n) == null) return error.MissingExport;
+            for (binds) |b| if (exports.get(b.name) == null) return error.MissingExport;
         },
         .default => {},
         .namespace => {}, // binds all exports; nothing to validate
+    };
+    // Renames from aliased named imports (`a as b`) -> rename `a` to `b` in this
+    // inlined module so importer references to `b` resolve and clashing names from
+    // different modules can coexist.
+    var renames: std.ArrayListUnmanaged(NamedBinding) = .empty;
+    if (import_kind) |kind| switch (kind) {
+        .named => |binds| for (binds) |b| {
+            if (!std.mem.eql(u8, b.name, b.alias)) try renames.append(arena, b);
+        },
+        else => {},
     };
     const default_name: ?[]const u8 = if (import_kind) |kind| switch (kind) {
         .default => |b| b,
@@ -399,12 +428,12 @@ fn appendExpandedSource(
         // keyword and emit the plain declaration into the shared program.
         if (parseNamedExportDecl(trimmed)) |ne| {
             // Preserve original indentation by emitting onto its own line.
-            try appendNsRewritten(arena, out, ne.decl, file_namespaces.items);
+            try appendTransformed(arena, out, ne.decl, file_namespaces.items, renames.items);
             try out.append(arena, '\n');
             continue;
         }
         if (std.mem.startsWith(u8, trimmed, "export ")) return error.InvalidImport;
-        try appendNsRewritten(arena, out, line, file_namespaces.items);
+        try appendTransformed(arena, out, line, file_namespaces.items, renames.items);
         try out.append(arena, '\n');
     }
     try emitted.put(arena, key, {});
