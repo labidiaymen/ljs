@@ -1116,7 +1116,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
-    const usage = "usage: lumen init [dir]\n       lumen compile [--release-fast] [--wasm] [--link <lib>] <file.ts>\n       lumen watch [--no-run] [--release-fast] <file.ts>\n       lumen test <file.ts>\n";
+    const usage = "usage: lumen init [dir]\n       lumen compile [--release-fast] [--wasm] [--reactor] [--link <lib>] <file.ts>\n       lumen watch [--no-run] [--release-fast] <file.ts>\n       lumen test <file.ts>\n";
     const code = if (std.mem.eql(u8, args[1], "init")) blk: {
         if (args.len > 3) {
             try err.writeAll(usage);
