@@ -32,10 +32,10 @@ WORKDIR /build
 COPY . /build
 
 # Build the compiler and the compile service.
-RUN zig build \
+RUN zig build -Dcpu=baseline \
   && mkdir -p /app \
   && cp zig-out/bin/lumen /app/lumen \
-  && zig build-exe playground/server.zig -O ReleaseSafe -femit-bin=/app/server
+  && zig build-exe playground/server.zig -O ReleaseSafe -mcpu=baseline -femit-bin=/app/server
 
 WORKDIR /app
 ENV PORT=8080
