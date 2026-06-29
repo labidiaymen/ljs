@@ -724,25 +724,47 @@ fn collectLinkLibs(arena: std.mem.Allocator, source: []const u8, argv: *std.Arra
     }
 }
 
-/// Top-level Zig appended to a wasm build that uses C FFI. Exposes a fixed
-/// scratch buffer in linear memory so host functions that return a `string`
-/// (lowered to `[*:0]const u8`) have somewhere to write the bytes the generated
-/// glue then reads back with `std.mem.span`. The embedder reads the buffer
-/// address/length via the two exported accessors. A single shared buffer means a
-/// returned string is only valid until the next FFI call — the same contract the
-/// native quickjs shim documents.
-const ffi_wasm_scratch =
-    \\
-    \\// --- wasm C-FFI host scratch buffer (string returns) ---
-    \\var __lumen_ffi_buf: [65536]u8 = undefined;
-    \\export fn __lumen_ffi_buf_ptr() u32 {
-    \\    return @intCast(@intFromPtr(&__lumen_ffi_buf));
-    \\}
-    \\export fn __lumen_ffi_buf_len() u32 {
-    \\    return @intCast(__lumen_ffi_buf.len);
-    \\}
-    \\
-;
+/// Fetches a prebuilt wasm archive named by a `// @wasm-link <url>` pragma and
+/// returns a local path to it, caching by URL in the compile working directory
+/// so the (multi-MB) archive is downloaded once per process, not per compile.
+fn fetchWasmLib(arena: std.mem.Allocator, io: std.Io, url: []const u8) ![]const u8 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(url);
+    const cache = try std.fmt.allocPrint(arena, ".lumen-wasmlink-{x}.a", .{h.final()});
+    if (std.Io.Dir.cwd().openFile(io, cache, .{})) |f| {
+        f.close(io);
+        return cache;
+    } else |_| {}
+    const bytes = try fetchUrl(arena, io, url);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cache, .data = bytes });
+    return cache;
+}
+
+/// Links prebuilt wasm archives named by `// @wasm-link <spec>` pragmas into a
+/// wasm build. An `https://` spec is fetched (and cached) and linked as a local
+/// archive; any other spec passes through `appendLink` (a local path or `-l`
+/// name). Linking these archives resolves the program's `extern` (FFI) symbols
+/// *inside* the module, so the result is a single self-contained wasm whose only
+/// imports are WASI — no host-supplied engine. Returns true if any were linked.
+fn collectWasmLinks(arena: std.mem.Allocator, io: std.Io, source: []const u8, argv: *std.ArrayListUnmanaged([]const u8)) !bool {
+    const marker = "// @wasm-link ";
+    var any = false;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, marker)) continue;
+        const spec = std.mem.trim(u8, trimmed[marker.len..], " \t");
+        if (spec.len == 0) continue;
+        if (std.mem.startsWith(u8, spec, "https://")) {
+            const local = try fetchWasmLib(arena, io, spec);
+            try argv.append(arena, local);
+        } else {
+            try appendLink(arena, argv, spec);
+        }
+        any = true;
+    }
+    return any;
+}
 
 fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: CompileMode, action: Action, cli_libs: []const []const u8, wasm: bool, err: *std.Io.Writer) !u8 {
     if (!std.mem.endsWith(u8, path, ".ts")) {
@@ -763,7 +785,7 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
     };
 
     var diag: compiler.Diag = .{};
-    var zig_src = compiler.compileToZigWithOptions(arena, source, path, &diag, .{
+    const zig_src = compiler.compileToZigWithOptions(arena, source, path, &diag, .{
         .runtime_locations = mode.runtimeLocations(),
     }) catch {
         try printDiag(err, source, path, diag);
@@ -776,17 +798,12 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
         return 1;
     }
 
-    // C FFI on wasm: an `extern fn` lowers to a wasm import the embedder must
-    // supply (e.g. the playground host backs the quickjs package with a wasm
-    // QuickJS). Native `// @link` pragmas are ignored on wasm (link collection
-    // is skipped below). For host functions that return a `string`, the embedder
-    // needs a place in linear memory to write the result; expose a fixed scratch
-    // buffer it can fill, matching the FFI string convention "valid until the
-    // next call". Only emitted when the program actually has externs.
+    // C FFI on wasm: an `extern fn` is resolved by linking a prebuilt wasm
+    // archive named by a `// @wasm-link <url>` pragma (the wasm analogue of the
+    // native `// @link`). The compiler fetches the archive and links it into the
+    // module, so the FFI symbols resolve internally and the output is a single
+    // self-contained wasm whose only imports are WASI.
     const wasm_ffi = wasm and std.mem.indexOf(u8, zig_src, "extern fn ") != null;
-    if (wasm_ffi) {
-        zig_src = try std.mem.concat(arena, u8, &.{ zig_src, ffi_wasm_scratch });
-    }
 
     const base = std.fs.path.stem(path);
     // The generated backend source is an internal artifact: write it to a hidden
@@ -808,18 +825,29 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
     // downloaded build is self-contained without exposing zig in the user's shell.
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     switch (action) {
-        .build_exe => if (wasm) {
-            try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-target", "wasm32-wasi", "-O", "ReleaseSmall", emit });
-            // A wasm executable exports only `_start` by default; explicitly
-            // export the FFI scratch accessors so the embedder can locate the
-            // return-string buffer.
-            if (wasm_ffi) try argv.appendSlice(arena, &.{ "--export=__lumen_ffi_buf_ptr", "--export=__lumen_ffi_buf_len" });
-        } else try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-O", mode.zigName(), emit }),
+        .build_exe => if (wasm)
+            try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-target", "wasm32-wasi", "-O", "ReleaseSmall", emit })
+        else
+            try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-O", mode.zigName(), emit }),
         .run_test => try argv.appendSlice(arena, &.{ "zig", "test", gen_path }),
     }
-    // Native builds link C libraries; the wasm target has none (FFI/async were
-    // rejected above), so skip link collection entirely for wasm.
-    if (!wasm) {
+    if (wasm) {
+        // wasm C FFI: link the prebuilt archive(s) named by `// @wasm-link`, plus
+        // the wasi-libc support libraries they reference (math, and the emulated
+        // clock/signal shims QuickJS-style libraries use). The archive carries the
+        // FFI implementation, so the program needs no host engine.
+        if (wasm_ffi) {
+            const linked = collectWasmLinks(arena, io, source, &argv) catch |e| {
+                try err.print("{s}:1:1: error: could not fetch a // @wasm-link archive: {s}\n", .{ path, @errorName(e) });
+                return 1;
+            };
+            if (!linked) {
+                try err.print("{s}:1:1: error: wasm C FFI requires a // @wasm-link <url> archive to link\n", .{path});
+                return 1;
+            }
+            try argv.appendSlice(arena, &.{ "-lc", "-lwasi-emulated-process-clocks", "-lwasi-emulated-signal", "-lm" });
+        }
+    } else {
         // The async event loop is libuv: when the program uses async/await, the
         // generated backend imports `uv.h`, so auto-inject libuv's include/link
         // flags (this is a language feature, not a user `// @link`).

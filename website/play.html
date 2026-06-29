@@ -210,46 +210,9 @@ function show(text, isErr) {
   out.classList.toggle("err", !!isErr);
 }
 
-// C-FFI web bindings. A Lumen package that uses C FFI (e.g. quickjs) ships a
-// "web binding" module next to its source -- it backs the package's env.* FFI
-// imports with a wasm engine, with the engine and its version pinned in the
-// package itself. The playground hardcodes no engine: it loads a package's web
-// binding by URL, and only when a compiled program actually imports its symbols
-// (so nothing is fetched unless used). The symbol->URL registry below is the one
-// bit of per-package knowledge that still lives here; a future compiler change
-// could emit the package URL as the import's module name and drop even this.
-const FFI_BINDINGS = [
-  {
-    test: (name) => name.startsWith("qjs_"),
-    url: "https://lumen-lang.org/package/std-contrib/quickjs/quickjs.web.js",
-  },
-];
-
-const _bindingModules = new Map();
-function loadBindingModule(url) {
-  if (!_bindingModules.has(url)) _bindingModules.set(url, import(url));
-  return _bindingModules.get(url);
-}
-
-// Inspect a compiled module's `env` imports and assemble the env import table by
-// loading whichever package web bindings those imports call for. Returns
-// undefined when the program uses no FFI, so plain programs instantiate as before.
-async function buildFfiEnv(module, getInstance) {
-  const envImports = WebAssembly.Module.imports(module).filter((i) => i.module === "env");
-  if (envImports.length === 0) return undefined;
-  const urls = new Set();
-  for (const imp of envImports) {
-    const b = FFI_BINDINGS.find((x) => x.test(imp.name));
-    if (b) urls.add(b.url);
-  }
-  const env = {};
-  for (const url of urls) {
-    const mod = await loadBindingModule(url);
-    Object.assign(env, await mod.createBinding(getInstance));
-  }
-  return env;
-}
-
+// The compile service returns a single self-contained wasm: any C FFI a program
+// uses (e.g. the quickjs package) is linked into the module at compile time, so
+// there is no engine to load here -- the only import is WASI.
 async function runWasm(bytes) {
   let text = "";
   const wasi = new WASI([], [], [
@@ -257,15 +220,7 @@ async function runWasm(bytes) {
     ConsoleStdout.lineBuffered((s) => { text += s + "\n"; }),
     ConsoleStdout.lineBuffered((s) => { text += s + "\n"; }),
   ]);
-  // Compile first so we can read the module's imports and load any FFI bindings
-  // before instantiating. `getInstance` is read lazily by the bindings -- the
-  // host functions only run while the program runs, after `instance` is set.
-  const module = await WebAssembly.compile(bytes);
-  let instance;
-  const env = await buildFfiEnv(module, () => instance);
-  const imports = { wasi_snapshot_preview1: wasi.wasiImport };
-  if (env) imports.env = env;
-  instance = await WebAssembly.instantiate(module, imports);
+  const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi.wasiImport });
   try { wasi.start(instance); } catch (e) { /* proc_exit throws to unwind */ }
   return text;
 }
