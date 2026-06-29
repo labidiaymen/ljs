@@ -724,18 +724,50 @@ fn collectLinkLibs(arena: std.mem.Allocator, source: []const u8, argv: *std.Arra
     }
 }
 
+/// Writes the lowercase hex SHA-256 of `bytes` into `out`, returning the slice.
+fn sha256Hex(out: *[64]u8, bytes: []const u8) []const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        out[i * 2] = hex[b >> 4];
+        out[i * 2 + 1] = hex[b & 0xf];
+    }
+    return out[0..64];
+}
+
 /// Fetches a prebuilt wasm archive named by a `// @wasm-link <url>` pragma and
-/// returns a local path to it, caching by URL in the compile working directory
+/// returns a local path to it, caching by spec in the compile working directory
 /// so the (multi-MB) archive is downloaded once per process, not per compile.
-fn fetchWasmLib(arena: std.mem.Allocator, io: std.Io, url: []const u8) ![]const u8 {
+/// An optional `#sha256=<hex>` fragment pins the archive: the bytes are verified
+/// against it (on download and on cache reuse), so a tampered or swapped artifact
+/// is rejected rather than linked.
+fn fetchWasmLib(arena: std.mem.Allocator, io: std.Io, spec: []const u8) ![]const u8 {
+    var url = spec;
+    var want_hash: ?[]const u8 = null;
+    if (std.mem.indexOfScalar(u8, spec, '#')) |hp| {
+        url = spec[0..hp];
+        const frag = spec[hp + 1 ..];
+        const pfx = "sha256=";
+        if (std.mem.startsWith(u8, frag, pfx)) want_hash = frag[pfx.len..];
+    }
+
     var h = std.hash.Wyhash.init(0);
-    h.update(url);
+    h.update(spec);
     const cache = try std.fmt.allocPrint(arena, ".lumen-wasmlink-{x}.a", .{h.final()});
-    if (std.Io.Dir.cwd().openFile(io, cache, .{})) |f| {
-        f.close(io);
-        return cache;
+    var hexbuf: [64]u8 = undefined;
+
+    // Reuse a cached copy, re-verifying its hash when pinned (guards the cache).
+    if (std.Io.Dir.cwd().readFileAlloc(io, cache, arena, .limited(256 * 1024 * 1024))) |cached| {
+        if (want_hash) |wh| {
+            if (std.ascii.eqlIgnoreCase(sha256Hex(&hexbuf, cached), wh)) return cache;
+        } else return cache;
     } else |_| {}
+
     const bytes = try fetchUrl(arena, io, url);
+    if (want_hash) |wh| {
+        if (!std.ascii.eqlIgnoreCase(sha256Hex(&hexbuf, bytes), wh)) return error.WasmLinkHashMismatch;
+    }
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cache, .data = bytes });
     return cache;
 }
