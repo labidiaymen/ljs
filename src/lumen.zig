@@ -509,7 +509,7 @@ fn watchRebuild(
 ) !void {
     // Reuse the standard compile path so diagnostics are identical to `lumen
     // compile`. compileFile prints either the diagnostic or the success line.
-    const code = compileFile(arena, io, path, mode, .build_exe, &.{}, false, err) catch |e| {
+    const code = compileFile(arena, io, path, mode, .build_exe, &.{}, false, false, err) catch |e| {
         try err.print("watch: rebuild error: {s}\n", .{@errorName(e)});
         try err.flush();
         return;
@@ -901,7 +901,55 @@ fn collectWasmLinks(arena: std.mem.Allocator, io: std.Io, source: []const u8, ar
     return any;
 }
 
-fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: CompileMode, action: Action, cli_libs: []const []const u8, wasm: bool, err: *std.Io.Writer) !u8 {
+/// Names of `export function NAME(...)` declarations in the entry file — the
+/// functions surfaced as callable wasm exports in `--reactor` mode.
+fn collectReactorExports(arena: std.mem.Allocator, source: []const u8) ![]const []const u8 {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    const pfx = "export function ";
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, t, pfx)) continue;
+        const rest = t[pfx.len..];
+        const paren = std.mem.indexOfScalar(u8, rest, '(') orelse continue;
+        const name = std.mem.trim(u8, rest[0..paren], " \t");
+        if (name.len > 0) try names.append(arena, name);
+    }
+    return names.items;
+}
+
+/// Reactor glue appended to the generated Zig: a fixed input buffer the embedder
+/// writes into, and per export a `__lumen_call_<name>(ptr, len) -> result_ptr`
+/// that runs the `string -> string` function and reports the length via
+/// `__lumen_out_len()`. The string arena is reset at each call (the previous
+/// result has been read by then), giving repeated calls constant memory.
+fn reactorWrappers(arena: std.mem.Allocator, names: []const []const u8) ![]const u8 {
+    var w: std.ArrayListUnmanaged(u8) = .empty;
+    try w.appendSlice(arena,
+        \\
+        \\// --- reactor exports (callable string-in / string-out) ---
+        \\var __lumen_in_buf: [1 << 20]u8 = undefined;
+        \\var __lumen_out_len_val: u32 = 0;
+        \\export fn __lumen_in_ptr() u32 { return @intCast(@intFromPtr(&__lumen_in_buf)); }
+        \\export fn __lumen_in_cap() u32 { return @intCast(__lumen_in_buf.len); }
+        \\export fn __lumen_out_len() u32 { return __lumen_out_len_val; }
+        \\
+    );
+    for (names) |n| {
+        try w.print(arena,
+            "export fn __lumen_call_{s}(__p: u32, __n: u32) u32 {{\n" ++
+                "    _ = __sa_arena.reset(.retain_capacity);\n" ++
+                "    const __r = {s}(@as([*]const u8, @ptrFromInt(@as(usize, __p)))[0..@as(usize, __n)]);\n" ++
+                "    __lumen_out_len_val = @intCast(__r.len);\n" ++
+                "    return @intCast(@intFromPtr(__r.ptr));\n" ++
+                "}}\n",
+            .{ n, n },
+        );
+    }
+    return w.items;
+}
+
+fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: CompileMode, action: Action, cli_libs: []const []const u8, wasm: bool, reactor: bool, err: *std.Io.Writer) !u8 {
     if (!std.mem.endsWith(u8, path, ".ts")) {
         try err.print("error: expected a .ts source file, got {s}\n", .{path});
         return 2;
@@ -920,12 +968,27 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
     };
 
     var diag: compiler.Diag = .{};
-    const zig_src = compiler.compileToZigWithOptions(arena, source, path, &diag, .{
+    var zig_src = compiler.compileToZigWithOptions(arena, source, path, &diag, .{
         .runtime_locations = mode.runtimeLocations(),
     }) catch {
         try printDiag(err, source, path, diag);
         return 1;
     };
+
+    // `--reactor`: surface the entry file's `export function`s as callable wasm
+    // exports (string in/out via linear memory) so an embedder instantiates once
+    // and calls them repeatedly, instead of re-running the program per call.
+    var reactor_exports: []const []const u8 = &.{};
+    if (reactor and wasm) {
+        const entry_src = if (std.mem.startsWith(u8, path, "https://"))
+            fetchUrl(arena, io, path) catch return error.FetchFailed
+        else
+            std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024)) catch return error.ImportReadFailed;
+        reactor_exports = try collectReactorExports(arena, entry_src);
+        if (reactor_exports.len > 0) {
+            zig_src = try std.mem.concat(arena, u8, &.{ zig_src, try reactorWrappers(arena, reactor_exports) });
+        }
+    }
 
     // The wasm target has no event loop, so async is still unavailable there.
     if (wasm and std.mem.indexOf(u8, zig_src, "@cInclude(\"uv.h\")") != null) {
@@ -981,6 +1044,11 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
                 return 1;
             }
             try argv.appendSlice(arena, &.{ "-lc", "-lwasi-emulated-process-clocks", "-lwasi-emulated-signal", "-lm" });
+        }
+        // Surface the reactor exports (a wasm exe exports only `_start` by default).
+        if (reactor_exports.len > 0) {
+            try argv.appendSlice(arena, &.{ "--export=__lumen_in_ptr", "--export=__lumen_in_cap", "--export=__lumen_out_len" });
+            for (reactor_exports) |n| try argv.append(arena, try std.fmt.allocPrint(arena, "--export=__lumen_call_{s}", .{n}));
         }
     } else {
         // The async event loop is libuv: when the program uses async/await, the
@@ -1061,7 +1129,7 @@ pub fn main(init: std.process.Init) !void {
             try err.writeAll("usage: lumen test <file.ts>\n");
             break :blk 2;
         }
-        break :blk try compileFile(arena, io, args[2], .release_safe, .run_test, &.{}, false, err);
+        break :blk try compileFile(arena, io, args[2], .release_safe, .run_test, &.{}, false, false, err);
     } else if (std.mem.eql(u8, args[1], "watch")) blk: {
         if (args.len < 3) {
             try err.writeAll("usage: lumen watch [--no-run] [--release-fast] <file.ts>\n");
@@ -1099,6 +1167,7 @@ pub fn main(init: std.process.Init) !void {
         var source_arg: ?[]const u8 = null;
         var libs: std.ArrayListUnmanaged([]const u8) = .empty;
         var wasm = false;
+        var reactor = false;
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             const arg = args[i];
@@ -1108,6 +1177,9 @@ pub fn main(init: std.process.Init) !void {
                 mode = .release_safe;
             } else if (std.mem.eql(u8, arg, "--wasm")) {
                 wasm = true;
+            } else if (std.mem.eql(u8, arg, "--reactor")) {
+                reactor = true;
+                wasm = true; // reactor implies the wasm target
             } else if (std.mem.eql(u8, arg, "--link")) {
                 i += 1;
                 if (i >= args.len) {
@@ -1125,9 +1197,9 @@ pub fn main(init: std.process.Init) !void {
         break :blk try compileFile(arena, io, source_arg orelse {
             try err.writeAll(usage);
             break :blk 2;
-        }, mode, .build_exe, libs.items, wasm, err);
+        }, mode, .build_exe, libs.items, wasm, reactor, err);
     } else blk: {
-        break :blk try compileFile(arena, io, args[1], .release_safe, .build_exe, &.{}, false, err);
+        break :blk try compileFile(arena, io, args[1], .release_safe, .build_exe, &.{}, false, false, err);
     };
 
     try err.flush();
