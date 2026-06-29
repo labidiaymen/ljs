@@ -122,6 +122,11 @@ console.log(scores.get("ada") ?? 0);</script>
 let add10 = makeAdder(10);
 using _ = defer(() => console.log("cleaned up"));
 console.log(add10(5));</script>
+<script type="text/x-lumen" data-title="Community package (URL import)">// Import a package straight from a URL. It is fetched over HTTPS and compiled
+// in, so this Run takes a little longer than the others.
+import greet from "https://lumen-lang.org/package/std-contrib/hello/hello.ts";
+
+console.log(greet("playground"));</script>
 </div>
 
 <footer><div class="wrap">
