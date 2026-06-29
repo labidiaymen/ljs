@@ -155,7 +155,6 @@ close();</script>
 
 <script type="module">
 import { WASI, OpenFile, File, ConsoleStdout } from "https://cdn.jsdelivr.net/npm/@bjorn3/browser_wasi_shim@0.3.0/+esm";
-import { getQuickJS } from "https://esm.sh/quickjs-emscripten@0.29.2";
 
 const ENDPOINT = "https://play-api.lumen-lang.org/compile";
 const editorEl = document.getElementById("editor");
@@ -211,65 +210,44 @@ function show(text, isErr) {
   out.classList.toggle("err", !!isErr);
 }
 
-// QuickJS (wasm) is loaded lazily on the first Run and reused thereafter, so the
-// ~1 MB engine is only fetched if you actually run something.
-let _quickjs = null;
-async function ensureQuickJS() {
-  if (!_quickjs) _quickjs = await getQuickJS();
-  return _quickjs;
+// C-FFI web bindings. A Lumen package that uses C FFI (e.g. quickjs) ships a
+// "web binding" module next to its source -- it backs the package's env.* FFI
+// imports with a wasm engine, with the engine and its version pinned in the
+// package itself. The playground hardcodes no engine: it loads a package's web
+// binding by URL, and only when a compiled program actually imports its symbols
+// (so nothing is fetched unless used). The symbol->URL registry below is the one
+// bit of per-package knowledge that still lives here; a future compiler change
+// could emit the package URL as the import's module name and drop even this.
+const FFI_BINDINGS = [
+  {
+    test: (name) => name.startsWith("qjs_"),
+    url: "https://lumen-lang.org/package/std-contrib/quickjs/quickjs.web.js",
+  },
+];
+
+const _bindingModules = new Map();
+function loadBindingModule(url) {
+  if (!_bindingModules.has(url)) _bindingModules.set(url, import(url));
+  return _bindingModules.get(url);
 }
 
-// Back the quickjs package's FFI imports (env.qjs_*) with a wasm QuickJS engine.
-// `getInstance` is read lazily: the host functions are only called while the
-// Lumen module runs, by which point the instance (and its memory + the exported
-// FFI scratch buffer) exists. Strings cross via linear memory: arguments are
-// NUL-terminated bytes the module wrote; returns are written into the module's
-// __lumen_ffi_buf scratch buffer (valid until the next FFI call).
-function makeQjsHost(QuickJS, getInstance) {
-  let vm = null;
-  let lastError = "";
-  let scratchPtr = 0, scratchLen = 0;
-  const exps = () => getInstance().exports;
-  const mem = () => new Uint8Array(exps().memory.buffer);
-  const scratch = () => {
-    if (!scratchPtr) { scratchPtr = exps().__lumen_ffi_buf_ptr(); scratchLen = exps().__lumen_ffi_buf_len(); }
-    return [scratchPtr, scratchLen];
-  };
-  const readStr = (ptr) => {
-    const m = mem(); let end = ptr; while (m[end] !== 0) end++;
-    return new TextDecoder().decode(m.subarray(ptr, end));
-  };
-  const retStr = (s) => {
-    const [ptr, len] = scratch();
-    const bytes = new TextEncoder().encode(s);
-    const n = Math.min(bytes.length, len - 1);
-    const m = mem(); m.set(bytes.subarray(0, n), ptr); m[ptr + n] = 0;
-    return ptr;
-  };
-  const evalCode = (src) => {
-    const r = vm.evalCode(src);
-    if (r.error) { lastError = String(vm.dump(r.error)); r.error.dispose(); return undefined; }
-    const v = vm.dump(r.value); r.value.dispose(); lastError = ""; return v;
-  };
-  const setGlobal = (name, handle) => { vm.setProp(vm.global, name, handle); handle.dispose(); };
-  const getGlobal = (name) => { const h = vm.getProp(vm.global, name); const v = vm.dump(h); h.dispose(); return v; };
-  return {
-    qjs_open:  () => { vm = QuickJS.newContext(); lastError = ""; },
-    qjs_close: () => { if (vm) { vm.dispose(); vm = null; } },
-    qjs_set_int:    (np, v) => setGlobal(readStr(np), vm.newNumber(v)),
-    qjs_set_number: (np, v) => setGlobal(readStr(np), vm.newNumber(v)),
-    qjs_set_bool:   (np, v) => setGlobal(readStr(np), v ? vm.true : vm.false),
-    qjs_set_string: (np, vp) => setGlobal(readStr(np), vm.newString(readStr(vp))),
-    qjs_eval_int:    (sp) => (evalCode(readStr(sp)) | 0),
-    qjs_eval_number: (sp) => (Number(evalCode(readStr(sp))) || 0),
-    qjs_eval_bool:   (sp) => (evalCode(readStr(sp)) ? 1 : 0),
-    qjs_eval_string: (sp) => retStr(String(evalCode(readStr(sp)) ?? "")),
-    qjs_get_int:    (np) => (getGlobal(readStr(np)) | 0),
-    qjs_get_number: (np) => (Number(getGlobal(readStr(np))) || 0),
-    qjs_get_bool:   (np) => (getGlobal(readStr(np)) ? 1 : 0),
-    qjs_get_string: (np) => retStr(String(getGlobal(readStr(np)) ?? "")),
-    qjs_last_error: () => retStr(lastError),
-  };
+// Inspect a compiled module's `env` imports and assemble the env import table by
+// loading whichever package web bindings those imports call for. Returns
+// undefined when the program uses no FFI, so plain programs instantiate as before.
+async function buildFfiEnv(module, getInstance) {
+  const envImports = WebAssembly.Module.imports(module).filter((i) => i.module === "env");
+  if (envImports.length === 0) return undefined;
+  const urls = new Set();
+  for (const imp of envImports) {
+    const b = FFI_BINDINGS.find((x) => x.test(imp.name));
+    if (b) urls.add(b.url);
+  }
+  const env = {};
+  for (const url of urls) {
+    const mod = await loadBindingModule(url);
+    Object.assign(env, await mod.createBinding(getInstance));
+  }
+  return env;
 }
 
 async function runWasm(bytes) {
@@ -279,11 +257,15 @@ async function runWasm(bytes) {
     ConsoleStdout.lineBuffered((s) => { text += s + "\n"; }),
     ConsoleStdout.lineBuffered((s) => { text += s + "\n"; }),
   ]);
-  const QuickJS = await ensureQuickJS();
+  // Compile first so we can read the module's imports and load any FFI bindings
+  // before instantiating. `getInstance` is read lazily by the bindings -- the
+  // host functions only run while the program runs, after `instance` is set.
+  const module = await WebAssembly.compile(bytes);
   let instance;
-  const env = makeQjsHost(QuickJS, () => instance);
-  const res = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi.wasiImport, env });
-  instance = res.instance;
+  const env = await buildFfiEnv(module, () => instance);
+  const imports = { wasi_snapshot_preview1: wasi.wasiImport };
+  if (env) imports.env = env;
+  instance = await WebAssembly.instantiate(module, imports);
   try { wasi.start(instance); } catch (e) { /* proc_exit throws to unwind */ }
   return text;
 }
