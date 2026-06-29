@@ -1,0 +1,21 @@
+# Fly.io configuration for the Lumen playground compile service.
+#
+# Set `app` to your own Fly app name before deploying (or let `fly launch`
+# generate one). The service scales to zero: when no requests arrive, the
+# machine stops; the next request starts it again.
+app = "lumen-playground"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
