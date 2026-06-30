@@ -153,9 +153,20 @@
   </table>
 
   <h4 id="fs">fs · process</h4>
+  <p class="sub">The synchronous core, statically typed and Node-conventional. This
+  is a practical subset, not the full <a href="https://nodejs.org/docs/latest/api/fs.html">Node <code>fs</code> API</a>
+  (no streams, watchers, file descriptors, symlinks, or async/promise variants
+  yet) &mdash; see Planned below for what is next.</p>
   <table>
     <tr><th>API</th><th>Type</th><th>Notes</th></tr>
     <tr><td><code>fs.readFileSync(path, encoding?)</code></td><td>(string, string?) → string</td><td>UTF-8 text; "" if unreadable</td></tr>
+    <tr><td><code>fs.writeFileSync(path, data)</code></td><td>(string, string) → void</td><td>creates or truncates</td></tr>
+    <tr><td><code>fs.appendFileSync(path, data)</code></td><td>(string, string) → void</td><td>creates if missing</td></tr>
+    <tr><td><code>fs.existsSync(path)</code></td><td>string → bool</td><td></td></tr>
+    <tr><td><code>fs.mkdirSync(path, recursive?)</code></td><td>(string, bool?) → void</td><td>recursive defaults to false</td></tr>
+    <tr><td><code>fs.unlinkSync(path)</code></td><td>string → void</td><td>delete a file</td></tr>
+    <tr><td><code>fs.renameSync(a, b)</code></td><td>(string, string) → void</td><td></td></tr>
+    <tr><td><code>fs.copyFileSync(a, b)</code></td><td>(string, string) → void</td><td></td></tr>
     <tr><td><code>argsCount()</code> · <code>arg(i)</code></td><td>→ int · int → string</td><td>process arguments</td></tr>
   </table>
 
@@ -167,13 +178,9 @@
   <h4>fs</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
-    <tr><td><code>fs.writeFileSync(path, data)</code></td><td></td></tr>
-    <tr><td><code>fs.appendFileSync(path, data)</code></td><td></td></tr>
-    <tr><td><code>fs.existsSync(path)</code></td><td>→ bool</td></tr>
-    <tr><td><code>fs.mkdirSync(path, recursive?)</code></td><td></td></tr>
-    <tr><td><code>fs.rmSync(path)</code> · <code>fs.unlinkSync(path)</code></td><td></td></tr>
-    <tr><td><code>fs.renameSync(a, b)</code> · <code>fs.copyFileSync(a, b)</code></td><td></td></tr>
+    <tr><td><code>fs.rmSync(path, recursive?)</code></td><td>recursive directory removal</td></tr>
     <tr><td><code>fs.statSync(path)</code> → <code>{ size, isFile, isDirectory }</code></td><td>record return</td></tr>
+    <tr><td><code>fs.promises.*</code> / watch / streams</td><td>needs the async event loop</td></tr>
     <tr><td><code>fs.readdirSync(path)</code> → <code>string[]</code></td><td>needs growable arrays</td></tr>
   </table>
 
