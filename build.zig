@@ -54,6 +54,7 @@ pub fn build(b: *std.Build) void {
         "src/lumen_lexer.zig",
         "src/lumen_types.zig",
         "src/lumen_compiler.zig",
+        "src/regex_rt.zig",
         "tools/lumen_conformance.zig",
     };
 

@@ -1913,14 +1913,26 @@ fn collectReturns(body: []const Stmt, list: *std.ArrayListUnmanaged(*const Expr)
 }
 fn collectReturnsStmt(s: *const Stmt, list: *std.ArrayListUnmanaged(*const Expr), arena: std.mem.Allocator) CompileError!void {
     switch (s.*) {
-        .return_stmt => |r| { if (r.value) |v| try list.append(arena, v); },
+        .return_stmt => |r| {
+            if (r.value) |v| try list.append(arena, v);
+        },
         .while_stmt => |w| try collectReturns(w.body, list, arena),
         .do_while_stmt => |w| try collectReturns(w.body, list, arena),
         .for_stmt => |f| try collectReturns(f.body, list, arena),
         .for_of_stmt => |f| try collectReturns(f.body, list, arena),
-        .if_stmt => |b| { try collectReturns(b.then_body, list, arena); if (b.else_body) |eb| try collectReturns(eb, list, arena); },
-        .switch_stmt => |sw| { for (sw.cases) |cse| try collectReturns(cse.body, list, arena); if (sw.default_body) |db| try collectReturns(db, list, arena); },
-        .try_stmt => |t| { try collectReturns(t.try_body, list, arena); try collectReturns(t.catch_body, list, arena); if (t.finally_body) |fb| try collectReturns(fb, list, arena); },
+        .if_stmt => |b| {
+            try collectReturns(b.then_body, list, arena);
+            if (b.else_body) |eb| try collectReturns(eb, list, arena);
+        },
+        .switch_stmt => |sw| {
+            for (sw.cases) |cse| try collectReturns(cse.body, list, arena);
+            if (sw.default_body) |db| try collectReturns(db, list, arena);
+        },
+        .try_stmt => |t| {
+            try collectReturns(t.try_body, list, arena);
+            try collectReturns(t.catch_body, list, arena);
+            if (t.finally_body) |fb| try collectReturns(fb, list, arena);
+        },
         .defer_stmt => |d| try collectReturns(d.body, list, arena),
         else => {},
     }
@@ -1957,13 +1969,22 @@ fn destPassableAcc(fd: *const ast.FunctionDecl, arena: std.mem.Allocator) Compil
 
 fn collectDestPassable(stmts: []Stmt, map: *std.StringHashMapUnmanaged([]const u8), arena: std.mem.Allocator) CompileError!void {
     for (stmts) |*s| switch (s.*) {
-        .function_decl => |*fd| { if (try destPassableAcc(fd, arena)) |acc| try map.put(arena, fd.name, acc); try collectDestPassable(fd.body, map, arena); },
-        .class_decl => |*cd| for (cd.methods) |*m| { if (try destPassableAcc(m, arena)) |acc| try map.put(arena, m.name, acc); try collectDestPassable(m.body, map, arena); },
+        .function_decl => |*fd| {
+            if (try destPassableAcc(fd, arena)) |acc| try map.put(arena, fd.name, acc);
+            try collectDestPassable(fd.body, map, arena);
+        },
+        .class_decl => |*cd| for (cd.methods) |*m| {
+            if (try destPassableAcc(m, arena)) |acc| try map.put(arena, m.name, acc);
+            try collectDestPassable(m.body, map, arena);
+        },
         .while_stmt => |*w| try collectDestPassable(w.body, map, arena),
         .do_while_stmt => |*w| try collectDestPassable(w.body, map, arena),
         .for_stmt => |*f| try collectDestPassable(f.body, map, arena),
         .for_of_stmt => |*f| try collectDestPassable(f.body, map, arena),
-        .if_stmt => |*b| { try collectDestPassable(b.then_body, map, arena); if (b.else_body) |eb| try collectDestPassable(eb, map, arena); },
+        .if_stmt => |*b| {
+            try collectDestPassable(b.then_body, map, arena);
+            if (b.else_body) |eb| try collectDestPassable(eb, map, arena);
+        },
         else => {},
     };
 }
@@ -1988,15 +2009,27 @@ fn markBuilderPartsStmt(s: *Stmt, map: *const std.StringHashMapUnmanaged([]const
         .assign => |*a| if (a.is_accumulator) {
             var parts: std.ArrayListUnmanaged(*Expr) = .empty;
             try collectStrConcatMut(a.value, &parts, arena);
-            for (parts.items) |p| if (p.* == .call and !p.call.is_closure and map.contains(p.call.name)) { p.call.is_into_call = true; };
+            for (parts.items) |p| if (p.* == .call and !p.call.is_closure and map.contains(p.call.name)) {
+                p.call.is_into_call = true;
+            };
         },
         .while_stmt => |*w| try markBuilderParts(w.body, map, arena),
         .do_while_stmt => |*w| try markBuilderParts(w.body, map, arena),
         .for_stmt => |*f| try markBuilderParts(f.body, map, arena),
         .for_of_stmt => |*f| try markBuilderParts(f.body, map, arena),
-        .if_stmt => |*b| { try markBuilderParts(b.then_body, map, arena); if (b.else_body) |eb| try markBuilderParts(eb, map, arena); },
-        .switch_stmt => |*sw| { for (sw.cases) |*cse| try markBuilderParts(cse.body, map, arena); if (sw.default_body) |db| try markBuilderParts(db, map, arena); },
-        .try_stmt => |*t| { try markBuilderParts(t.try_body, map, arena); try markBuilderParts(t.catch_body, map, arena); if (t.finally_body) |fb| try markBuilderParts(fb, map, arena); },
+        .if_stmt => |*b| {
+            try markBuilderParts(b.then_body, map, arena);
+            if (b.else_body) |eb| try markBuilderParts(eb, map, arena);
+        },
+        .switch_stmt => |*sw| {
+            for (sw.cases) |*cse| try markBuilderParts(cse.body, map, arena);
+            if (sw.default_body) |db| try markBuilderParts(db, map, arena);
+        },
+        .try_stmt => |*t| {
+            try markBuilderParts(t.try_body, map, arena);
+            try markBuilderParts(t.catch_body, map, arena);
+            if (t.finally_body) |fb| try markBuilderParts(fb, map, arena);
+        },
         .defer_stmt => |*d| try markBuilderParts(d.body, map, arena),
         .function_decl => |*fd| try markBuilderParts(fd.body, map, arena),
         .class_decl => |*cd| for (cd.methods) |*m| try markBuilderParts(m.body, map, arena),
@@ -2032,8 +2065,14 @@ fn accIsAppend(value: *const Expr, name: []const u8, arena: std.mem.Allocator) C
 fn accBadRef(e: *const Expr, name: []const u8) bool {
     return switch (e.*) {
         .var_ref => |r| std.mem.eql(u8, r.name, name) and (r.capture or r.deref),
-        .array => |a| blk: { for (a.items) |it| if (accBadRef(it, name)) break :blk true; break :blk false; },
-        .tuple_lit => |t| blk: { for (t.items) |it| if (accBadRef(it, name)) break :blk true; break :blk false; },
+        .array => |a| blk: {
+            for (a.items) |it| if (accBadRef(it, name)) break :blk true;
+            break :blk false;
+        },
+        .tuple_lit => |t| blk: {
+            for (t.items) |it| if (accBadRef(it, name)) break :blk true;
+            break :blk false;
+        },
         .spread => |inner| accBadRef(inner, name),
         .neg, .not, .bnot, .await_expr => |inner| accBadRef(inner, name),
         .bin => |b| accBadRef(b.l, name) or accBadRef(b.r, name),
@@ -2042,15 +2081,39 @@ fn accBadRef(e: *const Expr, name: []const u8) bool {
         .ternary => |t| accBadRef(t.cond, name) or accBadRef(t.then_expr, name) or accBadRef(t.else_expr, name),
         .coalesce => |c| accBadRef(c.l, name) or accBadRef(c.r, name),
         .arrow => |a| accBadRef(a.body_expr, name),
-        .new_expr => |ne| blk: { for (ne.args) |it| if (accBadRef(it, name)) break :blk true; break :blk false; },
-        .method_call => |mc| blk: { if (accBadRef(mc.obj, name)) break :blk true; for (mc.args) |it| if (accBadRef(it, name)) break :blk true; break :blk false; },
-        .super_call => |sc| blk: { for (sc.args) |it| if (accBadRef(it, name)) break :blk true; break :blk false; },
-        .template => |parts| blk: { for (parts) |pt| if (pt.expr) |x| { if (accBadRef(x, name)) break :blk true; }; break :blk false; },
-        .obj => |fields| blk: { for (fields) |f| if (accBadRef(f.value, name)) break :blk true; break :blk false; },
+        .new_expr => |ne| blk: {
+            for (ne.args) |it| if (accBadRef(it, name)) break :blk true;
+            break :blk false;
+        },
+        .method_call => |mc| blk: {
+            if (accBadRef(mc.obj, name)) break :blk true;
+            for (mc.args) |it| if (accBadRef(it, name)) break :blk true;
+            break :blk false;
+        },
+        .super_call => |sc| blk: {
+            for (sc.args) |it| if (accBadRef(it, name)) break :blk true;
+            break :blk false;
+        },
+        .template => |parts| blk: {
+            for (parts) |pt| if (pt.expr) |x| {
+                if (accBadRef(x, name)) break :blk true;
+            };
+            break :blk false;
+        },
+        .obj => |fields| blk: {
+            for (fields) |f| if (accBadRef(f.value, name)) break :blk true;
+            break :blk false;
+        },
         .field => |f| accBadRef(f.obj, name),
         .index => |idx| accBadRef(idx.obj, name) or accBadRef(idx.value, name),
-        .call => |cl| blk: { for (cl.args) |it| if (accBadRef(it, name)) break :blk true; break :blk false; },
-        .static_call => |sc| blk: { for (sc.args) |it| if (accBadRef(it, name)) break :blk true; break :blk false; },
+        .call => |cl| blk: {
+            for (cl.args) |it| if (accBadRef(it, name)) break :blk true;
+            break :blk false;
+        },
+        .static_call => |sc| blk: {
+            for (sc.args) |it| if (accBadRef(it, name)) break :blk true;
+            break :blk false;
+        },
         .cast => |c| accBadRef(c.inner, name),
         else => false,
     };
@@ -2091,7 +2154,10 @@ fn accDisqStmt(stmt: *const Stmt, name: []const u8, arena: std.mem.Allocator) Co
         .if_stmt => |b| return accBadRef(b.cond, name) or (try accDisqBody(b.then_body, name, arena)) or (b.else_body != null and (try accDisqBody(b.else_body.?, name, arena))),
         .switch_stmt => |sw| {
             if (accBadRef(sw.value, name)) return true;
-            for (sw.cases) |cse| { if (accBadRef(cse.value, name)) return true; if (try accDisqBody(cse.body, name, arena)) return true; }
+            for (sw.cases) |cse| {
+                if (accBadRef(cse.value, name)) return true;
+                if (try accDisqBody(cse.body, name, arena)) return true;
+            }
             if (sw.default_body) |db| if (try accDisqBody(db, name, arena)) return true;
             return false;
         },
@@ -2142,45 +2208,112 @@ fn markAccBody(body: []Stmt, name: []const u8) void {
 fn markAccStmt(stmt: *Stmt, name: []const u8) void {
     switch (stmt.*) {
         .var_decl => |*d| markAccExpr(d.init, name),
-        .assign => |*a| { if (std.mem.eql(u8, a.name, name)) a.is_accumulator = true; markAccExpr(a.value, name); },
-        .member_assign => |*ma| { markAccExpr(ma.value, name); if (ma.obj) |o| markAccExpr(o, name); },
+        .assign => |*a| {
+            if (std.mem.eql(u8, a.name, name)) a.is_accumulator = true;
+            markAccExpr(a.value, name);
+        },
+        .member_assign => |*ma| {
+            markAccExpr(ma.value, name);
+            if (ma.obj) |o| markAccExpr(o, name);
+        },
         .console_log => |*log| markAccExpr(log.value, name),
-        .return_stmt => |*r| { if (r.value) |x| markAccExpr(x, name); },
+        .return_stmt => |*r| {
+            if (r.value) |x| markAccExpr(x, name);
+        },
         .throw_stmt => |*t| markAccExpr(t.value, name),
         .expr_stmt => |*x| markAccExpr(x.value, name),
-        .while_stmt => |*w| { markAccExpr(w.cond, name); markAccBody(w.body, name); },
-        .do_while_stmt => |*w| { markAccExpr(w.cond, name); markAccBody(w.body, name); },
-        .for_stmt => |*f| { markAccExpr(f.init.init, name); markAccExpr(f.cond, name); markAccExpr(f.update.value, name); markAccBody(f.body, name); },
-        .for_of_stmt => |*f| { markAccExpr(f.iterable, name); markAccBody(f.body, name); },
-        .if_stmt => |*b| { markAccExpr(b.cond, name); markAccBody(b.then_body, name); if (b.else_body) |eb| markAccBody(eb, name); },
-        .switch_stmt => |*sw| { markAccExpr(sw.value, name); for (sw.cases) |*cse| { markAccExpr(cse.value, name); markAccBody(cse.body, name); } if (sw.default_body) |db| markAccBody(db, name); },
-        .try_stmt => |*t| { markAccBody(t.try_body, name); markAccBody(t.catch_body, name); if (t.finally_body) |fb| markAccBody(fb, name); },
+        .while_stmt => |*w| {
+            markAccExpr(w.cond, name);
+            markAccBody(w.body, name);
+        },
+        .do_while_stmt => |*w| {
+            markAccExpr(w.cond, name);
+            markAccBody(w.body, name);
+        },
+        .for_stmt => |*f| {
+            markAccExpr(f.init.init, name);
+            markAccExpr(f.cond, name);
+            markAccExpr(f.update.value, name);
+            markAccBody(f.body, name);
+        },
+        .for_of_stmt => |*f| {
+            markAccExpr(f.iterable, name);
+            markAccBody(f.body, name);
+        },
+        .if_stmt => |*b| {
+            markAccExpr(b.cond, name);
+            markAccBody(b.then_body, name);
+            if (b.else_body) |eb| markAccBody(eb, name);
+        },
+        .switch_stmt => |*sw| {
+            markAccExpr(sw.value, name);
+            for (sw.cases) |*cse| {
+                markAccExpr(cse.value, name);
+                markAccBody(cse.body, name);
+            }
+            if (sw.default_body) |db| markAccBody(db, name);
+        },
+        .try_stmt => |*t| {
+            markAccBody(t.try_body, name);
+            markAccBody(t.catch_body, name);
+            if (t.finally_body) |fb| markAccBody(fb, name);
+        },
         .defer_stmt => |*d| markAccBody(d.body, name),
-        .using_decl => |*u| { if (u.defer_body) |b| markAccBody(b, name); if (u.dispose_call) |dc| markAccExpr(dc, name); markAccExpr(u.init, name); },
+        .using_decl => |*u| {
+            if (u.defer_body) |b| markAccBody(b, name);
+            if (u.dispose_call) |dc| markAccExpr(dc, name);
+            markAccExpr(u.init, name);
+        },
         .destructure_decl => |*d| markAccExpr(d.source, name),
         else => {},
     }
 }
 fn markAccExpr(e: *Expr, name: []const u8) void {
     switch (e.*) {
-        .var_ref => |*r| { if (std.mem.eql(u8, r.name, name)) r.is_accumulator = true; },
+        .var_ref => |*r| {
+            if (std.mem.eql(u8, r.name, name)) r.is_accumulator = true;
+        },
         .array => |a| for (a.items) |it| markAccExpr(it, name),
         .tuple_lit => |t| for (t.items) |it| markAccExpr(it, name),
         .spread => |inner| markAccExpr(inner, name),
         .neg, .not, .bnot, .await_expr => |inner| markAccExpr(inner, name),
-        .bin => |b| { markAccExpr(b.l, name); markAccExpr(b.r, name); },
-        .bool_bin => |b| { markAccExpr(b.l, name); markAccExpr(b.r, name); },
-        .cmp => |b| { markAccExpr(b.l, name); markAccExpr(b.r, name); },
-        .ternary => |t| { markAccExpr(t.cond, name); markAccExpr(t.then_expr, name); markAccExpr(t.else_expr, name); },
-        .coalesce => |c| { markAccExpr(c.l, name); markAccExpr(c.r, name); },
+        .bin => |b| {
+            markAccExpr(b.l, name);
+            markAccExpr(b.r, name);
+        },
+        .bool_bin => |b| {
+            markAccExpr(b.l, name);
+            markAccExpr(b.r, name);
+        },
+        .cmp => |b| {
+            markAccExpr(b.l, name);
+            markAccExpr(b.r, name);
+        },
+        .ternary => |t| {
+            markAccExpr(t.cond, name);
+            markAccExpr(t.then_expr, name);
+            markAccExpr(t.else_expr, name);
+        },
+        .coalesce => |c| {
+            markAccExpr(c.l, name);
+            markAccExpr(c.r, name);
+        },
         .arrow => |a| markAccExpr(a.body_expr, name),
         .new_expr => |ne| for (ne.args) |it| markAccExpr(it, name),
-        .method_call => |mc| { markAccExpr(mc.obj, name); for (mc.args) |it| markAccExpr(it, name); },
+        .method_call => |mc| {
+            markAccExpr(mc.obj, name);
+            for (mc.args) |it| markAccExpr(it, name);
+        },
         .super_call => |sc| for (sc.args) |it| markAccExpr(it, name),
-        .template => |parts| for (parts) |pt| { if (pt.expr) |x| markAccExpr(x, name); },
+        .template => |parts| for (parts) |pt| {
+            if (pt.expr) |x| markAccExpr(x, name);
+        },
         .obj => |fields| for (fields) |f| markAccExpr(f.value, name),
         .field => |f| markAccExpr(f.obj, name),
-        .index => |idx| { markAccExpr(idx.obj, name); markAccExpr(idx.value, name); },
+        .index => |idx| {
+            markAccExpr(idx.obj, name);
+            markAccExpr(idx.value, name);
+        },
         .call => |cl| for (cl.args) |it| markAccExpr(it, name),
         .static_call => |sc| for (sc.args) |it| markAccExpr(it, name),
         .cast => |c| markAccExpr(c.inner, name),
@@ -2219,8 +2352,15 @@ fn accRecurseFns(stmt: *Stmt, arena: std.mem.Allocator) CompileError!void {
         .do_while_stmt => |*w| for (w.body) |*b| try accRecurseFns(b, arena),
         .for_stmt => |*f| for (f.body) |*b| try accRecurseFns(b, arena),
         .for_of_stmt => |*f| for (f.body) |*b| try accRecurseFns(b, arena),
-        .if_stmt => |*b| { for (b.then_body) |*x| try accRecurseFns(x, arena); if (b.else_body) |eb| for (eb) |*x| try accRecurseFns(x, arena); },
-        .try_stmt => |*t| { for (t.try_body) |*x| try accRecurseFns(x, arena); for (t.catch_body) |*x| try accRecurseFns(x, arena); if (t.finally_body) |fb| for (fb) |*x| try accRecurseFns(x, arena); },
+        .if_stmt => |*b| {
+            for (b.then_body) |*x| try accRecurseFns(x, arena);
+            if (b.else_body) |eb| for (eb) |*x| try accRecurseFns(x, arena);
+        },
+        .try_stmt => |*t| {
+            for (t.try_body) |*x| try accRecurseFns(x, arena);
+            for (t.catch_body) |*x| try accRecurseFns(x, arena);
+            if (t.finally_body) |fb| for (fb) |*x| try accRecurseFns(x, arena);
+        },
         .defer_stmt => |*d| for (d.body) |*b| try accRecurseFns(b, arena),
         else => {},
     }
@@ -2247,7 +2387,10 @@ fn reAtomMatches(atom: *const ReNode, byte: u8) bool {
 }
 
 fn reBareAtom(n: *const ReNode) bool {
-    return switch (n.*) { .char, .any, .class => true, else => false };
+    return switch (n.*) {
+        .char, .any, .class => true,
+        else => false,
+    };
 }
 
 /// No byte matches both atoms -> a greedy quantifier on `a` can never need to
