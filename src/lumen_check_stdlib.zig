@@ -596,6 +596,29 @@ pub fn fsCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, 
         call.checked_type = .bool;
         return .bool;
     }
+    if (std.mem.eql(u8, call.name, "cpSync")) {
+        if (call.args.len != 2 and call.args.len != 3) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const a_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const b_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        if (!types.same(.string, a_type) or !types.same(.string, b_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        if (call.args.len == 3) {
+            const recursive_type = self.exprType(program, call.args[2], line, col) orelse return null;
+            if (!types.same(.bool, recursive_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+        }
+        program.uses_io = true;
+        program.needs_cp_sync = true;
+        call.checked_type = .void;
+        return .void;
+    }
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
 }

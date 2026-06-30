@@ -31,8 +31,9 @@ what `std.Io.Dir` in Zig can do.
 | `fs.readlinkSync(path)` | `string -> string` | `Dir.readLink` |
 | `fs.chmodSync(path, mode)` | `(string, int) -> void` | `Dir.openFile` + `File.setPermissions(.fromMode(mode))` |
 | `fs.accessSync(path, mode?)` | `(string, int?) -> bool` | `Dir.access` with `AccessOptions{read,write,execute}` |
+| `fs.cpSync(src, dest, recursive?)` | `(string, string, bool?) -> void` | `Dir.openDir(.{.iterate=true})` + `Dir.iterate`, recursing; falls back to a single `copyFile` |
 
-After Phase 1, Lumen covers 16 of Node's 48 sync functions.
+After Phase 1 (+ `cpSync`), Lumen covers 17 of Node's 48 sync functions.
 
 **Deviation from Node, called out explicitly**: Node's `accessSync` *throws* on
 failure and returns nothing; Lumen's returns `bool` (like `existsSync`) for
@@ -44,11 +45,15 @@ detour into exception-based builtins. `mode` is the POSIX bitmask
 
 | Function | Blocker |
 | --- | --- |
-| `fs.mkdtempSync(prefix)`, `fs.mkdtempDisposableSync` | needs a random-suffix generator (not yet written) |
-| `fs.cpSync(src, dest, options?)` | recursive copy; doable by composing Phase 1 primitives + directory walk, more code |
-| `fs.realpathSync(path)` | no `realpath` found in this Zig version's `std.Io`; needs a manual posix syscall wrapper |
-| `fs.utimesSync(path, atime, mtime)` | no `updateTimes`/`setTimes` found on `Dir`/`File` in this Zig version; needs research |
+| `fs.mkdtempSync(prefix)`, `fs.mkdtempDisposableSync` | needs a random-suffix generator (not yet written; no clear `std.crypto.random` in this Zig version) |
+| `fs.realpathSync(path)`, `fs.utimesSync(path, atime, mtime)` | `realpath`/`utimes` only exist as raw `std.c` libc bindings in this Zig version, not wrapped by `std.Io.Dir`/`File`; calling them directly would bypass the `Io` abstraction every other fs function goes through (inconsistent, and breaks under wasm) |
 | `fs.statfsSync(path)` | filesystem-level stats; platform-specific, low value for now |
+
+`fs.cpSync(src, dest, recursive?)` **shipped** (see Available now): composed from
+`Dir.openDir(.{.iterate=true})` + `Dir.iterate` + the existing `copyFileSync`/
+`mkdirSync` primitives, recursing into subdirectories when `recursive` is true
+(default false, matching `mkdirSync`'s convention) and falling back to a single
+file copy when the source does not open as a directory.
 
 ### Not planned (needs a real language feature first)
 

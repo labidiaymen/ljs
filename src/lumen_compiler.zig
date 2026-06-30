@@ -516,6 +516,31 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_cp_sync) {
+        // Composed from the same primitives as copyFileSync/mkdirSync/iterate:
+        // if `src_path` opens as an iterable directory, recurse into it (only
+        // when `recursive` is true); otherwise treat it as a single file.
+        try out.appendSlice(arena,
+            \\fn __cpSync(io: std.Io, alloc: std.mem.Allocator, src_path: []const u8, dest_path: []const u8, recursive: bool) void {
+            \\    if (recursive) {
+            \\        if (std.Io.Dir.cwd().openDir(io, src_path, .{ .iterate = true })) |src_dir_const| {
+            \\            var src_dir = src_dir_const;
+            \\            defer src_dir.close(io);
+            \\            std.Io.Dir.cwd().createDirPath(io, dest_path) catch {};
+            \\            var it = src_dir.iterate();
+            \\            while (it.next(io) catch null) |entry| {
+            \\                const sub_src = std.fmt.allocPrint(alloc, "{s}/{s}", .{ src_path, entry.name }) catch continue;
+            \\                const sub_dest = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_path, entry.name }) catch continue;
+            \\                __cpSync(io, alloc, sub_src, sub_dest, true);
+            \\            }
+            \\            return;
+            \\        } else |_| {}
+            \\    }
+            \\    std.Io.Dir.copyFile(std.Io.Dir.cwd(), src_path, std.Io.Dir.cwd(), dest_path, io, .{}) catch {};
+            \\}
+            \\
+        );
+    }
     if (program.needs_rmdir_sync) {
         try out.appendSlice(arena,
             \\fn __rmdirSync(io: std.Io, path: []const u8) void {
