@@ -32,8 +32,9 @@ what `std.Io.Dir` in Zig can do.
 | `fs.chmodSync(path, mode)` | `(string, int) -> void` | `Dir.openFile` + `File.setPermissions(.fromMode(mode))` |
 | `fs.accessSync(path, mode?)` | `(string, int?) -> bool` | `Dir.access` with `AccessOptions{read,write,execute}` |
 | `fs.cpSync(src, dest, recursive?)` | `(string, string, bool?) -> void` | `Dir.openDir(.{.iterate=true})` + `Dir.iterate`, recursing; falls back to a single `copyFile` |
+| `fs.mkdtempSync(prefix)` | `string -> string` | `Dir.createDir` with a timestamp+counter suffix (not cryptographic) |
 
-After Phase 1 (+ `cpSync`), Lumen covers 17 of Node's 48 sync functions.
+After Phase 1 (+ `cpSync`, `mkdtempSync`), Lumen covers 18 of Node's 48 sync functions.
 
 **Deviation from Node, called out explicitly**: Node's `accessSync` *throws* on
 failure and returns nothing; Lumen's returns `bool` (like `existsSync`) for
@@ -45,15 +46,23 @@ detour into exception-based builtins. `mode` is the POSIX bitmask
 
 | Function | Blocker |
 | --- | --- |
-| `fs.mkdtempSync(prefix)`, `fs.mkdtempDisposableSync` | needs a random-suffix generator (not yet written; no clear `std.crypto.random` in this Zig version) |
+| `fs.mkdtempDisposableSync` | the `using`-disposable variant; `mkdtempSync` itself shipped (see below) |
 | `fs.realpathSync(path)`, `fs.utimesSync(path, atime, mtime)` | `realpath`/`utimes` only exist as raw `std.c` libc bindings in this Zig version, not wrapped by `std.Io.Dir`/`File`; calling them directly would bypass the `Io` abstraction every other fs function goes through (inconsistent, and breaks under wasm) |
 | `fs.statfsSync(path)` | filesystem-level stats; platform-specific, low value for now |
 
-`fs.cpSync(src, dest, recursive?)` **shipped** (see Available now): composed from
-`Dir.openDir(.{.iterate=true})` + `Dir.iterate` + the existing `copyFileSync`/
-`mkdirSync` primitives, recursing into subdirectories when `recursive` is true
-(default false, matching `mkdirSync`'s convention) and falling back to a single
-file copy when the source does not open as a directory.
+`fs.cpSync(src, dest, recursive?)` and `fs.mkdtempSync(prefix)` **shipped** (see
+Available now).
+
+- `cpSync` is composed from `Dir.openDir(.{.iterate=true})` + `Dir.iterate` + the
+  existing `copyFileSync`/`mkdirSync` primitives, recursing into subdirectories
+  when `recursive` is true (default false, matching `mkdirSync`'s convention) and
+  falling back to a single file copy when the source does not open as a
+  directory.
+- `mkdtempSync` generates its unique suffix from `std.Io.Clock.now(.real,
+  io).nanoseconds` mixed with a per-process counter, **not cryptographic
+  randomness** (this Zig version has no clear `std.crypto.random` source) --
+  adequate for a unique scratch directory name, not for anything
+  security-sensitive. Returns the created path, or `""` on failure.
 
 ### Not planned (needs a real language feature first)
 

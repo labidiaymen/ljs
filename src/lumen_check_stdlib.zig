@@ -619,6 +619,21 @@ pub fn fsCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, 
         call.checked_type = .void;
         return .void;
     }
+    if (std.mem.eql(u8, call.name, "mkdtempSync")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const prefix_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, prefix_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_mkdtemp_sync = true;
+        call.checked_type = .string;
+        return .string;
+    }
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
 }

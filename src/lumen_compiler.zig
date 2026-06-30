@@ -541,6 +541,24 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_mkdtemp_sync) {
+        // Not Node's mkdtempSync exactly: the suffix is a timestamp mixed with a
+        // per-process counter, not cryptographic randomness (no clear
+        // std.crypto.random source in this Zig version) -- adequate for a unique
+        // scratch directory name, not for anything security-sensitive.
+        try out.appendSlice(arena,
+            \\var __mkdtemp_counter: u64 = 0;
+            \\fn __mkdtempSync(io: std.Io, alloc: std.mem.Allocator, prefix: []const u8) []const u8 {
+            \\    const ts = std.Io.Clock.now(.real, io).nanoseconds;
+            \\    __mkdtemp_counter +%= 1;
+            \\    const mixed: u32 = @as(u32, @truncate(@as(u96, @bitCast(ts)))) ^ @as(u32, @truncate(__mkdtemp_counter *% 2654435761));
+            \\    const path = std.fmt.allocPrint(alloc, "{s}{x:0>8}", .{ prefix, mixed }) catch return "";
+            \\    std.Io.Dir.cwd().createDir(io, path, std.Io.File.Permissions.default_dir) catch return "";
+            \\    return path;
+            \\}
+            \\
+        );
+    }
     if (program.needs_rmdir_sync) {
         try out.appendSlice(arena,
             \\fn __rmdirSync(io: std.Io, path: []const u8) void {

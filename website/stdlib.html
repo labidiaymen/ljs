@@ -176,6 +176,7 @@
     <tr><td><code>fs.chmodSync(path, mode)</code></td><td>(string, int) → void</td><td>POSIX mode bits</td></tr>
     <tr><td><code>fs.accessSync(path, mode?)</code></td><td>(string, int?) → bool</td><td>mode bitmask R_OK=4 W_OK=2 X_OK=1; returns bool rather than throwing</td></tr>
     <tr><td><code>fs.cpSync(src, dest, recursive?)</code></td><td>(string, string, bool?) → void</td><td>recursive copy; falls back to a single file copy</td></tr>
+    <tr><td><code>fs.mkdtempSync(prefix)</code></td><td>string → string</td><td>unique suffix from a timestamp + counter, not cryptographic; returns the created path</td></tr>
     <tr><td><code>argsCount()</code> · <code>arg(i)</code></td><td>→ int · int → string</td><td>process arguments</td></tr>
   </table>
 
@@ -187,7 +188,6 @@
   <h4>fs</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
-    <tr><td><code>fs.mkdtempSync(prefix)</code></td><td>needs a random-suffix generator</td></tr>
     <tr><td><code>fs.realpathSync(path)</code> · <code>fs.utimesSync(path, atime, mtime)</code></td><td>only raw libc bindings exist in this Zig version, not wrapped by std.Io</td></tr>
     <tr><td><code>fs.statSync(path)</code> → <code>{ size, isFile, isDirectory }</code></td><td>record return</td></tr>
     <tr><td><code>fs.openSync</code> / <code>readSync</code> / <code>writeSync</code> / <code>closeSync</code></td><td>needs a file-descriptor type + <code>Buffer</code></td></tr>

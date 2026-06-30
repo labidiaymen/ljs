@@ -361,6 +361,10 @@ pub fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
                 try w.appendSlice(arena, ", ");
                 if (cl.args.len == 3) try emitExpr(cl.args[2], w, arena) else try w.appendSlice(arena, "false");
                 try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "mkdtempSync")) {
+                try w.appendSlice(arena, "__mkdtempSync(__io, __alloc, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
             } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "rmdirSync")) {
                 try w.appendSlice(arena, "__rmdirSync(__io, ");
                 try emitExpr(cl.args[0], w, arena);
