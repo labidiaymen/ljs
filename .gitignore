@@ -18,3 +18,8 @@ vendor/node-test/
 
 # Lumen generated backend artifacts
 .lumen-*.zig
+
+# Lumen runtime fetch caches (wasm-link archives, the libxev async runtime
+# source) -- fetched on demand by the compiler, not vendored
+.lumen-wasmlink-*.a
+.lumen-libxev-*/
