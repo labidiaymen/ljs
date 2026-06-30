@@ -1,3 +1,19 @@
+//! The Abstract Syntax Tree -- the data structure shared by the parser, the
+//! checker, and the codegen.
+//!
+//! This file is pure data: node definitions, no logic. The pipeline uses it like a
+//! relay baton:
+//!   * the parser (in `lumen_compiler.zig`) builds these nodes from tokens;
+//!   * the checker (`lumen_check.zig`) walks them and fills in the resolved-type
+//!     fields -- the `?types.Type` fields you see scattered on many nodes -- so the
+//!     codegen does not have to re-derive types;
+//!   * the codegen (`lumen_compiler.zig`) reads the now-typed nodes to emit Zig.
+//!
+//! The three central types are `Expr` (expressions), `Stmt` (statements), and
+//! `Program` (a whole file). `Expr` and `Stmt` are closed `union(enum)`s, so
+//! adding a variant makes every exhaustive `switch` over them fail to compile until
+//! it is handled -- a deliberate, very useful to-do list when adding a feature.
+
 const types = @import("lumen_types.zig");
 
 /// An object-literal entry. A normal field has a `name`; a spread entry

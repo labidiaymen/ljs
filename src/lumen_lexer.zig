@@ -1,3 +1,16 @@
+//! The lexer (tokenizer) -- stage 1 of the compiler.
+//!
+//! Turns raw `.ts` source bytes into a stream of `Tok` values that the parser in
+//! `lumen_compiler.zig` pulls one at a time via `Lexer.next()`. It is a small,
+//! hand-written scanner with only a few characters of lookahead.
+//!
+//! The one genuinely tricky thing it does: a leading `/` is ambiguous between
+//! *division* and the start of a *regex literal*. It is resolved exactly the way
+//! JavaScript does -- by remembering the previous significant token in `prev`. A
+//! `/` after a value (number, identifier, `)`, `]`, postfix `++`/`--`) is
+//! division; a `/` where an expression is expected starts a regex literal. See
+//! `regexStartAllowed` and `lexRegex`.
+
 const std = @import("std");
 const diag = @import("lumen_diag.zig");
 

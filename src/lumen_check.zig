@@ -1,3 +1,18 @@
+//! The type checker -- stage 3, between parsing and codegen.
+//!
+//! Walks the AST the parser produced, computes and validates a `Type` for every
+//! expression and declaration, and writes the resolved types back onto the AST
+//! nodes (the `?types.Type` fields) so the codegen never re-derives them. Type
+//! errors become diagnostics (`lumen_diag.zig`); the first error aborts the build.
+//!
+//! This is one of the two large files (the other is the codegen). It is a `Checker`
+//! struct that threads scope/binding/narrowing state, with one method per construct
+//! (expressions, statements, declarations, classes, methods, imports). `exprType`
+//! is the heart: given an expression it returns its `Type`, or null plus a
+//! diagnostic on error. If you are adding a language feature, this is where its
+//! typing rules live; keep the resolved-type fields it sets in sync with what the
+//! codegen reads.
+
 const std = @import("std");
 const ast = @import("lumen_ast.zig");
 const diag_mod = @import("lumen_diag.zig");

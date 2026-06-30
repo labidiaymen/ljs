@@ -1,3 +1,17 @@
+//! The type system.
+//!
+//! `Type` is the closed union of every type the language understands: scalars
+//! (`i32`/`i64`/`f64`/`bool`/`string`), arrays, `optional`, named records/unions,
+//! `class_type`, `map_type`/`set_type`, `tuple_type`, `func_type`, `regexp`, and so
+//! on. The checker (`lumen_check.zig`) assigns a `Type` to every expression; the
+//! codegen (`lumen_compiler.zig`) lowers a `Type` to:
+//!   * a concrete Zig type name via `zigName` (e.g. `.string` -> `[]const u8`), and
+//!   * a unique mangled identifier via `mangle` (used to name generated structs for
+//!     tuples, closures, maps, ...).
+//! Use `same(a, b)` to test type equality. When you add a `Type` variant, the
+//! exhaustive switches in `zigName`/`mangle`/`same` (and others) will fail to
+//! compile until you handle it -- follow that list.
+
 const std = @import("std");
 const ast = @import("lumen_ast.zig");
 
