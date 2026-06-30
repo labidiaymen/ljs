@@ -725,6 +725,28 @@ pub fn fsCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, 
         call.checked_type = .i32;
         return .i32;
     }
+    if (std.mem.eql(u8, call.name, "readFile")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, path_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        // `fs.readFile(path)` -> `Promise<string>`, read via libxev's io_uring
+        // backend (true async file I/O, no thread pool) instead of the
+        // synchronous `fs.readFileSync`.
+        const p = self.arena.create(types.Type) catch return null;
+        p.* = .string;
+        const result = types.Type{ .promise_type = p };
+        call.checked_type = result;
+        program.uses_io = true;
+        program.needs_async = true;
+        program.needs_async_read_file = true;
+        return result;
+    }
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
 }

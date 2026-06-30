@@ -443,6 +443,63 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_async_read_file) {
+        // `fs.readFile` -- true async read on libxev's io_uring backend (no
+        // thread pool, unlike fs.readFileSync's synchronous std.Io.Dir call or
+        // Node's libuv-backed fs.readFile, which is always thread-pool-based).
+        // The open is synchronous (a fast metadata-only syscall); the read loop
+        // (pread at increasing offsets into a fixed chunk, accumulating into a
+        // growable buffer until a zero-length read) is fully async, resolving
+        // the returned Promise<string> on completion.
+        try out.appendSlice(arena,
+            \\const __ReadFileChunk = 65536;
+            \\const __ReadFileState = struct {
+            \\    file: xev.File,
+            \\    promise: *LumenPromise([]const u8),
+            \\    buf: std.ArrayListUnmanaged(u8) = .empty,
+            \\    chunk: [__ReadFileChunk]u8 = undefined,
+            \\    offset: u64 = 0,
+            \\    completion: xev.Completion = undefined,
+            \\    close_completion: xev.Completion = undefined,
+            \\    fn onRead(ud: ?*__ReadFileState, loop: *xev.Loop, c: *xev.Completion, file: xev.File, rb: xev.ReadBuffer, result: xev.ReadError!usize) xev.CallbackAction {
+            \\        _ = loop;
+            \\        _ = c;
+            \\        _ = rb;
+            \\        const st = ud.?;
+            \\        const n = result catch 0;
+            \\        if (n == 0) {
+            \\            st.promise.resolve(st.buf.toOwnedSlice(__alloc) catch "");
+            \\            file.close(&__xev_loop, &st.close_completion, void, null, struct {
+            \\                fn cb(_: ?*void, _: *xev.Loop, _: *xev.Completion, _: xev.File, _: xev.CloseError!void) xev.CallbackAction {
+            \\                    return .disarm;
+            \\                }
+            \\            }.cb);
+            \\            return .disarm;
+            \\        }
+            \\        st.buf.appendSlice(__alloc, st.chunk[0..n]) catch {};
+            \\        st.offset += n;
+            \\        st.file.pread(&__xev_loop, &st.completion, .{ .slice = &st.chunk }, st.offset, __ReadFileState, st, onRead);
+            \\        return .disarm;
+            \\    }
+            \\};
+            \\fn __readFileAsync(path: []const u8) *LumenPromise([]const u8) {
+            \\    const p = LumenPromise([]const u8).create();
+            \\    const sync_file = std.Io.Dir.cwd().openFile(__io, path, .{ .mode = .read_only }) catch {
+            \\        p.resolve("");
+            \\        return p;
+            \\    };
+            \\    const xf = xev.File.init(sync_file) catch {
+            \\        p.resolve("");
+            \\        return p;
+            \\    };
+            \\    const st = __alloc.create(__ReadFileState) catch unreachable;
+            \\    st.* = .{ .file = xf, .promise = p };
+            \\    st.file.pread(&__xev_loop, &st.completion, .{ .slice = &st.chunk }, 0, __ReadFileState, st, __ReadFileState.onRead);
+            \\    return p;
+            \\}
+            \\
+        );
+    }
     try out.appendSlice(arena, decls.items);
 
     if (program.needs_read_file_sync) {
