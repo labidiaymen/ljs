@@ -341,6 +341,50 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
                 try w.appendSlice(arena, ", ");
                 try emitExpr(cl.args[1], w, arena);
                 try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "rmdirSync")) {
+                try w.appendSlice(arena, "__rmdirSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "rmSync")) {
+                try w.appendSlice(arena, "__rmSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                if (cl.args.len == 2) try emitExpr(cl.args[1], w, arena) else try w.appendSlice(arena, "false");
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "truncateSync")) {
+                try w.appendSlice(arena, "__truncateSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "linkSync")) {
+                try w.appendSlice(arena, "__linkSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "symlinkSync")) {
+                try w.appendSlice(arena, "__symlinkSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "readlinkSync")) {
+                try w.appendSlice(arena, "__readlinkSync(__io, __alloc, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "chmodSync")) {
+                try w.appendSlice(arena, "__chmodSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "accessSync")) {
+                try w.appendSlice(arena, "__accessSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                if (cl.args.len == 2) try emitExpr(cl.args[1], w, arena) else try w.appendSlice(arena, "0");
+                try w.append(arena, ')');
             } else if (std.mem.eql(u8, cl.namespace, "Promise") and std.mem.eql(u8, cl.name, "resolve")) {
                 // Promise.resolve(v) -> an already-resolved promise of v's type.
                 const inner = cl.checked_arg_type orelse return error.ParseError;

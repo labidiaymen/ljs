@@ -167,6 +167,14 @@
     <tr><td><code>fs.unlinkSync(path)</code></td><td>string → void</td><td>delete a file</td></tr>
     <tr><td><code>fs.renameSync(a, b)</code></td><td>(string, string) → void</td><td></td></tr>
     <tr><td><code>fs.copyFileSync(a, b)</code></td><td>(string, string) → void</td><td></td></tr>
+    <tr><td><code>fs.rmdirSync(path)</code></td><td>string → void</td><td>removes an empty directory</td></tr>
+    <tr><td><code>fs.rmSync(path, recursive?)</code></td><td>(string, bool?) → void</td><td>recursive removes a directory tree</td></tr>
+    <tr><td><code>fs.truncateSync(path, len)</code></td><td>(string, int) → void</td><td></td></tr>
+    <tr><td><code>fs.linkSync(existingPath, newPath)</code></td><td>(string, string) → void</td><td>hard link</td></tr>
+    <tr><td><code>fs.symlinkSync(target, path)</code></td><td>(string, string) → void</td><td></td></tr>
+    <tr><td><code>fs.readlinkSync(path)</code></td><td>string → string</td><td></td></tr>
+    <tr><td><code>fs.chmodSync(path, mode)</code></td><td>(string, int) → void</td><td>POSIX mode bits</td></tr>
+    <tr><td><code>fs.accessSync(path, mode?)</code></td><td>(string, int?) → bool</td><td>mode bitmask R_OK=4 W_OK=2 X_OK=1; returns bool rather than throwing</td></tr>
     <tr><td><code>argsCount()</code> · <code>arg(i)</code></td><td>→ int · int → string</td><td>process arguments</td></tr>
   </table>
 
@@ -178,9 +186,11 @@
   <h4>fs</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
-    <tr><td><code>fs.rmSync(path, recursive?)</code></td><td>recursive directory removal</td></tr>
+    <tr><td><code>fs.mkdtempSync(prefix)</code> · <code>fs.cpSync(src, dest)</code></td><td>needs a random-suffix generator / recursive copy</td></tr>
+    <tr><td><code>fs.realpathSync(path)</code> · <code>fs.utimesSync(path, atime, mtime)</code></td><td>needs a manual posix syscall wrapper (not in this Zig version's std.Io)</td></tr>
     <tr><td><code>fs.statSync(path)</code> → <code>{ size, isFile, isDirectory }</code></td><td>record return</td></tr>
-    <tr><td><code>fs.promises.*</code> / watch / streams</td><td>needs the async event loop</td></tr>
+    <tr><td><code>fs.openSync</code> / <code>readSync</code> / <code>writeSync</code> / <code>closeSync</code></td><td>needs a file-descriptor type + <code>Buffer</code></td></tr>
+    <tr><td><code>fs.promises.*</code> / watch / streams / all async callback variants</td><td>needs fs wired to the event loop</td></tr>
     <tr><td><code>fs.readdirSync(path)</code> → <code>string[]</code></td><td>needs growable arrays</td></tr>
   </table>
 

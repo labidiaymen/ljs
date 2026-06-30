@@ -516,6 +516,89 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_rmdir_sync) {
+        try out.appendSlice(arena,
+            \\fn __rmdirSync(io: std.Io, path: []const u8) void {
+            \\    std.Io.Dir.cwd().deleteDir(io, path) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_rm_sync) {
+        try out.appendSlice(arena,
+            \\fn __rmSync(io: std.Io, path: []const u8, recursive: bool) void {
+            \\    if (recursive) {
+            \\        std.Io.Dir.cwd().deleteTree(io, path) catch {};
+            \\    } else {
+            \\        std.Io.Dir.cwd().deleteFile(io, path) catch {
+            \\            std.Io.Dir.cwd().deleteDir(io, path) catch {};
+            \\        };
+            \\    }
+            \\}
+            \\
+        );
+    }
+    if (program.needs_truncate_sync) {
+        try out.appendSlice(arena,
+            \\fn __truncateSync(io: std.Io, path: []const u8, len: i64) void {
+            \\    var file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write }) catch return;
+            \\    defer file.close(io);
+            \\    file.setLength(io, @intCast(len)) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_link_sync) {
+        try out.appendSlice(arena,
+            \\fn __linkSync(io: std.Io, existing_path: []const u8, new_path: []const u8) void {
+            \\    std.Io.Dir.hardLink(std.Io.Dir.cwd(), existing_path, std.Io.Dir.cwd(), new_path, io, .{}) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_symlink_sync) {
+        try out.appendSlice(arena,
+            \\fn __symlinkSync(io: std.Io, target: []const u8, path: []const u8) void {
+            \\    std.Io.Dir.cwd().symLink(io, target, path, .{}) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_readlink_sync) {
+        try out.appendSlice(arena,
+            \\fn __readlinkSync(io: std.Io, alloc: std.mem.Allocator, path: []const u8) []const u8 {
+            \\    var buf: [4096]u8 = undefined;
+            \\    const n = std.Io.Dir.cwd().readLink(io, path, &buf) catch return "";
+            \\    return alloc.dupe(u8, buf[0..n]) catch "";
+            \\}
+            \\
+        );
+    }
+    if (program.needs_chmod_sync) {
+        try out.appendSlice(arena,
+            \\fn __chmodSync(io: std.Io, path: []const u8, mode: i64) void {
+            \\    var file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch return;
+            \\    defer file.close(io);
+            \\    file.setPermissions(io, std.Io.File.Permissions.fromMode(@intCast(mode))) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_access_sync) {
+        try out.appendSlice(arena,
+            \\fn __accessSync(io: std.Io, path: []const u8, mode: i64) bool {
+            \\    const m: u32 = @intCast(mode);
+            \\    const opts: std.Io.Dir.AccessOptions = .{
+            \\        .read = (m & 4) != 0,
+            \\        .write = (m & 2) != 0,
+            \\        .execute = (m & 1) != 0,
+            \\    };
+            \\    std.Io.Dir.cwd().access(io, path, opts) catch return false;
+            \\    return true;
+            \\}
+            \\
+        );
+    }
     if (program.needs_httpget) {
         // A real std.http one-shot GET, wrapped to a Lumen-friendly `i64` (status code, or -1 on error).
         try out.appendSlice(arena,

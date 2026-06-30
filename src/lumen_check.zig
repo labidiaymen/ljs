@@ -3307,6 +3307,144 @@ const Checker = struct {
             call.checked_type = .void;
             return .void;
         }
+        if (std.mem.eql(u8, call.name, "rmdirSync")) {
+            if (call.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            if (!types.same(.string, path_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            program.uses_io = true;
+            program.needs_rmdir_sync = true;
+            call.checked_type = .void;
+            return .void;
+        }
+        if (std.mem.eql(u8, call.name, "rmSync")) {
+            if (call.args.len != 1 and call.args.len != 2) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            if (!types.same(.string, path_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            if (call.args.len == 2) {
+                const recursive_type = self.exprType(program, call.args[1], line, col) orelse return null;
+                if (!types.same(.bool, recursive_type)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+            }
+            program.uses_io = true;
+            program.needs_rm_sync = true;
+            call.checked_type = .void;
+            return .void;
+        }
+        if (std.mem.eql(u8, call.name, "truncateSync")) {
+            if (call.args.len != 2) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            const len_type = self.exprType(program, call.args[1], line, col) orelse return null;
+            if (!types.same(.string, path_type) or !types.isInteger(len_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            program.uses_io = true;
+            program.needs_truncate_sync = true;
+            call.checked_type = .void;
+            return .void;
+        }
+        if (std.mem.eql(u8, call.name, "linkSync")) {
+            if (call.args.len != 2) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const a_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            const b_type = self.exprType(program, call.args[1], line, col) orelse return null;
+            if (!types.same(.string, a_type) or !types.same(.string, b_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            program.uses_io = true;
+            program.needs_link_sync = true;
+            call.checked_type = .void;
+            return .void;
+        }
+        if (std.mem.eql(u8, call.name, "symlinkSync")) {
+            if (call.args.len != 2) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const a_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            const b_type = self.exprType(program, call.args[1], line, col) orelse return null;
+            if (!types.same(.string, a_type) or !types.same(.string, b_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            program.uses_io = true;
+            program.needs_symlink_sync = true;
+            call.checked_type = .void;
+            return .void;
+        }
+        if (std.mem.eql(u8, call.name, "readlinkSync")) {
+            if (call.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            if (!types.same(.string, path_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            program.uses_io = true;
+            program.needs_readlink_sync = true;
+            call.checked_type = .string;
+            return .string;
+        }
+        if (std.mem.eql(u8, call.name, "chmodSync")) {
+            if (call.args.len != 2) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            const mode_type = self.exprType(program, call.args[1], line, col) orelse return null;
+            if (!types.same(.string, path_type) or !types.isInteger(mode_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            program.uses_io = true;
+            program.needs_chmod_sync = true;
+            call.checked_type = .void;
+            return .void;
+        }
+        if (std.mem.eql(u8, call.name, "accessSync")) {
+            if (call.args.len != 1 and call.args.len != 2) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            if (!types.same(.string, path_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            if (call.args.len == 2) {
+                const mode_type = self.exprType(program, call.args[1], line, col) orelse return null;
+                if (!types.isInteger(mode_type)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+            }
+            program.uses_io = true;
+            program.needs_access_sync = true;
+            call.checked_type = .bool;
+            return .bool;
+        }
         _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
         return null;
     }
