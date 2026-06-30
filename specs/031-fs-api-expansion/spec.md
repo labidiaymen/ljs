@@ -34,8 +34,23 @@ what `std.Io.Dir` in Zig can do.
 | `fs.cpSync(src, dest, recursive?)` | `(string, string, bool?) -> void` | `Dir.openDir(.{.iterate=true})` + `Dir.iterate`, recursing; falls back to a single `copyFile` |
 | `fs.mkdtempSync(prefix)` | `string -> string` | `Dir.createDir` with a timestamp+counter suffix (not cryptographic) |
 | `fs.statSync(path)` | `string -> { size, isFile, isDirectory, mtimeMs }` | `Dir.statFile`; the first **record-returning builtin** (see below) |
+| `fs.openSync(path, flags)` | `(string, string) -> int` | `Dir.openFile`/`createFile`; `flags` is `"r"` or `"w"` only (no `"a"`, see Phase 2) |
+| `fs.closeSync(fd)` | `int -> void` | `File.close` |
+| `fs.readSync(fd, length)` | `(int, int) -> string` | `File.readStreaming` |
+| `fs.writeSync(fd, data)` | `(int, string) -> int` | `File.writeStreamingAll`, returns `data.len` |
 
-After Phase 1 (+ `cpSync`, `mkdtempSync`, `statSync`), Lumen covers 19 of Node's 48 sync functions.
+After Phase 1 (+ `cpSync`, `mkdtempSync`, `statSync`, the fd group), Lumen
+covers 23 of Node's 48 sync functions.
+
+**The fd group is a deliberately scoped version of Node's fd API**, unblocked
+by treating a "fd" as a plain `int` (an index into an internal
+`std.Io.File` table) rather than a real OS handle, and using `string` instead
+of a `Buffer` for read/write data (Lumen has no `Buffer` type). This keeps the
+group inside the existing language surface instead of waiting on two more
+features. Deviations from Node: `openSync` only supports `"r"`/`"w"` flags (no
+`"a"`/append — no seek primitive in this Zig version's `std.Io.File`);
+`writeSync` always writes the full string and returns its length rather than a
+possibly-partial byte count.
 
 **`statSync` is the proof-of-concept for record-returning builtins.** Lumen
 had no mechanism for a builtin to return a multi-field object before this: the
@@ -82,9 +97,10 @@ Available now).
 
 | Group | Needs |
 | --- | --- |
-| `fs.lstatSync`, `fs.fstatSync` | `lstat` needs `Dir.statFile` to not follow symlinks (a flag away); `fstat` needs the fd-based group below. `statSync` itself **shipped** (see below) |
+| `fs.lstatSync`, `fs.fstatSync` | `lstat` needs `Dir.statFile` to not follow symlinks (a flag away); `fstat` reuses `__LumenStat` once it takes an fd instead of a path. `statSync` itself **shipped** (see below) |
 | `fs.readdirSync`, `fs.opendirSync`, `fs.globSync` | **growable arrays** (`Array.push` is not implemented yet — verified directly) or a directory-iterator class |
-| `fs.openSync`/`closeSync`/`readSync`/`writeSync`/`readvSync`/`writevSync` and every `f*Sync` (`fchmodSync`, `fchownSync`, `fdatasyncSync`, `fstatSync`, `fsyncSync`, `ftruncateSync`, `futimesSync`) | a **file-descriptor** concept exposed to user code, plus a **`Buffer`** type for the read/write data — a bigger "fd API" feature, own spec |
+| `fs.readvSync`/`writevSync`, append-mode `openSync` ("a") | readv/writev need an array-of-buffers type; append mode needs a seek primitive not in this Zig version's `std.Io.File` |
+| every `f*Sync` other than the four shipped (`fchmodSync`, `fchownSync`, `fdatasyncSync`, `fsyncSync`, `ftruncateSync`, `futimesSync`) | low priority; revisit alongside the shipped fd group if requested |
 | `fs.chownSync`, `fs.fchownSync`, `fs.lchownSync` | uid/gid ownership: POSIX-only, niche for an experiment-stage language; revisit only if requested |
 | `fs.lchmodSync`, `fs.lutimesSync` | symlink-targeted variants of already-niche/deferred ops |
 | All async/callback functions (`fs.readFile`, `fs.writeFile`, ... ~50 of them) and `fs.promises.*` | fs is not wired to the libuv event loop yet (async/await today only drives timers/promises); a real "async fs" milestone |

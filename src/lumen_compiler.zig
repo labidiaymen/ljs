@@ -577,6 +577,42 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_fd_api) {
+        // A Lumen "fd" is an index into this table, not a raw OS handle (so the
+        // type stays a plain `int`). openSync supports only "r" (read, must
+        // exist) and "w" (write, create/truncate) -- "a" (append) needs a seek
+        // primitive not available in this Zig version's std.Io.File, so it is
+        // deferred. readSync/writeSync work on `string`, not a Buffer type
+        // (Lumen has none yet), and are sequential (advance the OS file
+        // position), matching Node's positionless readSync/writeSync.
+        try out.appendSlice(arena,
+            \\var __fd_table: std.ArrayListUnmanaged(std.Io.File) = .empty;
+            \\fn __openSync(io: std.Io, alloc: std.mem.Allocator, path: []const u8, flags: []const u8) i32 {
+            \\    const file = if (std.mem.eql(u8, flags, "w"))
+            \\        std.Io.Dir.cwd().createFile(io, path, .{}) catch return -1
+            \\    else
+            \\        std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch return -1;
+            \\    __fd_table.append(alloc, file) catch return -1;
+            \\    return @intCast(__fd_table.items.len - 1);
+            \\}
+            \\fn __closeSync(io: std.Io, fd: i32) void {
+            \\    if (fd < 0 or @as(usize, @intCast(fd)) >= __fd_table.items.len) return;
+            \\    __fd_table.items[@intCast(fd)].close(io);
+            \\}
+            \\fn __readSync(io: std.Io, alloc: std.mem.Allocator, fd: i32, len: i32) []const u8 {
+            \\    if (fd < 0 or @as(usize, @intCast(fd)) >= __fd_table.items.len or len <= 0) return "";
+            \\    const buf = alloc.alloc(u8, @intCast(len)) catch return "";
+            \\    const n = __fd_table.items[@intCast(fd)].readStreaming(io, &.{buf}) catch return "";
+            \\    return buf[0..n];
+            \\}
+            \\fn __writeSync(io: std.Io, fd: i32, data: []const u8) i32 {
+            \\    if (fd < 0 or @as(usize, @intCast(fd)) >= __fd_table.items.len) return 0;
+            \\    __fd_table.items[@intCast(fd)].writeStreamingAll(io, data) catch return 0;
+            \\    return @intCast(data.len);
+            \\}
+            \\
+        );
+    }
     if (program.needs_rmdir_sync) {
         try out.appendSlice(arena,
             \\fn __rmdirSync(io: std.Io, path: []const u8) void {

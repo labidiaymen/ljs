@@ -155,9 +155,9 @@
   <h4 id="fs">fs · process</h4>
   <p class="sub">The synchronous core, statically typed and Node-conventional. This
   is a practical subset, not the full <a href="https://nodejs.org/docs/latest/api/fs.html">Node <code>fs</code> API</a>
-  (no streams, watchers, file descriptors, symlinks, or async/promise variants
-  yet) &mdash; see Planned below for what is next. Every entry below links
-  straight to its example, the same way <a href="https://nodejs.org/docs/latest/api/fs.html">Node's own docs</a> do.</p>
+  (no streams, watchers, or async/promise variants yet; a Lumen "fd" is a plain
+  <code>int</code> index, not a raw OS handle) &mdash; see Planned below for what
+  is next.</p>
 
   <div class="api-list">
     <a href="#fs-readFileSync">readFileSync</a>
@@ -179,6 +179,10 @@
     <a href="#fs-cpSync">cpSync</a>
     <a href="#fs-mkdtempSync">mkdtempSync</a>
     <a href="#fs-statSync">statSync</a>
+    <a href="#fs-openSync">openSync</a>
+    <a href="#fs-closeSync">closeSync</a>
+    <a href="#fs-readSync">readSync</a>
+    <a href="#fs-writeSync">writeSync</a>
   </div>
 
   <div class="api" id="fs-readFileSync">
@@ -306,6 +310,38 @@ console.log(info.size);
 console.log(info.isFile);</code></pre>
   </div>
 
+  <div class="api" id="fs-openSync">
+    <h5><code>fs.openSync(path, flags)</code></h5>
+    <p class="sub">(string, string) → int &mdash; a Lumen "fd" is an index into an internal
+    file table, not a raw OS handle. <code>flags</code> is <code>"r"</code> (read, must exist) or
+    <code>"w"</code> (write, create/truncate); <code>"a"</code> is not supported yet.</p>
+<pre><code class="lumen">const fd: int = fs.openSync("data.bin", "r");</code></pre>
+  </div>
+
+  <div class="api" id="fs-closeSync">
+    <h5><code>fs.closeSync(fd)</code></h5>
+    <p class="sub">int → void</p>
+<pre><code class="lumen">fs.closeSync(fd);</code></pre>
+  </div>
+
+  <div class="api" id="fs-readSync">
+    <h5><code>fs.readSync(fd, length)</code></h5>
+    <p class="sub">(int, int) → string &mdash; reads up to <code>length</code> bytes from the
+    current file position; works on <code>string</code>, not a Buffer (Lumen has none yet).</p>
+<pre><code class="lumen">const fd: int = fs.openSync("data.bin", "r");
+const chunk: string = fs.readSync(fd, 1024);
+fs.closeSync(fd);</code></pre>
+  </div>
+
+  <div class="api" id="fs-writeSync">
+    <h5><code>fs.writeSync(fd, data)</code></h5>
+    <p class="sub">(int, string) → int &mdash; writes at the current file position, returns
+    bytes written.</p>
+<pre><code class="lumen">const fd: int = fs.openSync("out.bin", "w");
+const n: int = fs.writeSync(fd, "hello");
+fs.closeSync(fd);</code></pre>
+  </div>
+
   <div class="api" id="process">
     <h5><code>argsCount()</code> · <code>arg(i)</code></h5>
     <p class="sub">→ int · int → string &mdash; process arguments.</p>
@@ -322,8 +358,8 @@ console.log(arg(0));</code></pre>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
     <tr><td><code>fs.realpathSync(path)</code> · <code>fs.utimesSync(path, atime, mtime)</code></td><td>only raw libc bindings exist in this Zig version, not wrapped by std.Io</td></tr>
-    <tr><td><code>fs.lstatSync(path)</code> · <code>fs.fstatSync(fd)</code></td><td>lstat needs a no-follow-symlinks flag; fstat needs the fd group below</td></tr>
-    <tr><td><code>fs.openSync</code> / <code>readSync</code> / <code>writeSync</code> / <code>closeSync</code></td><td>needs a file-descriptor type + <code>Buffer</code></td></tr>
+    <tr><td><code>fs.lstatSync(path)</code> · <code>fs.fstatSync(fd)</code></td><td>lstat needs a no-follow-symlinks flag; fstat reuses statSync's record once it takes an fd</td></tr>
+    <tr><td><code>fs.readvSync</code> / <code>writevSync</code> · append-mode <code>openSync</code></td><td>readv/writev need an array of buffers; append mode needs a seek primitive not in this Zig version</td></tr>
     <tr><td><code>fs.promises.*</code> / watch / streams / all async callback variants</td><td>needs fs wired to the event loop</td></tr>
     <tr><td><code>fs.readdirSync(path)</code> → <code>string[]</code></td><td>needs growable arrays</td></tr>
   </table>

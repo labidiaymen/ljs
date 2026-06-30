@@ -662,6 +662,69 @@ pub fn fsCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, 
         call.checked_type = .{ .named = "__LumenStat" };
         return .{ .named = "__LumenStat" };
     }
+    if (std.mem.eql(u8, call.name, "openSync")) {
+        if (call.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const flags_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        if (!types.same(.string, path_type) or !types.same(.string, flags_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_fd_api = true;
+        call.checked_type = .i32;
+        return .i32;
+    }
+    if (std.mem.eql(u8, call.name, "closeSync")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const fd_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.isInteger(fd_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_fd_api = true;
+        call.checked_type = .void;
+        return .void;
+    }
+    if (std.mem.eql(u8, call.name, "readSync")) {
+        if (call.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const fd_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const len_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        if (!types.isInteger(fd_type) or !types.isInteger(len_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_fd_api = true;
+        call.checked_type = .string;
+        return .string;
+    }
+    if (std.mem.eql(u8, call.name, "writeSync")) {
+        if (call.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const fd_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const data_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        if (!types.isInteger(fd_type) or !types.same(.string, data_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_fd_api = true;
+        call.checked_type = .i32;
+        return .i32;
+    }
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
 }
