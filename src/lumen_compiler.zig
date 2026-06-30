@@ -2440,31 +2440,92 @@ fn reEmitAtomCond(atom: *const ReNode, charx: []const u8, w: *std.ArrayListUnman
 /// Handles `^`-anchored patterns that are a concatenation of single-atom terms
 /// (char / class / `.`) with safe greedy quantifiers. Returns true if it emitted
 /// the code; false means the caller should fall back to the runtime interpreter.
-fn reEmitSpecializedTest(source: []const u8, flags: []const u8, arg: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!bool {
-    if (flags.len != 0) return false; // flags handled by later cycles
-    const re_ast = regex_engine.__lumen_regex.parse(arena, source) orelse return false;
-    var one_buf = [_]*ReNode{re_ast};
-    const terms: []const *ReNode = switch (re_ast.*) {
-        .concat => |items| items,
-        else => one_buf[0..],
-    };
-    if (terms.len < 2) return false;
-    if (terms[0].* != .astart) return false; // require `^` anchor
-    var end_idx = terms.len;
-    var has_end = false;
-    if (terms[terms.len - 1].* == .aend) {
-        has_end = true;
-        end_idx = terms.len - 1;
+/// Flattens nested `concat` nodes into one term list. The parser desugars
+/// `x{n,m}` into a concat of copies, so flattening makes those copies first-class
+/// terms the specializer handles directly.
+fn reFlatten(n: *const ReNode, list: *std.ArrayListUnmanaged(*const ReNode), arena: std.mem.Allocator) CompileError!void {
+    switch (n.*) {
+        .concat => |items| for (items) |it| try reFlatten(it, list, arena),
+        else => try list.append(arena, n),
     }
-    const middle = terms[1..end_idx];
+}
+
+/// Emits the per-term matching code. `fail` is the statement run on a mismatch
+/// (`break :__re_N false` when anchored, `break :__re_try_N` to try the next
+/// start position when unanchored).
+fn reEmitTerms(middle: []const *const ReNode, uid: usize, charx: []const u8, fail: []const u8, has_end: bool, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
+    for (middle) |tn| {
+        const ti = reTermInfo(tn).?;
+        switch (ti.quant) {
+            0 => { // exactly one
+                try w.print(arena, "if (__re_i_{d} >= __re_s_{d}.len or !(", .{ uid, uid });
+                try reEmitAtomCond(ti.atom, charx, w, arena);
+                try w.print(arena, ")) {s}; __re_i_{d} += 1; ", .{ fail, uid });
+            },
+            1 => { // star (greedy)
+                try w.print(arena, "while (__re_i_{d} < __re_s_{d}.len and (", .{ uid, uid });
+                try reEmitAtomCond(ti.atom, charx, w, arena);
+                try w.print(arena, ")) __re_i_{d} += 1; ", .{uid});
+            },
+            2 => { // plus (greedy, >=1)
+                try w.print(arena, "{{ const __re_a_{d} = __re_i_{d}; while (__re_i_{d} < __re_s_{d}.len and (", .{ uid, uid, uid, uid });
+                try reEmitAtomCond(ti.atom, charx, w, arena);
+                try w.print(arena, ")) __re_i_{d} += 1; if (__re_i_{d} == __re_a_{d}) {s}; }} ", .{ uid, uid, uid, fail });
+            },
+            else => { // quest (0 or 1)
+                try w.print(arena, "if (__re_i_{d} < __re_s_{d}.len and (", .{ uid, uid });
+                try reEmitAtomCond(ti.atom, charx, w, arena);
+                try w.print(arena, ")) __re_i_{d} += 1; ", .{uid});
+            },
+        }
+    }
+    if (has_end) try w.print(arena, "if (__re_i_{d} != __re_s_{d}.len) {s}; ", .{ uid, uid, fail });
+}
+
+fn reEmitSpecializedTest(source: []const u8, flags: []const u8, arg: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!bool {
+    if (flags.len != 0) return false; // the `i` flag is handled by a later cycle
+    const re_ast = regex_engine.__lumen_regex.parse(arena, source) orelse return false;
+    var term_list: std.ArrayListUnmanaged(*const ReNode) = .empty;
+    try reFlatten(re_ast, &term_list, arena);
+    const terms = term_list.items;
+    if (terms.len == 0) return false;
+
+    // Strip a leading `^` and trailing `$`.
+    var lo: usize = 0;
+    var anchored = false;
+    if (terms[0].* == .astart) {
+        anchored = true;
+        lo = 1;
+    }
+    var hi = terms.len;
+    var has_end = false;
+    if (hi > lo and terms[hi - 1].* == .aend) {
+        has_end = true;
+        hi -= 1;
+    }
+    const middle = terms[lo..hi];
     if (middle.len == 0) return false;
 
-    // Validate every term; a greedy term must be disjoint from the next term.
+    // Every term must be a single-atom term; no stray anchors in the middle.
+    for (middle) |tn| {
+        switch (tn.*) {
+            .astart, .aend => return false,
+            else => {},
+        }
+        _ = reTermInfo(tn) orelse return false;
+    }
+    // A greedy/optional term is only safe if its atom is disjoint from the next
+    // *mandatory* term's atom (so greedy consumption never needs to backtrack).
     for (middle, 0..) |tn, idx| {
-        const ti = reTermInfo(tn) orelse return false;
-        if (ti.quant != 0 and idx + 1 < middle.len) {
-            const nt = reTermInfo(middle[idx + 1]) orelse return false;
-            if (!reAtomsDisjoint(ti.atom, nt.atom)) return false;
+        const ti = reTermInfo(tn).?;
+        if (ti.quant == 0) continue;
+        var j = idx + 1;
+        while (j < middle.len) : (j += 1) {
+            const tj = reTermInfo(middle[j]).?;
+            if (tj.quant == 0 or tj.quant == 2) { // next mandatory term
+                if (!reAtomsDisjoint(ti.atom, tj.atom)) return false;
+                break;
+            }
         }
     }
 
@@ -2473,34 +2534,19 @@ fn reEmitSpecializedTest(source: []const u8, flags: []const u8, arg: *const Expr
     const charx = try std.fmt.allocPrint(arena, "__re_s_{d}[__re_i_{d}]", .{ uid, uid });
     try w.print(arena, "__re_{d}: {{ const __re_s_{d} = ", .{ uid, uid });
     try emitExpr(arg, w, arena);
-    try w.print(arena, "; var __re_i_{d}: usize = 0; ", .{uid});
-    for (middle) |tn| {
-        const ti = reTermInfo(tn).?;
-        switch (ti.quant) {
-            0 => {
-                try w.print(arena, "if (__re_i_{d} >= __re_s_{d}.len or !(", .{ uid, uid });
-                try reEmitAtomCond(ti.atom, charx, w, arena);
-                try w.print(arena, ")) break :__re_{d} false; __re_i_{d} += 1; ", .{ uid, uid });
-            },
-            1 => {
-                try w.print(arena, "while (__re_i_{d} < __re_s_{d}.len and (", .{ uid, uid });
-                try reEmitAtomCond(ti.atom, charx, w, arena);
-                try w.print(arena, ")) __re_i_{d} += 1; ", .{uid});
-            },
-            2 => {
-                try w.print(arena, "{{ const __re_a_{d} = __re_i_{d}; while (__re_i_{d} < __re_s_{d}.len and (", .{ uid, uid, uid, uid });
-                try reEmitAtomCond(ti.atom, charx, w, arena);
-                try w.print(arena, ")) __re_i_{d} += 1; if (__re_i_{d} == __re_a_{d}) break :__re_{d} false; }} ", .{ uid, uid, uid, uid });
-            },
-            else => {
-                try w.print(arena, "if (__re_i_{d} < __re_s_{d}.len and (", .{ uid, uid });
-                try reEmitAtomCond(ti.atom, charx, w, arena);
-                try w.print(arena, ")) __re_i_{d} += 1; ", .{uid});
-            },
-        }
+    try w.appendSlice(arena, "; ");
+    if (anchored) {
+        const fail = try std.fmt.allocPrint(arena, "break :__re_{d} false", .{uid});
+        try w.print(arena, "var __re_i_{d}: usize = 0; ", .{uid});
+        try reEmitTerms(middle, uid, charx, fail, has_end, w, arena);
+        try w.print(arena, "break :__re_{d} true; }}", .{uid});
+    } else {
+        // Unanchored: try the match at each start position.
+        const fail = try std.fmt.allocPrint(arena, "break :__re_try_{d}", .{uid});
+        try w.print(arena, "var __re_st_{d}: usize = 0; while (__re_st_{d} <= __re_s_{d}.len) : (__re_st_{d} += 1) {{ var __re_i_{d}: usize = __re_st_{d}; __re_try_{d}: {{ ", .{ uid, uid, uid, uid, uid, uid, uid });
+        try reEmitTerms(middle, uid, charx, fail, has_end, w, arena);
+        try w.print(arena, "break :__re_{d} true; }} }} break :__re_{d} false; }}", .{ uid, uid });
     }
-    if (has_end) try w.print(arena, "if (__re_i_{d} != __re_s_{d}.len) break :__re_{d} false; ", .{ uid, uid, uid });
-    try w.print(arena, "break :__re_{d} true; }}", .{uid});
     return true;
 }
 
