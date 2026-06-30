@@ -156,30 +156,162 @@
   <p class="sub">The synchronous core, statically typed and Node-conventional. This
   is a practical subset, not the full <a href="https://nodejs.org/docs/latest/api/fs.html">Node <code>fs</code> API</a>
   (no streams, watchers, file descriptors, symlinks, or async/promise variants
-  yet) &mdash; see Planned below for what is next.</p>
-  <table>
-    <tr><th>API</th><th>Type</th><th>Notes</th></tr>
-    <tr><td><code>fs.readFileSync(path, encoding?)</code></td><td>(string, string?) → string</td><td>UTF-8 text; "" if unreadable</td></tr>
-    <tr><td><code>fs.writeFileSync(path, data)</code></td><td>(string, string) → void</td><td>creates or truncates</td></tr>
-    <tr><td><code>fs.appendFileSync(path, data)</code></td><td>(string, string) → void</td><td>creates if missing</td></tr>
-    <tr><td><code>fs.existsSync(path)</code></td><td>string → bool</td><td></td></tr>
-    <tr><td><code>fs.mkdirSync(path, recursive?)</code></td><td>(string, bool?) → void</td><td>recursive defaults to false</td></tr>
-    <tr><td><code>fs.unlinkSync(path)</code></td><td>string → void</td><td>delete a file</td></tr>
-    <tr><td><code>fs.renameSync(a, b)</code></td><td>(string, string) → void</td><td></td></tr>
-    <tr><td><code>fs.copyFileSync(a, b)</code></td><td>(string, string) → void</td><td></td></tr>
-    <tr><td><code>fs.rmdirSync(path)</code></td><td>string → void</td><td>removes an empty directory</td></tr>
-    <tr><td><code>fs.rmSync(path, recursive?)</code></td><td>(string, bool?) → void</td><td>recursive removes a directory tree</td></tr>
-    <tr><td><code>fs.truncateSync(path, len)</code></td><td>(string, int) → void</td><td></td></tr>
-    <tr><td><code>fs.linkSync(existingPath, newPath)</code></td><td>(string, string) → void</td><td>hard link</td></tr>
-    <tr><td><code>fs.symlinkSync(target, path)</code></td><td>(string, string) → void</td><td></td></tr>
-    <tr><td><code>fs.readlinkSync(path)</code></td><td>string → string</td><td></td></tr>
-    <tr><td><code>fs.chmodSync(path, mode)</code></td><td>(string, int) → void</td><td>POSIX mode bits</td></tr>
-    <tr><td><code>fs.accessSync(path, mode?)</code></td><td>(string, int?) → bool</td><td>mode bitmask R_OK=4 W_OK=2 X_OK=1; returns bool rather than throwing</td></tr>
-    <tr><td><code>fs.cpSync(src, dest, recursive?)</code></td><td>(string, string, bool?) → void</td><td>recursive copy; falls back to a single file copy</td></tr>
-    <tr><td><code>fs.mkdtempSync(prefix)</code></td><td>string → string</td><td>unique suffix from a timestamp + counter, not cryptographic; returns the created path</td></tr>
-    <tr><td><code>fs.statSync(path)</code></td><td>string → <code>{ size, isFile, isDirectory, mtimeMs }</code></td><td>first record-returning builtin; isFile/isDirectory are bool fields, not methods</td></tr>
-    <tr><td><code>argsCount()</code> · <code>arg(i)</code></td><td>→ int · int → string</td><td>process arguments</td></tr>
-  </table>
+  yet) &mdash; see Planned below for what is next. Every entry below links
+  straight to its example, the same way <a href="https://nodejs.org/docs/latest/api/fs.html">Node's own docs</a> do.</p>
+
+  <div class="api-list">
+    <a href="#fs-readFileSync">readFileSync</a>
+    <a href="#fs-writeFileSync">writeFileSync</a>
+    <a href="#fs-appendFileSync">appendFileSync</a>
+    <a href="#fs-existsSync">existsSync</a>
+    <a href="#fs-mkdirSync">mkdirSync</a>
+    <a href="#fs-unlinkSync">unlinkSync</a>
+    <a href="#fs-renameSync">renameSync</a>
+    <a href="#fs-copyFileSync">copyFileSync</a>
+    <a href="#fs-rmdirSync">rmdirSync</a>
+    <a href="#fs-rmSync">rmSync</a>
+    <a href="#fs-truncateSync">truncateSync</a>
+    <a href="#fs-linkSync">linkSync</a>
+    <a href="#fs-symlinkSync">symlinkSync</a>
+    <a href="#fs-readlinkSync">readlinkSync</a>
+    <a href="#fs-chmodSync">chmodSync</a>
+    <a href="#fs-accessSync">accessSync</a>
+    <a href="#fs-cpSync">cpSync</a>
+    <a href="#fs-mkdtempSync">mkdtempSync</a>
+    <a href="#fs-statSync">statSync</a>
+  </div>
+
+  <div class="api" id="fs-readFileSync">
+    <h5><code>fs.readFileSync(path, encoding?)</code></h5>
+    <p class="sub">(string, string?) → string &mdash; UTF-8 text; <code>""</code> if unreadable.</p>
+<pre><code class="lumen">const data: string = fs.readFileSync("notes.txt");
+console.log(data);</code></pre>
+  </div>
+
+  <div class="api" id="fs-writeFileSync">
+    <h5><code>fs.writeFileSync(path, data)</code></h5>
+    <p class="sub">(string, string) → void &mdash; creates the file or truncates it first.</p>
+<pre><code class="lumen">fs.writeFileSync("notes.txt", "hello world");</code></pre>
+  </div>
+
+  <div class="api" id="fs-appendFileSync">
+    <h5><code>fs.appendFileSync(path, data)</code></h5>
+    <p class="sub">(string, string) → void &mdash; creates the file if it does not exist yet.</p>
+<pre><code class="lumen">fs.appendFileSync("log.txt", "new line\n");</code></pre>
+  </div>
+
+  <div class="api" id="fs-existsSync">
+    <h5><code>fs.existsSync(path)</code></h5>
+    <p class="sub">string → bool</p>
+<pre><code class="lumen">if (fs.existsSync("config.json")) {
+  console.log("found it");
+}</code></pre>
+  </div>
+
+  <div class="api" id="fs-mkdirSync">
+    <h5><code>fs.mkdirSync(path, recursive?)</code></h5>
+    <p class="sub">(string, bool?) → void &mdash; <code>recursive</code> defaults to <code>false</code>.</p>
+<pre><code class="lumen">fs.mkdirSync("build/output", true);</code></pre>
+  </div>
+
+  <div class="api" id="fs-unlinkSync">
+    <h5><code>fs.unlinkSync(path)</code></h5>
+    <p class="sub">string → void &mdash; delete a file.</p>
+<pre><code class="lumen">fs.unlinkSync("scratch.tmp");</code></pre>
+  </div>
+
+  <div class="api" id="fs-renameSync">
+    <h5><code>fs.renameSync(oldPath, newPath)</code></h5>
+    <p class="sub">(string, string) → void</p>
+<pre><code class="lumen">fs.renameSync("draft.md", "final.md");</code></pre>
+  </div>
+
+  <div class="api" id="fs-copyFileSync">
+    <h5><code>fs.copyFileSync(src, dest)</code></h5>
+    <p class="sub">(string, string) → void</p>
+<pre><code class="lumen">fs.copyFileSync("template.txt", "output.txt");</code></pre>
+  </div>
+
+  <div class="api" id="fs-rmdirSync">
+    <h5><code>fs.rmdirSync(path)</code></h5>
+    <p class="sub">string → void &mdash; removes an empty directory.</p>
+<pre><code class="lumen">fs.rmdirSync("empty-dir");</code></pre>
+  </div>
+
+  <div class="api" id="fs-rmSync">
+    <h5><code>fs.rmSync(path, recursive?)</code></h5>
+    <p class="sub">(string, bool?) → void &mdash; recursive removes a whole directory tree.</p>
+<pre><code class="lumen">fs.rmSync("build", true);</code></pre>
+  </div>
+
+  <div class="api" id="fs-truncateSync">
+    <h5><code>fs.truncateSync(path, len)</code></h5>
+    <p class="sub">(string, int) → void</p>
+<pre><code class="lumen">fs.truncateSync("log.txt", 0);</code></pre>
+  </div>
+
+  <div class="api" id="fs-linkSync">
+    <h5><code>fs.linkSync(existingPath, newPath)</code></h5>
+    <p class="sub">(string, string) → void &mdash; hard link.</p>
+<pre><code class="lumen">fs.linkSync("original.txt", "alias.txt");</code></pre>
+  </div>
+
+  <div class="api" id="fs-symlinkSync">
+    <h5><code>fs.symlinkSync(target, path)</code></h5>
+    <p class="sub">(string, string) → void</p>
+<pre><code class="lumen">fs.symlinkSync("/etc/hosts", "hosts-link");</code></pre>
+  </div>
+
+  <div class="api" id="fs-readlinkSync">
+    <h5><code>fs.readlinkSync(path)</code></h5>
+    <p class="sub">string → string</p>
+<pre><code class="lumen">console.log(fs.readlinkSync("hosts-link"));  // /etc/hosts</code></pre>
+  </div>
+
+  <div class="api" id="fs-chmodSync">
+    <h5><code>fs.chmodSync(path, mode)</code></h5>
+    <p class="sub">(string, int) → void &mdash; POSIX mode bits.</p>
+<pre><code class="lumen">fs.chmodSync("script.sh", 0o755);  // rwxr-xr-x</code></pre>
+  </div>
+
+  <div class="api" id="fs-accessSync">
+    <h5><code>fs.accessSync(path, mode?)</code></h5>
+    <p class="sub">(string, int?) → bool &mdash; mode bitmask <code>R_OK=4 W_OK=2 X_OK=1</code>; returns
+    bool rather than throwing.</p>
+<pre><code class="lumen">console.log(fs.accessSync("data.csv", 4));  // readable?</code></pre>
+  </div>
+
+  <div class="api" id="fs-cpSync">
+    <h5><code>fs.cpSync(src, dest, recursive?)</code></h5>
+    <p class="sub">(string, string, bool?) → void &mdash; falls back to a single file copy when
+    <code>src</code> is not a directory.</p>
+<pre><code class="lumen">fs.cpSync("assets", "dist/assets", true);</code></pre>
+  </div>
+
+  <div class="api" id="fs-mkdtempSync">
+    <h5><code>fs.mkdtempSync(prefix)</code></h5>
+    <p class="sub">string → string &mdash; unique suffix from a timestamp + counter, not
+    cryptographic; returns the created path.</p>
+<pre><code class="lumen">const dir: string = fs.mkdtempSync("/tmp/build-");
+console.log(dir);  // /tmp/build-1a2b3c4d</code></pre>
+  </div>
+
+  <div class="api" id="fs-statSync">
+    <h5><code>fs.statSync(path)</code></h5>
+    <p class="sub">string → <code>{ size, isFile, isDirectory, mtimeMs }</code> &mdash; the first
+    record-returning builtin; <code>isFile</code>/<code>isDirectory</code> are bool fields, not
+    methods.</p>
+<pre><code class="lumen">const info = fs.statSync("report.pdf");
+console.log(info.size);
+console.log(info.isFile);</code></pre>
+  </div>
+
+  <div class="api" id="process">
+    <h5><code>argsCount()</code> · <code>arg(i)</code></h5>
+    <p class="sub">→ int · int → string &mdash; process arguments.</p>
+<pre><code class="lumen">console.log(argsCount());
+console.log(arg(0));</code></pre>
+  </div>
 
   <h3 id="planned">Planned</h3>
   <p class="sub">The surface grows in explicit, conformance-backed slices. These
@@ -190,7 +322,7 @@
   <table>
     <tr><th>API</th><th>Notes</th></tr>
     <tr><td><code>fs.realpathSync(path)</code> · <code>fs.utimesSync(path, atime, mtime)</code></td><td>only raw libc bindings exist in this Zig version, not wrapped by std.Io</td></tr>
-    <tr><td><code>fs.statSync(path)</code> → <code>{ size, isFile, isDirectory }</code></td><td>record return</td></tr>
+    <tr><td><code>fs.lstatSync(path)</code> · <code>fs.fstatSync(fd)</code></td><td>lstat needs a no-follow-symlinks flag; fstat needs the fd group below</td></tr>
     <tr><td><code>fs.openSync</code> / <code>readSync</code> / <code>writeSync</code> / <code>closeSync</code></td><td>needs a file-descriptor type + <code>Buffer</code></td></tr>
     <tr><td><code>fs.promises.*</code> / watch / streams / all async callback variants</td><td>needs fs wired to the event loop</td></tr>
     <tr><td><code>fs.readdirSync(path)</code> → <code>string[]</code></td><td>needs growable arrays</td></tr>
