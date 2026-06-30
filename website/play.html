@@ -71,6 +71,14 @@ console.log(`Hello, ${name}!`);</script>
 import { render } from "https://lumen-lang.org/package/std-contrib/markdown/markdown.ts";
 
 console.log(render("# Lumen\n\nWrite **TypeScript syntax**, ship a fast `wasm` library.\n\n- no runtime\n- zero dependencies\n\n> Imported straight from a URL."));</script>
+<script type="text/x-lumen" data-title="Regex (compiled, faster than V8)">// Regex literals are compiled to specialized native matchers at build time.
+// Anchored patterns like these run a few times faster than V8's RegExp; anything
+// the compiler can't specialize falls back to a built-in engine, so every pattern
+// works. Results match JavaScript exactly.
+console.log(/^\d+\.\d+\.\d+$/.test("1.2.30"));       // true   (valid semver)
+console.log(/^\d+\.\d+\.\d+$/.test("1.2"));          // false
+console.log(/^[a-z_][a-z0-9_]*$/.test("my_var1"));   // true   (identifier)
+console.log(/^(cat|dog|bird)$/.test("parrot"));      // false  (alternation)</script>
 <script type="text/x-lumen" data-title="Generics">function firstOf<T>(xs: T[]): T {
   return xs[0];
 }
