@@ -779,39 +779,38 @@ fn appendLink(arena: std.mem.Allocator, argv: *std.ArrayListUnmanaged([]const u8
     }
 }
 
-/// Auto-links libuv when a program uses async/await. libuv is the async event
-/// loop, so it is a built-in language dependency rather than a user `// @link`.
-/// Flags are discovered with `pkg-config --cflags --libs libuv`; if pkg-config
-/// is unavailable we fall back to the conventional Homebrew install location.
-/// Each whitespace-separated token (e.g. `-I/...`, `-L/...`, `-luv`) becomes its
-/// own argv element, and `zig build-exe` is told to link libc so libuv resolves.
-fn collectAsyncRuntimeLibs(arena: std.mem.Allocator, io: std.Io, argv: *std.ArrayListUnmanaged([]const u8)) !void {
-    try argv.append(arena, "-lc");
-    if (pkgConfigFlags(arena, io)) |flags| {
-        var it = std.mem.tokenizeAny(u8, flags, " \t\r\n");
-        while (it.next()) |tok| try argv.append(arena, try arena.dupe(u8, tok));
-        return;
-    }
-    // Fallback: the documented Homebrew libuv prefix on this platform.
-    const prefix = "/opt/homebrew/opt/libuv";
-    try argv.append(arena, try std.fmt.allocPrint(arena, "-I{s}/include", .{prefix}));
-    try argv.append(arena, try std.fmt.allocPrint(arena, "-L{s}/lib", .{prefix}));
-    try argv.append(arena, "-luv");
-}
+/// The libxev commit this compiler builds async programs against. Pinned (not
+/// `main`) so every compile fetches the identical, previously-verified source
+/// tree; bump deliberately when adopting a newer libxev.
+const LIBXEV_COMMIT = "9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf";
 
-/// Runs `pkg-config --cflags --libs libuv` and returns its trimmed stdout, or
-/// null if pkg-config is missing or reports failure.
-fn pkgConfigFlags(arena: std.mem.Allocator, io: std.Io) ?[]const u8 {
-    const res = std.process.run(arena, io, .{
-        .argv = &.{ "pkg-config", "--cflags", "--libs", "libuv" },
-    }) catch return null;
-    switch (res.term) {
-        .exited => |code| if (code != 0) return null,
-        else => return null,
-    }
-    const out = std.mem.trim(u8, res.stdout, " \t\r\n");
-    if (out.len == 0) return null;
-    return out;
+/// Fetches and extracts libxev's source (the async event loop backing
+/// async/await, Promise, and setTimeout) and returns a local path to its
+/// `src/main.zig` module root, suitable for `-Mxev=<path>`. libxev is a pure
+/// Zig dependency (no system install, no C library, unlike the libuv this
+/// replaced), so this mirrors `fetchWasmLib`'s fetch-and-cache shape rather
+/// than `pkg-config`: a one-time download (gzip+tar extracted via `std.compress
+/// .flate`/`std.tar`) cached by commit, reused on every later compile.
+fn fetchLibxev(arena: std.mem.Allocator, io: std.Io) ![]const u8 {
+    const cache_dir = ".lumen-libxev-" ++ LIBXEV_COMMIT[0..12];
+    const root = cache_dir ++ "/src/main.zig";
+    if (std.Io.Dir.cwd().access(io, root, .{})) |_| {
+        return root;
+    } else |_| {}
+
+    const url = "https://github.com/mitchellh/libxev/archive/" ++ LIBXEV_COMMIT ++ ".tar.gz";
+    const bytes = try fetchUrl(arena, io, url);
+
+    var fixed_reader = std.Io.Reader.fixed(bytes);
+    const decomp_buf = try arena.alloc(u8, std.compress.flate.max_window_len);
+    var decomp = std.compress.flate.Decompress.init(&fixed_reader, .gzip, decomp_buf);
+
+    try std.Io.Dir.cwd().createDirPath(io, cache_dir);
+    var out_dir = try std.Io.Dir.cwd().openDir(io, cache_dir, .{ .iterate = true });
+    defer out_dir.close(io);
+    try std.tar.extract(io, out_dir, &decomp.reader, .{ .strip_components = 1 });
+
+    return root;
 }
 
 /// Links from each `// @link <lib>` pragma line in the source.
@@ -936,7 +935,8 @@ fn reactorWrappers(arena: std.mem.Allocator, names: []const []const u8) ![]const
         \\
     );
     for (names) |n| {
-        try w.print(arena,
+        try w.print(
+            arena,
             "export fn __lumen_call_{s}(__p: u32, __n: u32) u32 {{\n" ++
                 "    _ = __sa_arena.reset(.retain_capacity);\n" ++
                 "    const __r = {s}(@as([*]const u8, @ptrFromInt(@as(usize, __p)))[0..@as(usize, __n)]);\n" ++
@@ -991,7 +991,7 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
     }
 
     // The wasm target has no event loop, so async is still unavailable there.
-    if (wasm and std.mem.indexOf(u8, zig_src, "@cInclude(\"uv.h\")") != null) {
+    if (wasm and std.mem.indexOf(u8, zig_src, "@import(\"xev\")") != null) {
         try err.print("{s}:1:1: error: the wasm target does not support async yet\n", .{path});
         return 1;
     }
@@ -1022,11 +1022,29 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
     // a private toolchain that the `lumen` launcher injects into PATH, so a
     // downloaded build is self-contained without exposing zig in the user's shell.
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    const needs_xev = !wasm and std.mem.indexOf(u8, zig_src, "@import(\"xev\")") != null;
     switch (action) {
-        .build_exe => if (wasm)
-            try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-target", "wasm32-wasi", "-O", "ReleaseSmall", emit })
-        else
-            try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-O", mode.zigName(), emit }),
+        .build_exe => if (wasm) {
+            try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-target", "wasm32-wasi", "-O", "ReleaseSmall", emit });
+        } else if (needs_xev) {
+            // libxev (the async event loop) is a pure-Zig dependency, not a system
+            // library: fetched once and wired in as a named module via `-Mxev=`,
+            // bare CLI flags (no build.zig needed) -- the same single-file
+            // `zig build-exe` invocation as every other compile.
+            const xev_root = fetchLibxev(arena, io) catch |e| {
+                try err.print("{s}:1:1: error: could not fetch the libxev async runtime: {s}\n", .{ path, @errorName(e) });
+                return 1;
+            };
+            try argv.appendSlice(arena, &.{
+                "zig",                                                    "build-exe",
+                "--dep",                                                  "xev",
+                try std.fmt.allocPrint(arena, "-Mroot={s}", .{gen_path}), try std.fmt.allocPrint(arena, "-Mxev={s}", .{xev_root}),
+                "-O",                                                     mode.zigName(),
+                emit,
+            });
+        } else {
+            try argv.appendSlice(arena, &.{ "zig", "build-exe", gen_path, "-O", mode.zigName(), emit });
+        },
         .run_test => try argv.appendSlice(arena, &.{ "zig", "test", gen_path }),
     }
     if (wasm) {
@@ -1051,12 +1069,6 @@ fn compileFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, mode: Com
             for (reactor_exports) |n| try argv.append(arena, try std.fmt.allocPrint(arena, "--export=__lumen_call_{s}", .{n}));
         }
     } else {
-        // The async event loop is libuv: when the program uses async/await, the
-        // generated backend imports `uv.h`, so auto-inject libuv's include/link
-        // flags (this is a language feature, not a user `// @link`).
-        if (std.mem.indexOf(u8, zig_src, "@cInclude(\"uv.h\")") != null) {
-            try collectAsyncRuntimeLibs(arena, io, &argv);
-        }
         // Link C libraries: from `// @link <lib>` source pragmas and `--link` flags.
         try collectLinkLibs(arena, source, &argv);
         for (cli_libs) |lib| try appendLink(arena, &argv, lib);

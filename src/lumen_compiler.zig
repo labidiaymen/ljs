@@ -201,11 +201,12 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
     try out.appendSlice(arena, "const __LumenRegExp = struct { source: []const u8, flags: []const u8 };\n");
     try out.appendSlice(arena, REGEX_RT);
     try out.appendSlice(arena, "\n");
-    // Async programs run their event loop on libuv. The CLI auto-injects libuv's
-    // include/link flags into the native build whenever a program uses async, so
-    // this C import resolves without any user configuration.
+    // Async programs run their event loop on libxev (a pure-Zig dependency: no
+    // system install, unlike the libuv this replaced). The CLI auto-fetches it
+    // and injects `-Mxev=...` into the native build whenever a program uses
+    // async, so this import resolves without any user configuration.
     if (program.needs_async) {
-        try out.appendSlice(arena, "const uv = @cImport(@cInclude(\"uv.h\"));\n");
+        try out.appendSlice(arena, "const xev = @import(\"xev\");\n");
     }
 
     // I/O plumbing is hoisted to file scope so builtins (arg, fs, httpGet, …)
@@ -376,23 +377,23 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
         );
     }
     if (program.needs_async) {
-        // The event loop is libuv. `setTimeout` schedules a `uv_timer_t`; `await`
-        // drives the loop one event at a time (`uv_run(..., UV_RUN_ONCE)`) until
+        // The event loop is libxev. `setTimeout` schedules an `xev.Timer`;
+        // `await` drives the loop one event at a time (`loop.run(.once)`) until
         // the awaited promise resolves, then reads its value; the program ends by
-        // draining remaining work with `uv_run(..., UV_RUN_DEFAULT)`. This is
-        // sound for the supported subset (already-resolved and timer-resolved
-        // promises) and keeps timer ordering deterministic, because libuv fires
-        // equal-deadline timers in start order.
+        // draining remaining work with `loop.run(.until_done)`. This is sound for
+        // the supported subset (already-resolved and timer-resolved promises) and
+        // keeps timer ordering deterministic (libxev, like libuv, fires
+        // equal-deadline timers in start order).
         try out.appendSlice(arena,
-            \\var __uv_loop: *uv.uv_loop_t = undefined;
+            \\var __xev_loop: xev.Loop = undefined;
             \\const LumenLoop = struct {
-            \\    fn init() void { __uv_loop = uv.uv_default_loop().?; }
+            \\    fn init() void { __xev_loop = xev.Loop.init(.{}) catch unreachable; }
             \\    fn driveUntil(ctx: *const anyopaque, done: *const fn (*const anyopaque) bool) void {
             \\        while (!done(ctx)) {
-            \\            if (uv.uv_run(__uv_loop, uv.UV_RUN_ONCE) == 0) break;
+            \\            __xev_loop.run(.once) catch break;
             \\        }
             \\    }
-            \\    fn drain() void { _ = uv.uv_run(__uv_loop, uv.UV_RUN_DEFAULT); }
+            \\    fn drain() void { __xev_loop.run(.until_done) catch {}; }
             \\};
             \\fn LumenPromise(comptime T: type) type {
             \\    return struct {
@@ -424,19 +425,20 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\    const Cb = @TypeOf(cb);
             \\    const Holder = struct {
             \\        f: Cb,
-            \\        timer: uv.uv_timer_t,
-            \\        fn onTimer(t: [*c]uv.uv_timer_t) callconv(.c) void {
-            \\            const h: *@This() = @fieldParentPtr("timer", @as(*uv.uv_timer_t, @ptrCast(t)));
-            \\            h.f.call(h.f.ctx);
-            \\            _ = uv.uv_timer_stop(t);
-            \\            uv.uv_close(@ptrCast(t), null);
+            \\        timer: xev.Timer,
+            \\        completion: xev.Completion = undefined,
+            \\        fn onTimer(ud: ?*@This(), loop: *xev.Loop, c: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
+            \\            _ = loop;
+            \\            _ = c;
+            \\            _ = result catch {};
+            \\            ud.?.f.call(ud.?.f.ctx);
+            \\            return .disarm;
             \\        }
             \\    };
             \\    const h = __alloc.create(Holder) catch unreachable;
-            \\    h.* = .{ .f = cb, .timer = undefined };
-            \\    _ = uv.uv_timer_init(__uv_loop, &h.timer);
+            \\    h.* = .{ .f = cb, .timer = xev.Timer.init() catch unreachable };
             \\    const delay: u64 = if (ms > 0) @intCast(ms) else 0;
-            \\    _ = uv.uv_timer_start(&h.timer, Holder.onTimer, delay, 0);
+            \\    h.timer.run(&__xev_loop, &h.completion, delay, Holder, h, Holder.onTimer);
             \\}
             \\
         );
