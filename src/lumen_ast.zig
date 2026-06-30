@@ -377,6 +377,7 @@ pub const Expr = union(enum) {
     float: f64,
     bool: bool,
     str: []const u8,
+    regex: struct { source: []const u8, flags: []const u8 }, // `/pattern/flags` literal
     null_lit, // null / undefined
     array: struct { items: []*Expr, elem_type: ?types.Type = null }, // `[a, b, ...rest]`; elem_type is filled by the checker when a spread element is present
     spread: *Expr, // `...expr` element inside an array literal or call argument list

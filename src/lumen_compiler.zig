@@ -12,6 +12,14 @@
 //! comparisons (`< > <= >= == !=`), `while` loops + assignment, typed objects (`type T = {…}` →
 //! struct, object literals, field access), and `console.log`.
 const std = @import("std");
+
+// The regex runtime engine, embedded verbatim into programs that use regex.
+const REGEX_RT = @embedFile("regex_rt.zig");
+// The same engine imported as a module, so the compiler can parse a literal
+// pattern at build time and specialize it into straight-line code (Plan B).
+const regex_engine = @import("regex_rt.zig");
+const ReNode = regex_engine.__lumen_regex.Node;
+var g_regex_uid: usize = 0; // unique-name counter for emitted specialized matchers
 const ast = @import("lumen_ast.zig");
 const check = @import("lumen_check.zig");
 const diag_mod = @import("lumen_diag.zig");
@@ -651,6 +659,11 @@ const Parser = struct {
             const v = self.cur.flt;
             try self.advance();
             return self.node(.{ .float = v });
+        }
+        if (self.cur == .regex) {
+            const rx = self.cur.regex;
+            try self.advance();
+            return self.node(.{ .regex = .{ .source = rx.pattern, .flags = rx.flags } });
         }
         if (self.isKw("true") or self.isKw("false")) {
             const v = self.isKw("true");
@@ -1830,6 +1843,25 @@ fn externZigName(t: types.Type, arena: std.mem.Allocator) []const u8 {
 /// its escape sequences decoded. The lexer keeps `.str` raw (escapes verbatim),
 /// so `\n` `\t` `\r` `\0` `\\` `\"` `\'` are interpreted here and the resulting
 /// bytes are re-escaped for the Zig literal.
+/// Emits `s` as a Zig string literal preserving its bytes verbatim (no Lumen
+/// escape decoding). Used for regex patterns, where `\d`, `\.` etc. are regex
+/// escapes that must reach the engine intact, not be interpreted as string
+/// escapes. Only Zig's own literal syntax is escaped.
+fn emitRawStrLit(w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, s: []const u8) CompileError!void {
+    try w.append(arena, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try w.appendSlice(arena, "\\\""),
+            '\\' => try w.appendSlice(arena, "\\\\"),
+            '\n' => try w.appendSlice(arena, "\\n"),
+            '\r' => try w.appendSlice(arena, "\\r"),
+            '\t' => try w.appendSlice(arena, "\\t"),
+            else => try w.append(arena, c),
+        }
+    }
+    try w.append(arena, '"');
+}
+
 fn emitStrLit(w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator, s: []const u8) CompileError!void {
     try w.append(arena, '"');
     var i: usize = 0;
@@ -2194,10 +2226,152 @@ fn accRecurseFns(stmt: *Stmt, arena: std.mem.Allocator) CompileError!void {
     }
 }
 
+// --- Plan B: compile-time regex specialization ---
+
+fn reAtomMatches(atom: *const ReNode, byte: u8) bool {
+    return switch (atom.*) {
+        .char => |c| byte == c,
+        .any => byte != '\n',
+        .class => |cl| blk: {
+            var hit = false;
+            for (cl.ranges) |r| {
+                if (byte >= r.lo and byte <= r.hi) {
+                    hit = true;
+                    break;
+                }
+            }
+            break :blk hit != cl.negated;
+        },
+        else => false,
+    };
+}
+
+fn reBareAtom(n: *const ReNode) bool {
+    return switch (n.*) { .char, .any, .class => true, else => false };
+}
+
+/// No byte matches both atoms -> a greedy quantifier on `a` can never need to
+/// backtrack into `b`, so straight-line greedy matching is correct.
+fn reAtomsDisjoint(a: *const ReNode, b: *const ReNode) bool {
+    var byte: u16 = 0;
+    while (byte < 256) : (byte += 1) {
+        const bb: u8 = @intCast(byte);
+        if (reAtomMatches(a, bb) and reAtomMatches(b, bb)) return false;
+    }
+    return true;
+}
+
+const ReTerm = struct { atom: *const ReNode, quant: u8 }; // 0 one, 1 star, 2 plus, 3 quest
+
+fn reTermInfo(n: *const ReNode) ?ReTerm {
+    return switch (n.*) {
+        .char, .any, .class => ReTerm{ .atom = n, .quant = 0 },
+        .star => |a| if (reBareAtom(a)) ReTerm{ .atom = a, .quant = 1 } else null,
+        .plus => |a| if (reBareAtom(a)) ReTerm{ .atom = a, .quant = 2 } else null,
+        .quest => |a| if (reBareAtom(a)) ReTerm{ .atom = a, .quant = 3 } else null,
+        else => null,
+    };
+}
+
+fn reEmitAtomCond(atom: *const ReNode, charx: []const u8, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
+    switch (atom.*) {
+        .char => |c| try w.print(arena, "{s} == {d}", .{ charx, c }),
+        .any => try w.print(arena, "{s} != 10", .{charx}),
+        .class => |cl| {
+            try w.appendSlice(arena, if (cl.negated) "!(" else "(");
+            if (cl.ranges.len == 0) try w.appendSlice(arena, "false");
+            for (cl.ranges, 0..) |r, i| {
+                if (i > 0) try w.appendSlice(arena, " or ");
+                if (r.lo == r.hi)
+                    try w.print(arena, "{s} == {d}", .{ charx, r.lo })
+                else
+                    try w.print(arena, "({s} >= {d} and {s} <= {d})", .{ charx, r.lo, charx, r.hi });
+            }
+            try w.appendSlice(arena, ")");
+        },
+        else => unreachable,
+    }
+}
+
+/// Tries to emit a specialized straight-line matcher for `/source/flags.test(arg)`.
+/// Handles `^`-anchored patterns that are a concatenation of single-atom terms
+/// (char / class / `.`) with safe greedy quantifiers. Returns true if it emitted
+/// the code; false means the caller should fall back to the runtime interpreter.
+fn reEmitSpecializedTest(source: []const u8, flags: []const u8, arg: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!bool {
+    if (flags.len != 0) return false; // flags handled by later cycles
+    const re_ast = regex_engine.__lumen_regex.parse(arena, source) orelse return false;
+    var one_buf = [_]*ReNode{re_ast};
+    const terms: []const *ReNode = switch (re_ast.*) {
+        .concat => |items| items,
+        else => one_buf[0..],
+    };
+    if (terms.len < 2) return false;
+    if (terms[0].* != .astart) return false; // require `^` anchor
+    var end_idx = terms.len;
+    var has_end = false;
+    if (terms[terms.len - 1].* == .aend) {
+        has_end = true;
+        end_idx = terms.len - 1;
+    }
+    const middle = terms[1..end_idx];
+    if (middle.len == 0) return false;
+
+    // Validate every term; a greedy term must be disjoint from the next term.
+    for (middle, 0..) |tn, idx| {
+        const ti = reTermInfo(tn) orelse return false;
+        if (ti.quant != 0 and idx + 1 < middle.len) {
+            const nt = reTermInfo(middle[idx + 1]) orelse return false;
+            if (!reAtomsDisjoint(ti.atom, nt.atom)) return false;
+        }
+    }
+
+    const uid = g_regex_uid;
+    g_regex_uid += 1;
+    const charx = try std.fmt.allocPrint(arena, "__re_s_{d}[__re_i_{d}]", .{ uid, uid });
+    try w.print(arena, "__re_{d}: {{ const __re_s_{d} = ", .{ uid, uid });
+    try emitExpr(arg, w, arena);
+    try w.print(arena, "; var __re_i_{d}: usize = 0; ", .{uid});
+    for (middle) |tn| {
+        const ti = reTermInfo(tn).?;
+        switch (ti.quant) {
+            0 => {
+                try w.print(arena, "if (__re_i_{d} >= __re_s_{d}.len or !(", .{ uid, uid });
+                try reEmitAtomCond(ti.atom, charx, w, arena);
+                try w.print(arena, ")) break :__re_{d} false; __re_i_{d} += 1; ", .{ uid, uid });
+            },
+            1 => {
+                try w.print(arena, "while (__re_i_{d} < __re_s_{d}.len and (", .{ uid, uid });
+                try reEmitAtomCond(ti.atom, charx, w, arena);
+                try w.print(arena, ")) __re_i_{d} += 1; ", .{uid});
+            },
+            2 => {
+                try w.print(arena, "{{ const __re_a_{d} = __re_i_{d}; while (__re_i_{d} < __re_s_{d}.len and (", .{ uid, uid, uid, uid });
+                try reEmitAtomCond(ti.atom, charx, w, arena);
+                try w.print(arena, ")) __re_i_{d} += 1; if (__re_i_{d} == __re_a_{d}) break :__re_{d} false; }} ", .{ uid, uid, uid, uid });
+            },
+            else => {
+                try w.print(arena, "if (__re_i_{d} < __re_s_{d}.len and (", .{ uid, uid });
+                try reEmitAtomCond(ti.atom, charx, w, arena);
+                try w.print(arena, ")) __re_i_{d} += 1; ", .{uid});
+            },
+        }
+    }
+    if (has_end) try w.print(arena, "if (__re_i_{d} != __re_s_{d}.len) break :__re_{d} false; ", .{ uid, uid, uid });
+    try w.print(arena, "break :__re_{d} true; }}", .{uid});
+    return true;
+}
+
 fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Allocator) CompileError!void {
     switch (e.*) {
         .num => |v| try w.print(arena, "{d}", .{v}),
         .float => |v| try w.print(arena, "{d}", .{v}),
+        .regex => |rx| {
+            try w.appendSlice(arena, "__LumenRegExp{ .source = ");
+            try emitRawStrLit(w, arena, rx.source);
+            try w.appendSlice(arena, ", .flags = ");
+            try emitRawStrLit(w, arena, rx.flags);
+            try w.appendSlice(arena, " }");
+        },
         .null_lit => try w.appendSlice(arena, "null"),
         .bool => |v| try w.appendSlice(arena, if (v) "true" else "false"),
         .str => |s| try emitStrLit(w, arena, s),
@@ -2556,7 +2730,24 @@ fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.Alloc
             try w.append(arena, ')');
         },
         .method_call => |mc| {
-            if (mc.string_method) {
+            if (mc.container_type != null and mc.container_type.? == .regexp) {
+                // Plan B: if the object is a literal regex, try to emit a
+                // specialized straight-line matcher; otherwise fall back to the
+                // runtime interpreter over (re).source / (re).flags.
+                var specialized = false;
+                if (mc.obj.* == .regex) {
+                    specialized = try reEmitSpecializedTest(mc.obj.regex.source, mc.obj.regex.flags, mc.args[0], w, arena);
+                }
+                if (!specialized) {
+                    try w.appendSlice(arena, "__lumen_regex.search((");
+                    try emitExpr(mc.obj, w, arena);
+                    try w.appendSlice(arena, ").source, (");
+                    try emitExpr(mc.obj, w, arena);
+                    try w.appendSlice(arena, ").flags, ");
+                    try emitExpr(mc.args[0], w, arena);
+                    try w.append(arena, ')');
+                }
+            } else if (mc.string_method) {
                 try emitStringMethod(mc, w, arena);
             } else if (mc.container_type != null) {
                 // Map/Set method: dispatch directly to the runtime container method.
@@ -3053,7 +3244,7 @@ fn emitTemplateText(text: []const u8, w: *std.ArrayListUnmanaged(u8), arena: std
 /// emitted Zig compiles (Zig forbids unused parameters/locals).
 fn exprUsesName(e: *const Expr, name: []const u8) bool {
     return switch (e.*) {
-        .num, .float, .bool, .str, .null_lit, .this_expr => false,
+        .num, .float, .bool, .str, .regex, .null_lit, .this_expr => false,
         .var_ref => |r| std.mem.eql(u8, r.name, name),
         .array => |a| blk: {
             for (a.items) |it| if (exprUsesName(it, name)) break :blk true;
@@ -3217,7 +3408,7 @@ fn bodyAlwaysReturns(body: []const Stmt) bool {
 fn exprUsesThis(e: *const Expr) bool {
     return switch (e.*) {
         .this_expr => true,
-        .num, .float, .bool, .str, .null_lit, .var_ref => false,
+        .num, .float, .bool, .str, .regex, .null_lit, .var_ref => false,
         .array => |a| blk: {
             for (a.items) |it| if (exprUsesThis(it)) break :blk true;
             break :blk false;
@@ -4191,6 +4382,11 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.appendSlice(arena, "const std = @import(\"std\");\n");
     try out.appendSlice(arena, "var __sa_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);\nfn __sa() std.mem.Allocator { return __sa_arena.allocator(); }\n");
+    // Regex literal value: the source/flags strings. Matching methods are added in
+    // later cycles; for now it carries `.source` and `.flags`.
+    try out.appendSlice(arena, "const __LumenRegExp = struct { source: []const u8, flags: []const u8 };\n");
+    try out.appendSlice(arena, REGEX_RT);
+    try out.appendSlice(arena, "\n");
     // Async programs run their event loop on libuv. The CLI auto-injects libuv's
     // include/link flags into the native build whenever a program uses async, so
     // this C import resolves without any user configuration.

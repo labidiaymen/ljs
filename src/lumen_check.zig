@@ -1042,7 +1042,7 @@ const Checker = struct {
     fn cloneExpr(self: *Checker, e: *const ast.Expr) CompileError!*ast.Expr {
         const p = self.arena.create(ast.Expr) catch return error.OutOfMemory;
         p.* = switch (e.*) {
-            .num, .float, .bool, .str, .null_lit, .this_expr => e.*,
+            .num, .float, .bool, .str, .regex, .null_lit, .this_expr => e.*,
             .array => |a| blk: {
                 const c = self.arena.alloc(*ast.Expr, a.items.len) catch return error.OutOfMemory;
                 for (a.items, 0..) |it, i| c[i] = try self.cloneExpr(it);
@@ -2663,6 +2663,9 @@ const Checker = struct {
                     field.builtin = .error_message;
                     return .string;
                 }
+                if (obj_type == .regexp and (std.mem.eql(u8, field.name, "source") or std.mem.eql(u8, field.name, "flags"))) {
+                    return .string;
+                }
                 return switch (obj_type) {
                     .named => |type_name| self.fieldType(type_name, field.name, line, col),
                     .union_type => |union_name| blk2: {
@@ -2818,6 +2821,23 @@ const Checker = struct {
                     return rm.method.checked_return_type orelse return null;
                 }
                 const obj_type = self.exprType(program, mc.obj, line, col) orelse return null;
+                if (obj_type == .regexp) {
+                    // `re.test(s)` -> bool. (Other regex methods arrive in later cycles.)
+                    if (!std.mem.eql(u8, mc.name, "test")) {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    }
+                    if (mc.args.len != 1) {
+                        _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                        return null;
+                    }
+                    self.ensureAssignable(program, .string, mc.args[0], line, col) catch {
+                        _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                        return null;
+                    };
+                    mc.container_type = .regexp; // sentinel for codegen
+                    return .bool;
+                }
                 if (types.isArray(obj_type)) {
                     return self.arrayMethod(program, mc, obj_type, line, col);
                 }
