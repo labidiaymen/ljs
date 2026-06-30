@@ -3223,6 +3223,90 @@ const Checker = struct {
             call.checked_type = .string;
             return .string;
         }
+        if (std.mem.eql(u8, call.name, "existsSync")) {
+            if (call.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            if (!types.same(.string, path_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            program.uses_io = true;
+            program.needs_exists_sync = true;
+            call.checked_type = .bool;
+            return .bool;
+        }
+        if (std.mem.eql(u8, call.name, "writeFileSync") or std.mem.eql(u8, call.name, "appendFileSync")) {
+            if (call.args.len != 2) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            const data_type = self.exprType(program, call.args[1], line, col) orelse return null;
+            if (!types.same(.string, path_type) or !types.same(.string, data_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            program.uses_io = true;
+            if (std.mem.eql(u8, call.name, "writeFileSync")) program.needs_write_file_sync = true else program.needs_append_file_sync = true;
+            call.checked_type = .void;
+            return .void;
+        }
+        if (std.mem.eql(u8, call.name, "mkdirSync")) {
+            if (call.args.len != 1 and call.args.len != 2) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            if (!types.same(.string, path_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            if (call.args.len == 2) {
+                const recursive_type = self.exprType(program, call.args[1], line, col) orelse return null;
+                if (!types.same(.bool, recursive_type)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+            }
+            program.uses_io = true;
+            program.needs_mkdir_sync = true;
+            call.checked_type = .void;
+            return .void;
+        }
+        if (std.mem.eql(u8, call.name, "unlinkSync")) {
+            if (call.args.len != 1) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            if (!types.same(.string, path_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            program.uses_io = true;
+            program.needs_unlink_sync = true;
+            call.checked_type = .void;
+            return .void;
+        }
+        if (std.mem.eql(u8, call.name, "renameSync") or std.mem.eql(u8, call.name, "copyFileSync")) {
+            if (call.args.len != 2) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            const a_type = self.exprType(program, call.args[0], line, col) orelse return null;
+            const b_type = self.exprType(program, call.args[1], line, col) orelse return null;
+            if (!types.same(.string, a_type) or !types.same(.string, b_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            program.uses_io = true;
+            if (std.mem.eql(u8, call.name, "renameSync")) program.needs_rename_sync = true else program.needs_copy_file_sync = true;
+            call.checked_type = .void;
+            return .void;
+        }
         _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
         return null;
     }

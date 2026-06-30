@@ -451,6 +451,71 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_exists_sync) {
+        try out.appendSlice(arena,
+            \\fn __existsSync(io: std.Io, path: []const u8) bool {
+            \\    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+            \\    return true;
+            \\}
+            \\
+        );
+    }
+    if (program.needs_write_file_sync) {
+        try out.appendSlice(arena,
+            \\fn __writeFileSync(io: std.Io, path: []const u8, data: []const u8) void {
+            \\    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data }) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_append_file_sync) {
+        // No direct append API on this std.Io.Dir; read the existing content (if
+        // any), concatenate, and rewrite. Fine for sync, single-writer use.
+        try out.appendSlice(arena,
+            \\fn __appendFileSync(io: std.Io, alloc: std.mem.Allocator, path: []const u8, data: []const u8) void {
+            \\    const existing = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(64 * 1024 * 1024)) catch "";
+            \\    const combined = std.mem.concat(alloc, u8, &.{ existing, data }) catch return;
+            \\    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = combined }) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_mkdir_sync) {
+        try out.appendSlice(arena,
+            \\fn __mkdirSync(io: std.Io, path: []const u8, recursive: bool) void {
+            \\    if (recursive) {
+            \\        std.Io.Dir.cwd().createDirPath(io, path) catch {};
+            \\    } else {
+            \\        std.Io.Dir.cwd().createDir(io, path, std.Io.File.Permissions.default_dir) catch {};
+            \\    }
+            \\}
+            \\
+        );
+    }
+    if (program.needs_unlink_sync) {
+        try out.appendSlice(arena,
+            \\fn __unlinkSync(io: std.Io, path: []const u8) void {
+            \\    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_rename_sync) {
+        try out.appendSlice(arena,
+            \\fn __renameSync(io: std.Io, old_path: []const u8, new_path: []const u8) void {
+            \\    std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, io) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_copy_file_sync) {
+        try out.appendSlice(arena,
+            \\fn __copyFileSync(io: std.Io, src_path: []const u8, dest_path: []const u8) void {
+            \\    std.Io.Dir.copyFile(std.Io.Dir.cwd(), src_path, std.Io.Dir.cwd(), dest_path, io, .{}) catch {};
+            \\}
+            \\
+        );
+    }
     if (program.needs_httpget) {
         // A real std.http one-shot GET, wrapped to a Lumen-friendly `i64` (status code, or -1 on error).
         try out.appendSlice(arena,
