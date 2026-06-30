@@ -33,8 +33,22 @@ what `std.Io.Dir` in Zig can do.
 | `fs.accessSync(path, mode?)` | `(string, int?) -> bool` | `Dir.access` with `AccessOptions{read,write,execute}` |
 | `fs.cpSync(src, dest, recursive?)` | `(string, string, bool?) -> void` | `Dir.openDir(.{.iterate=true})` + `Dir.iterate`, recursing; falls back to a single `copyFile` |
 | `fs.mkdtempSync(prefix)` | `string -> string` | `Dir.createDir` with a timestamp+counter suffix (not cryptographic) |
+| `fs.statSync(path)` | `string -> { size, isFile, isDirectory, mtimeMs }` | `Dir.statFile`; the first **record-returning builtin** (see below) |
 
-After Phase 1 (+ `cpSync`, `mkdtempSync`), Lumen covers 18 of Node's 48 sync functions.
+After Phase 1 (+ `cpSync`, `mkdtempSync`, `statSync`), Lumen covers 19 of Node's 48 sync functions.
+
+**`statSync` is the proof-of-concept for record-returning builtins.** Lumen
+had no mechanism for a builtin to return a multi-field object before this: the
+checker lazily registers a synthetic record type (`__LumenStat`) into the same
+`type_decls` map a user `type X = {...}` declaration would use, with each
+field's `checked_type` pre-set (skipping annotation resolution, which expects
+source text). Everything downstream — field access (`s.size`), the
+declaration's emitted Zig type (`types.zigName` on a `.named` type returns the
+name verbatim) — is the *existing* record machinery, unmodified. Deviation
+from Node: `isFile`/`isDirectory` are plain `bool` **fields**, not methods (no
+method dispatch on a builtin-record type yet); `size`/`mtimeMs` are Lumen's
+32-bit `int`, truncating for files >2GB or dates needing >32-bit millisecond
+precision (an experiment-stage tradeoff, not Node-exact).
 
 **Deviation from Node, called out explicitly**: Node's `accessSync` *throws* on
 failure and returns nothing; Lumen's returns `bool` (like `existsSync`) for
@@ -68,7 +82,7 @@ Available now).
 
 | Group | Needs |
 | --- | --- |
-| `fs.statSync`, `fs.lstatSync`, `fs.fstatSync` | a builtin that returns a **record** type (`{ size, isFile(), isDirectory(), mtime }`) — no builtin returns a record today |
+| `fs.lstatSync`, `fs.fstatSync` | `lstat` needs `Dir.statFile` to not follow symlinks (a flag away); `fstat` needs the fd-based group below. `statSync` itself **shipped** (see below) |
 | `fs.readdirSync`, `fs.opendirSync`, `fs.globSync` | **growable arrays** (`Array.push` is not implemented yet — verified directly) or a directory-iterator class |
 | `fs.openSync`/`closeSync`/`readSync`/`writeSync`/`readvSync`/`writevSync` and every `f*Sync` (`fchmodSync`, `fchownSync`, `fdatasyncSync`, `fstatSync`, `fsyncSync`, `ftruncateSync`, `futimesSync`) | a **file-descriptor** concept exposed to user code, plus a **`Buffer`** type for the read/write data — a bigger "fd API" feature, own spec |
 | `fs.chownSync`, `fs.fchownSync`, `fs.lchownSync` | uid/gid ownership: POSIX-only, niche for an experiment-stage language; revisit only if requested |

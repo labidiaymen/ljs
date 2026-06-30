@@ -559,6 +559,24 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_stat_sync) {
+        // Backs the synthetic `__LumenStat` record type the checker registers
+        // for fs.statSync (lumen_check_stdlib.zig): isFile/isDirectory are plain
+        // bool fields here, not methods, since builtins can't have methods yet.
+        try out.appendSlice(arena,
+            \\pub const __LumenStat = struct { size: i32, isFile: bool, isDirectory: bool, mtimeMs: i32 };
+            \\fn __statSync(io: std.Io, path: []const u8) __LumenStat {
+            \\    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return .{ .size = 0, .isFile = false, .isDirectory = false, .mtimeMs = 0 };
+            \\    return .{
+            \\        .size = @truncate(@as(i64, @intCast(st.size))),
+            \\        .isFile = st.kind == .file,
+            \\        .isDirectory = st.kind == .directory,
+            \\        .mtimeMs = @truncate(@divTrunc(@as(i96, st.mtime.nanoseconds), 1_000_000)),
+            \\    };
+            \\}
+            \\
+        );
+    }
     if (program.needs_rmdir_sync) {
         try out.appendSlice(arena,
             \\fn __rmdirSync(io: std.Io, path: []const u8) void {

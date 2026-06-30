@@ -634,6 +634,34 @@ pub fn fsCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, 
         call.checked_type = .string;
         return .string;
     }
+    if (std.mem.eql(u8, call.name, "statSync")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, path_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        // A builtin record return: lazily register a synthetic record type
+        // (`__LumenStat`) the first time statSync is used, then return it like
+        // any user-declared `type X = {...}`. This is a deliberate deviation
+        // from Node: isFile/isDirectory are plain bool fields here, not
+        // methods (Lumen has no method dispatch on a builtin-record type yet).
+        if (self.type_decls.get("__LumenStat") == null) {
+            const fields = self.arena.alloc(ast.TypeField, 4) catch return null;
+            fields[0] = .{ .name = "size", .annotation = "int", .checked_type = .i32 };
+            fields[1] = .{ .name = "isFile", .annotation = "bool", .checked_type = .bool };
+            fields[2] = .{ .name = "isDirectory", .annotation = "bool", .checked_type = .bool };
+            fields[3] = .{ .name = "mtimeMs", .annotation = "int", .checked_type = .i32 };
+            self.type_decls.put(self.arena, "__LumenStat", .{ .fields = fields }) catch return null;
+        }
+        program.uses_io = true;
+        program.needs_stat_sync = true;
+        call.checked_type = .{ .named = "__LumenStat" };
+        return .{ .named = "__LumenStat" };
+    }
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
 }

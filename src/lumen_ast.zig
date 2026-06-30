@@ -389,6 +389,7 @@ pub const Program = struct {
     needs_copy_file_sync: bool = false,
     needs_cp_sync: bool = false,
     needs_mkdtemp_sync: bool = false,
+    needs_stat_sync: bool = false,
     needs_rmdir_sync: bool = false,
     needs_rm_sync: bool = false,
     needs_truncate_sync: bool = false,
