@@ -134,6 +134,18 @@ Available now).
   adequate for a unique scratch directory name, not for anything
   security-sensitive. Returns the created path, or `""` on failure.
 
+### Phase 4 -- true async I/O: `fs.readFile` and `fs.writeFile`
+
+Two functions run on the async event loop instead of blocking: `fs.readFile(path)
+-> Promise<string>` and `fs.writeFile(path, data) -> Promise<void>`. Both are
+genuinely non-blocking (no thread pool involved, unlike Node's own
+`fs.promises.readFile`/`writeFile`), reading or writing in a loop of fixed-size
+chunks until done, then resolving the promise. `writeFile` mirrors `readFile`'s
+shape closely: a fast synchronous open, then an async chunked loop, then close.
+
+Everything else in `fs` stays synchronous; the async pair above is additive,
+not a replacement.
+
 ### Not planned (needs a real language feature first)
 
 | Group | Needs |
@@ -142,7 +154,7 @@ Available now).
 | `fs.readvSync`/`writevSync`, append-mode `openSync` ("a") | readv/writev need an array-of-buffers type; append mode needs a seek primitive not in this Zig version's `std.Io.File` |
 | `fs.realpathSync`, `fs.statfsSync` | see Phase 2 blockers above |
 | `fs.chownSync`, `fs.lchownSync` | `Dir.setFileOwner` is an unconditional `@panic("TODO implement dirSetFileOwner")` in this Zig version's `Io.Threaded` backend on Linux, plus a real signature/error-set bug in the `Dir.zig` wrapper itself; `fs.fchownSync` (fd-based) is unaffected and shipped |
-| Remaining async/callback functions (`fs.writeFile`, `fs.appendFile`, ... most of the ~54) and `fs.promises.*` beyond `fs.readFile` | fs is now wired to the libxev event loop for `readFile` only (spec 107); the rest is a follow-up milestone extending the same pattern |
+| Remaining async/callback functions (`fs.appendFile`, `fs.unlink`, `fs.mkdir`, ... most of the ~54) and `fs.promises.*` beyond `readFile`/`writeFile` | the async event loop now covers `readFile` and `writeFile`; the rest is a follow-up milestone extending the same pattern |
 | `fs.createReadStream`/`createWriteStream` | no `Stream` abstraction in the language |
 | `fs.watch`/`watchFile`/`unwatchFile` | no watcher/listener infra |
 | `fs.openAsBlob` | no `Blob` type |

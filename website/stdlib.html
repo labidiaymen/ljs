@@ -212,6 +212,7 @@
   <div class="api-list">
     <a href="#fs-readFileSync">readFileSync</a>
     <a href="#fs-readFile">readFile</a>
+    <a href="#fs-writeFile">writeFile</a>
     <a href="#fs-writeFileSync">writeFileSync</a>
     <a href="#fs-appendFileSync">appendFileSync</a>
     <a href="#fs-existsSync">existsSync</a>
@@ -256,13 +257,24 @@ console.log(data);</code></pre>
   </div>
 
   <div class="api" id="fs-readFile">
-    <h5><code>fs.readFile(path)</code> <span class="stability-pill stability-experimental" title="Runs on libxev's io_uring backend: a pure-Zig dependency pinned by commit, with no tagged releases, on Zig's newest std.Io async surface.">Experimental</span></h5>
-    <p class="sub">string → <code>Promise&lt;string&gt;</code> &mdash; the only async
-    fs function so far; true non-blocking I/O via <code>io_uring</code> (no
-    thread pool), unlike Node's <code>fs.promises.readFile</code>.</p>
+    <h5><code>fs.readFile(path)</code> <span class="stability-pill stability-experimental" title="Runs on the event loop's io_uring backend: no tagged releases yet, still the newest corner of the async runtime.">Experimental</span></h5>
+    <p class="sub">string → <code>Promise&lt;string&gt;</code> &mdash; true
+    non-blocking I/O, no thread pool, unlike Node's
+    <code>fs.promises.readFile</code>.</p>
 <pre><code class="lumen">async function main(): Promise&lt;void&gt; {
   const data: string = await fs.readFile("notes.txt");
   console.log(data);
+}</code></pre>
+  </div>
+
+  <div class="api" id="fs-writeFile">
+    <h5><code>fs.writeFile(path, data)</code> <span class="stability-pill stability-experimental" title="Same async runtime as fs.readFile.">Experimental</span></h5>
+    <p class="sub">(string, string) → <code>Promise&lt;void&gt;</code> &mdash;
+    the async counterpart to <code>fs.writeFileSync</code>; creates the file
+    or truncates it first, same as the sync version.</p>
+<pre><code class="lumen">async function main(): Promise&lt;void&gt; {
+  await fs.writeFile("notes.txt", "hello async world");
+  console.log("done");
 }</code></pre>
   </div>
 
@@ -885,7 +897,7 @@ console.log(loads[0]);</code></pre>
     <tr><td><code>fs.realpathSync(path)</code></td><td>only a raw libc binding exists in this Zig version, not wrapped by std.Io</td></tr>
     <tr><td><code>fs.chownSync(path, uid, gid)</code> · <code>fs.lchownSync(path, uid, gid)</code></td><td>unimplemented in this Zig version's standard <code>Io</code> backend (the fd-based <code>fchownSync</code> works and shipped)</td></tr>
     <tr><td><code>fs.readvSync</code> / <code>writevSync</code> · append-mode <code>openSync</code></td><td>readv/writev need an array of buffers; append mode needs a seek primitive not in this Zig version</td></tr>
-    <tr><td><code>fs.promises.*</code> / watch / streams / most async callback variants</td><td><code>fs.readFile</code> is wired to the event loop (libxev); the rest is a follow-up</td></tr>
+    <tr><td><code>fs.promises.*</code> / watch / streams / most async callback variants</td><td><code>fs.readFile</code> and <code>fs.writeFile</code> are wired to the event loop; the rest is a follow-up</td></tr>
     <tr><td><code>fs.opendirSync(path)</code> · <code>fs.globSync(pattern)</code></td><td>need a directory-iterator class / a real glob algorithm</td></tr>
   </table>
 

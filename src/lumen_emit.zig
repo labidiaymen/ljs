@@ -319,6 +319,12 @@ pub fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
                 try w.appendSlice(arena, "__readFileAsync(");
                 try emitExpr(cl.args[0], w, arena);
                 try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "writeFile")) {
+                try w.appendSlice(arena, "__writeFileAsync(");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.append(arena, ')');
             } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "existsSync")) {
                 try w.appendSlice(arena, "__existsSync(__io, ");
                 try emitExpr(cl.args[0], w, arena);

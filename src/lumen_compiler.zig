@@ -503,6 +503,66 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_async_write_file) {
+        // `fs.writeFile` -- the async counterpart to `fs.readFile`. The open
+        // (create/truncate) is a fast synchronous metadata call; the write
+        // loop (pwrite at increasing offsets, looping on a short write) is
+        // fully async, resolving the returned Promise<void> on completion.
+        try out.appendSlice(arena,
+            \\const __WriteFileState = struct {
+            \\    file: xev.File,
+            \\    promise: *LumenPromise(void),
+            \\    data: []const u8,
+            \\    offset: u64 = 0,
+            \\    completion: xev.Completion = undefined,
+            \\    close_completion: xev.Completion = undefined,
+            \\    fn onWrite(ud: ?*__WriteFileState, loop: *xev.Loop, c: *xev.Completion, file: xev.File, wb: xev.WriteBuffer, result: xev.WriteError!usize) xev.CallbackAction {
+            \\        _ = loop;
+            \\        _ = c;
+            \\        _ = wb;
+            \\        const st = ud.?;
+            \\        const n = result catch 0;
+            \\        st.offset += n;
+            \\        if (n == 0 or st.offset >= st.data.len) {
+            \\            st.promise.resolve({});
+            \\            file.close(&__xev_loop, &st.close_completion, void, null, struct {
+            \\                fn cb(_: ?*void, _: *xev.Loop, _: *xev.Completion, _: xev.File, _: xev.CloseError!void) xev.CallbackAction {
+            \\                    return .disarm;
+            \\                }
+            \\            }.cb);
+            \\            return .disarm;
+            \\        }
+            \\        st.file.pwrite(&__xev_loop, &st.completion, .{ .slice = st.data[st.offset..] }, st.offset, __WriteFileState, st, onWrite);
+            \\        return .disarm;
+            \\    }
+            \\};
+            \\fn __writeFileAsync(path: []const u8, data: []const u8) *LumenPromise(void) {
+            \\    const p = LumenPromise(void).create();
+            \\    const sync_file = std.Io.Dir.cwd().createFile(__io, path, .{}) catch {
+            \\        p.resolve({});
+            \\        return p;
+            \\    };
+            \\    const xf = xev.File.init(sync_file) catch {
+            \\        p.resolve({});
+            \\        return p;
+            \\    };
+            \\    if (data.len == 0) {
+            \\        p.resolve({});
+            \\        xf.close(&__xev_loop, &(__alloc.create(xev.Completion) catch unreachable).*, void, null, struct {
+            \\            fn cb(_: ?*void, _: *xev.Loop, _: *xev.Completion, _: xev.File, _: xev.CloseError!void) xev.CallbackAction {
+            \\                return .disarm;
+            \\            }
+            \\        }.cb);
+            \\        return p;
+            \\    }
+            \\    const st = __alloc.create(__WriteFileState) catch unreachable;
+            \\    st.* = .{ .file = xf, .promise = p, .data = data };
+            \\    st.file.pwrite(&__xev_loop, &st.completion, .{ .slice = data }, 0, __WriteFileState, st, __WriteFileState.onWrite);
+            \\    return p;
+            \\}
+            \\
+        );
+    }
     try out.appendSlice(arena, decls.items);
 
     if (program.needs_read_file_sync) {
