@@ -572,7 +572,7 @@ pub fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
             } else if (std.mem.eql(u8, cl.namespace, "process") and std.mem.eql(u8, cl.name, "arch")) {
                 try w.appendSlice(arena, "__processArch()");
             } else if (std.mem.eql(u8, cl.namespace, "process") and std.mem.eql(u8, cl.name, "pid")) {
-                try w.appendSlice(arena, "@as(i32, @intCast(std.os.linux.getpid()))");
+                try w.appendSlice(arena, "__processPid()");
             } else if (std.mem.eql(u8, cl.namespace, "process") and std.mem.eql(u8, cl.name, "argv")) {
                 try w.appendSlice(arena, "__args");
             } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "platform")) {

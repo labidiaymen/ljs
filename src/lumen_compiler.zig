@@ -982,6 +982,10 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\        else => "unknown",
             \\    };
             \\}
+            \\fn __processPid() i32 {
+            \\    if (@import("builtin").os.tag != .linux) return 0;
+            \\    return @intCast(std.os.linux.getpid());
+            \\}
             \\
         );
     }
@@ -996,8 +1000,8 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
         // (the only functions here that call __processEnv) are used.
         try out.appendSlice(arena,
             \\fn __osUname() std.os.linux.utsname {
-            \\    var uts: std.os.linux.utsname = undefined;
-            \\    _ = std.os.linux.uname(&uts);
+            \\    var uts: std.os.linux.utsname = std.mem.zeroes(std.os.linux.utsname);
+            \\    if (@import("builtin").os.tag == .linux) _ = std.os.linux.uname(&uts);
             \\    return uts;
             \\}
             \\fn __osUnameField(comptime field: []const u8) []const u8 {
@@ -1018,8 +1022,8 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\    return "/tmp";
             \\}
             \\fn __osSysinfo() std.os.linux.Sysinfo {
-            \\    var info: std.os.linux.Sysinfo = undefined;
-            \\    _ = std.os.linux.sysinfo(&info);
+            \\    var info: std.os.linux.Sysinfo = std.mem.zeroes(std.os.linux.Sysinfo);
+            \\    if (@import("builtin").os.tag == .linux) _ = std.os.linux.sysinfo(&info);
             \\    return info;
             \\}
             \\fn __osMemBytes(total: bool) i32 {
