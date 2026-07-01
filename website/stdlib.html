@@ -964,5 +964,38 @@ console.log(loads[0]);</code></pre>
 </div></footer>
 
 <script src="highlight.js"></script>
+<script>
+// Highlight the left nav entry for whichever section is currently in view.
+(function () {
+  var navLinks = document.querySelectorAll('.docs-nav a[href^="#"]');
+  var sections = [];
+  navLinks.forEach(function (link) {
+    var el = document.getElementById(link.getAttribute('href').slice(1));
+    if (el) sections.push({ id: el.id, link: link, el: el });
+  });
+  if (!sections.length || !('IntersectionObserver' in window)) return;
+
+  var current = null;
+  function setActive(id) {
+    if (id === current) return;
+    current = id;
+    navLinks.forEach(function (l) { l.classList.remove('active'); });
+    var match = sections.find(function (s) { return s.id === id; });
+    if (match) match.link.classList.add('active');
+  }
+
+  // Track sections crossing a line near the top of the viewport (below the
+  // sticky nav bar), picking the topmost one still in view as "current".
+  var observer = new IntersectionObserver(function (entries) {
+    var visible = entries.filter(function (e) { return e.isIntersecting; });
+    if (!visible.length) return;
+    visible.sort(function (a, b) { return a.boundingClientRect.top - b.boundingClientRect.top; });
+    setActive(visible[0].target.id);
+  }, { rootMargin: '-80px 0px -70% 0px', threshold: 0 });
+
+  sections.forEach(function (s) { observer.observe(s.el); });
+  setActive(sections[0].id);
+})();
+</script>
 </body>
 </html>
