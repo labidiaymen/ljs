@@ -39,8 +39,10 @@ what `std.Io.Dir` in Zig can do.
 | `fs.readSync(fd, length)` | `(int, int) -> string` | `File.readStreaming` |
 | `fs.writeSync(fd, data)` | `(int, string) -> int` | `File.writeStreamingAll`, returns `data.len` |
 
-After Phase 1 (+ `cpSync`, `mkdtempSync`, `statSync`, the fd group), Lumen
-covers 23 of Node's 48 sync functions.
+After Phase 1 (+ `cpSync`, `mkdtempSync`, `statSync`, the fd group) and Phase 3
+(12 more: `lstatSync`, `fstatSync`, `fchmodSync`, `lchmodSync`, `fchownSync`,
+`fsyncSync`, `fdatasyncSync`, `ftruncateSync`, `futimesSync`, `utimesSync`,
+`lutimesSync`, `readdirSync`), Lumen covers 35 of Node's 48 sync functions.
 
 **The fd group is a deliberately scoped version of Node's fd API**, unblocked
 by treating a "fd" as a plain `int` (an index into an internal
@@ -76,8 +78,47 @@ detour into exception-based builtins. `mode` is the POSIX bitmask
 | Function | Blocker |
 | --- | --- |
 | `fs.mkdtempDisposableSync` | the `using`-disposable variant; `mkdtempSync` itself shipped (see below) |
-| `fs.realpathSync(path)`, `fs.utimesSync(path, atime, mtime)` | `realpath`/`utimes` only exist as raw `std.c` libc bindings in this Zig version, not wrapped by `std.Io.Dir`/`File`; calling them directly would bypass the `Io` abstraction every other fs function goes through (inconsistent, and breaks under wasm) |
+| `fs.realpathSync(path)` | `realpath` only exists as a raw `std.c` libc binding in this Zig version, not wrapped by `std.Io.Dir`/`File`; calling it directly would bypass the `Io` abstraction every other fs function goes through (inconsistent, and breaks under wasm) |
 | `fs.statfsSync(path)` | filesystem-level stats; platform-specific, low value for now |
+| append-mode `fs.openSync(path, "a")` | no `seek`/`lseek` exposed on `std.Io.File` in this Zig version |
+
+### Phase 3 — unblocked by re-checking the actual `std.Io` API surface
+
+An earlier pass under-searched `std.Io.Dir`/`File` (wrong function names: looked
+for `updateTimes`, not the real `setTimestamps`) and marked several functions
+"needs a new language feature" that turned out to need neither — just a
+primitive that was there all along, or a reframing that avoids the missing
+feature entirely:
+
+| Function | How it's actually achievable |
+| --- | --- |
+| `fs.lstatSync(path)` | `Dir.statFile(io, path, .{.follow_symlinks = false})`, reuses `__LumenStat` |
+| `fs.fstatSync(fd)` | `__fd_table[fd].stat(io)`, reuses `__LumenStat` |
+| `fs.fchmodSync(fd, mode)` | `__fd_table[fd].setPermissions(io, .fromMode(mode))` |
+| `fs.fchownSync(fd, uid, gid)` | `File.setOwner` -- the fd-based POSIX `fchown` syscall, fully implemented in this Zig version's `Io.Threaded` backend |
+| `fs.fsyncSync(fd)`, `fs.fdatasyncSync(fd)` | `File.sync`; `fdatasyncSync` aliases it (Zig does not distinguish data-only sync) |
+| `fs.ftruncateSync(fd, len)` | `File.setLength` (already used by the path-based `truncateSync`) |
+| `fs.futimesSync(fd, atimeMs, mtimeMs)`, `fs.utimesSync(path, ...)`, `fs.lutimesSync(path, ...)` | `File.setTimestamps` / `Dir.setTimestamps(..., .{.follow_symlinks})` -- **`Dir.setTimestamps` exists**; the earlier "blocked" call was wrong |
+| `fs.lchmodSync(path, mode)` | `Dir.openFile(.{.follow_symlinks = false})` + `File.setPermissions`; best-effort (POSIX itself does not let every OS chmod a symlink) |
+| `fs.readdirSync(path) -> string[]` | **routes around the growable-array blocker entirely**: `string[]` already lowers to a plain `[]const []const u8` (checked in `lumen_types.zig`), not a growable buffer, so a two-pass `Dir.iterate()` (count, then allocate-and-fill) produces one with no `Array.push` involved |
+
+**`fs.chownSync(path, uid, gid)` / `fs.lchownSync(path, uid, gid)` turned out to
+still be blocked**, despite `Dir.setFileOwner` existing as a *declared*
+function: this Zig version's default `Io.Threaded` backend has it as an
+unconditional `@panic("TODO implement dirSetFileOwner")` on Linux (verified by
+reading `Io/Threaded.zig` directly), and even setting that aside, `Dir.zig`'s
+own `setFileOwner` wrapper has a real signature bug -- its declared return
+type (`SetOwnerError!void`) doesn't include `error.NameTooLong` /
+`error.BadPathName`, which the vtable call it wraps can actually produce, so
+it fails to even type-check. The fd-based `fs.fchownSync` does NOT share this
+problem (`File.setOwner` is a real, working `fchown` syscall wrapper) and
+shipped normally.
+
+After Phase 3, Lumen will cover essentially all of Node's *synchronous,
+path/fd-based* fs surface -- everything except `realpathSync` (raw-libc-only),
+append-mode `openSync`, `statfsSync`, `chownSync`/`lchownSync` (stdlib stub,
+see above), and `globSync`/`opendirSync` (need a real glob algorithm /
+directory-iterator class, not just an array).
 
 `fs.cpSync(src, dest, recursive?)` and `fs.mkdtempSync(prefix)` **shipped** (see
 Available now).
@@ -97,13 +138,11 @@ Available now).
 
 | Group | Needs |
 | --- | --- |
-| `fs.lstatSync`, `fs.fstatSync` | `lstat` needs `Dir.statFile` to not follow symlinks (a flag away); `fstat` reuses `__LumenStat` once it takes an fd instead of a path. `statSync` itself **shipped** (see below) |
-| `fs.readdirSync`, `fs.opendirSync`, `fs.globSync` | **growable arrays** (`Array.push` is not implemented yet — verified directly) or a directory-iterator class |
+| `fs.opendirSync`, `fs.globSync` | a directory-iterator class / a real glob algorithm — `readdirSync` itself **shipped** (Phase 3, two-pass array fill) |
 | `fs.readvSync`/`writevSync`, append-mode `openSync` ("a") | readv/writev need an array-of-buffers type; append mode needs a seek primitive not in this Zig version's `std.Io.File` |
-| every `f*Sync` other than the four shipped (`fchmodSync`, `fchownSync`, `fdatasyncSync`, `fsyncSync`, `ftruncateSync`, `futimesSync`) | low priority; revisit alongside the shipped fd group if requested |
-| `fs.chownSync`, `fs.fchownSync`, `fs.lchownSync` | uid/gid ownership: POSIX-only, niche for an experiment-stage language; revisit only if requested |
-| `fs.lchmodSync`, `fs.lutimesSync` | symlink-targeted variants of already-niche/deferred ops |
-| All async/callback functions (`fs.readFile`, `fs.writeFile`, ... ~50 of them) and `fs.promises.*` | fs is not wired to the libuv event loop yet (async/await today only drives timers/promises); a real "async fs" milestone |
+| `fs.realpathSync`, `fs.statfsSync` | see Phase 2 blockers above |
+| `fs.chownSync`, `fs.lchownSync` | `Dir.setFileOwner` is an unconditional `@panic("TODO implement dirSetFileOwner")` in this Zig version's `Io.Threaded` backend on Linux, plus a real signature/error-set bug in the `Dir.zig` wrapper itself; `fs.fchownSync` (fd-based) is unaffected and shipped |
+| Remaining async/callback functions (`fs.writeFile`, `fs.appendFile`, ... most of the ~54) and `fs.promises.*` beyond `fs.readFile` | fs is now wired to the libxev event loop for `readFile` only (spec 107); the rest is a follow-up milestone extending the same pattern |
 | `fs.createReadStream`/`createWriteStream` | no `Stream` abstraction in the language |
 | `fs.watch`/`watchFile`/`unwatchFile` | no watcher/listener infra |
 | `fs.openAsBlob` | no `Blob` type |

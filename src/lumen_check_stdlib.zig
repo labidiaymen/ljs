@@ -346,6 +346,8 @@ pub fn staticCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCa
     if (std.mem.eql(u8, call.namespace, "String")) return self.stringCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "Array")) return self.arrayCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "fs")) return self.fsCallType(program, call, line, col);
+    if (std.mem.eql(u8, call.namespace, "path")) return self.pathCallType(program, call, line, col);
+    if (std.mem.eql(u8, call.namespace, "process")) return self.processCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "Promise")) return self.promiseCallType(program, call, line, col);
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
@@ -645,18 +647,12 @@ pub fn fsCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, 
             return null;
         }
         // A builtin record return: lazily register a synthetic record type
-        // (`__LumenStat`) the first time statSync is used, then return it like
-        // any user-declared `type X = {...}`. This is a deliberate deviation
-        // from Node: isFile/isDirectory are plain bool fields here, not
-        // methods (Lumen has no method dispatch on a builtin-record type yet).
-        if (self.type_decls.get("__LumenStat") == null) {
-            const fields = self.arena.alloc(ast.TypeField, 4) catch return null;
-            fields[0] = .{ .name = "size", .annotation = "int", .checked_type = .i32 };
-            fields[1] = .{ .name = "isFile", .annotation = "bool", .checked_type = .bool };
-            fields[2] = .{ .name = "isDirectory", .annotation = "bool", .checked_type = .bool };
-            fields[3] = .{ .name = "mtimeMs", .annotation = "int", .checked_type = .i32 };
-            self.type_decls.put(self.arena, "__LumenStat", .{ .fields = fields }) catch return null;
-        }
+        // (`__LumenStat`) the first time a stat-family function is used, then
+        // return it like any user-declared `type X = {...}`. This is a
+        // deliberate deviation from Node: isFile/isDirectory are plain bool
+        // fields here, not methods (Lumen has no method dispatch on a
+        // builtin-record type yet).
+        registerLumenStat(self) orelse return null;
         program.uses_io = true;
         program.needs_stat_sync = true;
         call.checked_type = .{ .named = "__LumenStat" };
@@ -746,6 +742,438 @@ pub fn fsCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, 
         program.needs_async = true;
         program.needs_async_read_file = true;
         return result;
+    }
+    if (std.mem.eql(u8, call.name, "lstatSync")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, path_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        registerLumenStat(self) orelse return null;
+        program.uses_io = true;
+        program.needs_lstat_sync = true;
+        call.checked_type = .{ .named = "__LumenStat" };
+        return .{ .named = "__LumenStat" };
+    }
+    if (std.mem.eql(u8, call.name, "fstatSync")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const fd_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.isInteger(fd_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        registerLumenStat(self) orelse return null;
+        program.uses_io = true;
+        program.needs_fstat_sync = true;
+        call.checked_type = .{ .named = "__LumenStat" };
+        return .{ .named = "__LumenStat" };
+    }
+    if (std.mem.eql(u8, call.name, "fchmodSync")) {
+        if (call.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const fd_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const mode_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        if (!types.isInteger(fd_type) or !types.isInteger(mode_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_fchmod_sync = true;
+        call.checked_type = .void;
+        return .void;
+    }
+    if (std.mem.eql(u8, call.name, "lchmodSync")) {
+        if (call.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const mode_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        if (!types.same(.string, path_type) or !types.isInteger(mode_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_lchmod_sync = true;
+        call.checked_type = .void;
+        return .void;
+    }
+    if (std.mem.eql(u8, call.name, "fchownSync")) {
+        if (call.args.len != 3) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const fd_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const uid_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        const gid_type = self.exprType(program, call.args[2], line, col) orelse return null;
+        if (!types.isInteger(fd_type) or !types.isInteger(uid_type) or !types.isInteger(gid_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_fchown_sync = true;
+        call.checked_type = .void;
+        return .void;
+    }
+    if (std.mem.eql(u8, call.name, "fsyncSync") or std.mem.eql(u8, call.name, "fdatasyncSync")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const fd_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.isInteger(fd_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_fsync_sync = true;
+        call.checked_type = .void;
+        return .void;
+    }
+    if (std.mem.eql(u8, call.name, "ftruncateSync")) {
+        if (call.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const fd_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const len_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        if (!types.isInteger(fd_type) or !types.isInteger(len_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_ftruncate_sync = true;
+        call.checked_type = .void;
+        return .void;
+    }
+    if (std.mem.eql(u8, call.name, "futimesSync")) {
+        if (call.args.len != 3) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const fd_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const atime_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        const mtime_type = self.exprType(program, call.args[2], line, col) orelse return null;
+        if (!types.isInteger(fd_type) or !types.isInteger(atime_type) or !types.isInteger(mtime_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_futimes_sync = true;
+        call.checked_type = .void;
+        return .void;
+    }
+    if (std.mem.eql(u8, call.name, "utimesSync") or std.mem.eql(u8, call.name, "lutimesSync")) {
+        if (call.args.len != 3) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const atime_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        const mtime_type = self.exprType(program, call.args[2], line, col) orelse return null;
+        if (!types.same(.string, path_type) or !types.isInteger(atime_type) or !types.isInteger(mtime_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_utimes_sync = true;
+        call.checked_type = .void;
+        return .void;
+    }
+    if (std.mem.eql(u8, call.name, "readdirSync")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, path_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_readdir_sync = true;
+        call.checked_type = .string_array;
+        return .string_array;
+    }
+    _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+    return null;
+}
+
+// Lazily registers the synthetic `__LumenStat` record type (shared by
+// statSync/lstatSync/fstatSync) into the same `type_decls` map a user
+// `type X = {...}` declaration would use. See statSync above for the full
+// rationale; this just factors out the now-repeated registration so each
+// stat-family branch can call it without duplicating the field list.
+fn registerLumenStat(self: *Checker) ?void {
+    if (self.type_decls.get("__LumenStat") == null) {
+        const fields = self.arena.alloc(ast.TypeField, 4) catch return null;
+        fields[0] = .{ .name = "size", .annotation = "int", .checked_type = .i32 };
+        fields[1] = .{ .name = "isFile", .annotation = "bool", .checked_type = .bool };
+        fields[2] = .{ .name = "isDirectory", .annotation = "bool", .checked_type = .bool };
+        fields[3] = .{ .name = "mtimeMs", .annotation = "int", .checked_type = .i32 };
+        self.type_decls.put(self.arena, "__LumenStat", .{ .fields = fields }) catch return null;
+    }
+}
+
+// `path.*` (spec 032): pure string manipulation, no `std.Io`/syscalls --
+// unlike every `fs.*` function, nothing here ever touches `io`. It still
+// sets `program.uses_io` purely to get the prologue to declare `__alloc`
+// (the codegen ties that declaration to the same flag as `__io`'s; several
+// path functions allocate even though none of them do file I/O).
+pub fn pathCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
+    if (std.mem.eql(u8, call.name, "basename")) {
+        if (call.args.len != 1 and call.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        for (call.args) |a| {
+            const t = self.exprType(program, a, line, col) orelse return null;
+            if (!types.same(.string, t)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+        }
+        program.uses_io = true;
+        program.needs_path_api = true;
+        call.checked_type = .string;
+        return .string;
+    }
+    if (std.mem.eql(u8, call.name, "dirname") or std.mem.eql(u8, call.name, "extname") or std.mem.eql(u8, call.name, "normalize")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const t = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, t)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_path_api = true;
+        call.checked_type = .string;
+        return .string;
+    }
+    if (std.mem.eql(u8, call.name, "isAbsolute")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const t = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, t)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_path_api = true;
+        call.checked_type = .bool;
+        return .bool;
+    }
+    if (std.mem.eql(u8, call.name, "join")) {
+        if (call.args.len < 2 or call.args.len > 6) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        for (call.args) |a| {
+            const t = self.exprType(program, a, line, col) orelse return null;
+            if (!types.same(.string, t)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+        }
+        program.uses_io = true;
+        program.needs_path_api = true;
+        call.checked_type = .string;
+        return .string;
+    }
+    if (std.mem.eql(u8, call.name, "resolve")) {
+        if (call.args.len < 1 or call.args.len > 6) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        for (call.args) |a| {
+            const t = self.exprType(program, a, line, col) orelse return null;
+            if (!types.same(.string, t)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+        }
+        program.uses_io = true;
+        program.needs_path_api = true;
+        call.checked_type = .string;
+        return .string;
+    }
+    if (std.mem.eql(u8, call.name, "parse")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const t = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, t)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        registerLumenPathParts(self) orelse return null;
+        program.uses_io = true;
+        program.needs_path_api = true;
+        call.checked_type = .{ .named = "__LumenPathParts" };
+        return .{ .named = "__LumenPathParts" };
+    }
+    if (std.mem.eql(u8, call.name, "format")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        registerLumenPathParts(self) orelse return null;
+        self.ensureAssignable(program, .{ .named = "__LumenPathParts" }, call.args[0], line, col) catch {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        };
+        program.uses_io = true;
+        program.needs_path_api = true;
+        call.checked_type = .string;
+        return .string;
+    }
+    // `path.sep()` / `path.delimiter()`: Node exposes these as plain string
+    // properties (`path.sep`, no call), but Lumen has no static-namespace
+    // constant-property mechanism yet -- only call dispatch. Exposed as
+    // zero-arg functions instead; a deliberate, documented deviation rather
+    // than inventing a whole new expression form for two constants.
+    if (std.mem.eql(u8, call.name, "sep") or std.mem.eql(u8, call.name, "delimiter")) {
+        if (call.args.len != 0) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_path_api = true;
+        call.checked_type = .string;
+        return .string;
+    }
+    _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+    return null;
+}
+
+// Lazily registers the synthetic `__LumenPathParts` record type (shared by
+// `path.parse`'s return value and `path.format`'s parameter), following the
+// exact pattern `registerLumenStat` introduced for `fs.statSync`. All five
+// fields are plain (non-optional) strings -- a deliberate simplification vs.
+// Node, where `path.format`'s argument may omit any field. Round-tripping
+// `path.format(path.parse(p))` works perfectly; constructing a literal by
+// hand requires every field.
+fn registerLumenPathParts(self: *Checker) ?void {
+    if (self.type_decls.get("__LumenPathParts") == null) {
+        const fields = self.arena.alloc(ast.TypeField, 5) catch return null;
+        fields[0] = .{ .name = "root", .annotation = "string", .checked_type = .string };
+        fields[1] = .{ .name = "dir", .annotation = "string", .checked_type = .string };
+        fields[2] = .{ .name = "base", .annotation = "string", .checked_type = .string };
+        fields[3] = .{ .name = "name", .annotation = "string", .checked_type = .string };
+        fields[4] = .{ .name = "ext", .annotation = "string", .checked_type = .string };
+        self.type_decls.put(self.arena, "__LumenPathParts", .{ .fields = fields }) catch return null;
+    }
+}
+
+// `process.*` (spec 033): mixed bag -- cwd/chdir/env go through std.process's
+// own Io-abstracted primitives (so they need `io`, like `fs`); platform/arch
+// are compile-time constants; pid/argv are cheap reads of state Zig's own
+// entry already captured, no Io involved at all (argv reuses the existing
+// `__args` machinery `argsCount()`/`arg(i)` already set up).
+pub fn processCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
+    if (std.mem.eql(u8, call.name, "cwd")) {
+        if (call.args.len != 0) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_process_api = true;
+        call.checked_type = .string;
+        return .string;
+    }
+    if (std.mem.eql(u8, call.name, "chdir")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const t = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, t)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_process_api = true;
+        call.checked_type = .void;
+        return .void;
+    }
+    if (std.mem.eql(u8, call.name, "exit")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const t = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.isInteger(t)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_process_api = true;
+        call.checked_type = .void;
+        return .void;
+    }
+    if (std.mem.eql(u8, call.name, "env")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const t = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, t)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_process_api = true;
+        const inner = self.arena.create(types.Type) catch return null;
+        inner.* = .string;
+        const result = types.Type{ .optional = inner };
+        call.checked_type = result;
+        return result;
+    }
+    if (std.mem.eql(u8, call.name, "platform") or std.mem.eql(u8, call.name, "arch")) {
+        if (call.args.len != 0) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_process_api = true;
+        call.checked_type = .string;
+        return .string;
+    }
+    if (std.mem.eql(u8, call.name, "pid")) {
+        if (call.args.len != 0) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_process_api = true;
+        call.checked_type = .i32;
+        return .i32;
+    }
+    if (std.mem.eql(u8, call.name, "argv")) {
+        if (call.args.len != 0) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_process_api = true;
+        program.needs_args = true;
+        call.checked_type = .string_array;
+        return .string_array;
     }
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;

@@ -439,6 +439,142 @@ pub fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
                 try w.appendSlice(arena, ", ");
                 if (cl.args.len == 2) try emitExpr(cl.args[1], w, arena) else try w.appendSlice(arena, "0");
                 try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "lstatSync")) {
+                try w.appendSlice(arena, "__lstatSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "fstatSync")) {
+                try w.appendSlice(arena, "__fstatSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "fchmodSync")) {
+                try w.appendSlice(arena, "__fchmodSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "lchmodSync")) {
+                try w.appendSlice(arena, "__lchmodSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "fchownSync")) {
+                try w.appendSlice(arena, "__fchownSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[2], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and (std.mem.eql(u8, cl.name, "fsyncSync") or std.mem.eql(u8, cl.name, "fdatasyncSync"))) {
+                try w.appendSlice(arena, "__fsyncSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "ftruncateSync")) {
+                try w.appendSlice(arena, "__ftruncateSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "futimesSync")) {
+                try w.appendSlice(arena, "__futimesSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[2], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "utimesSync")) {
+                try w.appendSlice(arena, "__utimesSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[2], w, arena);
+                try w.appendSlice(arena, ", true)");
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "lutimesSync")) {
+                try w.appendSlice(arena, "__utimesSync(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[2], w, arena);
+                try w.appendSlice(arena, ", false)");
+            } else if (std.mem.eql(u8, cl.namespace, "fs") and std.mem.eql(u8, cl.name, "readdirSync")) {
+                try w.appendSlice(arena, "__readdirSync(__io, __alloc, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "basename")) {
+                try w.appendSlice(arena, "__pathBasename(");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                if (cl.args.len == 2) try emitExpr(cl.args[1], w, arena) else try w.appendSlice(arena, "\"\"");
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "dirname")) {
+                try w.appendSlice(arena, "__pathDirname(");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "extname")) {
+                try w.appendSlice(arena, "std.fs.path.extension(");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "isAbsolute")) {
+                try w.appendSlice(arena, "std.fs.path.isAbsolute(");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "normalize")) {
+                try w.appendSlice(arena, "__pathResolve(__alloc, &.{");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, "})");
+            } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "join")) {
+                try w.appendSlice(arena, "__pathJoin(__alloc, &.{ ");
+                for (cl.args, 0..) |a, i| {
+                    if (i > 0) try w.appendSlice(arena, ", ");
+                    try emitExpr(a, w, arena);
+                }
+                try w.appendSlice(arena, " })");
+            } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "resolve")) {
+                try w.appendSlice(arena, "__pathResolve(__alloc, &.{ ");
+                for (cl.args, 0..) |a, i| {
+                    if (i > 0) try w.appendSlice(arena, ", ");
+                    try emitExpr(a, w, arena);
+                }
+                try w.appendSlice(arena, " })");
+            } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "parse")) {
+                try w.appendSlice(arena, "__pathParse(");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "format")) {
+                try w.appendSlice(arena, "__pathFormat(__alloc, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "sep")) {
+                try w.appendSlice(arena, "@as([]const u8, \"/\")");
+            } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "delimiter")) {
+                try w.appendSlice(arena, "@as([]const u8, \":\")");
+            } else if (std.mem.eql(u8, cl.namespace, "process") and std.mem.eql(u8, cl.name, "cwd")) {
+                try w.appendSlice(arena, "__processCwd(__io, __alloc)");
+            } else if (std.mem.eql(u8, cl.namespace, "process") and std.mem.eql(u8, cl.name, "chdir")) {
+                try w.appendSlice(arena, "__processChdir(__io, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "process") and std.mem.eql(u8, cl.name, "exit")) {
+                try w.appendSlice(arena, "std.process.exit(@intCast(");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, "))");
+            } else if (std.mem.eql(u8, cl.namespace, "process") and std.mem.eql(u8, cl.name, "env")) {
+                try w.appendSlice(arena, "__processEnv(");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "process") and std.mem.eql(u8, cl.name, "platform")) {
+                try w.appendSlice(arena, "__processPlatform()");
+            } else if (std.mem.eql(u8, cl.namespace, "process") and std.mem.eql(u8, cl.name, "arch")) {
+                try w.appendSlice(arena, "__processArch()");
+            } else if (std.mem.eql(u8, cl.namespace, "process") and std.mem.eql(u8, cl.name, "pid")) {
+                try w.appendSlice(arena, "@as(i32, @intCast(std.os.linux.getpid()))");
+            } else if (std.mem.eql(u8, cl.namespace, "process") and std.mem.eql(u8, cl.name, "argv")) {
+                try w.appendSlice(arena, "__args");
             } else if (std.mem.eql(u8, cl.namespace, "Promise") and std.mem.eql(u8, cl.name, "resolve")) {
                 // Promise.resolve(v) -> an already-resolved promise of v's type.
                 const inner = cl.checked_arg_type orelse return error.ParseError;

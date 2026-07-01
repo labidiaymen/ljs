@@ -133,7 +133,7 @@ pub const Parser = struct {
         return p;
     }
     pub fn isStdNamespace(name: []const u8) bool {
-        return std.mem.eql(u8, name, "Math") or std.mem.eql(u8, name, "String") or std.mem.eql(u8, name, "Array") or std.mem.eql(u8, name, "fs") or std.mem.eql(u8, name, "Promise");
+        return std.mem.eql(u8, name, "Math") or std.mem.eql(u8, name, "String") or std.mem.eql(u8, name, "Array") or std.mem.eql(u8, name, "fs") or std.mem.eql(u8, name, "Promise") or std.mem.eql(u8, name, "path") or std.mem.eql(u8, name, "process");
     }
     pub fn parseBlock(self: *Parser) CompileError![]Stmt {
         try self.expectOp('{');

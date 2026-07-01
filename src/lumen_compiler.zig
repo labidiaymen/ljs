@@ -218,6 +218,9 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
     if (program.needs_args) {
         try out.appendSlice(arena, "var __args: []const []const u8 = &.{};\n");
     }
+    if (program.needs_process_api) {
+        try out.appendSlice(arena, "var __environ: std.process.Environ = .empty;\n");
+    }
 
     if (options.runtime_locations) {
         // Sanitize the filename for a Zig string literal (backslashes/quotes break it).
@@ -755,6 +758,233 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_lstat_sync) {
+        // Same `__LumenStat` record as statSync, but `follow_symlinks = false`
+        // so a symlink itself is stat'd rather than its target.
+        try out.appendSlice(arena,
+            \\fn __lstatSync(io: std.Io, path: []const u8) __LumenStat {
+            \\    const st = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return .{ .size = 0, .isFile = false, .isDirectory = false, .mtimeMs = 0 };
+            \\    return .{
+            \\        .size = @truncate(@as(i64, @intCast(st.size))),
+            \\        .isFile = st.kind == .file,
+            \\        .isDirectory = st.kind == .directory,
+            \\        .mtimeMs = @truncate(@divTrunc(@as(i96, st.mtime.nanoseconds), 1_000_000)),
+            \\    };
+            \\}
+            \\
+        );
+    }
+    if (program.needs_fstat_sync) {
+        // fd-based variant of statSync: stats the already-open file in
+        // __fd_table rather than re-resolving a path.
+        try out.appendSlice(arena,
+            \\fn __fstatSync(io: std.Io, fd: i32) __LumenStat {
+            \\    if (fd < 0 or @as(usize, @intCast(fd)) >= __fd_table.items.len) return .{ .size = 0, .isFile = false, .isDirectory = false, .mtimeMs = 0 };
+            \\    const st = __fd_table.items[@intCast(fd)].stat(io) catch return .{ .size = 0, .isFile = false, .isDirectory = false, .mtimeMs = 0 };
+            \\    return .{
+            \\        .size = @truncate(@as(i64, @intCast(st.size))),
+            \\        .isFile = st.kind == .file,
+            \\        .isDirectory = st.kind == .directory,
+            \\        .mtimeMs = @truncate(@divTrunc(@as(i96, st.mtime.nanoseconds), 1_000_000)),
+            \\    };
+            \\}
+            \\
+        );
+    }
+    if (program.needs_fchmod_sync) {
+        try out.appendSlice(arena,
+            \\fn __fchmodSync(io: std.Io, fd: i32, mode: i64) void {
+            \\    if (fd < 0 or @as(usize, @intCast(fd)) >= __fd_table.items.len) return;
+            \\    __fd_table.items[@intCast(fd)].setPermissions(io, std.Io.File.Permissions.fromMode(@intCast(mode))) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_lchmod_sync) {
+        // Best effort: not every OS lets you chmod a symlink directly: this
+        // opens without following the symlink, then sets permissions on
+        // whatever that resolves to.
+        try out.appendSlice(arena,
+            \\fn __lchmodSync(io: std.Io, path: []const u8, mode: i64) void {
+            \\    var file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only, .follow_symlinks = false }) catch return;
+            \\    defer file.close(io);
+            \\    file.setPermissions(io, std.Io.File.Permissions.fromMode(@intCast(mode))) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_fchown_sync) {
+        try out.appendSlice(arena,
+            \\fn __fchownSync(io: std.Io, fd: i32, uid: i64, gid: i64) void {
+            \\    if (fd < 0 or @as(usize, @intCast(fd)) >= __fd_table.items.len) return;
+            \\    const u: ?std.posix.uid_t = if (uid < 0) null else @intCast(uid);
+            \\    const g: ?std.posix.gid_t = if (gid < 0) null else @intCast(gid);
+            \\    __fd_table.items[@intCast(fd)].setOwner(io, u, g) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_fsync_sync) {
+        // Backs both fsyncSync and fdatasyncSync: Zig's std.Io.File has no
+        // data-only sync, so fdatasyncSync is treated as a full sync.
+        try out.appendSlice(arena,
+            \\fn __fsyncSync(io: std.Io, fd: i32) void {
+            \\    if (fd < 0 or @as(usize, @intCast(fd)) >= __fd_table.items.len) return;
+            \\    __fd_table.items[@intCast(fd)].sync(io) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_ftruncate_sync) {
+        try out.appendSlice(arena,
+            \\fn __ftruncateSync(io: std.Io, fd: i32, len: i64) void {
+            \\    if (fd < 0 or @as(usize, @intCast(fd)) >= __fd_table.items.len) return;
+            \\    __fd_table.items[@intCast(fd)].setLength(io, @intCast(len)) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_futimes_sync) {
+        try out.appendSlice(arena,
+            \\fn __futimesSync(io: std.Io, fd: i32, atime_ms: i64, mtime_ms: i64) void {
+            \\    if (fd < 0 or @as(usize, @intCast(fd)) >= __fd_table.items.len) return;
+            \\    __fd_table.items[@intCast(fd)].setTimestamps(io, .{
+            \\        .access_timestamp = .{ .new = .{ .nanoseconds = @as(i96, atime_ms) * 1_000_000 } },
+            \\        .modify_timestamp = .{ .new = .{ .nanoseconds = @as(i96, mtime_ms) * 1_000_000 } },
+            \\    }) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_utimes_sync) {
+        // Backs both utimesSync (follow_symlinks=true) and lutimesSync (false).
+        try out.appendSlice(arena,
+            \\fn __utimesSync(io: std.Io, path: []const u8, atime_ms: i64, mtime_ms: i64, follow_symlinks: bool) void {
+            \\    std.Io.Dir.cwd().setTimestamps(io, path, .{
+            \\        .follow_symlinks = follow_symlinks,
+            \\        .access_timestamp = .{ .new = .{ .nanoseconds = @as(i96, atime_ms) * 1_000_000 } },
+            \\        .modify_timestamp = .{ .new = .{ .nanoseconds = @as(i96, mtime_ms) * 1_000_000 } },
+            \\    }) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_readdir_sync) {
+        // string[] is already a plain []const []const u8 slice (not a
+        // growable list), so this is a two-pass count-then-fill: no
+        // Array.push language feature needed.
+        try out.appendSlice(arena,
+            \\fn __readdirSync(io: std.Io, alloc: std.mem.Allocator, path: []const u8) []const []const u8 {
+            \\    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return &.{};
+            \\    defer dir.close(io);
+            \\    var count: usize = 0;
+            \\    {
+            \\        var it = dir.iterate();
+            \\        while (it.next(io) catch null) |_| count += 1;
+            \\    }
+            \\    const names = alloc.alloc([]const u8, count) catch return &.{};
+            \\    var it2 = dir.iterate();
+            \\    var i: usize = 0;
+            \\    while (i < count) {
+            \\        const entry = (it2.next(io) catch null) orelse break;
+            \\        names[i] = alloc.dupe(u8, entry.name) catch entry.name;
+            \\        i += 1;
+            \\    }
+            \\    return names[0..i];
+            \\}
+            \\
+        );
+    }
+    if (program.needs_path_api) {
+        // path.* (spec 032): pure string manipulation, no Io parameter at all
+        // -- the one stdlib namespace that doesn't thread `io` through.
+        // __pathJoin/__pathResolve/normalize all reduce to std.fs.path.resolve:
+        // its "cd"-chaining behavior (an absolute segment resets the result,
+        // "." and ".." collapse without ever consulting a real working
+        // directory) is exactly Node's path.resolve semantics, *except* Node
+        // implicitly anchors a fully-relative input to process.cwd() and Zig
+        // does not (this Zig version has no working Io.Dir.realpath to get a
+        // real cwd string from, the same gap documented for fs.realpathSync).
+        try out.appendSlice(arena,
+            \\pub const __LumenPathParts = struct { root: []const u8, dir: []const u8, base: []const u8, name: []const u8, ext: []const u8 };
+            \\fn __pathBasename(path: []const u8, suffix: []const u8) []const u8 {
+            \\    const base = std.fs.path.basename(path);
+            \\    if (suffix.len > 0 and base.len > suffix.len and std.mem.endsWith(u8, base, suffix)) {
+            \\        return base[0 .. base.len - suffix.len];
+            \\    }
+            \\    return base;
+            \\}
+            \\fn __pathDirname(path: []const u8) []const u8 {
+            \\    return std.fs.path.dirname(path) orelse ".";
+            \\}
+            \\fn __pathResolve(alloc: std.mem.Allocator, paths: []const []const u8) []const u8 {
+            \\    return std.fs.path.resolve(alloc, paths) catch "";
+            \\}
+            \\fn __pathJoin(alloc: std.mem.Allocator, paths: []const []const u8) []const u8 {
+            \\    const naive = std.fs.path.join(alloc, paths) catch return "";
+            \\    return std.fs.path.resolve(alloc, &.{naive}) catch naive;
+            \\}
+            \\fn __pathParse(path: []const u8) __LumenPathParts {
+            \\    const ext = std.fs.path.extension(path);
+            \\    const base = std.fs.path.basename(path);
+            \\    return .{
+            \\        .root = if (std.fs.path.isAbsolute(path)) "/" else "",
+            \\        .dir = std.fs.path.dirname(path) orelse "",
+            \\        .base = base,
+            \\        .name = base[0 .. base.len - ext.len],
+            \\        .ext = ext,
+            \\    };
+            \\}
+            \\fn __pathFormat(alloc: std.mem.Allocator, parts: __LumenPathParts) []const u8 {
+            \\    const dir = if (parts.dir.len > 0) parts.dir else parts.root;
+            \\    const base = if (parts.base.len > 0) parts.base else std.fmt.allocPrint(alloc, "{s}{s}", .{ parts.name, parts.ext }) catch "";
+            \\    if (dir.len == 0) return base;
+            \\    if (dir[dir.len - 1] == '/') return std.fmt.allocPrint(alloc, "{s}{s}", .{ dir, base }) catch base;
+            \\    return std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, base }) catch base;
+            \\}
+            \\
+        );
+    }
+    if (program.needs_process_api) {
+        // cwd/chdir/env go through Io-abstracted (cwd/chdir) or entry-captured
+        // (env, same mechanism as __args) primitives -- none of these need
+        // libc linking. platform/arch are resolved at compile time.
+        try out.appendSlice(arena,
+            \\fn __processCwd(io: std.Io, alloc: std.mem.Allocator) []const u8 {
+            \\    var buf: [std.fs.max_path_bytes]u8 = undefined;
+            \\    const n = std.process.currentPath(io, &buf) catch return "";
+            \\    return alloc.dupe(u8, buf[0..n]) catch "";
+            \\}
+            \\fn __processChdir(io: std.Io, path: []const u8) void {
+            \\    std.process.setCurrentPath(io, path) catch {};
+            \\}
+            \\fn __processEnv(key: []const u8) ?[]const u8 {
+            \\    const v = std.process.Environ.getPosix(__environ, key) orelse return null;
+            \\    return v;
+            \\}
+            \\fn __processPlatform() []const u8 {
+            \\    return switch (@import("builtin").os.tag) {
+            \\        .linux => "linux",
+            \\        .macos => "darwin",
+            \\        .windows => "win32",
+            \\        .freebsd => "freebsd",
+            \\        .openbsd => "openbsd",
+            \\        else => "unknown",
+            \\    };
+            \\}
+            \\fn __processArch() []const u8 {
+            \\    return switch (@import("builtin").cpu.arch) {
+            \\        .x86_64 => "x64",
+            \\        .x86 => "ia32",
+            \\        .aarch64 => "arm64",
+            \\        .arm => "arm",
+            \\        .riscv64 => "riscv64",
+            \\        else => "unknown",
+            \\    };
+            \\}
+            \\
+        );
+    }
     if (program.needs_httpget) {
         // A real std.http one-shot GET, wrapped to a Lumen-friendly `i64` (status code, or -1 on error).
         try out.appendSlice(arena,
@@ -795,6 +1025,9 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
         try out.appendSlice(arena, "    __io = __init.io;\n    __alloc = __init.arena.allocator();\n");
         if (program.needs_args) {
             try out.appendSlice(arena, "    __args = __init.minimal.args.toSlice(__alloc) catch std.process.exit(1);\n");
+        }
+        if (program.needs_process_api) {
+            try out.appendSlice(arena, "    __environ = __init.minimal.environ;\n");
         }
         if (program.needs_async) {
             try out.appendSlice(arena, "    LumenLoop.init();\n");

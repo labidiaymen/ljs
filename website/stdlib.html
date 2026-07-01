@@ -74,7 +74,9 @@
     <a href="#async">async / await</a>
     <a href="#ffi">C FFI</a>
     <a href="#errors">Errors</a>
-    <a href="#fs">fs / process</a>
+    <a href="#fs">fs</a>
+    <a href="#path">path</a>
+    <a href="#process">process</a>
     <p class="docs-nav-title">Planned</p>
     <a href="#planned">Roadmap</a>
     <p class="docs-nav-title">Packages</p>
@@ -193,7 +195,7 @@
     <tr><td><code>try { … } catch (e) { … } finally { … }</code></td><td><code>e.message</code> holds the message</td></tr>
   </table>
 
-  <h4 id="fs">fs · process</h4>
+  <h4 id="fs">fs</h4>
   <p class="stability-note stability-stable">Stability: 2 - Stable &mdash; the
   synchronous core (everything except the individually-marked functions
   below) sits on Zig's <code>Io.Threaded</code> POSIX backend, wrapping
@@ -507,9 +509,217 @@ for (const n of names) {
 }</code></pre>
   </div>
 
-  <div class="api" id="process">
+  <h4 id="path">path</h4>
+  <p class="stability-note stability-stable">Stability: 2 - Stable &mdash; pure
+  string manipulation built on Zig's <code>std.fs.path</code>, one of the
+  oldest, least-churned corners of the standard library (predates
+  <code>std.Io</code> entirely; no syscalls of its own). Newly added to
+  Lumen, but resting on the most stable Zig primitive of any stdlib
+  namespace here.</p>
+  <p class="sub">No filesystem access, just string logic. A practical subset of
+  <a href="https://nodejs.org/docs/latest/api/path.html">Node's <code>path</code>
+  API</a> &mdash; POSIX only (no <code>path.win32</code>), and
+  <code>path.sep</code>/<code>path.delimiter</code> are called as
+  <code>path.sep()</code>/<code>path.delimiter()</code> rather than read as
+  properties, since Lumen has no static-namespace constant mechanism yet.</p>
+
+  <div class="api-list">
+    <a href="#path-basename">basename</a>
+    <a href="#path-dirname">dirname</a>
+    <a href="#path-extname">extname</a>
+    <a href="#path-isAbsolute">isAbsolute</a>
+    <a href="#path-normalize">normalize</a>
+    <a href="#path-join">join</a>
+    <a href="#path-resolve">resolve</a>
+    <a href="#path-parse">parse</a>
+    <a href="#path-format">format</a>
+    <a href="#path-sep">sep</a>
+    <a href="#path-delimiter">delimiter</a>
+  </div>
+
+  <div class="api" id="path-basename">
+    <h5><code>path.basename(path, suffix?)</code></h5>
+    <p class="sub">(string, string?) → string &mdash; the last path segment,
+    with <code>suffix</code> stripped if present.</p>
+<pre><code class="lumen">console.log(path.basename("/foo/bar/baz.html"));        // baz.html
+console.log(path.basename("/foo/bar/baz.html", ".html")); // baz</code></pre>
+  </div>
+
+  <div class="api" id="path-dirname">
+    <h5><code>path.dirname(path)</code></h5>
+    <p class="sub">string → string &mdash; returns <code>"."</code> for a path
+    with no directory segment.</p>
+<pre><code class="lumen">console.log(path.dirname("/foo/bar/baz.html")); // /foo/bar</code></pre>
+  </div>
+
+  <div class="api" id="path-extname">
+    <h5><code>path.extname(path)</code></h5>
+    <p class="sub">string → string &mdash; <code>""</code> for dotfiles like
+    <code>.gitignore</code>.</p>
+<pre><code class="lumen">console.log(path.extname("index.html")); // .html</code></pre>
+  </div>
+
+  <div class="api" id="path-isAbsolute">
+    <h5><code>path.isAbsolute(path)</code></h5>
+    <p class="sub">string → bool</p>
+<pre><code class="lumen">console.log(path.isAbsolute("/foo/bar")); // true</code></pre>
+  </div>
+
+  <div class="api" id="path-normalize">
+    <h5><code>path.normalize(path)</code></h5>
+    <p class="sub">string → string &mdash; collapses <code>.</code>/<code>..</code>
+    segments; does not require the path to exist.</p>
+<pre><code class="lumen">console.log(path.normalize("/foo/bar//baz/asdf/quux/..")); // /foo/bar/baz/asdf</code></pre>
+  </div>
+
+  <div class="api" id="path-join">
+    <h5><code>path.join(...paths)</code></h5>
+    <p class="sub">(string, string, ...) → string &mdash; 2 to 6 arguments;
+    joins then normalizes, matching Node's <code>join</code> definition.</p>
+<pre><code class="lumen">console.log(path.join("/foo", "bar", "baz/asdf", "quux", "..")); // /foo/bar/baz/asdf</code></pre>
+  </div>
+
+  <div class="api" id="path-resolve">
+    <h5><code>path.resolve(...paths)</code> <span class="stability-pill stability-experimental" title="Zig's std.fs.path.resolve does not anchor a fully-relative input to the real working directory (no working Io.Dir.realpath in this Zig version to supply one) -- it only resolves '.'/'..' across the given segments left to right.">Experimental</span></h5>
+    <p class="sub">(string, string, ...) → string &mdash; 1 to 6 arguments;
+    "cd"-chains left to right, an absolute segment resets the result.
+    <strong>Deviation from Node</strong>: if no argument is absolute, Node
+    anchors the result to <code>process.cwd()</code> to guarantee an absolute
+    path; Lumen has no working way to read the real cwd as a string yet (the
+    same gap that blocks <code>fs.realpathSync</code>), so it stays relative
+    instead.</p>
+<pre><code class="lumen">console.log(path.resolve("/foo/bar", "./baz")); // /foo/bar/baz
+console.log(path.resolve("foo", "bar"));        // foo/bar -- not absolute, see above</code></pre>
+  </div>
+
+  <div class="api" id="path-parse">
+    <h5><code>path.parse(path)</code></h5>
+    <p class="sub">string → <code>{ root, dir, base, name, ext }</code> &mdash;
+    the second record-returning builtin after <code>fs.statSync</code>.</p>
+<pre><code class="lumen">const p = path.parse("/home/user/dir/file.txt");
+console.log(p.dir);   // /home/user/dir
+console.log(p.name);  // file</code></pre>
+  </div>
+
+  <div class="api" id="path-format">
+    <h5><code>path.format(parts)</code></h5>
+    <p class="sub"><code>{ root, dir, base, name, ext }</code> → string
+    &mdash; the inverse of <code>parse</code>. <strong>Deviation from
+    Node</strong>: all five fields are required (Node allows omitting any of
+    them); round-tripping <code>path.format(path.parse(p))</code> works
+    perfectly, building a literal by hand needs every field filled in.</p>
+<pre><code class="lumen">console.log(path.format(path.parse("/home/user/dir/file.txt")));
+// /home/user/dir/file.txt</code></pre>
+  </div>
+
+  <div class="api" id="path-sep">
+    <h5><code>path.sep()</code></h5>
+    <p class="sub">→ string &mdash; always <code>"/"</code> (Lumen is POSIX-only).
+    Called as a function, not read as a property (see above).</p>
+<pre><code class="lumen">console.log(path.sep()); // /</code></pre>
+  </div>
+
+  <div class="api" id="path-delimiter">
+    <h5><code>path.delimiter()</code></h5>
+    <p class="sub">→ string &mdash; always <code>":"</code>.</p>
+<pre><code class="lumen">console.log(path.delimiter()); // :</code></pre>
+  </div>
+
+  <h4 id="process">process</h4>
+  <p class="stability-note stability-stable">Stability: 2 - Stable &mdash;
+  <code>cwd</code>/<code>chdir</code> go through the same <code>Io</code>-
+  abstracted primitives as <code>fs</code> (not the libc-only gap that blocks
+  <code>fs.realpathSync</code>); <code>env</code> and <code>argv()</code>
+  reuse the entry-captured state Zig's own program startup already collects;
+  <code>platform</code>/<code>arch</code> are compile-time constants;
+  <code>pid()</code> is a raw Linux syscall. No libc linking required for any
+  of it.</p>
+  <p class="sub">A practical subset of
+  <a href="https://nodejs.org/docs/latest/api/process.html">Node's <code>process</code>
+  object</a> &mdash; no events, IPC, signals, or worker threads yet.
+  <code>platform()</code>/<code>arch()</code> are called as functions, not
+  read as properties, the same deviation as <code>path.sep()</code>.</p>
+
+  <div class="api-list">
+    <a href="#process-cwd">cwd</a>
+    <a href="#process-chdir">chdir</a>
+    <a href="#process-exit">exit</a>
+    <a href="#process-env">env</a>
+    <a href="#process-platform">platform</a>
+    <a href="#process-arch">arch</a>
+    <a href="#process-pid">pid</a>
+    <a href="#process-argv">argv</a>
+    <a href="#process-args">argsCount / arg</a>
+  </div>
+
+  <div class="api" id="process-cwd">
+    <h5><code>process.cwd()</code></h5>
+    <p class="sub">→ string &mdash; the real current working directory.</p>
+<pre><code class="lumen">console.log(process.cwd());</code></pre>
+  </div>
+
+  <div class="api" id="process-chdir">
+    <h5><code>process.chdir(directory)</code></h5>
+    <p class="sub">string → void</p>
+<pre><code class="lumen">process.chdir("/tmp");
+console.log(process.cwd());</code></pre>
+  </div>
+
+  <div class="api" id="process-exit">
+    <h5><code>process.exit(code)</code></h5>
+    <p class="sub">int → void &mdash; terminates immediately; nothing after the
+    call runs. Truncates to a byte-sized exit code, matching the OS.</p>
+<pre><code class="lumen">console.log("before");
+process.exit(42);
+console.log("never runs");</code></pre>
+  </div>
+
+  <div class="api" id="process-env">
+    <h5><code>process.env(key)</code></h5>
+    <p class="sub">string → string | null &mdash; called as a function rather
+    than indexed as a property (<code>process.env.FOO</code> in Node), since
+    Lumen has no dynamic-object indexing.</p>
+<pre><code class="lumen">const home = process.env("HOME");
+if (home != null) {
+  console.log(home);
+}</code></pre>
+  </div>
+
+  <div class="api" id="process-platform">
+    <h5><code>process.platform()</code></h5>
+    <p class="sub">→ string &mdash; <code>"linux"</code>, <code>"darwin"</code>,
+    <code>"win32"</code>, ...</p>
+<pre><code class="lumen">console.log(process.platform()); // linux</code></pre>
+  </div>
+
+  <div class="api" id="process-arch">
+    <h5><code>process.arch()</code></h5>
+    <p class="sub">→ string &mdash; <code>"x64"</code>, <code>"arm64"</code>, ...</p>
+<pre><code class="lumen">console.log(process.arch()); // x64</code></pre>
+  </div>
+
+  <div class="api" id="process-pid">
+    <h5><code>process.pid()</code></h5>
+    <p class="sub">→ int</p>
+<pre><code class="lumen">console.log(process.pid() > 0); // true</code></pre>
+  </div>
+
+  <div class="api" id="process-argv">
+    <h5><code>process.argv()</code></h5>
+    <p class="sub">→ <code>string[]</code> &mdash; <strong>deviation from
+    Node</strong>: follows C/POSIX argv convention (index 0 is the invoked
+    binary itself), not Node's node-then-script convention where a user's
+    first real argument is <code>argv[2]</code>.</p>
+<pre><code class="lumen">const argv: string[] = process.argv();
+for (const a of argv) {
+  console.log(a);
+}</code></pre>
+  </div>
+
+  <div class="api" id="process-args">
     <h5><code>argsCount()</code> · <code>arg(i)</code></h5>
-    <p class="sub">→ int · int → string &mdash; process arguments.</p>
+    <p class="sub">→ int · int → string &mdash; unnamespaced, pre-dates
+    <code>process.argv()</code>; reads the same underlying argument data.</p>
 <pre><code class="lumen">console.log(argsCount());
 console.log(arg(0));</code></pre>
   </div>
@@ -532,19 +742,19 @@ console.log(arg(0));</code></pre>
   <h4>path</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
-    <tr><td><code>path.join(a, b, …)</code> · <code>path.resolve(…)</code></td><td></td></tr>
-    <tr><td><code>path.basename(p)</code> · <code>path.dirname(p)</code> · <code>path.extname(p)</code></td><td></td></tr>
-    <tr><td><code>path.isAbsolute(p)</code> · <code>path.sep</code></td><td></td></tr>
+    <tr><td><code>path.relative(from, to)</code></td><td>needs the real OS working directory as a string (same gap as <code>fs.realpathSync</code>)</td></tr>
+    <tr><td><code>path.matchesGlob(path, pattern)</code></td><td>needs a real glob algorithm</td></tr>
+    <tr><td><code>path.win32</code> / <code>path.posix</code> / <code>path.toNamespacedPath</code></td><td>Lumen targets POSIX only</td></tr>
   </table>
 
   <h4>process</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
-    <tr><td><code>process.cwd()</code></td><td>→ string</td></tr>
-    <tr><td><code>process.exit(code)</code></td><td></td></tr>
-    <tr><td><code>process.env(key)</code></td><td>→ string | null</td></tr>
-    <tr><td><code>process.platform</code> · <code>process.arch</code></td><td>compile-time constants</td></tr>
-    <tr><td><code>process.argv</code> → <code>string[]</code></td><td>needs growable arrays</td></tr>
+    <tr><td><code>process.hrtime()</code> · <code>process.uptime()</code></td><td>needs a recorded process-start timestamp</td></tr>
+    <tr><td><code>process.memoryUsage()</code> · <code>process.cpuUsage()</code></td><td>low priority for now</td></tr>
+    <tr><td><code>process.kill()</code> · signal events · <code>process.on(...)</code></td><td>no event/listener infrastructure yet</td></tr>
+    <tr><td><code>process.send()</code> / IPC</td><td>no child-process spawning yet, so no IPC channel can exist</td></tr>
+    <tr><td><code>process.stdout</code> / <code>stdin</code> / <code>stderr</code></td><td>no <code>Stream</code> abstraction in the language</td></tr>
   </table>
 
   <h4>os</h4>
