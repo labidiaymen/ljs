@@ -52,6 +52,16 @@
   with individual functions getting their own pill when they differ &mdash;
   usually because they sit on a newer, less-proven part of the runtime, like
   the async I/O path.</p>
+  <p class="sub">A separate tag marks target availability, since that's an
+  independent question from stability:
+  <span class="target-pill target-native-only">Native only</span> means the
+  function is rejected outright when compiling to WebAssembly (the whole
+  async/await surface, since the playground's in-browser target doesn't
+  support it yet);
+  <span class="target-pill target-wasm-limited">Wasm: limited</span> means it
+  compiles under WebAssembly but returns fallback/zeroed values there instead
+  of real data, because the underlying call it needs is Linux-specific.
+  Anything without either tag works the same on both targets.</p>
 
   <div class="docs">
   <aside class="docs-nav"><nav>
@@ -78,7 +88,7 @@
   <h3>Available now</h3>
 
   <h4 id="console">console</h4>
-  <p class="stability-note stability-stable">Stability: 2 - Stable</p>
+  <p class="stability-note stability-stable">Stable</p>
   <table>
     <tr><th>API</th><th>Type</th></tr>
     <tr><td><code>console.log(x)</code></td><td>any → void</td></tr>
@@ -86,7 +96,7 @@
   </table>
 
   <h4 id="math">Math</h4>
-  <p class="stability-note stability-stable">Stability: 2 - Stable &mdash; thin
+  <p class="stability-note stability-stable">Stable &mdash; thin
   wrappers over one of the oldest, least-churned corners of the runtime.</p>
   <table>
     <tr><th>API</th><th>Type</th></tr>
@@ -98,7 +108,7 @@
   </table>
 
   <h4 id="strings">String methods</h4>
-  <p class="stability-note stability-stable">Stability: 2 - Stable &mdash; pure
+  <p class="stability-note stability-stable">Stable &mdash; pure
   slice operations, no I/O, conformance-covered.</p>
   <p class="sub">Called directly on any <code>string</code> value.</p>
   <table>
@@ -116,7 +126,7 @@
   </table>
 
   <h4 id="arrays">Array methods</h4>
-  <p class="stability-note stability-stable">Stability: 2 - Stable &mdash;
+  <p class="stability-note stability-stable">Stable &mdash;
   fixed-size <code>[]const T</code> slices underneath; no allocation, no
   growable-array machinery, conformance-covered.</p>
   <p class="sub">Called directly on any <code>T[]</code> value; callbacks are
@@ -135,7 +145,7 @@
   </table>
 
   <h4 id="collections">Collections</h4>
-  <p class="stability-note stability-stable">Stability: 2 - Stable &mdash;
+  <p class="stability-note stability-stable">Stable &mdash;
   built on long-stable, widely used container implementations.</p>
   <p class="sub">Typed, generic containers, no dynamic shapes.</p>
   <table>
@@ -145,8 +155,8 @@
     <tr><td><code>[A, B]</code> tuple types</td><td>fixed-length, per-slot types; <code>t[0]</code>, <code>t[1]</code></td></tr>
   </table>
 
-  <h4 id="async">async · await</h4>
-  <p class="stability-note stability-experimental">Stability: 1 - Experimental
+  <h4 id="async">async · await <span class="target-pill target-native-only" title="Rejected at compile time under --wasm: the playground's target does not support async yet.">Native only</span></h4>
+  <p class="stability-note stability-experimental">Experimental
   &mdash; the event loop runs on <a href="https://github.com/mitchellh/libxev">libxev</a>,
   which has no tagged releases yet (pinned by commit) and sits on async I/O
   primitives that are still gaining backend coverage.</p>
@@ -161,7 +171,7 @@
   </table>
 
   <h4 id="ffi">C FFI</h4>
-  <p class="stability-note stability-experimental">Stability: 1 - Experimental
+  <p class="stability-note stability-experimental">Experimental
   &mdash; the marshaling layer covers strings and scalars only (no structs,
   callbacks, or arrays across the boundary yet); built on mature C-interop
   primitives, but Lumen's own wrapper around them is the newest,
@@ -174,7 +184,7 @@
   </table>
 
   <h4 id="errors">Errors</h4>
-  <p class="stability-note stability-stable">Stability: 2 - Stable &mdash;
+  <p class="stability-note stability-stable">Stable &mdash;
   lowers to the runtime's native error-union/catch machinery, its primary
   error-handling mechanism.</p>
   <table>
@@ -184,7 +194,7 @@
   </table>
 
   <h4 id="fs">fs</h4>
-  <p class="stability-note stability-stable">Stability: 2 - Stable &mdash; the
+  <p class="stability-note stability-stable">Stable &mdash; the
   synchronous core (everything except the individually-marked functions
   below) wraps long-stable POSIX syscalls (<code>open</code>,
   <code>read</code>, <code>stat</code>, ...) that predate the runtime's newer
@@ -244,7 +254,7 @@ console.log(data);</code></pre>
   </div>
 
   <div class="api" id="fs-readFile">
-    <h5><code>fs.readFile(path)</code> <span class="stability-pill stability-experimental" title="Runs on the event loop's io_uring backend: no tagged releases yet, still the newest corner of the async runtime.">Experimental</span></h5>
+    <h5><code>fs.readFile(path)</code> <span class="stability-pill stability-experimental" title="Runs on the event loop's io_uring backend: no tagged releases yet, still the newest corner of the async runtime.">Experimental</span> <span class="target-pill target-native-only" title="Rejected at compile time under --wasm: the playground's target does not support async yet.">Native only</span></h5>
     <p class="sub">string → <code>Promise&lt;string&gt;</code> &mdash; true
     non-blocking I/O, no thread pool, unlike Node's
     <code>fs.promises.readFile</code>.</p>
@@ -255,7 +265,7 @@ console.log(data);</code></pre>
   </div>
 
   <div class="api" id="fs-writeFile">
-    <h5><code>fs.writeFile(path, data)</code> <span class="stability-pill stability-experimental" title="Same async runtime as fs.readFile.">Experimental</span></h5>
+    <h5><code>fs.writeFile(path, data)</code> <span class="stability-pill stability-experimental" title="Same async runtime as fs.readFile.">Experimental</span> <span class="target-pill target-native-only" title="Rejected at compile time under --wasm: the playground's target does not support async yet.">Native only</span></h5>
     <p class="sub">(string, string) → <code>Promise&lt;void&gt;</code> &mdash;
     the async counterpart to <code>fs.writeFileSync</code>; creates the file
     or truncates it first, same as the sync version.</p>
@@ -266,7 +276,7 @@ console.log(data);</code></pre>
   </div>
 
   <div class="api" id="fs-appendFile">
-    <h5><code>fs.appendFile(path, data)</code> <span class="stability-pill stability-experimental" title="Same async runtime as fs.readFile.">Experimental</span></h5>
+    <h5><code>fs.appendFile(path, data)</code> <span class="stability-pill stability-experimental" title="Same async runtime as fs.readFile.">Experimental</span> <span class="target-pill target-native-only" title="Rejected at compile time under --wasm: the playground's target does not support async yet.">Native only</span></h5>
     <p class="sub">(string, string) → <code>Promise&lt;void&gt;</code> &mdash;
     the async counterpart to <code>fs.appendFileSync</code>; creates the file
     if it does not exist yet.</p>
@@ -522,7 +532,7 @@ for (const n of names) {
   </div>
 
   <h4 id="path">path</h4>
-  <p class="stability-note stability-stable">Stability: 2 - Stable &mdash; pure
+  <p class="stability-note stability-stable">Stable &mdash; pure
   string manipulation, no filesystem calls of its own. Newly added to Lumen,
   but resting on one of the oldest, least-churned corners of the runtime.</p>
   <p class="sub">No filesystem access, just string logic. A practical subset of
@@ -635,7 +645,7 @@ console.log(p.name);  // file</code></pre>
   </div>
 
   <h4 id="process">process</h4>
-  <p class="stability-note stability-stable">Stability: 2 - Stable &mdash;
+  <p class="stability-note stability-stable">Stable &mdash;
   <code>cwd</code>/<code>chdir</code> go through the same primitives as
   <code>fs</code> (not the libc-only gap that blocks
   <code>fs.realpathSync</code>); <code>env</code> and <code>argv()</code>
@@ -708,7 +718,7 @@ if (home != null) {
   </div>
 
   <div class="api" id="process-pid">
-    <h5><code>process.pid()</code></h5>
+    <h5><code>process.pid()</code> <span class="target-pill target-wasm-limited" title="Compiles under --wasm but returns a fallback/zeroed value there: the underlying call is Linux-specific and is skipped on other targets.">Wasm: limited</span></h5>
     <p class="sub">→ int</p>
 <pre><code class="lumen">console.log(process.pid() > 0); // true</code></pre>
   </div>
@@ -734,7 +744,7 @@ console.log(arg(0));</code></pre>
   </div>
 
   <h4 id="os">os</h4>
-  <p class="stability-note stability-stable">Stability: 2 - Stable &mdash;
+  <p class="stability-note stability-stable">Stable &mdash;
   almost the entire namespace is two raw Linux syscalls
   (<code>uname()</code> covers <code>type</code>/<code>release</code>/
   <code>version</code>/<code>machine</code>/<code>hostname</code> in one
@@ -781,31 +791,31 @@ console.log(arg(0));</code></pre>
   </div>
 
   <div class="api" id="os-type">
-    <h5><code>os.type()</code></h5>
+    <h5><code>os.type()</code> <span class="target-pill target-wasm-limited" title="Compiles under --wasm but returns a fallback/zeroed value there: the underlying call is Linux-specific and is skipped on other targets.">Wasm: limited</span></h5>
     <p class="sub">→ string &mdash; the kernel name, via <code>uname(2)</code>.</p>
 <pre><code class="lumen">console.log(os.type()); // Linux</code></pre>
   </div>
 
   <div class="api" id="os-release">
-    <h5><code>os.release()</code></h5>
+    <h5><code>os.release()</code> <span class="target-pill target-wasm-limited" title="Compiles under --wasm but returns a fallback/zeroed value there: the underlying call is Linux-specific and is skipped on other targets.">Wasm: limited</span></h5>
     <p class="sub">→ string &mdash; the kernel release string.</p>
 <pre><code class="lumen">console.log(os.release());</code></pre>
   </div>
 
   <div class="api" id="os-version">
-    <h5><code>os.version()</code></h5>
+    <h5><code>os.version()</code> <span class="target-pill target-wasm-limited" title="Compiles under --wasm but returns a fallback/zeroed value there: the underlying call is Linux-specific and is skipped on other targets.">Wasm: limited</span></h5>
     <p class="sub">→ string</p>
 <pre><code class="lumen">console.log(os.version());</code></pre>
   </div>
 
   <div class="api" id="os-machine">
-    <h5><code>os.machine()</code></h5>
+    <h5><code>os.machine()</code> <span class="target-pill target-wasm-limited" title="Compiles under --wasm but returns a fallback/zeroed value there: the underlying call is Linux-specific and is skipped on other targets.">Wasm: limited</span></h5>
     <p class="sub">→ string</p>
 <pre><code class="lumen">console.log(os.machine()); // x86_64</code></pre>
   </div>
 
   <div class="api" id="os-hostname">
-    <h5><code>os.hostname()</code></h5>
+    <h5><code>os.hostname()</code> <span class="target-pill target-wasm-limited" title="Compiles under --wasm but returns a fallback/zeroed value there: the underlying call is Linux-specific and is skipped on other targets.">Wasm: limited</span></h5>
     <p class="sub">→ string</p>
 <pre><code class="lumen">console.log(os.hostname());</code></pre>
   </div>
@@ -834,13 +844,13 @@ console.log(arg(0));</code></pre>
   </div>
 
   <div class="api" id="os-uptime">
-    <h5><code>os.uptime()</code></h5>
+    <h5><code>os.uptime()</code> <span class="target-pill target-wasm-limited" title="Compiles under --wasm but returns a fallback/zeroed value there: the underlying call is Linux-specific and is skipped on other targets.">Wasm: limited</span></h5>
     <p class="sub">→ int &mdash; system uptime in seconds.</p>
 <pre><code class="lumen">console.log(os.uptime() > 0); // true</code></pre>
   </div>
 
   <div class="api" id="os-totalmem">
-    <h5><code>os.totalmem()</code> <span class="stability-pill stability-experimental" title="Truncates to Lumen's 32-bit int. On a host with more than ~2GB of RAM the truncated value can be negative -- a real, observed deviation, not just a theoretical one.">Experimental</span></h5>
+    <h5><code>os.totalmem()</code> <span class="stability-pill stability-experimental" title="Truncates to Lumen's 32-bit int. On a host with more than ~2GB of RAM the truncated value can be negative -- a real, observed deviation, not just a theoretical one.">Experimental</span> <span class="target-pill target-wasm-limited" title="Compiles under --wasm but returns a fallback/zeroed value there: the underlying call is Linux-specific and is skipped on other targets.">Wasm: limited</span></h5>
     <p class="sub">→ int &mdash; total system memory in bytes.
     <strong>Deviation from Node</strong>: truncates to a 32-bit <code>int</code>
     (the same tradeoff as <code>fs.statSync</code>'s <code>size</code> field);
@@ -849,14 +859,14 @@ console.log(arg(0));</code></pre>
   </div>
 
   <div class="api" id="os-freemem">
-    <h5><code>os.freemem()</code> <span class="stability-pill stability-experimental" title="Same 32-bit truncation as totalmem().">Experimental</span></h5>
+    <h5><code>os.freemem()</code> <span class="stability-pill stability-experimental" title="Same 32-bit truncation as totalmem().">Experimental</span> <span class="target-pill target-wasm-limited" title="Compiles under --wasm but returns a fallback/zeroed value there: the underlying call is Linux-specific and is skipped on other targets.">Wasm: limited</span></h5>
     <p class="sub">→ int &mdash; same 32-bit truncation caveat as
     <code>totalmem()</code>.</p>
 <pre><code class="lumen">console.log(os.freemem() != 0);</code></pre>
   </div>
 
   <div class="api" id="os-loadavg">
-    <h5><code>os.loadavg()</code></h5>
+    <h5><code>os.loadavg()</code> <span class="target-pill target-wasm-limited" title="Compiles under --wasm but returns a fallback/zeroed value there: the underlying call is Linux-specific and is skipped on other targets.">Wasm: limited</span></h5>
     <p class="sub">→ <code>number[]</code> &mdash; 1, 5, and 15 minute load
     averages, always exactly 3 elements.</p>
 <pre><code class="lumen">const loads: number[] = os.loadavg();
