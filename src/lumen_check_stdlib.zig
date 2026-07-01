@@ -766,6 +766,28 @@ pub fn fsCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, 
         program.needs_async_write_file = true;
         return result;
     }
+    if (std.mem.eql(u8, call.name, "appendFile")) {
+        if (call.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const data_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        if (!types.same(.string, path_type) or !types.same(.string, data_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        // `fs.appendFile(path, data)` -> `Promise<void>`, the async counterpart
+        // to `fs.appendFileSync`.
+        const p = self.arena.create(types.Type) catch return null;
+        p.* = .void;
+        const result = types.Type{ .promise_type = p };
+        call.checked_type = result;
+        program.uses_io = true;
+        program.needs_async = true;
+        program.needs_async_append_file = true;
+        return result;
+    }
     if (std.mem.eql(u8, call.name, "lstatSync")) {
         if (call.args.len != 1) {
             _ = self.fail(line, col, "E_ARG_COUNT") catch {};

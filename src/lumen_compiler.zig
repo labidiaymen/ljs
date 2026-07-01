@@ -513,6 +513,10 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\    file: xev.File,
             \\    promise: *LumenPromise(void),
             \\    data: []const u8,
+            \\    // Where in the file writing starts -- 0 for writeFile, the
+            \\    // pre-write file size for appendFile. `offset` below always
+            \\    // tracks bytes of `data` written so far, relative to this.
+            \\    base_offset: u64 = 0,
             \\    offset: u64 = 0,
             \\    completion: xev.Completion = undefined,
             \\    close_completion: xev.Completion = undefined,
@@ -532,19 +536,14 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\            }.cb);
             \\            return .disarm;
             \\        }
-            \\        st.file.pwrite(&__xev_loop, &st.completion, .{ .slice = st.data[st.offset..] }, st.offset, __WriteFileState, st, onWrite);
+            \\        st.file.pwrite(&__xev_loop, &st.completion, .{ .slice = st.data[st.offset..] }, st.base_offset + st.offset, __WriteFileState, st, onWrite);
             \\        return .disarm;
             \\    }
             \\};
-            \\fn __writeFileAsync(path: []const u8, data: []const u8) *LumenPromise(void) {
-            \\    const p = LumenPromise(void).create();
-            \\    const sync_file = std.Io.Dir.cwd().createFile(__io, path, .{}) catch {
-            \\        p.resolve({});
-            \\        return p;
-            \\    };
+            \\fn __writeFileStart(p: *LumenPromise(void), sync_file: std.Io.File, data: []const u8, base_offset: u64) void {
             \\    const xf = xev.File.init(sync_file) catch {
             \\        p.resolve({});
-            \\        return p;
+            \\        return;
             \\    };
             \\    if (data.len == 0) {
             \\        p.resolve({});
@@ -553,11 +552,38 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\                return .disarm;
             \\            }
             \\        }.cb);
-            \\        return p;
+            \\        return;
             \\    }
             \\    const st = __alloc.create(__WriteFileState) catch unreachable;
-            \\    st.* = .{ .file = xf, .promise = p, .data = data };
-            \\    st.file.pwrite(&__xev_loop, &st.completion, .{ .slice = data }, 0, __WriteFileState, st, __WriteFileState.onWrite);
+            \\    st.* = .{ .file = xf, .promise = p, .data = data, .base_offset = base_offset };
+            \\    st.file.pwrite(&__xev_loop, &st.completion, .{ .slice = data }, base_offset, __WriteFileState, st, __WriteFileState.onWrite);
+            \\}
+            \\fn __writeFileAsync(path: []const u8, data: []const u8) *LumenPromise(void) {
+            \\    const p = LumenPromise(void).create();
+            \\    const sync_file = std.Io.Dir.cwd().createFile(__io, path, .{}) catch {
+            \\        p.resolve({});
+            \\        return p;
+            \\    };
+            \\    __writeFileStart(p, sync_file, data, 0);
+            \\    return p;
+            \\}
+            \\
+        );
+    }
+    if (program.needs_async_append_file) {
+        // `fs.appendFile` -- same async write loop as `fs.writeFile`, just
+        // starting past the file's existing content instead of at 0. There is
+        // no seek/append-mode primitive to lean on here, so the existing size
+        // is read with one fast synchronous stat before the async loop starts.
+        try out.appendSlice(arena,
+            \\fn __appendFileAsync(path: []const u8, data: []const u8) *LumenPromise(void) {
+            \\    const p = LumenPromise(void).create();
+            \\    const existing_size: u64 = if (std.Io.Dir.cwd().statFile(__io, path, .{}) catch null) |st| st.size else 0;
+            \\    const sync_file = std.Io.Dir.cwd().createFile(__io, path, .{ .truncate = false }) catch {
+            \\        p.resolve({});
+            \\        return p;
+            \\    };
+            \\    __writeFileStart(p, sync_file, data, existing_size);
             \\    return p;
             \\}
             \\

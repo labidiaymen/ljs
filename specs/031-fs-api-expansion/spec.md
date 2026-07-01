@@ -134,16 +134,21 @@ Available now).
   adequate for a unique scratch directory name, not for anything
   security-sensitive. Returns the created path, or `""` on failure.
 
-### Phase 4 -- true async I/O: `fs.readFile` and `fs.writeFile`
+### Phase 4 -- true async I/O: `fs.readFile`, `fs.writeFile`, `fs.appendFile`
 
-Two functions run on the async event loop instead of blocking: `fs.readFile(path)
--> Promise<string>` and `fs.writeFile(path, data) -> Promise<void>`. Both are
+Three functions run on the async event loop instead of blocking:
+`fs.readFile(path) -> Promise<string>`, `fs.writeFile(path, data) ->
+Promise<void>`, and `fs.appendFile(path, data) -> Promise<void>`. All three are
 genuinely non-blocking (no thread pool involved, unlike Node's own
-`fs.promises.readFile`/`writeFile`), reading or writing in a loop of fixed-size
-chunks until done, then resolving the promise. `writeFile` mirrors `readFile`'s
-shape closely: a fast synchronous open, then an async chunked loop, then close.
+`fs.promises.*`), reading or writing in a loop of fixed-size chunks until done,
+then resolving the promise. `writeFile` and `appendFile` share one write loop;
+`appendFile` differs only in where it starts writing -- one fast synchronous
+stat call up front finds the file's current size, then the same async loop
+writes starting there instead of at 0. That sidesteps needing a seek
+primitive entirely (see the sync `openSync("a")` row below, which is a
+genuinely different, still-blocked path).
 
-Everything else in `fs` stays synchronous; the async pair above is additive,
+Everything else in `fs` stays synchronous; the async trio above is additive,
 not a replacement.
 
 ### Not planned (needs a real language feature first)
@@ -151,10 +156,10 @@ not a replacement.
 | Group | Needs |
 | --- | --- |
 | `fs.opendirSync`, `fs.globSync` | a directory-iterator class / a real glob algorithm — `readdirSync` itself **shipped** (Phase 3, two-pass array fill) |
-| `fs.readvSync`/`writevSync`, append-mode `openSync` ("a") | readv/writev need an array-of-buffers type; append mode needs a seek primitive not in this Zig version's `std.Io.File` |
+| `fs.readvSync`/`writevSync`, append-mode `openSync` ("a") | readv/writev need an array-of-buffers type; the scoped fd API's append mode needs a seek primitive not available here (unrelated to async `fs.appendFile`, which computes its start offset from a stat call instead of seeking) |
 | `fs.realpathSync`, `fs.statfsSync` | see Phase 2 blockers above |
 | `fs.chownSync`, `fs.lchownSync` | `Dir.setFileOwner` is an unconditional `@panic("TODO implement dirSetFileOwner")` in this Zig version's `Io.Threaded` backend on Linux, plus a real signature/error-set bug in the `Dir.zig` wrapper itself; `fs.fchownSync` (fd-based) is unaffected and shipped |
-| Remaining async/callback functions (`fs.appendFile`, `fs.unlink`, `fs.mkdir`, ... most of the ~54) and `fs.promises.*` beyond `readFile`/`writeFile` | the async event loop now covers `readFile` and `writeFile`; the rest is a follow-up milestone extending the same pattern |
+| Remaining async/callback functions (`fs.unlink`, `fs.mkdir`, `fs.stat`, ... most of the ~54) and `fs.promises.*` beyond `readFile`/`writeFile`/`appendFile` | the underlying async runtime only exposes read/write/close as true async ops (confirmed by reading its io_uring backend directly) -- no unlink/mkdir/stat op exists to build on without submitting raw low-level requests ourselves, a bigger undertaking than this milestone |
 | `fs.createReadStream`/`createWriteStream` | no `Stream` abstraction in the language |
 | `fs.watch`/`watchFile`/`unwatchFile` | no watcher/listener infra |
 | `fs.openAsBlob` | no `Blob` type |

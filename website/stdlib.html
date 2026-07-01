@@ -44,24 +44,14 @@
   <h2>Standard library</h2>
   <p class="sub">Familiar, conventional APIs, the names you already know
   (<code>fs.readFileSync</code>, <code>path.join</code>, <code>process.cwd</code>),
-  but statically typed and compiled to native code. Every member is type- and
-  arity-checked before it lowers.</p>
-  <p class="sub">Each section below carries a Node-style stability index
+  statically typed and compiled to native code. Each section carries a
+  Node-style stability index
   (<span class="stability-pill stability-stable">Stable</span>
   <span class="stability-pill stability-experimental">Experimental</span>
   <span class="stability-pill stability-deprecated">Deprecated</span>),
-  and individual functions get their own pill when they differ from the rest
-  of their section. The rating tracks two things together: how
-  conformance-tested the Lumen wrapper itself is, and the maturity of the
-  underlying Zig API it lowers to. Lumen compiles against Zig's
-  <code>std.Io</code>, a vtable-based I/O abstraction introduced in Zig 0.16
-  that is still filling in backend coverage &mdash; a function built on a
-  long-stable POSIX wrapper (e.g. <code>fchmod</code>) is Stable even if
-  Lumen added it last week, while a function sitting on a newer or
-  thinner-covered corner of <code>std.Io</code> (the <code>io_uring</code>
-  async path, or a backend that turned out to be an unfinished stub) is
-  marked Experimental or held back entirely, regardless of how simple
-  Lumen's own wrapper code looks.</p>
+  with individual functions getting their own pill when they differ &mdash;
+  usually because they sit on a newer, less-proven part of the runtime, like
+  the async I/O path.</p>
 
   <div class="docs">
   <aside class="docs-nav"><nav>
@@ -97,8 +87,7 @@
 
   <h4 id="math">Math</h4>
   <p class="stability-note stability-stable">Stability: 2 - Stable &mdash; thin
-  wrappers over Zig's own <code>@import("std").math</code>, one of the
-  oldest, least-churned corners of the standard library.</p>
+  wrappers over one of the oldest, least-churned corners of the runtime.</p>
   <table>
     <tr><th>API</th><th>Type</th></tr>
     <tr><td><code>Math.abs(n)</code></td><td>number → number</td></tr>
@@ -147,8 +136,7 @@
 
   <h4 id="collections">Collections</h4>
   <p class="stability-note stability-stable">Stability: 2 - Stable &mdash;
-  built on Zig's <code>std.AutoHashMap</code>/<code>std.ArrayHashMap</code>,
-  long-stable, widely used containers.</p>
+  built on long-stable, widely used container implementations.</p>
   <p class="sub">Typed, generic containers, no dynamic shapes.</p>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
@@ -160,9 +148,8 @@
   <h4 id="async">async · await</h4>
   <p class="stability-note stability-experimental">Stability: 1 - Experimental
   &mdash; the event loop runs on <a href="https://github.com/mitchellh/libxev">libxev</a>,
-  a pure-Zig dependency with no tagged releases yet (pinned by commit), on top
-  of Zig's own <code>std.Io</code> async primitives, which are themselves new
-  in 0.16 and still gaining backend coverage.</p>
+  which has no tagged releases yet (pinned by commit) and sits on async I/O
+  primitives that are still gaining backend coverage.</p>
   <p class="sub">Asynchronous code runs on a native event loop. The program
   drains pending callbacks and promises before it exits.</p>
   <table>
@@ -176,9 +163,9 @@
   <h4 id="ffi">C FFI</h4>
   <p class="stability-note stability-experimental">Stability: 1 - Experimental
   &mdash; the marshaling layer covers strings and scalars only (no structs,
-  callbacks, or arrays across the boundary yet); built on Zig's
-  <code>@cImport</code>/<code>extern</code>, which is mature, but Lumen's own
-  wrapper around it is the newest, least-exercised part of the stdlib.</p>
+  callbacks, or arrays across the boundary yet); built on mature C-interop
+  primitives, but Lumen's own wrapper around them is the newest,
+  least-exercised part of the stdlib.</p>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
     <tr><td><code>declare function name(args): T;</code></td><td>calls a C function directly (<code>extern function</code> also works)</td></tr>
@@ -188,8 +175,8 @@
 
   <h4 id="errors">Errors</h4>
   <p class="stability-note stability-stable">Stability: 2 - Stable &mdash;
-  lowers to Zig's native error-union/`catch` machinery, the language's own
-  primary error-handling mechanism.</p>
+  lowers to the runtime's native error-union/catch machinery, its primary
+  error-handling mechanism.</p>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
     <tr><td><code>Error("message")</code> · <code>throw e</code></td><td>throw an error value</td></tr>
@@ -199,20 +186,20 @@
   <h4 id="fs">fs</h4>
   <p class="stability-note stability-stable">Stability: 2 - Stable &mdash; the
   synchronous core (everything except the individually-marked functions
-  below) sits on Zig's <code>Io.Threaded</code> POSIX backend, wrapping
-  long-stable syscalls (<code>open</code>, <code>read</code>,
-  <code>stat</code>, ...) that predate the <code>std.Io</code> abstraction
-  itself.</p>
-  <p class="sub">The synchronous core, statically typed and Node-conventional. This
-  is a practical subset, not the full <a href="https://nodejs.org/docs/latest/api/fs.html">Node <code>fs</code> API</a>
-  (no streams, watchers, or async/promise variants yet; a Lumen "fd" is a plain
-  <code>int</code> index, not a raw OS handle) &mdash; see Planned below for what
-  is next.</p>
+  below) wraps long-stable POSIX syscalls (<code>open</code>,
+  <code>read</code>, <code>stat</code>, ...) that predate the runtime's newer
+  async I/O layer.</p>
+  <p class="sub">Mostly synchronous, statically typed and Node-conventional, plus
+  a small async trio (<code>readFile</code>/<code>writeFile</code>/<code>appendFile</code>).
+  This is a practical subset, not the full <a href="https://nodejs.org/docs/latest/api/fs.html">Node <code>fs</code> API</a>
+  (no streams or watchers yet; a Lumen "fd" is a plain <code>int</code> index,
+  not a raw OS handle) &mdash; see Planned below for what is next.</p>
 
   <div class="api-list">
     <a href="#fs-readFileSync">readFileSync</a>
     <a href="#fs-readFile">readFile</a>
     <a href="#fs-writeFile">writeFile</a>
+    <a href="#fs-appendFile">appendFile</a>
     <a href="#fs-writeFileSync">writeFileSync</a>
     <a href="#fs-appendFileSync">appendFileSync</a>
     <a href="#fs-existsSync">existsSync</a>
@@ -274,6 +261,18 @@ console.log(data);</code></pre>
     or truncates it first, same as the sync version.</p>
 <pre><code class="lumen">async function main(): Promise&lt;void&gt; {
   await fs.writeFile("notes.txt", "hello async world");
+  console.log("done");
+}</code></pre>
+  </div>
+
+  <div class="api" id="fs-appendFile">
+    <h5><code>fs.appendFile(path, data)</code> <span class="stability-pill stability-experimental" title="Same async runtime as fs.readFile.">Experimental</span></h5>
+    <p class="sub">(string, string) → <code>Promise&lt;void&gt;</code> &mdash;
+    the async counterpart to <code>fs.appendFileSync</code>; creates the file
+    if it does not exist yet.</p>
+<pre><code class="lumen">async function main(): Promise&lt;void&gt; {
+  await fs.appendFile("log.txt", "line one\n");
+  await fs.appendFile("log.txt", "line two\n");
   console.log("done");
 }</code></pre>
   </div>
@@ -465,7 +464,7 @@ fs.closeSync(fd);</code></pre>
     <h5><code>fs.fchownSync(fd, uid, gid)</code> <span class="stability-pill stability-experimental" title="New this milestone, not yet covered by the conformance suite -- manually smoke-tested only.">Experimental</span></h5>
     <p class="sub">(int, int, int) → void &mdash; pass <code>-1</code> for either id to leave
     it unchanged. The path-based <code>chownSync</code>/<code>lchownSync</code> are not
-    available yet (unimplemented in this Zig version's standard <code>Io</code> backend).</p>
+    available yet (unimplemented in the underlying runtime).</p>
 <pre><code class="lumen">const fd: int = fs.openSync("data.bin", "w");
 fs.fchownSync(fd, 1000, -1);  // change owner, leave group alone
 fs.closeSync(fd);</code></pre>
@@ -479,8 +478,8 @@ fs.closeSync(fd);</code></pre>
 
   <div class="api" id="fs-fdatasyncSync">
     <h5><code>fs.fdatasyncSync(fd)</code> <span class="stability-pill stability-experimental" title="New this milestone, not yet covered by the conformance suite -- manually smoke-tested only.">Experimental</span></h5>
-    <p class="sub">int → void &mdash; aliases <code>fsyncSync</code> (Zig does not expose a
-    data-only sync separately from a full sync).</p>
+    <p class="sub">int → void &mdash; aliases <code>fsyncSync</code> (no
+    data-only sync separate from a full sync is exposed here).</p>
 <pre><code class="lumen">fs.fdatasyncSync(fd);</code></pre>
   </div>
 
@@ -524,11 +523,8 @@ for (const n of names) {
 
   <h4 id="path">path</h4>
   <p class="stability-note stability-stable">Stability: 2 - Stable &mdash; pure
-  string manipulation built on Zig's <code>std.fs.path</code>, one of the
-  oldest, least-churned corners of the standard library (predates
-  <code>std.Io</code> entirely; no syscalls of its own). Newly added to
-  Lumen, but resting on the most stable Zig primitive of any stdlib
-  namespace here.</p>
+  string manipulation, no filesystem calls of its own. Newly added to Lumen,
+  but resting on one of the oldest, least-churned corners of the runtime.</p>
   <p class="sub">No filesystem access, just string logic. A practical subset of
   <a href="https://nodejs.org/docs/latest/api/path.html">Node's <code>path</code>
   API</a> &mdash; POSIX only (no <code>path.win32</code>), and
@@ -593,7 +589,7 @@ console.log(path.basename("/foo/bar/baz.html", ".html")); // baz</code></pre>
   </div>
 
   <div class="api" id="path-resolve">
-    <h5><code>path.resolve(...paths)</code> <span class="stability-pill stability-experimental" title="Zig's std.fs.path.resolve does not anchor a fully-relative input to the real working directory (no working Io.Dir.realpath in this Zig version to supply one) -- it only resolves '.'/'..' across the given segments left to right.">Experimental</span></h5>
+    <h5><code>path.resolve(...paths)</code> <span class="stability-pill stability-experimental" title="Does not anchor a fully-relative input to the real working directory yet -- it only resolves '.'/'..' across the given segments left to right.">Experimental</span></h5>
     <p class="sub">(string, string, ...) → string &mdash; 1 to 6 arguments;
     "cd"-chains left to right, an absolute segment resets the result.
     <strong>Deviation from Node</strong>: if no argument is absolute, Node
@@ -640,10 +636,10 @@ console.log(p.name);  // file</code></pre>
 
   <h4 id="process">process</h4>
   <p class="stability-note stability-stable">Stability: 2 - Stable &mdash;
-  <code>cwd</code>/<code>chdir</code> go through the same <code>Io</code>-
-  abstracted primitives as <code>fs</code> (not the libc-only gap that blocks
+  <code>cwd</code>/<code>chdir</code> go through the same primitives as
+  <code>fs</code> (not the libc-only gap that blocks
   <code>fs.realpathSync</code>); <code>env</code> and <code>argv()</code>
-  reuse the entry-captured state Zig's own program startup already collects;
+  reuse state the program's own startup already collects;
   <code>platform</code>/<code>arch</code> are compile-time constants;
   <code>pid()</code> is a raw Linux syscall. No libc linking required for any
   of it.</p>
@@ -894,10 +890,10 @@ console.log(loads[0]);</code></pre>
   <h4>fs</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
-    <tr><td><code>fs.realpathSync(path)</code></td><td>only a raw libc binding exists in this Zig version, not wrapped by std.Io</td></tr>
-    <tr><td><code>fs.chownSync(path, uid, gid)</code> · <code>fs.lchownSync(path, uid, gid)</code></td><td>unimplemented in this Zig version's standard <code>Io</code> backend (the fd-based <code>fchownSync</code> works and shipped)</td></tr>
-    <tr><td><code>fs.readvSync</code> / <code>writevSync</code> · append-mode <code>openSync</code></td><td>readv/writev need an array of buffers; append mode needs a seek primitive not in this Zig version</td></tr>
-    <tr><td><code>fs.promises.*</code> / watch / streams / most async callback variants</td><td><code>fs.readFile</code> and <code>fs.writeFile</code> are wired to the event loop; the rest is a follow-up</td></tr>
+    <tr><td><code>fs.realpathSync(path)</code></td><td>only a raw libc binding exists, not wrapped by the runtime's I/O layer</td></tr>
+    <tr><td><code>fs.chownSync(path, uid, gid)</code> · <code>fs.lchownSync(path, uid, gid)</code></td><td>unimplemented in the underlying runtime (the fd-based <code>fchownSync</code> works and shipped)</td></tr>
+    <tr><td><code>fs.readvSync</code> / <code>writevSync</code> · append-mode <code>openSync</code></td><td>readv/writev need an array of buffers; append mode needs a seek primitive not available here</td></tr>
+    <tr><td><code>fs.promises.*</code> / watch / streams / most async callback variants</td><td><code>fs.readFile</code>, <code>fs.writeFile</code>, and <code>fs.appendFile</code> are wired to the event loop; the rest needs lower-level async ops the runtime doesn't expose yet</td></tr>
     <tr><td><code>fs.opendirSync(path)</code> · <code>fs.globSync(pattern)</code></td><td>need a directory-iterator class / a real glob algorithm</td></tr>
   </table>
 
@@ -925,7 +921,7 @@ console.log(loads[0]);</code></pre>
     <tr><td><code>os.cpus()</code></td><td>needs a record array parsed from /proc/cpuinfo and /proc/stat; no single-syscall shortcut</td></tr>
     <tr><td><code>os.networkInterfaces()</code></td><td>needs interface enumeration (a getifaddrs equivalent)</td></tr>
     <tr><td><code>os.userInfo()</code></td><td>needs a passwd-database lookup, the same libc gap as <code>homedir()</code>'s Node fallback</td></tr>
-    <tr><td><code>os.getPriority()</code> · <code>os.setPriority()</code></td><td>no wrapped Zig primitive in this version; would need a raw syscall number</td></tr>
+    <tr><td><code>os.getPriority()</code> · <code>os.setPriority()</code></td><td>no wrapped primitive available; would need a raw syscall number</td></tr>
     <tr><td><code>os.constants</code></td><td>low value without the functions that consume it</td></tr>
   </table>
 

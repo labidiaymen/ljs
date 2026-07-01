@@ -393,6 +393,7 @@ pub const Program = struct {
     needs_fd_api: bool = false,
     needs_async_read_file: bool = false,
     needs_async_write_file: bool = false,
+    needs_async_append_file: bool = false,
     needs_lstat_sync: bool = false,
     needs_fstat_sync: bool = false,
     needs_fchmod_sync: bool = false,
