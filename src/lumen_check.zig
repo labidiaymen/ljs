@@ -94,6 +94,7 @@ pub const Checker = struct {
     pub const osCallType = check_stdlib.osCallType;
     pub const cryptoCallType = check_stdlib.cryptoCallType;
     pub const urlCallType = check_stdlib.urlCallType;
+    pub const childProcessCallType = check_stdlib.childProcessCallType;
     pub const promiseCallType = check_stdlib.promiseCallType;
     pub const mathCallType = check_stdlib.mathCallType;
     pub const stringCallType = check_stdlib.stringCallType;

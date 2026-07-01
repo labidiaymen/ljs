@@ -1068,6 +1068,40 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_child_process_api) {
+        // child_process.spawnSync (spec 037): stdout and stderr are read to
+        // completion sequentially, then wait() -- a command that writes more
+        // than one pipe buffer (~64KB on Linux) to stderr while this is still
+        // blocked reading stdout could deadlock. Documented, accepted v1
+        // trade-off: real commands' stderr output is typically small.
+        try out.appendSlice(arena,
+            \\pub const __LumenSpawnResult = struct { stdout: []const u8, stderr: []const u8, status: i32 };
+            \\fn __spawnSync(io: std.Io, alloc: std.mem.Allocator, command: []const u8, args: []const []const u8) __LumenSpawnResult {
+            \\    const argv = alloc.alloc([]const u8, 1 + args.len) catch return .{ .stdout = "", .stderr = "", .status = -1 };
+            \\    argv[0] = command;
+            \\    for (args, 0..) |a, i| argv[i + 1] = a;
+            \\    var child = std.process.spawn(io, .{
+            \\        .argv = argv,
+            \\        .stdin = .ignore,
+            \\        .stdout = .pipe,
+            \\        .stderr = .pipe,
+            \\    }) catch return .{ .stdout = "", .stderr = "", .status = -1 };
+            \\    var out_buf: [4096]u8 = undefined;
+            \\    var out_reader = child.stdout.?.reader(io, &out_buf);
+            \\    const stdout_data = out_reader.interface.allocRemaining(alloc, .limited(16 * 1024 * 1024)) catch &.{};
+            \\    var err_buf: [4096]u8 = undefined;
+            \\    var err_reader = child.stderr.?.reader(io, &err_buf);
+            \\    const stderr_data = err_reader.interface.allocRemaining(alloc, .limited(16 * 1024 * 1024)) catch &.{};
+            \\    const term = child.wait(io) catch return .{ .stdout = stdout_data, .stderr = stderr_data, .status = -1 };
+            \\    const status: i32 = switch (term) {
+            \\        .exited => |code| code,
+            \\        else => -1,
+            \\    };
+            \\    return .{ .stdout = stdout_data, .stderr = stderr_data, .status = status };
+            \\}
+            \\
+        );
+    }
     if (program.needs_process_api) {
         // cwd/chdir/env go through Io-abstracted (cwd/chdir) or entry-captured
         // (env, same mechanism as __args) primitives -- none of these need

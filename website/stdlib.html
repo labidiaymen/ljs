@@ -80,6 +80,7 @@
     <a href="#os">os</a>
     <a href="#crypto">crypto</a>
     <a href="#url">url</a>
+    <a href="#child_process">child_process</a>
     <p class="docs-nav-title">Planned</p>
     <a href="#planned">Roadmap</a>
     <p class="docs-nav-title">Packages</p>
@@ -979,6 +980,35 @@ console.log(u.hash);     // #b</code></pre>
 console.log(url.format(u)); // https://example.com/foo?a=1</code></pre>
   </div>
 
+  <h4 id="child_process">child_process</h4>
+  <p class="stability-note stability-experimental">Experimental &mdash; new
+  this milestone, not yet covered by the conformance suite; manually
+  smoke-tested only (real stdout, a non-zero exit, stderr output, and a
+  nonexistent command).</p>
+  <p class="sub">A first, sync-only slice of
+  <a href="https://nodejs.org/docs/latest/api/child_process.html">Node's
+  <code>child_process</code> module</a>: the biggest capability gap in the
+  stdlib closed so far, since Lumen programs previously couldn't invoke
+  another program at all.</p>
+
+  <div class="api-list">
+    <a href="#child_process-spawnSync">spawnSync</a>
+  </div>
+
+  <div class="api" id="child_process-spawnSync">
+    <h5><code>child_process.spawnSync(command, args)</code> <span class="target-pill target-wasm-limited" title="Compiles under --wasm and runs without crashing, but every call fails at the spawn step there: WASI has no process-spawning capability at all, so status is always -1 on that target.">Wasm: limited</span></h5>
+    <p class="sub">(string, string[]) → <code>{ stdout, stderr, status }</code>
+    &mdash; runs <code>command</code> with <code>args</code> (no shell
+    involved, matching Node's real <code>spawnSync</code>, not
+    <code>execSync</code>'s shell-string form -- safer by default, no
+    shell-quoting needed), waits for it to exit. <code>status</code> is
+    <code>-1</code> if the command could not even be spawned (e.g. not
+    found).</p>
+<pre><code class="lumen">const r = child_process.spawnSync("echo", ["hello", "world"]);
+console.log(r.stdout); // hello world
+console.log(r.status); // 0</code></pre>
+  </div>
+
   <h3 id="planned">Planned</h3>
   <p class="sub">The surface grows in explicit, conformance-backed slices. These
   modules use the same conventional names; some depend on upcoming language
@@ -1038,6 +1068,15 @@ console.log(url.format(u)); // https://example.com/foo?a=1</code></pre>
     <tr><td><code>querystring.parse()</code>/<code>stringify()</code> · <code>URLSearchParams</code></td><td>needs a growable-array or <code>Map</code>-construction path from a builtin, neither exists yet</td></tr>
     <tr><td><code>username</code>/<code>password</code>/<code>auth</code> fields</td><td>niche; straightforward to add later</td></tr>
     <tr><td>relative-to-base URL resolution (<code>new URL(relative, base)</code>)</td><td>a separate feature from parsing one string</td></tr>
+  </table>
+
+  <h4>child_process</h4>
+  <table>
+    <tr><th>API</th><th>Notes</th></tr>
+    <tr><td><code>exec</code>/<code>execSync</code> (shell-string form)</td><td>needs shell-quoting/escaping logic to be safe; <code>spawnSync</code>'s array-of-args form sidesteps this for v1</td></tr>
+    <tr><td><code>spawn</code> (async, streaming stdio)</td><td>needs the same event-loop integration the async <code>fs</code> trio got, plus a design for streaming stdio</td></tr>
+    <tr><td><code>cwd</code>/<code>env</code>/<code>timeout</code> options</td><td>the underlying primitive already supports these; just not exposed as <code>spawnSync</code> parameters yet</td></tr>
+    <tr><td>stdin piping · signal-based exit status</td><td><code>spawnSync</code>'s one-shot model doesn't need stdin; no optional-string-or-int union exists yet to represent a signal-based exit</td></tr>
   </table>
 
   <h4>Math · Array (more)</h4>

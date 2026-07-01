@@ -351,6 +351,7 @@ pub fn staticCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCa
     if (std.mem.eql(u8, call.namespace, "os")) return self.osCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "crypto")) return self.cryptoCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "url")) return self.urlCallType(program, call, line, col);
+    if (std.mem.eql(u8, call.namespace, "child_process")) return self.childProcessCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "Promise")) return self.promiseCallType(program, call, line, col);
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
@@ -1384,6 +1385,41 @@ fn registerLumenUrlParts(self: *Checker) ?void {
         fields[5] = .{ .name = "hash", .annotation = "string", .checked_type = .string };
         fields[6] = .{ .name = "href", .annotation = "string", .checked_type = .string };
         self.type_decls.put(self.arena, "__LumenUrlParts", .{ .fields = fields }) catch return null;
+    }
+}
+
+pub fn childProcessCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
+    if (std.mem.eql(u8, call.name, "spawnSync")) {
+        if (call.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const cmd_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const args_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        if (!types.same(.string, cmd_type) or !types.same(.string_array, args_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        registerLumenSpawnResult(self) orelse return null;
+        program.uses_io = true;
+        program.needs_child_process_api = true;
+        call.checked_type = .{ .named = "__LumenSpawnResult" };
+        return .{ .named = "__LumenSpawnResult" };
+    }
+    _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+    return null;
+}
+
+// Lazily registers the synthetic `__LumenSpawnResult` record type returned by
+// `child_process.spawnSync`, following the exact pattern
+// `registerLumenPathParts`/`registerLumenUrlParts` introduced.
+fn registerLumenSpawnResult(self: *Checker) ?void {
+    if (self.type_decls.get("__LumenSpawnResult") == null) {
+        const fields = self.arena.alloc(ast.TypeField, 3) catch return null;
+        fields[0] = .{ .name = "stdout", .annotation = "string", .checked_type = .string };
+        fields[1] = .{ .name = "stderr", .annotation = "string", .checked_type = .string };
+        fields[2] = .{ .name = "status", .annotation = "int", .checked_type = .i32 };
+        self.type_decls.put(self.arena, "__LumenSpawnResult", .{ .fields = fields }) catch return null;
     }
 }
 
