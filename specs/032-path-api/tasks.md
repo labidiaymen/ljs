@@ -35,7 +35,7 @@
 - [x] T14 Updated `website/stdlib.html`: new `path` quick-jump list + per
   function blocks (mirroring the `fs` section); moved `path.*` out of the
   Planned table (`relative`/`matchesGlob`/win32 variants remain, correctly).
-- [ ] T15 Commit, push, redeploy `lumen-playground`.
+- [x] T15 Commit, push. Redeploy `lumen-playground`: in progress.
 
 ## Phase 2 / deferred (tracked, not scheduled)
 

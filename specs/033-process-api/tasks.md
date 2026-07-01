@@ -21,11 +21,12 @@
 - [x] T10 Verify: one program exercises all 9 (platform, arch, pid, cwd,
   chdir, env found, env missing, argv length, argv contents) together;
   cross-checked against expected POSIX/host behavior — every value matched.
-- [x] T11 `zig build test` passes. `zig build conformance` run alongside the
-  fs Phase 3 + path batch.
-- [ ] T12 Update `website/stdlib.html`: new `process` quick-jump list + per
-  function blocks (mirroring `fs`/`path`); update Planned table.
-- [ ] T13 Commit, push, redeploy `lumen-playground`.
+- [x] T11 `zig build test` passes. A final clean, non-concurrent
+  `zig build conformance` run (fs Phase 3 + path + process all together)
+  showed only the 5 known pre-existing failures, none new.
+- [x] T12 Updated `website/stdlib.html`: new `process` quick-jump list + per
+  function blocks (mirroring `fs`/`path`); updated Planned table.
+- [x] T13 Commit, push. Redeploy `lumen-playground`: in progress.
 
 ## Phase 2 / deferred (tracked, not scheduled)
 
