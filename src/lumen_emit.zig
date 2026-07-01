@@ -561,6 +561,14 @@ pub fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
                 try w.appendSlice(arena, "__pathFormat(__alloc, ");
                 try emitExpr(cl.args[0], w, arena);
                 try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "url") and std.mem.eql(u8, cl.name, "parse")) {
+                try w.appendSlice(arena, "__urlParse(__alloc, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "url") and std.mem.eql(u8, cl.name, "format")) {
+                try w.appendSlice(arena, "__urlFormat(__alloc, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
             } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "sep")) {
                 try w.appendSlice(arena, "@as([]const u8, \"/\")");
             } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "delimiter")) {

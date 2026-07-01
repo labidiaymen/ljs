@@ -79,6 +79,7 @@
     <a href="#process">process</a>
     <a href="#os">os</a>
     <a href="#crypto">crypto</a>
+    <a href="#url">url</a>
     <p class="docs-nav-title">Planned</p>
     <a href="#planned">Roadmap</a>
     <p class="docs-nav-title">Packages</p>
@@ -935,6 +936,49 @@ console.log(token.length); // 32</code></pre>
 // 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824</code></pre>
   </div>
 
+  <h4 id="url">url</h4>
+  <p class="stability-note stability-stable">Stable &mdash; pure string
+  parsing (the same underlying URI parser used elsewhere for HTTP requests),
+  no syscalls, works identically on the native and WebAssembly targets.</p>
+  <p class="sub">A practical subset of
+  <a href="https://nodejs.org/docs/latest/api/url.html">Node's <code>url</code>
+  module</a>: the older, function-based <code>url.parse()</code>/
+  <code>format()</code> API, not the class-based <code>URL</code> object.
+  <code>protocol</code> keeps its trailing colon, <code>search</code>/
+  <code>hash</code> keep their leading <code>?</code>/<code>#</code>, matching
+  WHATWG conventions; unlike <code>path.parse</code>/<code>format</code>,
+  parsing a malformed URL doesn't error, it falls back to an empty record
+  (<code>pathname</code> stays <code>"/"</code>, <code>href</code> always
+  keeps the original input verbatim).</p>
+
+  <div class="api-list">
+    <a href="#url-parse">parse</a>
+    <a href="#url-format">format</a>
+  </div>
+
+  <div class="api" id="url-parse">
+    <h5><code>url.parse(str)</code></h5>
+    <p class="sub">string → <code>{ protocol, hostname, port, pathname, search, hash, href }</code>
+    &mdash; the second record-returning builtin family after
+    <code>path.parse</code>, same pattern: a synthetic record type, all
+    fields plain (non-optional) strings.</p>
+<pre><code class="lumen">const u = url.parse("https://example.com:8080/foo?a=1#b");
+console.log(u.hostname); // example.com
+console.log(u.port);     // 8080
+console.log(u.pathname); // /foo
+console.log(u.search);   // ?a=1
+console.log(u.hash);     // #b</code></pre>
+  </div>
+
+  <div class="api" id="url-format">
+    <h5><code>url.format(parts)</code></h5>
+    <p class="sub"><code>{ protocol, hostname, port, pathname, search, hash, href }</code> → string
+    &mdash; reconstructs a URL string from the record; round-trips with
+    <code>parse</code>.</p>
+<pre><code class="lumen">const u = url.parse("https://example.com/foo?a=1");
+console.log(url.format(u)); // https://example.com/foo?a=1</code></pre>
+  </div>
+
   <h3 id="planned">Planned</h3>
   <p class="sub">The surface grows in explicit, conformance-backed slices. These
   modules use the same conventional names; some depend on upcoming language
@@ -985,6 +1029,15 @@ console.log(token.length); // 32</code></pre>
     <tr><td><code>crypto.createHmac()</code> · <code>crypto.sign()</code>/<code>verify()</code></td><td>asymmetric/keyed crypto, a much larger surface than this milestone's scope</td></tr>
     <tr><td><code>crypto.pbkdf2()</code> · <code>crypto.scrypt()</code></td><td>deliberately deferred rather than rushed; picking the right default cost parameters deserves its own pass</td></tr>
     <tr><td><code>md5</code>/<code>sha1</code> as named functions</td><td>available from the same source as <code>sha256</code> if needed later</td></tr>
+  </table>
+
+  <h4>url</h4>
+  <table>
+    <tr><th>API</th><th>Notes</th></tr>
+    <tr><td>a real <code>URL</code> class / <code>.searchParams</code> / <code>.toString()</code></td><td>Node's modern API is class-based; the older function-based <code>parse</code>/<code>format</code> fit the static-function stdlib pattern better for v1</td></tr>
+    <tr><td><code>querystring.parse()</code>/<code>stringify()</code> · <code>URLSearchParams</code></td><td>needs a growable-array or <code>Map</code>-construction path from a builtin, neither exists yet</td></tr>
+    <tr><td><code>username</code>/<code>password</code>/<code>auth</code> fields</td><td>niche; straightforward to add later</td></tr>
+    <tr><td>relative-to-base URL resolution (<code>new URL(relative, base)</code>)</td><td>a separate feature from parsing one string</td></tr>
   </table>
 
   <h4>Math · Array (more)</h4>

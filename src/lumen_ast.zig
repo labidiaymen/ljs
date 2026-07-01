@@ -408,6 +408,7 @@ pub const Program = struct {
     needs_process_api: bool = false,
     needs_os_api: bool = false,
     needs_crypto_api: bool = false,
+    needs_url_api: bool = false,
     needs_rmdir_sync: bool = false,
     needs_rm_sync: bool = false,
     needs_truncate_sync: bool = false,

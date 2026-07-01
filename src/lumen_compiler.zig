@@ -1031,6 +1031,43 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_url_api) {
+        // url.* (spec 036): the runtime's own URI type (the same one used
+        // elsewhere for HTTP requests) does the real parsing; this just walks
+        // its already-decoded component fields into a plain record. Pure
+        // string work otherwise, same as path -- no syscalls, works
+        // identically on the native and wasm targets.
+        try out.appendSlice(arena,
+            \\pub const __LumenUrlParts = struct { protocol: []const u8, hostname: []const u8, port: []const u8, pathname: []const u8, search: []const u8, hash: []const u8, href: []const u8 };
+            \\fn __urlParse(alloc: std.mem.Allocator, str: []const u8) __LumenUrlParts {
+            \\    const href = alloc.dupe(u8, str) catch str;
+            \\    const parsed = std.Uri.parse(str) catch return .{
+            \\        .protocol = "", .hostname = "", .port = "", .pathname = "/", .search = "", .hash = "", .href = href,
+            \\    };
+            \\    const protocol = std.fmt.allocPrint(alloc, "{s}:", .{parsed.scheme}) catch "";
+            \\    const hostname = if (parsed.host) |h| (h.toRawMaybeAlloc(alloc) catch "") else "";
+            \\    const port = if (parsed.port) |p| (std.fmt.allocPrint(alloc, "{d}", .{p}) catch "") else "";
+            \\    const raw_path = parsed.path.toRawMaybeAlloc(alloc) catch "/";
+            \\    const pathname = if (raw_path.len == 0) "/" else raw_path;
+            \\    const search = if (parsed.query) |q| (std.fmt.allocPrint(alloc, "?{s}", .{q.toRawMaybeAlloc(alloc) catch ""}) catch "") else "";
+            \\    const hash = if (parsed.fragment) |f| (std.fmt.allocPrint(alloc, "#{s}", .{f.toRawMaybeAlloc(alloc) catch ""}) catch "") else "";
+            \\    return .{
+            \\        .protocol = protocol,
+            \\        .hostname = hostname,
+            \\        .port = port,
+            \\        .pathname = pathname,
+            \\        .search = search,
+            \\        .hash = hash,
+            \\        .href = href,
+            \\    };
+            \\}
+            \\fn __urlFormat(alloc: std.mem.Allocator, parts: __LumenUrlParts) []const u8 {
+            \\    const host_port = if (parts.port.len > 0) (std.fmt.allocPrint(alloc, "{s}:{s}", .{ parts.hostname, parts.port }) catch parts.hostname) else parts.hostname;
+            \\    return std.fmt.allocPrint(alloc, "{s}//{s}{s}{s}{s}", .{ parts.protocol, host_port, parts.pathname, parts.search, parts.hash }) catch "";
+            \\}
+            \\
+        );
+    }
     if (program.needs_process_api) {
         // cwd/chdir/env go through Io-abstracted (cwd/chdir) or entry-captured
         // (env, same mechanism as __args) primitives -- none of these need

@@ -350,6 +350,7 @@ pub fn staticCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCa
     if (std.mem.eql(u8, call.namespace, "process")) return self.processCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "os")) return self.osCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "crypto")) return self.cryptoCallType(program, call, line, col);
+    if (std.mem.eql(u8, call.namespace, "url")) return self.urlCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "Promise")) return self.promiseCallType(program, call, line, col);
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
@@ -1329,6 +1330,61 @@ pub fn cryptoCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCa
     }
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
+}
+
+pub fn urlCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
+    if (std.mem.eql(u8, call.name, "parse")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const t = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, t)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        registerLumenUrlParts(self) orelse return null;
+        program.uses_io = true;
+        program.needs_url_api = true;
+        call.checked_type = .{ .named = "__LumenUrlParts" };
+        return .{ .named = "__LumenUrlParts" };
+    }
+    if (std.mem.eql(u8, call.name, "format")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        registerLumenUrlParts(self) orelse return null;
+        self.ensureAssignable(program, .{ .named = "__LumenUrlParts" }, call.args[0], line, col) catch {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        };
+        program.uses_io = true;
+        program.needs_url_api = true;
+        call.checked_type = .string;
+        return .string;
+    }
+    _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+    return null;
+}
+
+// Lazily registers the synthetic `__LumenUrlParts` record type (shared by
+// `url.parse`'s return value and `url.format`'s parameter), following the
+// exact pattern `registerLumenPathParts` introduced for `path.parse`. All
+// seven fields are plain (non-optional) strings, same simplification as
+// path's record.
+fn registerLumenUrlParts(self: *Checker) ?void {
+    if (self.type_decls.get("__LumenUrlParts") == null) {
+        const fields = self.arena.alloc(ast.TypeField, 7) catch return null;
+        fields[0] = .{ .name = "protocol", .annotation = "string", .checked_type = .string };
+        fields[1] = .{ .name = "hostname", .annotation = "string", .checked_type = .string };
+        fields[2] = .{ .name = "port", .annotation = "string", .checked_type = .string };
+        fields[3] = .{ .name = "pathname", .annotation = "string", .checked_type = .string };
+        fields[4] = .{ .name = "search", .annotation = "string", .checked_type = .string };
+        fields[5] = .{ .name = "hash", .annotation = "string", .checked_type = .string };
+        fields[6] = .{ .name = "href", .annotation = "string", .checked_type = .string };
+        self.type_decls.put(self.arena, "__LumenUrlParts", .{ .fields = fields }) catch return null;
+    }
 }
 
 pub fn promiseCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
