@@ -352,6 +352,8 @@ pub fn staticCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCa
     if (std.mem.eql(u8, call.namespace, "crypto")) return self.cryptoCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "url")) return self.urlCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "child_process")) return self.childProcessCallType(program, call, line, col);
+    if (std.mem.eql(u8, call.namespace, "assert")) return self.assertCallType(program, call, line, col);
+    if (std.mem.eql(u8, call.namespace, "time")) return self.timeCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "Promise")) return self.promiseCallType(program, call, line, col);
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
@@ -1423,6 +1425,64 @@ fn registerLumenSpawnResult(self: *Checker) ?void {
     }
 }
 
+// `assert.*`: wraps the language's own panic mechanism rather than the
+// throw/catch machinery, since a static call has no access to an enclosing
+// try's throw target. A failed assertion crashes the program (uncatchable),
+// the same idiom as C's assert() or an uncaught Node AssertionError.
+pub fn assertCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
+    if (std.mem.eql(u8, call.name, "ok")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const cond_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.bool, cond_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.needs_assert = true;
+        call.checked_type = .void;
+        return .void;
+    }
+    if (std.mem.eql(u8, call.name, "equal")) {
+        if (call.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const a_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const b_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        if (!types.same(a_type, b_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        // Strings compare by bytes, not slice identity -- same routing
+        // trick `expect(...).toBe(...)` uses for `__expectStrEqual`.
+        if (types.same(.string, a_type)) {
+            call.name = "__assertStrEqual";
+        }
+        program.needs_assert = true;
+        call.checked_type = .void;
+        return .void;
+    }
+    _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+    return null;
+}
+
+pub fn timeCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
+    if (std.mem.eql(u8, call.name, "now") or std.mem.eql(u8, call.name, "monotonic")) {
+        if (call.args.len != 0) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_time_api = true;
+        call.checked_type = .i64;
+        return .i64;
+    }
+    _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+    return null;
+}
+
 pub fn promiseCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
     // `Promise.resolve(v)` -> an already-resolved `Promise<typeof v>`.
     if (std.mem.eql(u8, call.name, "resolve")) {
@@ -1490,6 +1550,68 @@ pub fn mathCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall
         call.checked_arg_type = value_type;
         call.checked_type = value_type;
         return value_type;
+    }
+    // floor/ceil/round/trunc always produce a whole number -- return int,
+    // same reasoning as `sign` (the value is inherently integral).
+    if (std.mem.eql(u8, call.name, "floor") or std.mem.eql(u8, call.name, "ceil") or std.mem.eql(u8, call.name, "round") or std.mem.eql(u8, call.name, "trunc")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const arg_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.isNumeric(arg_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        call.checked_arg_type = arg_type;
+        call.checked_type = .i32;
+        return .i32;
+    }
+    // pow/log/sin/cos always return `number` -- like `sqrt`, the result can
+    // be fractional even from integer inputs.
+    if (std.mem.eql(u8, call.name, "pow")) {
+        if (call.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const base_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const exp_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        // Same-type requirement as max/min: simpler than tracking two
+        // independent arg types just to decide each one's int-to-f64
+        // conversion, and Node's Math.pow doesn't distinguish int vs float
+        // arguments anyway (there's only "number").
+        if (!types.isNumeric(base_type) or !types.same(base_type, exp_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        call.checked_arg_type = base_type;
+        call.checked_type = .f64;
+        return .f64;
+    }
+    if (std.mem.eql(u8, call.name, "log") or std.mem.eql(u8, call.name, "sin") or std.mem.eql(u8, call.name, "cos")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const arg_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.isNumeric(arg_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        call.checked_arg_type = arg_type;
+        call.checked_type = .f64;
+        return .f64;
+    }
+    // Math.PI() -- a zero-arg function, not a property, the same deviation
+    // as path.sep()/process.platform() (no static-namespace constant-
+    // property mechanism yet).
+    if (std.mem.eql(u8, call.name, "PI")) {
+        if (call.args.len != 0) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        call.checked_type = .f64;
+        return .f64;
     }
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;

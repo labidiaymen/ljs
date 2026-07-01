@@ -81,6 +81,8 @@
     <a href="#crypto">crypto</a>
     <a href="#url">url</a>
     <a href="#child_process">child_process</a>
+    <a href="#assert">assert</a>
+    <a href="#time">time</a>
     <p class="docs-nav-title">Planned</p>
     <a href="#planned">Roadmap</a>
     <p class="docs-nav-title">Packages</p>
@@ -108,6 +110,10 @@
     <tr><td><code>Math.sign(n)</code></td><td>number → int</td></tr>
     <tr><td><code>Math.clamp(n, lo, hi)</code></td><td>(number, number, number) → number</td></tr>
     <tr><td><code>Math.sqrt(n)</code></td><td>number → number</td></tr>
+    <tr><td><code>Math.floor(n)</code> · <code>Math.ceil(n)</code> · <code>Math.round(n)</code> · <code>Math.trunc(n)</code></td><td>number → int</td></tr>
+    <tr><td><code>Math.pow(base, exp)</code></td><td>(number, number) → number</td></tr>
+    <tr><td><code>Math.log(n)</code> · <code>Math.sin(n)</code> · <code>Math.cos(n)</code></td><td>number → number</td></tr>
+    <tr><td><code>Math.PI()</code></td><td>() → number</td></tr>
   </table>
 
   <h4 id="strings">String methods</h4>
@@ -1012,6 +1018,73 @@ console.log(r.stdout); // hello world
 console.log(r.status); // 0</code></pre>
   </div>
 
+  <h4 id="assert">assert</h4>
+  <p class="stability-note stability-stable">Stable &mdash; wraps the
+  language's own panic mechanism, works identically on native and
+  WebAssembly.</p>
+  <p class="sub">A minimal, practical subset of
+  <a href="https://nodejs.org/docs/latest/api/assert.html">Node's
+  <code>assert</code> module</a>. A failed assertion crashes the program
+  (uncatchable), the same idiom as C's <code>assert()</code> or an
+  uncaught Node <code>AssertionError</code> &mdash; not integrated with
+  <code>try</code>/<code>catch</code>.</p>
+
+  <div class="api-list">
+    <a href="#assert-ok">ok</a>
+    <a href="#assert-equal">equal</a>
+  </div>
+
+  <div class="api" id="assert-ok">
+    <h5><code>assert.ok(cond)</code></h5>
+    <p class="sub">bool → void &mdash; panics if <code>cond</code> is false.</p>
+<pre><code class="lumen">assert.ok(2 + 2 == 4);
+console.log("still running");</code></pre>
+  </div>
+
+  <div class="api" id="assert-equal">
+    <h5><code>assert.equal(a, b)</code></h5>
+    <p class="sub">(T, T) → void &mdash; panics with both values shown if
+    they are not equal. Strings compare by bytes.</p>
+<pre><code class="lumen">assert.equal(2 + 2, 4);
+assert.equal("hello", "hello");
+console.log("still running");</code></pre>
+  </div>
+
+  <h4 id="time">time</h4>
+  <p class="stability-note stability-stable">Stable &mdash; one clock read
+  each, the same primitive already used elsewhere in the compiler; pure
+  computation, works identically on native and WebAssembly.</p>
+  <p class="sub">Millisecond timestamps as <code>i64</code>, not
+  <code>int</code>: real epoch milliseconds hugely exceeds a 32-bit range,
+  so this returns the wider type rather than a truncated, effectively
+  meaningless value. Note that <code>i64</code> values can't be compared or
+  used in arithmetic directly against an int literal yet -- keep both sides
+  of a comparison as <code>i64</code>.</p>
+
+  <div class="api-list">
+    <a href="#time-now">now</a>
+    <a href="#time-monotonic">monotonic</a>
+  </div>
+
+  <div class="api" id="time-now">
+    <h5><code>time.now()</code></h5>
+    <p class="sub">→ i64 &mdash; milliseconds since the Unix epoch
+    (wall-clock/real time).</p>
+<pre><code class="lumen">const n: i64 = time.now();
+console.log(n);</code></pre>
+  </div>
+
+  <div class="api" id="time-monotonic">
+    <h5><code>time.monotonic()</code></h5>
+    <p class="sub">→ i64 &mdash; milliseconds from an arbitrary, consistent
+    starting point; never goes backwards, safe for measuring elapsed
+    durations, unaffected by the system clock being changed.</p>
+<pre><code class="lumen">const start: i64 = time.monotonic();
+// ... do work ...
+const elapsed: i64 = time.monotonic() - start;
+console.log(elapsed);</code></pre>
+  </div>
+
   <h3 id="planned">Planned</h3>
   <p class="sub">The surface grows in explicit, conformance-backed slices. These
   modules use the same conventional names; some depend on upcoming language
@@ -1082,19 +1155,16 @@ console.log(r.status); // 0</code></pre>
     <tr><td>stdin piping · signal-based exit status</td><td><code>spawnSync</code>'s one-shot model doesn't need stdin; no optional-string-or-int union exists yet to represent a signal-based exit</td></tr>
   </table>
 
-  <h4>Math · Array (more)</h4>
+  <h4>Array (more)</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
-    <tr><td><code>Math.floor/ceil/round/trunc/pow/log/sin/cos</code> · <code>Math.PI</code></td><td></td></tr>
     <tr><td><code>a.push/pop/sort</code></td><td>needs growable arrays</td></tr>
   </table>
 
-  <h4>time · crypto · http</h4>
+  <h4>http</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
-    <tr><td><code>time.now()</code> · <code>time.monotonic()</code></td><td>milliseconds</td></tr>
-    <tr><td><code>crypto.sha256(data)</code> · <code>crypto.sha1(data)</code></td><td>→ hex string</td></tr>
-    <tr><td><code>http.get(url)</code> → <code>{ status, body }</code></td><td>record return; async on the event loop</td></tr>
+    <tr><td><code>http.get(url)</code> → <code>{ status, body }</code></td><td>a global <code>httpGet(url)</code> exists today returning just a status code; completing it to a full record with the response body is a natural next step</td></tr>
   </table>
 
   <h3 id="community">Community packages</h3>

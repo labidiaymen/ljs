@@ -1146,6 +1146,44 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_assert) {
+        // assert.* wraps the language's own panic mechanism, not the throw/
+        // catch machinery (a static call has no access to an enclosing
+        // try's throw target) -- a failed assertion crashes the program,
+        // uncatchable, the same idiom as C's assert() or an uncaught Node
+        // AssertionError.
+        try out.appendSlice(arena,
+            \\fn __assertOk(cond: bool) void {
+            \\    if (!cond) @panic("AssertionError: assert.ok failed");
+            \\}
+            \\fn __assertEqual(a: anytype, b: anytype) void {
+            \\    if (a != b) std.debug.panic("AssertionError: {any} != {any}", .{ a, b });
+            \\}
+            \\fn __assertStrEqual(a: []const u8, b: []const u8) void {
+            \\    if (!std.mem.eql(u8, a, b)) std.debug.panic("AssertionError: \"{s}\" != \"{s}\"", .{ a, b });
+            \\}
+            \\
+        );
+    }
+    if (program.needs_time_api) {
+        // time.now()/monotonic() (spec 041): one clock read each, the same
+        // primitive that already backs fs.mkdtempSync's uniqueness suffix.
+        // Milliseconds as i64, not int: real epoch milliseconds hugely
+        // exceeds a 32-bit range, so truncating the way os.totalmem() does
+        // would make the result meaningless rather than an occasional
+        // deviation.
+        try out.appendSlice(arena,
+            \\fn __timeNow(io: std.Io) i64 {
+            \\    const ts = std.Io.Clock.now(.real, io);
+            \\    return @intCast(@divTrunc(ts.nanoseconds, 1_000_000));
+            \\}
+            \\fn __timeMonotonic(io: std.Io) i64 {
+            \\    const ts = std.Io.Clock.now(.awake, io);
+            \\    return @intCast(@divTrunc(ts.nanoseconds, 1_000_000));
+            \\}
+            \\
+        );
+    }
     if (program.needs_process_api) {
         // cwd/chdir/env go through Io-abstracted (cwd/chdir) or entry-captured
         // (env, same mechanism as __args) primitives -- none of these need

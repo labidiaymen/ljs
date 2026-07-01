@@ -258,9 +258,12 @@ pub fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
             const checked_type = cl.checked_type orelse return error.ParseError;
             if (std.mem.eql(u8, cl.namespace, "Math") and std.mem.eql(u8, cl.name, "abs")) {
                 if (checked_type == .f64) {
-                    try w.appendSlice(arena, "@abs(");
+                    // A "whole" float literal like 4.0 emits as the bare
+                    // numeral `4`, which @abs doesn't comptime_int-coerce
+                    // on its own -- @as forces the float type.
+                    try w.appendSlice(arena, "@abs(@as(f64, ");
                     try emitExpr(cl.args[0], w, arena);
-                    try w.append(arena, ')');
+                    try w.appendSlice(arena, "))");
                 } else {
                     try w.print(arena, "@as({s}, @intCast(@abs(", .{try types.zigName(arena, checked_type)});
                     try emitExpr(cl.args[0], w, arena);
@@ -276,7 +279,13 @@ pub fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
                 const arg_type = cl.checked_arg_type orelse return error.ParseError;
                 try w.appendSlice(arena, "@sqrt(");
                 if (arg_type == .f64) {
+                    // A "whole" float literal like 1.0 emits as the bare
+                    // numeral `1`, which Zig's own math builtins (unlike a
+                    // normal f64-typed function parameter) don't
+                    // comptime_int-coerce on their own -- @as forces it.
+                    try w.appendSlice(arena, "@as(f64, ");
                     try emitExpr(cl.args[0], w, arena);
+                    try w.append(arena, ')');
                 } else {
                     try w.appendSlice(arena, "@as(f64, @floatFromInt(");
                     try emitExpr(cl.args[0], w, arena);
@@ -297,6 +306,52 @@ pub fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
                 try w.appendSlice(arena, "), ");
                 try emitExpr(cl.args[2], w, arena);
                 try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "Math") and (std.mem.eql(u8, cl.name, "floor") or std.mem.eql(u8, cl.name, "ceil") or std.mem.eql(u8, cl.name, "round") or std.mem.eql(u8, cl.name, "trunc"))) {
+                const arg_type = cl.checked_arg_type orelse return error.ParseError;
+                try w.print(arena, "@as(i32, @intFromFloat(@{s}(", .{cl.name});
+                if (arg_type == .f64) {
+                    // See the sqrt branch above: a "whole" float literal
+                    // like 4.0 emits as the bare numeral `4`, which these
+                    // builtins don't comptime_int-coerce on their own.
+                    try w.appendSlice(arena, "@as(f64, ");
+                    try emitExpr(cl.args[0], w, arena);
+                    try w.append(arena, ')');
+                } else {
+                    try w.appendSlice(arena, "@as(f64, @floatFromInt(");
+                    try emitExpr(cl.args[0], w, arena);
+                    try w.appendSlice(arena, "))");
+                }
+                try w.appendSlice(arena, ")))");
+            } else if (std.mem.eql(u8, cl.namespace, "Math") and std.mem.eql(u8, cl.name, "pow")) {
+                const arg_type = cl.checked_arg_type orelse return error.ParseError;
+                try w.appendSlice(arena, "std.math.pow(f64, ");
+                if (arg_type == .f64) {
+                    try emitExpr(cl.args[0], w, arena);
+                    try w.appendSlice(arena, ", ");
+                    try emitExpr(cl.args[1], w, arena);
+                } else {
+                    try w.appendSlice(arena, "@as(f64, @floatFromInt(");
+                    try emitExpr(cl.args[0], w, arena);
+                    try w.appendSlice(arena, ")), @as(f64, @floatFromInt(");
+                    try emitExpr(cl.args[1], w, arena);
+                    try w.appendSlice(arena, "))");
+                }
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "Math") and (std.mem.eql(u8, cl.name, "log") or std.mem.eql(u8, cl.name, "sin") or std.mem.eql(u8, cl.name, "cos"))) {
+                const arg_type = cl.checked_arg_type orelse return error.ParseError;
+                try w.print(arena, "@{s}(", .{cl.name});
+                if (arg_type == .f64) {
+                    try w.appendSlice(arena, "@as(f64, ");
+                    try emitExpr(cl.args[0], w, arena);
+                    try w.append(arena, ')');
+                } else {
+                    try w.appendSlice(arena, "@as(f64, @floatFromInt(");
+                    try emitExpr(cl.args[0], w, arena);
+                    try w.appendSlice(arena, "))");
+                }
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "Math") and std.mem.eql(u8, cl.name, "PI")) {
+                try w.appendSlice(arena, "@as(f64, std.math.pi)");
             } else if (std.mem.eql(u8, cl.namespace, "String") and std.mem.eql(u8, cl.name, "isEmpty")) {
                 try w.append(arena, '(');
                 try emitExpr(cl.args[0], w, arena);
@@ -581,6 +636,26 @@ pub fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
                 try w.appendSlice(arena, ", ");
                 try emitExpr(cl.args[1], w, arena);
                 try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "assert") and std.mem.eql(u8, cl.name, "ok")) {
+                try w.appendSlice(arena, "__assertOk(");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "assert") and std.mem.eql(u8, cl.name, "equal")) {
+                try w.appendSlice(arena, "__assertEqual(");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "assert") and std.mem.eql(u8, cl.name, "__assertStrEqual")) {
+                try w.appendSlice(arena, "__assertStrEqual(");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "time") and std.mem.eql(u8, cl.name, "now")) {
+                try w.appendSlice(arena, "__timeNow(__io)");
+            } else if (std.mem.eql(u8, cl.namespace, "time") and std.mem.eql(u8, cl.name, "monotonic")) {
+                try w.appendSlice(arena, "__timeMonotonic(__io)");
             } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "sep")) {
                 try w.appendSlice(arena, "@as([]const u8, \"/\")");
             } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "delimiter")) {
