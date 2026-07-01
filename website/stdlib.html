@@ -77,6 +77,7 @@
     <a href="#fs">fs</a>
     <a href="#path">path</a>
     <a href="#process">process</a>
+    <a href="#os">os</a>
     <p class="docs-nav-title">Planned</p>
     <a href="#planned">Roadmap</a>
     <p class="docs-nav-title">Packages</p>
@@ -724,6 +725,155 @@ for (const a of argv) {
 console.log(arg(0));</code></pre>
   </div>
 
+  <h4 id="os">os</h4>
+  <p class="stability-note stability-stable">Stability: 2 - Stable &mdash;
+  almost the entire namespace is two raw Linux syscalls
+  (<code>uname()</code> covers <code>type</code>/<code>release</code>/
+  <code>version</code>/<code>machine</code>/<code>hostname</code> in one
+  call; <code>sysinfo()</code> covers <code>uptime</code>/<code>loadavg</code>/
+  <code>totalmem</code>/<code>freemem</code> in one call), no libc.</p>
+  <p class="sub">A practical subset of
+  <a href="https://nodejs.org/docs/latest/api/os.html">Node's <code>os</code>
+  module</a>. All called as functions, not read as properties, the same
+  deviation as <code>path.sep()</code>/<code>process.platform()</code>.
+  <code>os.platform()</code>/<code>os.arch()</code> duplicate
+  <code>process.platform()</code>/<code>process.arch()</code> intentionally
+  &mdash; Node itself defines both independently with identical values.</p>
+
+  <div class="api-list">
+    <a href="#os-platform">platform</a>
+    <a href="#os-arch">arch</a>
+    <a href="#os-type">type</a>
+    <a href="#os-release">release</a>
+    <a href="#os-version">version</a>
+    <a href="#os-machine">machine</a>
+    <a href="#os-hostname">hostname</a>
+    <a href="#os-endianness">endianness</a>
+    <a href="#os-tmpdir">tmpdir</a>
+    <a href="#os-homedir">homedir</a>
+    <a href="#os-uptime">uptime</a>
+    <a href="#os-totalmem">totalmem</a>
+    <a href="#os-freemem">freemem</a>
+    <a href="#os-loadavg">loadavg</a>
+    <a href="#os-availableParallelism">availableParallelism</a>
+    <a href="#os-EOL">EOL</a>
+    <a href="#os-devNull">devNull</a>
+  </div>
+
+  <div class="api" id="os-platform">
+    <h5><code>os.platform()</code></h5>
+    <p class="sub">→ string &mdash; same as <code>process.platform()</code>.</p>
+<pre><code class="lumen">console.log(os.platform()); // linux</code></pre>
+  </div>
+
+  <div class="api" id="os-arch">
+    <h5><code>os.arch()</code></h5>
+    <p class="sub">→ string &mdash; same as <code>process.arch()</code>.</p>
+<pre><code class="lumen">console.log(os.arch()); // x64</code></pre>
+  </div>
+
+  <div class="api" id="os-type">
+    <h5><code>os.type()</code></h5>
+    <p class="sub">→ string &mdash; the kernel name, via <code>uname(2)</code>.</p>
+<pre><code class="lumen">console.log(os.type()); // Linux</code></pre>
+  </div>
+
+  <div class="api" id="os-release">
+    <h5><code>os.release()</code></h5>
+    <p class="sub">→ string &mdash; the kernel release string.</p>
+<pre><code class="lumen">console.log(os.release());</code></pre>
+  </div>
+
+  <div class="api" id="os-version">
+    <h5><code>os.version()</code></h5>
+    <p class="sub">→ string</p>
+<pre><code class="lumen">console.log(os.version());</code></pre>
+  </div>
+
+  <div class="api" id="os-machine">
+    <h5><code>os.machine()</code></h5>
+    <p class="sub">→ string</p>
+<pre><code class="lumen">console.log(os.machine()); // x86_64</code></pre>
+  </div>
+
+  <div class="api" id="os-hostname">
+    <h5><code>os.hostname()</code></h5>
+    <p class="sub">→ string</p>
+<pre><code class="lumen">console.log(os.hostname());</code></pre>
+  </div>
+
+  <div class="api" id="os-endianness">
+    <h5><code>os.endianness()</code></h5>
+    <p class="sub">→ string &mdash; <code>"LE"</code> or <code>"BE"</code>.</p>
+<pre><code class="lumen">console.log(os.endianness()); // LE</code></pre>
+  </div>
+
+  <div class="api" id="os-tmpdir">
+    <h5><code>os.tmpdir()</code></h5>
+    <p class="sub">→ string &mdash; checks <code>TMPDIR</code>, <code>TMP</code>,
+    <code>TEMP</code>, falls back to <code>"/tmp"</code>.</p>
+<pre><code class="lumen">console.log(os.tmpdir());</code></pre>
+  </div>
+
+  <div class="api" id="os-homedir">
+    <h5><code>os.homedir()</code></h5>
+    <p class="sub">→ string &mdash; the <code>HOME</code> environment
+    variable. <strong>Deviation from Node</strong>: Node falls back to a
+    passwd-database lookup when <code>HOME</code> is unset; Lumen returns
+    <code>""</code> instead, rather than introduce the compiler's first libc
+    dependency for one rarely-hit fallback path.</p>
+<pre><code class="lumen">console.log(os.homedir());</code></pre>
+  </div>
+
+  <div class="api" id="os-uptime">
+    <h5><code>os.uptime()</code></h5>
+    <p class="sub">→ int &mdash; system uptime in seconds.</p>
+<pre><code class="lumen">console.log(os.uptime() > 0); // true</code></pre>
+  </div>
+
+  <div class="api" id="os-totalmem">
+    <h5><code>os.totalmem()</code> <span class="stability-pill stability-experimental" title="Truncates to Lumen's 32-bit int. On a host with more than ~2GB of RAM the truncated value can be negative -- a real, observed deviation, not just a theoretical one.">Experimental</span></h5>
+    <p class="sub">→ int &mdash; total system memory in bytes.
+    <strong>Deviation from Node</strong>: truncates to a 32-bit <code>int</code>
+    (the same tradeoff as <code>fs.statSync</code>'s <code>size</code> field);
+    on a host with more than ~2GB of RAM the value can come out negative.</p>
+<pre><code class="lumen">console.log(os.totalmem() != 0);</code></pre>
+  </div>
+
+  <div class="api" id="os-freemem">
+    <h5><code>os.freemem()</code> <span class="stability-pill stability-experimental" title="Same 32-bit truncation as totalmem().">Experimental</span></h5>
+    <p class="sub">→ int &mdash; same 32-bit truncation caveat as
+    <code>totalmem()</code>.</p>
+<pre><code class="lumen">console.log(os.freemem() != 0);</code></pre>
+  </div>
+
+  <div class="api" id="os-loadavg">
+    <h5><code>os.loadavg()</code></h5>
+    <p class="sub">→ <code>number[]</code> &mdash; 1, 5, and 15 minute load
+    averages, always exactly 3 elements.</p>
+<pre><code class="lumen">const loads: number[] = os.loadavg();
+console.log(loads[0]);</code></pre>
+  </div>
+
+  <div class="api" id="os-availableParallelism">
+    <h5><code>os.availableParallelism()</code></h5>
+    <p class="sub">→ int</p>
+<pre><code class="lumen">console.log(os.availableParallelism() > 0); // true</code></pre>
+  </div>
+
+  <div class="api" id="os-EOL">
+    <h5><code>os.EOL()</code></h5>
+    <p class="sub">→ string &mdash; always <code>"\n"</code> (Lumen is
+    POSIX-only).</p>
+<pre><code class="lumen">console.log(os.EOL() == "\n"); // true</code></pre>
+  </div>
+
+  <div class="api" id="os-devNull">
+    <h5><code>os.devNull()</code></h5>
+    <p class="sub">→ string &mdash; always <code>"/dev/null"</code>.</p>
+<pre><code class="lumen">console.log(os.devNull());</code></pre>
+  </div>
+
   <h3 id="planned">Planned</h3>
   <p class="sub">The surface grows in explicit, conformance-backed slices. These
   modules use the same conventional names; some depend on upcoming language
@@ -760,9 +910,11 @@ console.log(arg(0));</code></pre>
   <h4>os</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
-    <tr><td><code>os.platform()</code> · <code>os.arch()</code></td><td></td></tr>
-    <tr><td><code>os.tmpdir()</code> · <code>os.homedir()</code></td><td></td></tr>
-    <tr><td><code>os.cpus()</code> · <code>os.hostname()</code></td><td></td></tr>
+    <tr><td><code>os.cpus()</code></td><td>needs a record array parsed from /proc/cpuinfo and /proc/stat; no single-syscall shortcut</td></tr>
+    <tr><td><code>os.networkInterfaces()</code></td><td>needs interface enumeration (a getifaddrs equivalent)</td></tr>
+    <tr><td><code>os.userInfo()</code></td><td>needs a passwd-database lookup, the same libc gap as <code>homedir()</code>'s Node fallback</td></tr>
+    <tr><td><code>os.getPriority()</code> · <code>os.setPriority()</code></td><td>no wrapped Zig primitive in this version; would need a raw syscall number</td></tr>
+    <tr><td><code>os.constants</code></td><td>low value without the functions that consume it</td></tr>
   </table>
 
   <h4>Math · Array (more)</h4>

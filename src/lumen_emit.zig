@@ -575,6 +575,40 @@ pub fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
                 try w.appendSlice(arena, "@as(i32, @intCast(std.os.linux.getpid()))");
             } else if (std.mem.eql(u8, cl.namespace, "process") and std.mem.eql(u8, cl.name, "argv")) {
                 try w.appendSlice(arena, "__args");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "platform")) {
+                try w.appendSlice(arena, "__processPlatform()");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "arch")) {
+                try w.appendSlice(arena, "__processArch()");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "type")) {
+                try w.appendSlice(arena, "__osUnameField(\"sysname\")");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "release")) {
+                try w.appendSlice(arena, "__osUnameField(\"release\")");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "version")) {
+                try w.appendSlice(arena, "__osUnameField(\"version\")");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "machine")) {
+                try w.appendSlice(arena, "__osUnameField(\"machine\")");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "hostname")) {
+                try w.appendSlice(arena, "__osUnameField(\"nodename\")");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "endianness")) {
+                try w.appendSlice(arena, "__osEndianness()");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "tmpdir")) {
+                try w.appendSlice(arena, "__osTmpdir()");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "homedir")) {
+                try w.appendSlice(arena, "(__processEnv(\"HOME\") orelse \"\")");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "uptime")) {
+                try w.appendSlice(arena, "@as(i32, @truncate(__osSysinfo().uptime))");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "totalmem")) {
+                try w.appendSlice(arena, "__osMemBytes(true)");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "freemem")) {
+                try w.appendSlice(arena, "__osMemBytes(false)");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "loadavg")) {
+                try w.appendSlice(arena, "__osLoadavg(__alloc)");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "availableParallelism")) {
+                try w.appendSlice(arena, "@as(i32, @intCast(std.Thread.getCpuCount() catch 1))");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "EOL")) {
+                try w.appendSlice(arena, "@as([]const u8, \"\\n\")");
+            } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "devNull")) {
+                try w.appendSlice(arena, "@as([]const u8, \"/dev/null\")");
             } else if (std.mem.eql(u8, cl.namespace, "Promise") and std.mem.eql(u8, cl.name, "resolve")) {
                 // Promise.resolve(v) -> an already-resolved promise of v's type.
                 const inner = cl.checked_arg_type orelse return error.ParseError;

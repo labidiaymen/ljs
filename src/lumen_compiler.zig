@@ -985,6 +985,60 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_os_api) {
+        // Two raw Linux syscalls cover almost this whole namespace: uname()
+        // (sysname/nodename/release/version/machine in one call) and
+        // sysinfo() (uptime/loads/totalram/freeram in one call). No libc.
+        // __osTmpdir/__osHomedir below reference __processEnv, only emitted
+        // when program.needs_process_api is set -- safe because Zig only
+        // semantically analyzes a function body when it's actually called,
+        // and the checker sets needs_process_api whenever tmpdir/homedir
+        // (the only functions here that call __processEnv) are used.
+        try out.appendSlice(arena,
+            \\fn __osUname() std.os.linux.utsname {
+            \\    var uts: std.os.linux.utsname = undefined;
+            \\    _ = std.os.linux.uname(&uts);
+            \\    return uts;
+            \\}
+            \\fn __osUnameField(comptime field: []const u8) []const u8 {
+            \\    const uts = __osUname();
+            \\    const s = std.mem.sliceTo(&@field(uts, field), 0);
+            \\    return __alloc.dupe(u8, s) catch "";
+            \\}
+            \\fn __osEndianness() []const u8 {
+            \\    return switch (@import("builtin").cpu.arch.endian()) {
+            \\        .little => "LE",
+            \\        .big => "BE",
+            \\    };
+            \\}
+            \\fn __osTmpdir() []const u8 {
+            \\    if (__processEnv("TMPDIR")) |v| return v;
+            \\    if (__processEnv("TMP")) |v| return v;
+            \\    if (__processEnv("TEMP")) |v| return v;
+            \\    return "/tmp";
+            \\}
+            \\fn __osSysinfo() std.os.linux.Sysinfo {
+            \\    var info: std.os.linux.Sysinfo = undefined;
+            \\    _ = std.os.linux.sysinfo(&info);
+            \\    return info;
+            \\}
+            \\fn __osMemBytes(total: bool) i32 {
+            \\    const info = __osSysinfo();
+            \\    const raw: u64 = if (total) @intCast(info.totalram) else @intCast(info.freeram);
+            \\    const bytes: u64 = raw * @as(u64, @intCast(info.mem_unit));
+            \\    return @truncate(@as(i64, @intCast(bytes)));
+            \\}
+            \\fn __osLoadavg(alloc: std.mem.Allocator) []const f64 {
+            \\    const info = __osSysinfo();
+            \\    const out = alloc.alloc(f64, 3) catch return &.{};
+            \\    out[0] = @as(f64, @floatFromInt(info.loads[0])) / 65536.0;
+            \\    out[1] = @as(f64, @floatFromInt(info.loads[1])) / 65536.0;
+            \\    out[2] = @as(f64, @floatFromInt(info.loads[2])) / 65536.0;
+            \\    return out;
+            \\}
+            \\
+        );
+    }
     if (program.needs_httpget) {
         // A real std.http one-shot GET, wrapped to a Lumen-friendly `i64` (status code, or -1 on error).
         try out.appendSlice(arena,

@@ -348,6 +348,7 @@ pub fn staticCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCa
     if (std.mem.eql(u8, call.namespace, "fs")) return self.fsCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "path")) return self.pathCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "process")) return self.processCallType(program, call, line, col);
+    if (std.mem.eql(u8, call.namespace, "os")) return self.osCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "Promise")) return self.promiseCallType(program, call, line, col);
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
@@ -1174,6 +1175,65 @@ pub fn processCallType(self: *Checker, program: *ast.Program, call: *ast.StaticC
         program.needs_args = true;
         call.checked_type = .string_array;
         return .string_array;
+    }
+    _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+    return null;
+}
+
+// `os.*` (spec 034): almost entirely two syscalls (uname, sysinfo), no libc.
+// `platform()`/`arch()` intentionally duplicate `process.*`'s mapping rather
+// than share it at the language level -- Node defines both independently
+// with identical values, so this matches Node's actual shape.
+pub fn osCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
+    const string_fns = [_][]const u8{
+        "platform", "arch", "type", "release", "version", "machine",
+        "hostname", "endianness", "tmpdir",     "homedir", "EOL",
+        "devNull",
+    };
+    for (string_fns) |name| {
+        if (std.mem.eql(u8, call.name, name)) {
+            if (call.args.len != 0) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            program.uses_io = true;
+            program.needs_os_api = true;
+            // Every os.* helper is emitted as one unconditional block, and
+            // Zig checks top-level declarations eagerly (not only when
+            // called) -- so __osTmpdir/__osHomedir's reference to
+            // __processEnv must resolve even if the program never calls
+            // tmpdir()/homedir(). Simplest fix: any os.* usage pulls in
+            // process's __environ/__processEnv machinery (spec 033), not
+            // just the two functions that actually need it.
+            program.needs_process_api = true;
+            call.checked_type = .string;
+            return .string;
+        }
+    }
+    const int_fns = [_][]const u8{ "uptime", "totalmem", "freemem", "availableParallelism" };
+    for (int_fns) |name| {
+        if (std.mem.eql(u8, call.name, name)) {
+            if (call.args.len != 0) {
+                _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                return null;
+            }
+            program.uses_io = true;
+            program.needs_os_api = true;
+            program.needs_process_api = true;
+            call.checked_type = .i32;
+            return .i32;
+        }
+    }
+    if (std.mem.eql(u8, call.name, "loadavg")) {
+        if (call.args.len != 0) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_os_api = true;
+        program.needs_process_api = true;
+        call.checked_type = .f64_array;
+        return .f64_array;
     }
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
