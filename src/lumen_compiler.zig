@@ -424,24 +424,68 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\    p.resolve(v);
             \\    return p;
             \\}
-            \\fn __setTimeout(cb: anytype, ms: i64) void {
+            \\const __TimerCancelFlag = struct { cancelled: bool = false };
+            \\var __timer_ids: std.AutoHashMapUnmanaged(i32, *__TimerCancelFlag) = .empty;
+            \\var __timer_next_id: i32 = 1;
+            \\fn __timerRegister(flag: *__TimerCancelFlag) i32 {
+            \\    const id = __timer_next_id;
+            \\    __timer_next_id += 1;
+            \\    __timer_ids.put(__alloc, id, flag) catch {};
+            \\    return id;
+            \\}
+            \\fn __clearTimer(id: i32) void {
+            \\    if (__timer_ids.get(id)) |flag| flag.cancelled = true;
+            \\}
+            \\fn __setTimeout(cb: anytype, ms: i64) i32 {
             \\    const Cb = @TypeOf(cb);
             \\    const Holder = struct {
             \\        f: Cb,
             \\        timer: xev.Timer,
             \\        completion: xev.Completion = undefined,
+            \\        flag: *__TimerCancelFlag,
             \\        fn onTimer(ud: ?*@This(), loop: *xev.Loop, c: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
             \\            _ = loop;
             \\            _ = c;
             \\            _ = result catch {};
-            \\            ud.?.f.call(ud.?.f.ctx);
+            \\            if (!ud.?.flag.cancelled) ud.?.f.call(ud.?.f.ctx);
             \\            return .disarm;
             \\        }
             \\    };
+            \\    const flag = __alloc.create(__TimerCancelFlag) catch unreachable;
+            \\    flag.* = .{};
             \\    const h = __alloc.create(Holder) catch unreachable;
-            \\    h.* = .{ .f = cb, .timer = xev.Timer.init() catch unreachable };
+            \\    h.* = .{ .f = cb, .timer = xev.Timer.init() catch unreachable, .flag = flag };
             \\    const delay: u64 = if (ms > 0) @intCast(ms) else 0;
             \\    h.timer.run(&__xev_loop, &h.completion, delay, Holder, h, Holder.onTimer);
+            \\    return __timerRegister(flag);
+            \\}
+            \\fn __setInterval(cb: anytype, ms: i64) i32 {
+            \\    const Cb = @TypeOf(cb);
+            \\    const Holder = struct {
+            \\        f: Cb,
+            \\        timer: xev.Timer,
+            \\        completion: xev.Completion = undefined,
+            \\        flag: *__TimerCancelFlag,
+            \\        delay: u64,
+            \\        fn onTimer(ud: ?*@This(), loop: *xev.Loop, c: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
+            \\            _ = loop;
+            \\            _ = c;
+            \\            _ = result catch {};
+            \\            const self = ud.?;
+            \\            if (self.flag.cancelled) return .disarm;
+            \\            self.f.call(self.f.ctx);
+            \\            if (self.flag.cancelled) return .disarm;
+            \\            self.timer.run(&__xev_loop, &self.completion, self.delay, @This(), self, onTimer);
+            \\            return .disarm;
+            \\        }
+            \\    };
+            \\    const flag = __alloc.create(__TimerCancelFlag) catch unreachable;
+            \\    flag.* = .{};
+            \\    const delay: u64 = if (ms > 0) @intCast(ms) else 0;
+            \\    const h = __alloc.create(Holder) catch unreachable;
+            \\    h.* = .{ .f = cb, .timer = xev.Timer.init() catch unreachable, .flag = flag, .delay = delay };
+            \\    h.timer.run(&__xev_loop, &h.completion, delay, Holder, h, Holder.onTimer);
+            \\    return __timerRegister(flag);
             \\}
             \\
         );

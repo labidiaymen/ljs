@@ -170,7 +170,10 @@
     <tr><td><code>async function f(): Promise&lt;T&gt; { … }</code></td><td>declares an async function</td></tr>
     <tr><td><code>await expr</code></td><td>awaits a <code>Promise&lt;T&gt;</code>, yields <code>T</code></td></tr>
     <tr><td><code>Promise.resolve(x)</code></td><td>T → Promise&lt;T&gt;</td></tr>
-    <tr><td><code>setTimeout(fn, ms)</code></td><td>schedules a callback after a delay</td></tr>
+    <tr><td><code>setTimeout(fn, ms)</code></td><td>(() =&gt; void, int) → int &mdash; schedules a callback after a delay, returns a handle</td></tr>
+    <tr><td><code>clearTimeout(id)</code></td><td>int → void &mdash; cancels a pending <code>setTimeout</code></td></tr>
+    <tr><td><code>setInterval(fn, ms)</code></td><td>(() =&gt; void, int) → int &mdash; repeats a callback every delay until cancelled</td></tr>
+    <tr><td><code>clearInterval(id)</code></td><td>int → void &mdash; cancels a running <code>setInterval</code>; the same underlying function as <code>clearTimeout</code>, two names to match Node</td></tr>
   </table>
 
   <h4 id="ffi">C FFI</h4>

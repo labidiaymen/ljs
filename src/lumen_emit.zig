@@ -213,6 +213,12 @@ pub fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
                 try w.appendSlice(arena, ", @intCast(");
                 if (cl.args.len > 1) try emitExpr(cl.args[1], w, arena);
                 try w.appendSlice(arena, "))");
+            } else if (std.mem.eql(u8, cl.name, "setInterval")) {
+                try w.appendSlice(arena, "__setInterval(");
+                if (cl.args.len > 0) try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", @intCast(");
+                if (cl.args.len > 1) try emitExpr(cl.args[1], w, arena);
+                try w.appendSlice(arena, "))");
             } else if (cl.is_closure) {
                 // Function-value call through the fat pointer: f.call(f.ctx, args).
                 const fname = cl.emit_name orelse cl.name;

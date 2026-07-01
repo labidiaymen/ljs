@@ -706,7 +706,7 @@ pub fn exprType(self: *Checker, program: *ast.Program, e: *ast.Expr, line: u32, 
                 program.needs_serve = true;
                 return .void;
             }
-            if (std.mem.eql(u8, call.name, "setTimeout")) {
+            if (std.mem.eql(u8, call.name, "setTimeout") or std.mem.eql(u8, call.name, "setInterval")) {
                 if (call.args.len != 2) {
                     _ = self.fail(line, col, "E_ARG_COUNT") catch {};
                     return null;
@@ -724,6 +724,27 @@ pub fn exprType(self: *Checker, program: *ast.Program, e: *ast.Expr, line: u32, 
                     _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                     return null;
                 }
+                program.uses_io = true;
+                program.needs_async = true;
+                // A handle (spec 038), like an fs.openSync fd -- not `void`
+                // anymore, so `clearTimeout`/`clearInterval` have something
+                // to cancel.
+                return .i32;
+            }
+            if (std.mem.eql(u8, call.name, "clearTimeout") or std.mem.eql(u8, call.name, "clearInterval")) {
+                if (call.args.len != 1) {
+                    _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                    return null;
+                }
+                const id_type = self.exprType(program, call.args[0], line, col) orelse return null;
+                if (!types.same(.i32, id_type)) {
+                    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                    return null;
+                }
+                // clearTimeout/clearInterval are the same runtime function
+                // under the hood (spec 038) -- both just flip a
+                // cancellation flag looked up by id.
+                call.name = "__clearTimer";
                 program.uses_io = true;
                 program.needs_async = true;
                 return .void;
