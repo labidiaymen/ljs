@@ -28,6 +28,53 @@ const compile_timeout_secs: u32 = 40;
 /// to its input, so each compile happens inside this directory.
 const work_dir = "/tmp/lumen-playground";
 
+/// A small in-memory cache from exact request body to compiled wasm bytes.
+/// The playground page loads with one of a handful of prefilled examples, and
+/// most visits click Run without editing anything -- so the very same bytes
+/// arrive over and over. Keying on the exact body (not a fixed list of known
+/// examples) means this needs no knowledge of what the frontend's examples
+/// are and stays correct if they change; it also happens to help anyone who
+/// reloads the same edited program. Bounded and FIFO-evicted so an endless
+/// stream of distinct inputs can't grow this without limit; the server has
+/// no concurrency (one connection handled at a time), so no locking is needed.
+const cache_capacity = 16;
+/// Skip caching unusually large outputs (e.g. programs embedding SQLite or
+/// QuickJS) so a handful of entries can't dominate memory.
+const cache_max_wasm_bytes = 8 * 1024 * 1024;
+
+const CacheEntry = struct {
+    source: []const u8,
+    wasm: []const u8,
+};
+
+var cache_entries: [cache_capacity]?CacheEntry = @splat(null);
+var cache_next: usize = 0;
+
+fn cacheLookup(body: []const u8) ?[]const u8 {
+    for (cache_entries) |maybe_entry| {
+        const entry = maybe_entry orelse continue;
+        if (std.mem.eql(u8, entry.source, body)) return entry.wasm;
+    }
+    return null;
+}
+
+fn cacheStore(body: []const u8, wasm: []const u8) void {
+    if (wasm.len > cache_max_wasm_bytes) return;
+    if (cacheLookup(body) != null) return;
+    const gpa = std.heap.page_allocator;
+    const source_owned = gpa.dupe(u8, body) catch return;
+    const wasm_owned = gpa.dupe(u8, wasm) catch {
+        gpa.free(source_owned);
+        return;
+    };
+    if (cache_entries[cache_next]) |old| {
+        gpa.free(old.source);
+        gpa.free(old.wasm);
+    }
+    cache_entries[cache_next] = .{ .source = source_owned, .wasm = wasm_owned };
+    cache_next = (cache_next + 1) % cache_capacity;
+}
+
 /// Source/output/diagnostic file names inside `work_dir`.
 const src_name = "play.ts";
 const wasm_name = "play.wasm";
@@ -169,6 +216,11 @@ fn handleCompile(
         return;
     };
 
+    if (cacheLookup(body)) |cached_wasm| {
+        try writeBytes(w, "200 OK", "application/wasm", cached_wasm);
+        return;
+    }
+
     var dir = std.Io.Dir.cwd().openDir(io, work_dir, .{}) catch {
         try writeJsonError(w, "500 Internal Server Error", "service working directory unavailable");
         return;
@@ -222,6 +274,7 @@ fn handleCompile(
             try writeJsonError(w, "500 Internal Server Error", "compiler produced no output");
             return;
         };
+        cacheStore(body, wasm);
         try writeBytes(w, "200 OK", "application/wasm", wasm);
         return;
     }
