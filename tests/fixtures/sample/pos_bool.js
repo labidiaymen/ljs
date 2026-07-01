@@ -1,4 +1,0 @@
-/*---
-description: boolean literal
----*/
-true;

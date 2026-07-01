@@ -7,12 +7,6 @@ zig-pkg/
 # Spec Kit / agent (may contain credentials)
 .claude/
 
-# Test262 vendored suite (large)
-vendor/test262/
-
-# Node.js test suite vendored subset (spec 104, node-test harness)
-vendor/node-test/
-
 # OS
 .DS_Store
 
