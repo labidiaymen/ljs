@@ -1129,6 +1129,44 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_crypto_api) {
+        // Pure computation throughout -- the entropy source and the hash
+        // implementation are both just data manipulation, no syscalls, so
+        // this works identically on the native and wasm targets.
+        try out.appendSlice(arena,
+            \\fn __cryptoHexEncode(alloc: std.mem.Allocator, bytes: []const u8) []const u8 {
+            \\    const hex_chars = "0123456789abcdef";
+            \\    const out = alloc.alloc(u8, bytes.len * 2) catch return "";
+            \\    for (bytes, 0..) |b, i| {
+            \\        out[i * 2] = hex_chars[b >> 4];
+            \\        out[i * 2 + 1] = hex_chars[b & 0x0f];
+            \\    }
+            \\    return out;
+            \\}
+            \\fn __cryptoRandomBytes(io: std.Io, alloc: std.mem.Allocator, n: i32) []const u8 {
+            \\    const count: usize = @intCast(@max(n, 0));
+            \\    const buf = alloc.alloc(u8, count) catch return "";
+            \\    std.Io.random(io, buf);
+            \\    return __cryptoHexEncode(alloc, buf);
+            \\}
+            \\fn __cryptoRandomUUID(io: std.Io, alloc: std.mem.Allocator) []const u8 {
+            \\    var bytes: [16]u8 = undefined;
+            \\    std.Io.random(io, &bytes);
+            \\    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+            \\    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+            \\    const hex = __cryptoHexEncode(alloc, &bytes);
+            \\    return std.fmt.allocPrint(alloc, "{s}-{s}-{s}-{s}-{s}", .{
+            \\        hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32],
+            \\    }) catch "";
+            \\}
+            \\fn __cryptoSha256(alloc: std.mem.Allocator, data: []const u8) []const u8 {
+            \\    var out: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            \\    std.crypto.hash.sha2.Sha256.hash(data, &out, .{});
+            \\    return __cryptoHexEncode(alloc, &out);
+            \\}
+            \\
+        );
+    }
     if (program.needs_httpget) {
         // A real std.http one-shot GET, wrapped to a Lumen-friendly `i64` (status code, or -1 on error).
         try out.appendSlice(arena,

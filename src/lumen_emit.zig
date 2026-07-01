@@ -621,6 +621,16 @@ pub fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
                 try w.appendSlice(arena, "@as([]const u8, \"\\n\")");
             } else if (std.mem.eql(u8, cl.namespace, "os") and std.mem.eql(u8, cl.name, "devNull")) {
                 try w.appendSlice(arena, "@as([]const u8, \"/dev/null\")");
+            } else if (std.mem.eql(u8, cl.namespace, "crypto") and std.mem.eql(u8, cl.name, "randomBytes")) {
+                try w.appendSlice(arena, "__cryptoRandomBytes(__io, __alloc, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "crypto") and std.mem.eql(u8, cl.name, "randomUUID")) {
+                try w.appendSlice(arena, "__cryptoRandomUUID(__io, __alloc)");
+            } else if (std.mem.eql(u8, cl.namespace, "crypto") and std.mem.eql(u8, cl.name, "sha256")) {
+                try w.appendSlice(arena, "__cryptoSha256(__alloc, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.append(arena, ')');
             } else if (std.mem.eql(u8, cl.namespace, "Promise") and std.mem.eql(u8, cl.name, "resolve")) {
                 // Promise.resolve(v) -> an already-resolved promise of v's type.
                 const inner = cl.checked_arg_type orelse return error.ParseError;

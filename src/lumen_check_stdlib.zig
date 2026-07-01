@@ -349,6 +349,7 @@ pub fn staticCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCa
     if (std.mem.eql(u8, call.namespace, "path")) return self.pathCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "process")) return self.processCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "os")) return self.osCallType(program, call, line, col);
+    if (std.mem.eql(u8, call.namespace, "crypto")) return self.cryptoCallType(program, call, line, col);
     if (std.mem.eql(u8, call.namespace, "Promise")) return self.promiseCallType(program, call, line, col);
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
@@ -1278,6 +1279,53 @@ pub fn osCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, 
         program.needs_process_api = true;
         call.checked_type = .f64_array;
         return .f64_array;
+    }
+    _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
+    return null;
+}
+
+pub fn cryptoCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
+    if (std.mem.eql(u8, call.name, "randomBytes")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const n_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.i32, n_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_crypto_api = true;
+        call.checked_type = .string;
+        return .string;
+    }
+    if (std.mem.eql(u8, call.name, "randomUUID")) {
+        if (call.args.len != 0) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_crypto_api = true;
+        call.checked_type = .string;
+        return .string;
+    }
+    if (std.mem.eql(u8, call.name, "sha256")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const data_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, data_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        // sha256 does no I/O, but __cryptoSha256 still needs __alloc for the
+        // hex-encoded output, and __alloc's declaration is gated on uses_io.
+        program.uses_io = true;
+        program.needs_crypto_api = true;
+        call.checked_type = .string;
+        return .string;
     }
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;

@@ -78,6 +78,7 @@
     <a href="#path">path</a>
     <a href="#process">process</a>
     <a href="#os">os</a>
+    <a href="#crypto">crypto</a>
     <p class="docs-nav-title">Planned</p>
     <a href="#planned">Roadmap</a>
     <p class="docs-nav-title">Packages</p>
@@ -892,6 +893,48 @@ console.log(loads[0]);</code></pre>
 <pre><code class="lumen">console.log(os.devNull());</code></pre>
   </div>
 
+  <h4 id="crypto">crypto</h4>
+  <p class="stability-note stability-stable">Stable &mdash; pure computation
+  throughout (an entropy source and a hash implementation, no syscalls
+  involved), so unlike <code>os</code> and <code>process.pid()</code> this
+  works identically on the native and WebAssembly targets.</p>
+  <p class="sub">A practical subset of
+  <a href="https://nodejs.org/docs/latest/api/crypto.html">Node's
+  <code>crypto</code> module</a>. Static functions, not Node's
+  <code>createHash(...).update(...).digest(...)</code> fluent style &mdash;
+  there's no streaming-hash object in the language yet, and a one-shot
+  function covers the common case.</p>
+
+  <div class="api-list">
+    <a href="#crypto-randomBytes">randomBytes</a>
+    <a href="#crypto-randomUUID">randomUUID</a>
+    <a href="#crypto-sha256">sha256</a>
+  </div>
+
+  <div class="api" id="crypto-randomBytes">
+    <h5><code>crypto.randomBytes(n)</code></h5>
+    <p class="sub">int → string &mdash; <code>n</code> random bytes,
+    hex-encoded (a <code>2n</code>-character string). No <code>Buffer</code>
+    type in the language yet, so this returns the encoded form directly.</p>
+<pre><code class="lumen">const token: string = crypto.randomBytes(16);
+console.log(token.length); // 32</code></pre>
+  </div>
+
+  <div class="api" id="crypto-randomUUID">
+    <h5><code>crypto.randomUUID()</code></h5>
+    <p class="sub">→ string &mdash; a v4 UUID
+    (<code>xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx</code>).</p>
+<pre><code class="lumen">console.log(crypto.randomUUID());</code></pre>
+  </div>
+
+  <div class="api" id="crypto-sha256">
+    <h5><code>crypto.sha256(data)</code></h5>
+    <p class="sub">string → string &mdash; hex digest of the SHA-256 hash of
+    <code>data</code>'s bytes.</p>
+<pre><code class="lumen">console.log(crypto.sha256("hello"));
+// 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824</code></pre>
+  </div>
+
   <h3 id="planned">Planned</h3>
   <p class="sub">The surface grows in explicit, conformance-backed slices. These
   modules use the same conventional names; some depend on upcoming language
@@ -933,6 +976,15 @@ console.log(loads[0]);</code></pre>
     <tr><td><code>os.userInfo()</code></td><td>needs a passwd-database lookup, the same libc gap as <code>homedir()</code>'s Node fallback</td></tr>
     <tr><td><code>os.getPriority()</code> · <code>os.setPriority()</code></td><td>no wrapped primitive available; would need a raw syscall number</td></tr>
     <tr><td><code>os.constants</code></td><td>low value without the functions that consume it</td></tr>
+  </table>
+
+  <h4>crypto</h4>
+  <table>
+    <tr><th>API</th><th>Notes</th></tr>
+    <tr><td><code>crypto.createHash(algo)</code> streaming API</td><td>needs a stateful hash-builder object; the language has no built-in equivalent yet</td></tr>
+    <tr><td><code>crypto.createHmac()</code> · <code>crypto.sign()</code>/<code>verify()</code></td><td>asymmetric/keyed crypto, a much larger surface than this milestone's scope</td></tr>
+    <tr><td><code>crypto.pbkdf2()</code> · <code>crypto.scrypt()</code></td><td>deliberately deferred rather than rushed; picking the right default cost parameters deserves its own pass</td></tr>
+    <tr><td><code>md5</code>/<code>sha1</code> as named functions</td><td>available from the same source as <code>sha256</code> if needed later</td></tr>
   </table>
 
   <h4>Math · Array (more)</h4>
