@@ -734,6 +734,27 @@ pub const Checker = struct {
 
     fn checkProgram(self: *Checker, program: *ast.Program) CompileError!void {
         try self.pushScope();
+        // `__LumenHttpRequest`/`__LumenHttpResponse` are registered eagerly,
+        // unconditionally, rather than lazily when `http.createServer`'s call
+        // site is checked (the way every other record-returning builtin's
+        // type gets registered): `http.createServer`'s handler needs an
+        // explicit parameter type annotation naming `__LumenHttpRequest`,
+        // and that annotation is checked wherever the handler function is
+        // declared -- which can be textually *before* the `createServer`
+        // call that would otherwise register the type. No other
+        // record-returning builtin hits this, since their types are only
+        // ever used as an inferred return value, never as a named parameter
+        // type that has to resolve before its registering call site is
+        // reached. Registering both eagerly costs nothing when `http` isn't
+        // used at all.
+        check_stdlib.registerLumenHttpRequest(self) orelse {};
+        check_stdlib.registerLumenHttpResponse(self) orelse {};
+        // Clean, writable aliases for the two names above -- an
+        // `http.createServer` handler needs to name its parameter/return
+        // types explicitly, and asking users to write the internal
+        // double-underscore name directly would be a real rough edge.
+        self.aliases.put(self.arena, "HttpRequest", "__LumenHttpRequest") catch {};
+        self.aliases.put(self.arena, "HttpResponse", "__LumenHttpResponse") catch {};
         for (program.stmts) |*stmt| {
             if (stmt.* == .type_decl) {
                 if (stmt.type_decl.type_params.len > 0) {

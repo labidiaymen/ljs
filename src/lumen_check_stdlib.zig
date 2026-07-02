@@ -1599,20 +1599,56 @@ pub fn httpCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall
         call.checked_type = .{ .named = "__LumenHttpResponse" };
         return .{ .named = "__LumenHttpResponse" };
     }
+    if (std.mem.eql(u8, call.name, "createServer")) {
+        if (call.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const port_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.i32, port_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        registerLumenHttpRequest(self) orelse return null;
+        registerLumenHttpResponse(self) orelse return null;
+        const want = self.makeFuncType(&.{.{ .named = "__LumenHttpRequest" }}, .{ .named = "__LumenHttpResponse" }) orelse return null;
+        self.ensureAssignable(program, want, call.args[1], line, col) catch {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        };
+        program.uses_io = true;
+        program.needs_http_module = true;
+        program.needs_http_server = true;
+        call.checked_type = .void;
+        return .void;
+    }
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
 }
 
 // Lazily registers the synthetic `__LumenHttpResponse` record type returned
-// by `http.request`/`http.get`, following the exact pattern
-// `registerLumenSpawnResult` introduced.
-fn registerLumenHttpResponse(self: *Checker) ?void {
+// by `http.request`/`http.get`, and returned by `http.createServer`'s
+// handler, following the exact pattern `registerLumenSpawnResult`
+// introduced.
+pub fn registerLumenHttpResponse(self: *Checker) ?void {
     if (self.type_decls.get("__LumenHttpResponse") == null) {
         const fields = self.arena.alloc(ast.TypeField, 3) catch return null;
         fields[0] = .{ .name = "status", .annotation = "int", .checked_type = .i32 };
         fields[1] = .{ .name = "body", .annotation = "string", .checked_type = .string };
         fields[2] = .{ .name = "ok", .annotation = "bool", .checked_type = .bool };
         self.type_decls.put(self.arena, "__LumenHttpResponse", .{ .fields = fields }) catch return null;
+    }
+}
+
+// Lazily registers the synthetic `__LumenHttpRequest` record type passed to
+// `http.createServer`'s handler.
+pub fn registerLumenHttpRequest(self: *Checker) ?void {
+    if (self.type_decls.get("__LumenHttpRequest") == null) {
+        const fields = self.arena.alloc(ast.TypeField, 3) catch return null;
+        fields[0] = .{ .name = "method", .annotation = "string", .checked_type = .string };
+        fields[1] = .{ .name = "path", .annotation = "string", .checked_type = .string };
+        fields[2] = .{ .name = "body", .annotation = "string", .checked_type = .string };
+        self.type_decls.put(self.arena, "__LumenHttpRequest", .{ .fields = fields }) catch return null;
     }
 }
 

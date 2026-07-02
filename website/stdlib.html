@@ -1161,6 +1161,7 @@ console.log(elapsed);</code></pre>
   <div class="api-list">
     <a href="#http-request">request</a>
     <a href="#http-get">get</a>
+    <a href="#http-createServer">createServer</a>
   </div>
 
   <div class="api" id="http-request">
@@ -1183,6 +1184,39 @@ console.log(r.ok);     // true</code></pre>
 <pre><code class="lumen">const r = http.get("https://example.com");
 console.log(r.status); // 200
 console.log(r.body.includes("Example Domain")); // true</code></pre>
+  </div>
+
+  <div class="api" id="http-createServer">
+    <h5><code>http.createServer(port, handler)</code></h5>
+    <p class="sub">(int, (HttpRequest) → HttpResponse) → void &mdash;
+    blocking accept loop, calls <code>handler</code> per request, never
+    returns. <code>handler</code> must be a named function (block-bodied
+    inline arrow functions don't parse in this position yet), and returns
+    the <em>same</em> <code>{ status, body, ok }</code> record the client
+    side uses (<code>ok</code> goes unused server-side). Superseded the
+    old canned-response <code>serve()</code> global, which always
+    returned the same body to every request; this one genuinely inspects
+    each request.</p>
+<pre><code class="lumen">function handleRequest(req: HttpRequest): HttpResponse {
+  if (req.path == "/notfound") {
+    return { status: 404, body: "not found", ok: false };
+  }
+  return { status: 200, body: "hello from lumen (" + req.method + ")", ok: true };
+}
+
+http.createServer(8080, handleRequest);</code></pre>
+    <p class="sub"><strong>~1.1&ndash;1.2&times; faster than Node's native
+    <code>http.createServer</code></strong> on 300 sequential GETs (same
+    Node.js client hitting both servers, isolating the server as the only
+    variable): ~139ms vs Node's ~157ms. Wasn't always true &mdash; the
+    first version closed the connection after every response, forcing a
+    fresh TCP handshake per request and running ~1.3&ndash;1.5&times;
+    <em>slower</em> than Node; this server now supports HTTP keep-alive
+    (the connection stays open and serves further requests until the
+    client sends <code>Connection: close</code>), the same thing Node's
+    server does by default. No idle-connection timeout yet, and still one
+    connection served at a time (no concurrency), just no longer paying a
+    fresh handshake for every request on the same connection.</p>
   </div>
 
   <h3 id="planned">Planned</h3>
@@ -1264,7 +1298,8 @@ console.log(r.body.includes("Example Domain")); // true</code></pre>
   <h4>http</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
-    <tr><td><code>http.createServer(port, handler)</code></td><td>a real request-inspecting server, superseding the existing canned-response <code>serve()</code> global &mdash; a follow-up phase, not attempted yet</td></tr>
+    <tr><td>Idle keep-alive connection timeouts</td><td>a connection stays open indefinitely as long as the client keeps sending requests and doesn't send <code>Connection: close</code></td></tr>
+    <tr><td>Concurrent/multi-connection serving</td><td>still one connection served at a time (though its requests are now handled with keep-alive); real concurrency is a separate, later feature</td></tr>
     <tr><td>Custom request/response headers (set or read)</td><td>needs a header-collection type; the same gap that deferred <code>url</code>'s querystring</td></tr>
     <tr><td>Response headers on the client side</td><td>the underlying client's convenience wrapper only surfaces the status code; reading headers needs the lower-level request/response flow underneath it</td></tr>
     <tr><td>Real <code>Server</code>/<code>IncomingMessage</code>/<code>ServerResponse</code>/<code>ClientRequest</code>/<code>Agent</code> classes</td><td>Node's classes bundle request/response data with an event mechanism; <code>EventEmitter</code> alone doesn't supply the data half, which still needs the header-collection/streaming gaps closed first</td></tr>

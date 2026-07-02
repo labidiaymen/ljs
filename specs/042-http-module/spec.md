@@ -92,11 +92,34 @@ client does.
 | `http.createServer(port, handler)` | `(int, (HttpRequest) -> HttpResponse) -> void` | blocking accept loop, calls `handler` per request, never returns |
 
 `HttpRequest` record: `{ method: string, path: string, body: string }`.
-`HttpResponse` (server-returned) record: `{ status: int, body: string }`.
-Real per-request parsing (method, path, `Content-Length`-based body),
-reusing the exact manual HTTP/1.1 parsing approach the playground's own
-compile service (`playground/server.zig`) already proves works -- not a
-new, unverified technique.
+The handler returns the *same* `HttpResponse` record the client side
+already uses (`{ status, body, ok }`), not a second, similar-but-different
+record -- one shape to learn instead of two. `ok` goes unused by the
+server (it just reads `.status`/`.body` to write the response), the same
+"construct a literal by hand, fill every field" simplification
+`path.format`'s record parameter already established. Real per-request
+parsing (method, path, `Content-Length`-based body), reusing the exact
+manual HTTP/1.1 parsing approach the playground's own compile service
+(`playground/server.zig`) already proves works -- not a new, unverified
+technique.
+
+**Benchmark against Node's own `http.createServer`**, using the same
+Node.js client against both (isolating the server implementation as the
+only variable): Node initially won, ~165ms vs Lumen's ~235ms on 300
+sequential GETs (Lumen roughly 1.3-1.5x slower). Root cause: the server was
+sending `Connection: close` and tearing the socket down after every
+response (matching the old `serve()` global's exact behavior), forcing a
+fresh TCP handshake per request, while Node's server keeps the connection
+alive by default. Unlike the earlier CA-bundle-rescan/`EventEmitter`
+reallocation bugs (accidental, zero-tradeoff waste, fixed immediately),
+this needed a real feature, not a one-line patch -- added HTTP keep-alive:
+the reader/writer are now set up once per accepted connection, with an
+inner loop reading and answering requests off that same connection until
+the client sends `Connection: close` or the connection drops (checked, via
+`curl -v`, that a real client's second request actually reuses the first
+connection rather than opening a new one). After: Lumen measured ~139ms
+vs Node's ~157ms on the same 300-request loop -- Lumen now modestly faster
+(~1.1-1.2x), not just closing the gap.
 
 ## Migration note
 
@@ -130,6 +153,7 @@ streaming remain blocked on unrelated gaps (a header-collection type, a
 | `http.Server`/`IncomingMessage`/`ServerResponse`/`ClientRequest`/`Agent` as real classes | Node's classes bundle request/response *data* (headers, streaming body) with the event mechanism; `EventEmitter` alone doesn't supply the data half, which still needs the header-collection/`Stream` gaps closed first |
 | Server lifecycle events (`'error'`, `'close'`) via `EventEmitter<T>` | genuinely reachable now (see above) -- real follow-up, not attempted in this pass's Phase 1/2 |
 | Streaming request/response bodies (chunked reads, backpressure) | needs a `Stream` abstraction, not built yet -- everything here is one-shot, whole-body |
-| Concurrent/multi-connection serving | the accept loop is single-threaded and blocking, matching the existing `serve()`'s simplicity; a real concurrent server is a separate, later feature |
+| Concurrent/multi-connection serving | the accept loop is single-threaded and blocking, one connection served at a time (though each connection's requests are now handled with keep-alive, see above); real concurrency (a thread/task per connection) is a separate, later feature |
+| Idle keep-alive connection timeouts | a connection is currently held open indefinitely as long as the client keeps sending requests and doesn't send `Connection: close`; no timeout closes an idle-but-still-open connection yet |
 | `http.METHODS`/`STATUS_CODES` constants | low value without more consumers of them yet; easy to add later as plain string-array/record constants |
 | HTTPS/TLS-specific configuration, WebSocket upgrade, `Agent`/connection pooling exposure | each a real, separate feature; `std.http.Client` handles basic TLS internally already for `https://` URLs on the client side, just not exposed as configuration |

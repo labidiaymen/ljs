@@ -1280,6 +1280,80 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_http_server) {
+        // http.createServer (spec 042 Phase 2): a real request-inspecting
+        // server, superseding the old canned-response serve() global.
+        // Blocking, single-connection-at-a-time accept loop; real HTTP/1.1
+        // request-line + header parsing (method, path, Content-Length-based
+        // body), reusing the exact manual parsing approach the
+        // playground's own compile service already proves works.
+        //
+        // HTTP keep-alive: the reader/writer (and the underlying buffered
+        // state) are set up once per accepted connection, then an inner
+        // loop reads and answers requests off that same stream until the
+        // client either sends `Connection: close` or the connection drops.
+        // Benchmarked ~1.3-1.5x slower than Node's http.createServer before
+        // this; root cause was closing the connection after every single
+        // response (a fresh TCP handshake per request), the same gap this
+        // closes.
+        try out.appendSlice(arena,
+            \\pub const __LumenHttpRequest = struct { method: []const u8, path: []const u8, body: []const u8 };
+            \\fn __httpCreateServer(io: std.Io, alloc: std.mem.Allocator, port: i32, handler: anytype) noreturn {
+            \\    _ = alloc;
+            \\    const addr = std.Io.net.IpAddress.parse("0.0.0.0", @intCast(port)) catch std.process.exit(1);
+            \\    var server = addr.listen(io, .{ .reuse_address = true }) catch std.process.exit(1);
+            \\    while (true) {
+            \\        const stream = server.accept(io) catch continue;
+            \\        defer stream.close(io);
+            \\        var read_buf: [16 * 1024]u8 = undefined;
+            \\        var reader = stream.reader(io, &read_buf);
+            \\        const r = &reader.interface;
+            \\        var write_buf: [16 * 1024]u8 = undefined;
+            \\        var writer = stream.writer(io, &write_buf);
+            \\        const w = &writer.interface;
+            \\        conn: while (true) {
+            \\            var conn_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            \\            defer conn_arena.deinit();
+            \\            const carena = conn_arena.allocator();
+            \\            const first = r.takeDelimiterInclusive('\n') catch break :conn;
+            \\            const line = std.mem.trimEnd(u8, first, "\r\n");
+            \\            var it = std.mem.tokenizeScalar(u8, line, ' ');
+            \\            const method = it.next() orelse break :conn;
+            \\            const path = it.next() orelse break :conn;
+            \\            var content_length: usize = 0;
+            \\            var keep_alive = true;
+            \\            while (true) {
+            \\                const raw = r.takeDelimiterInclusive('\n') catch break;
+            \\                const h = std.mem.trimEnd(u8, raw, "\r\n");
+            \\                if (h.len == 0) break;
+            \\                const colon = std.mem.indexOfScalar(u8, h, ':') orelse continue;
+            \\                const name = std.mem.trim(u8, h[0..colon], " \t");
+            \\                const value = std.mem.trim(u8, h[colon + 1 ..], " \t");
+            \\                if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            \\                    content_length = std.fmt.parseInt(usize, value, 10) catch 0;
+            \\                } else if (std.ascii.eqlIgnoreCase(name, "connection") and std.ascii.eqlIgnoreCase(value, "close")) {
+            \\                    keep_alive = false;
+            \\                }
+            \\            }
+            \\            const body = carena.alloc(u8, content_length) catch break :conn;
+            \\            r.readSliceAll(body) catch break :conn;
+            \\            const req: __LumenHttpRequest = .{
+            \\                .method = carena.dupe(u8, method) catch break :conn,
+            \\                .path = carena.dupe(u8, path) catch break :conn,
+            \\                .body = body,
+            \\            };
+            \\            const res = handler.call(handler.ctx, req);
+            \\            const conn_header: []const u8 = if (keep_alive) "keep-alive" else "close";
+            \\            w.print("HTTP/1.1 {d} OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n", .{ res.status, res.body.len, conn_header }) catch break :conn;
+            \\            w.writeAll(res.body) catch break :conn;
+            \\            w.flush() catch break :conn;
+            \\            if (!keep_alive) break :conn;
+            \\        }
+            \\    }
+            \\}
+            \\
+        );
+    }
     if (program.needs_process_api) {
         // cwd/chdir/env go through Io-abstracted (cwd/chdir) or entry-captured
         // (env, same mechanism as __args) primitives -- none of these need
