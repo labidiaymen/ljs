@@ -559,6 +559,12 @@ pub fn exprType(self: *Checker, program: *ast.Program, e: *ast.Expr, line: u32, 
             if (types.isEventEmitter(obj_type)) {
                 return self.eventEmitterMethod(program, mc, obj_type, line, col);
             }
+            if (types.isReadableStream(obj_type)) {
+                return self.readableStreamMethod(program, mc, obj_type, line, col);
+            }
+            if (types.isWritableStream(obj_type)) {
+                return self.writableStreamMethod(program, mc, obj_type, line, col);
+            }
             if (obj_type != .class_type) {
                 _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
                 return null;

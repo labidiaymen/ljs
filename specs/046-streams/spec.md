@@ -84,6 +84,16 @@ extending it to a second, more complex backing source.
   chunk size for consistency), not exposed as a parameter. Simpler API
   surface for v1; straightforward to add a size parameter later without
   breaking the existing no-argument calls.
+- **Works under `--wasm` the same way `fs.readFileSync` already does, no
+  `target-wasm-limited` tag needed**: confirmed by actually running the
+  compiled wasm module (not just compile-checking it). The first attempt
+  used an absolute path and produced wrong results (0 bytes read) --
+  investigated rather than written off as broken, and turned out to be a
+  WASI preopen/absolute-path resolution quirk unrelated to this feature: a
+  relative path with matching directory access produced byte-identical
+  output to the native run. File-backed streams don't touch anything
+  fundamentally incompatible with the wasm sandbox the way
+  `http`/`child_process`/`fs.watch` do.
 
 ## Not planned (this pass)
 

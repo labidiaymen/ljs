@@ -37,3 +37,50 @@
 - [x] T23 Update `specs/031-fs-api-expansion/spec.md` coverage count and
   `website/stdlib.html` (quick-jump list + per-function blocks + Planned table).
 - [x] T24 Commit, push. Redeploy `lumen-playground` Docker service: in progress.
+
+## Phase 5 (2026-07-02: re-checked three more "blocked" entries rather than
+## trusting the old notes, following spec 045's precedent of re-verifying
+## assumptions instead of carrying them forward unquestioned)
+
+- [x] T25 `fs.realpathSync(path)` — the "raw libc binding only" note was
+  stale; `Dir.realPathFileAlloc` is real and working in this Zig version
+  (confirmed by reading `Io/Threaded.zig`'s `dirRealPathFile`, dispatching
+  to genuine per-OS implementations, not a stub). Verified against a real
+  symlink (resolved to its target) and a nonexistent path (falls back to
+  the input unchanged).
+- [x] T26 `fs.chownSync(path, uid, gid)` — opens the file first and reuses
+  `fchownSync`'s working fd-based `File.setOwner`, sidestepping the
+  path-based `Dir.setFileOwner` panic entirely (the same "open, then use
+  the file-level method" pattern `chmodSync` already established).
+  Verified with a real ownership change confirmed via `stat` (root in the
+  dev container). `lchownSync` still isn't achievable this way: it must
+  not follow a symlink, and `OpenFileOptions` has no way to open one
+  without following it — stays in "Not planned", reason sharpened.
+- [x] T27 `fs.writevSync(fd, buffers: string[])` — raw
+  `std.os.linux.writev` syscall (`std.Io.File` has no vectored-write
+  wrapper, confirmed absent). One real bug hit and fixed:
+  `std.os.linux.iovec_const` is a private alias, not the type to actually
+  reference — `std.posix.iovec_const` is (found via the debug-preserve
+  trick reading the real underlying Zig compiler error). Verified with a
+  3-chunk write reassembling correctly from one syscall.
+  `readvSync` deliberately not shipped alongside it: Node's `readv` fills
+  caller-provided *mutable* buffers, and Lumen's `string` is immutable —
+  no natural Lumen shape the way `writevSync`'s (read-only chunks in,
+  byte count out) has.
+- [x] T28 Investigated whether `fs.realpathSync(".")` gives a real,
+  usable cwd string (relevant to `path.resolve`'s long-standing Node-parity
+  gap: anchoring a fully-relative result to the real working directory).
+  Confirmed yes — matched a real `pwd` exactly. Not wired into
+  `path.resolve` this pass: `path.*` functions are pure string
+  manipulation today with no `io` parameter at all, and giving one
+  function `io` access would be a real signature/architecture change to
+  an existing, working call site, not a pure addition like T25-T27.
+  Documented as a confirmed-achievable follow-up in `website/stdlib.html`.
+- [x] T29 `zig build test` and a full, clean, non-concurrent
+  `zig build conformance` run — verify no regressions from T25-T27.
+- [x] T30 Updated `specs/031-fs-api-expansion/spec.md` (new Phase 5
+  section) and `website/stdlib.html` (quick-jump list, three new
+  per-function blocks, Planned table narrowed to `lchownSync`/`readvSync`/
+  append-mode `openSync`, stale `fs.realpathSync`-as-blocker references in
+  `path.resolve`/`process` cleaned up).
+- [x] T31 Commit, push, redeploy `lumen-playground`.

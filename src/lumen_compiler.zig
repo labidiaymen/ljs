@@ -714,6 +714,23 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_realpath_sync) {
+        // fs.realpathSync (spec 031 revisited): earlier notes assumed this
+        // was blocked ("only a raw libc binding exists, not wrapped by the
+        // runtime's I/O layer"), but that turned out to be stale -- this
+        // Zig version's std.Io.Dir has a real, working realPathFileAlloc
+        // (dispatching to a genuine per-OS implementation, not a stub;
+        // confirmed by reading the Io.Threaded backend directly). Falls
+        // back to returning path unchanged on error (nonexistent path,
+        // permissions, ...), the same "fallback, don't crash" shape every
+        // other fs function uses.
+        try out.appendSlice(arena,
+            \\fn __realpathSync(io: std.Io, alloc: std.mem.Allocator, path: []const u8) []const u8 {
+            \\    return std.Io.Dir.cwd().realPathFileAlloc(io, path, alloc) catch (alloc.dupe(u8, path) catch path);
+            \\}
+            \\
+        );
+    }
     if (program.needs_write_file_sync) {
         try out.appendSlice(arena,
             \\fn __writeFileSync(io: std.Io, path: []const u8, data: []const u8) void {
@@ -1016,6 +1033,51 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_chown_sync) {
+        // fs.chownSync (spec 031 revisited): the path-based Dir.setFileOwner
+        // is an unconditional @panic in this Zig version's Io.Threaded
+        // backend on Linux, confirmed still true by reading the source
+        // directly -- genuinely blocked at that layer. But File.setOwner
+        // (the fd-based one fchownSync already uses) is a real, working
+        // implementation, not a stub. So this opens the file first and uses
+        // that instead, the same "open, then use the file-level method"
+        // pattern chmodSync already established, sidestepping the broken
+        // path-level wrapper entirely.
+        try out.appendSlice(arena,
+            \\fn __chownSync(io: std.Io, path: []const u8, uid: i64, gid: i64) void {
+            \\    var file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch return;
+            \\    defer file.close(io);
+            \\    const u: ?std.posix.uid_t = if (uid < 0) null else @intCast(uid);
+            \\    const g: ?std.posix.gid_t = if (gid < 0) null else @intCast(gid);
+            \\    file.setOwner(io, u, g) catch {};
+            \\}
+            \\
+        );
+    }
+    if (program.needs_writev_sync) {
+        // fs.writevSync (spec 031 revisited): std.Io.File has no vectored
+        // write wrapper in this Zig version (confirmed absent, not just
+        // unused), but the raw std.os.linux.writev syscall does exist --
+        // the same "raw Linux syscall, no libc" pattern os.uptime()/
+        // fs.watch already established. readvSync is deliberately not
+        // shipped alongside this: Node's readv fills caller-provided
+        // mutable buffers, and Lumen's `string` is immutable, so that
+        // signature doesn't have a natural Lumen shape the way writev's
+        // (read-only chunks in, byte count out) does.
+        try out.appendSlice(arena,
+            \\fn __writevSync(fd: i32, bufs: []const []const u8) i32 {
+            \\    if (@import("builtin").os.tag != .linux) return 0;
+            \\    if (fd < 0 or @as(usize, @intCast(fd)) >= __fd_table.items.len) return 0;
+            \\    const handle = __fd_table.items[@intCast(fd)].handle;
+            \\    const iov = std.heap.page_allocator.alloc(std.posix.iovec_const, bufs.len) catch return 0;
+            \\    defer std.heap.page_allocator.free(iov);
+            \\    for (bufs, 0..) |b, i| iov[i] = .{ .base = b.ptr, .len = b.len };
+            \\    const n = std.os.linux.writev(handle, iov.ptr, iov.len);
+            \\    return @intCast(n);
+            \\}
+            \\
+        );
+    }
     if (program.needs_fsync_sync) {
         // Backs both fsyncSync and fdatasyncSync: Zig's std.Io.File has no
         // data-only sync, so fdatasyncSync is treated as a full sync.
@@ -1116,6 +1178,75 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\            offset += @sizeOf(std.os.linux.inotify_event) + ev.len;
             \\        }
             \\    }
+            \\}
+            \\
+        );
+    }
+    if (program.needs_fs_streams) {
+        // fs.createReadStream/createWriteStream (spec 046): built the same
+        // way as Map/Set/EventEmitter (a dedicated, non-generic type), not
+        // via Lumen's own array syntax (which has no growable-array support
+        // to build one with anyway). Synchronous, blocking .read()/.write()
+        // calls -- no async/backpressure integration in this pass. A
+        // missing/unopenable file degrades to a stream where .read() always
+        // returns "" and .close() is a no-op, the same "return a fallback,
+        // don't crash" shape every other fs function already uses.
+        try out.appendSlice(arena,
+            \\pub const LumenReadableStream = struct {
+            \\    file: ?std.Io.File,
+            \\    io: std.Io,
+            \\    reader: std.Io.File.Reader = undefined,
+            \\    fn __init(io: std.Io, file: ?std.Io.File) *LumenReadableStream {
+            \\        const p = __sa().create(LumenReadableStream) catch unreachable;
+            \\        p.* = .{ .file = file, .io = io };
+            \\        if (file) |f| {
+            \\            const buf = __sa().alloc(u8, 65536) catch unreachable;
+            \\            p.reader = f.readerStreaming(io, buf);
+            \\        }
+            \\        return p;
+            \\    }
+            \\    fn read(self: *LumenReadableStream) []const u8 {
+            \\        if (self.file == null) return "";
+            \\        var scratch: [65536]u8 = undefined;
+            \\        const n = self.reader.interface.readSliceShort(&scratch) catch return "";
+            \\        if (n == 0) return "";
+            \\        return __sa().dupe(u8, scratch[0..n]) catch "";
+            \\    }
+            \\    fn close(self: *LumenReadableStream) void {
+            \\        if (self.file) |f| f.close(self.io);
+            \\    }
+            \\};
+            \\fn __fsCreateReadStream(io: std.Io, path: []const u8) *LumenReadableStream {
+            \\    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch null;
+            \\    return LumenReadableStream.__init(io, file);
+            \\}
+            \\pub const LumenWritableStream = struct {
+            \\    file: ?std.Io.File,
+            \\    io: std.Io,
+            \\    writer: std.Io.File.Writer = undefined,
+            \\    fn __init(io: std.Io, file: ?std.Io.File) *LumenWritableStream {
+            \\        const p = __sa().create(LumenWritableStream) catch unreachable;
+            \\        p.* = .{ .file = file, .io = io };
+            \\        if (file) |f| {
+            \\            const buf = __sa().alloc(u8, 65536) catch unreachable;
+            \\            p.writer = f.writerStreaming(io, buf);
+            \\        }
+            \\        return p;
+            \\    }
+            \\    fn write(self: *LumenWritableStream, chunk: []const u8) void {
+            \\        if (self.file == null) return;
+            \\        self.writer.interface.writeAll(chunk) catch {};
+            \\    }
+            \\    fn close(self: *LumenWritableStream) void {
+            \\        if (self.file) |f| {
+            \\            self.writer.interface.flush() catch {};
+            \\            f.close(self.io);
+            \\        }
+            \\    }
+            \\};
+            \\fn __fsCreateWriteStream(io: std.Io, path: []const u8) *LumenWritableStream {
+            \\    const file = std.Io.Dir.cwd().createFile(io, path, .{}) catch null;
+            \\    return LumenWritableStream.__init(io, file);
             \\}
             \\
         );

@@ -367,6 +367,63 @@ pub fn eventEmitterMethod(self: *Checker, program: *ast.Program, mc: anytype, ob
     return null;
 }
 
+/// Validate a method call on a `ReadableStream` receiver (spec 046,
+/// `fs.createReadStream`'s return type). Mirrors `mapMethod`/`setMethod`/
+/// `eventEmitterMethod`.
+pub fn readableStreamMethod(self: *Checker, program: *ast.Program, mc: anytype, obj_type: types.Type, line: u32, col: u32) ?types.Type {
+    _ = program;
+    mc.container_type = obj_type;
+    const name = mc.name;
+    const eq = std.mem.eql;
+
+    if (eq(u8, name, "read")) {
+        if (mc.args.len != 0) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        return .string;
+    }
+    if (eq(u8, name, "close")) {
+        if (mc.args.len != 0) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        return .void;
+    }
+    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+    return null;
+}
+
+/// Validate a method call on a `WritableStream` receiver (spec 046,
+/// `fs.createWriteStream`'s return type). Mirrors `readableStreamMethod`.
+pub fn writableStreamMethod(self: *Checker, program: *ast.Program, mc: anytype, obj_type: types.Type, line: u32, col: u32) ?types.Type {
+    mc.container_type = obj_type;
+    const name = mc.name;
+    const eq = std.mem.eql;
+
+    if (eq(u8, name, "write")) {
+        if (mc.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const chunk_type = self.exprType(program, mc.args[0], line, col) orelse return null;
+        if (!types.same(.string, chunk_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        return .void;
+    }
+    if (eq(u8, name, "close")) {
+        if (mc.args.len != 0) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        return .void;
+    }
+    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+    return null;
+}
+
 /// Validate an instance method call on a `string` receiver and return its
 /// statically-known result type. Mirrors `arrayMethod`.
 pub fn stringMethod(self: *Checker, program: *ast.Program, mc: anytype, line: u32, col: u32) ?types.Type {
@@ -477,6 +534,21 @@ pub fn fsCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, 
         program.needs_exists_sync = true;
         call.checked_type = .bool;
         return .bool;
+    }
+    if (std.mem.eql(u8, call.name, "realpathSync")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, path_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_realpath_sync = true;
+        call.checked_type = .string;
+        return .string;
     }
     if (std.mem.eql(u8, call.name, "writeFileSync") or std.mem.eql(u8, call.name, "appendFileSync")) {
         if (call.args.len != 2) {
@@ -955,6 +1027,39 @@ pub fn fsCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, 
         call.checked_type = .void;
         return .void;
     }
+    if (std.mem.eql(u8, call.name, "chownSync")) {
+        if (call.args.len != 3) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const uid_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        const gid_type = self.exprType(program, call.args[2], line, col) orelse return null;
+        if (!types.same(.string, path_type) or !types.isInteger(uid_type) or !types.isInteger(gid_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_chown_sync = true;
+        call.checked_type = .void;
+        return .void;
+    }
+    if (std.mem.eql(u8, call.name, "writevSync")) {
+        if (call.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const fd_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        const bufs_type = self.exprType(program, call.args[1], line, col) orelse return null;
+        if (!types.isInteger(fd_type) or !types.same(.string_array, bufs_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_writev_sync = true;
+        call.checked_type = .i32;
+        return .i32;
+    }
     if (std.mem.eql(u8, call.name, "fsyncSync") or std.mem.eql(u8, call.name, "fdatasyncSync")) {
         if (call.args.len != 1) {
             _ = self.fail(line, col, "E_ARG_COUNT") catch {};
@@ -1053,6 +1158,36 @@ pub fn fsCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, 
         program.needs_fs_watch = true;
         call.checked_type = .void;
         return .void;
+    }
+    if (std.mem.eql(u8, call.name, "createReadStream")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, path_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_fs_streams = true;
+        call.checked_type = .readable_stream_type;
+        return .readable_stream_type;
+    }
+    if (std.mem.eql(u8, call.name, "createWriteStream")) {
+        if (call.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, path_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        program.uses_io = true;
+        program.needs_fs_streams = true;
+        call.checked_type = .writable_stream_type;
+        return .writable_stream_type;
     }
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;

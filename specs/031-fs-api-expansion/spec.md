@@ -78,7 +78,6 @@ detour into exception-based builtins. `mode` is the POSIX bitmask
 | Function | Blocker |
 | --- | --- |
 | `fs.mkdtempDisposableSync` | the `using`-disposable variant; `mkdtempSync` itself shipped (see below) |
-| `fs.realpathSync(path)` | `realpath` only exists as a raw `std.c` libc binding in this Zig version, not wrapped by `std.Io.Dir`/`File`; calling it directly would bypass the `Io` abstraction every other fs function goes through (inconsistent, and breaks under wasm) |
 | `fs.statfsSync(path)` | filesystem-level stats; platform-specific, low value for now |
 | append-mode `fs.openSync(path, "a")` | no `seek`/`lseek` exposed on `std.Io.File` in this Zig version |
 
@@ -120,6 +119,19 @@ append-mode `openSync`, `statfsSync`, `chownSync`/`lchownSync` (stdlib stub,
 see above), and `globSync`/`opendirSync` (need a real glob algorithm /
 directory-iterator class, not just an array).
 
+### Phase 5 -- revisited again (2026-07-02): `realpathSync`, `chownSync`, `writevSync`
+
+Re-checked three more "blocked" entries rather than continuing to trust the
+earlier notes, the same way Phase 3 re-checked "needs a new language feature"
+and found several were wrong:
+
+| Function | What was actually true |
+| --- | --- |
+| `fs.realpathSync(path)` | The "only a raw libc binding" note was stale. This Zig version's `std.Io.Dir` has a real `realPathFileAlloc`, dispatching to a genuine per-OS implementation (confirmed by reading `Io/Threaded.zig`'s `dirRealPathFile`, not a stub). Shipped; falls back to returning `path` unchanged on error. Verified against a real symlink, not just a plain file. |
+| `fs.chownSync(path, uid, gid)` | Still true that path-based `Dir.setFileOwner` panics unconditionally. But `File.setOwner` (the fd-based one `fchownSync` already uses) is a real, working implementation -- so this opens the file first (the same "open, then use the file-level method" pattern `chmodSync` already established) and calls that instead, sidestepping the broken path-level wrapper entirely. Verified with a real ownership change confirmed via `stat` (running as root in the dev container). |
+| `fs.writevSync(fd, buffers)` | `std.Io.File` genuinely has no vectored-write wrapper, but the raw `std.os.linux.writev` syscall exists -- the same "raw Linux syscall, no libc" pattern `os.uptime()`/`fs.watch` already established. Ran into one real bug while shipping this: `std.os.linux.iovec_const` is a private alias, not the type to actually reference -- `std.posix.iovec_const` is. Shipped; verified with a 3-chunk write reassembling correctly in one syscall. `readvSync` is deliberately not shipped alongside it: Node's `readv` fills caller-provided *mutable* buffers, and Lumen's `string` is immutable, so that signature has no natural Lumen shape the way `writevSync`'s (read-only chunks in, byte count out) does. |
+| `fs.lchownSync(path, uid, gid)` | Still genuinely blocked, but for a more precise reason now: unlike `chownSync`, this one must *not* follow a symlink, and `std.Io.Dir.OpenFileOptions` has no "don't follow symlinks" field to open one without following it (confirmed by reading the struct directly) -- so there's no path-level handle to call `setOwner` on the way `chownSync` does. Would need a raw `fchownat(..., AT_SYMLINK_NOFOLLOW)` syscall instead, not attempted this pass. |
+
 `fs.cpSync(src, dest, recursive?)` and `fs.mkdtempSync(prefix)` **shipped** (see
 Available now).
 
@@ -156,12 +168,11 @@ not a replacement.
 | Group | Needs |
 | --- | --- |
 | `fs.opendirSync`, `fs.globSync` | a directory-iterator class / a real glob algorithm — `readdirSync` itself **shipped** (Phase 3, two-pass array fill) |
-| `fs.readvSync`/`writevSync`, append-mode `openSync` ("a") | readv/writev need an array-of-buffers type; the scoped fd API's append mode needs a seek primitive not available here (unrelated to async `fs.appendFile`, which computes its start offset from a stat call instead of seeking) |
-| `fs.realpathSync`, `fs.statfsSync` | see Phase 2 blockers above |
-| `fs.chownSync`, `fs.lchownSync` | `Dir.setFileOwner` is an unconditional `@panic("TODO implement dirSetFileOwner")` in this Zig version's `Io.Threaded` backend on Linux, plus a real signature/error-set bug in the `Dir.zig` wrapper itself; `fs.fchownSync` (fd-based) is unaffected and shipped |
+| `fs.readvSync`, append-mode `openSync` ("a") | `readv` fills caller-provided mutable buffers, no natural Lumen shape given `string` is immutable (`writevSync` **shipped**, Phase 5); append mode needs a seek primitive not available here (unrelated to async `fs.appendFile`, which computes its start offset from a stat call instead of seeking) |
+| `fs.statfsSync` | see Phase 2 blockers above |
+| `fs.lchownSync` | needs a raw `fchownat(..., AT_SYMLINK_NOFOLLOW)` syscall — see Phase 5 (`chownSync` itself **shipped**) |
 | Remaining async/callback functions (`fs.unlink`, `fs.mkdir`, `fs.stat`, ... most of the ~54) and `fs.promises.*` beyond `readFile`/`writeFile`/`appendFile` | the underlying async runtime only exposes read/write/close as true async ops (confirmed by reading its io_uring backend directly) -- no unlink/mkdir/stat op exists to build on without submitting raw low-level requests ourselves, a bigger undertaking than this milestone |
-| `fs.createReadStream`/`createWriteStream` | no `Stream` abstraction in the language |
-| `fs.watch`/`watchFile`/`unwatchFile` | no watcher/listener infra |
+| `fs.watch`/`watchFile`/`unwatchFile` | no watcher/listener infra -- `fs.watch(path, listener)` itself **shipped** (spec 044) |
 | `fs.openAsBlob` | no `Blob` type |
 
 ## Requirements

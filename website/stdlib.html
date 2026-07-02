@@ -263,10 +263,12 @@ console.log(emitter.listenerCount("greet")); // 1</code></pre>
   <code>read</code>, <code>stat</code>, ...) that predate the runtime's newer
   async I/O layer.</p>
   <p class="sub">Mostly synchronous, statically typed and Node-conventional, plus
-  a small async trio (<code>readFile</code>/<code>writeFile</code>/<code>appendFile</code>).
-  This is a practical subset, not the full <a href="https://nodejs.org/docs/latest/api/fs.html">Node <code>fs</code> API</a>
-  (no streams or watchers yet; a Lumen "fd" is a plain <code>int</code> index,
-  not a raw OS handle) &mdash; see Planned below for what is next.</p>
+  a small async trio (<code>readFile</code>/<code>writeFile</code>/<code>appendFile</code>),
+  file watching (<code>watch</code>), and file-backed streams
+  (<code>createReadStream</code>/<code>createWriteStream</code>). This is a
+  practical subset, not the full <a href="https://nodejs.org/docs/latest/api/fs.html">Node <code>fs</code> API</a>
+  (a Lumen "fd" is a plain <code>int</code> index, not a raw OS handle)
+  &mdash; see Planned below for what is next.</p>
 
   <div class="api-list">
     <a href="#fs-readFileSync">readFileSync</a>
@@ -300,6 +302,9 @@ console.log(emitter.listenerCount("greet")); // 1</code></pre>
     <a href="#fs-fchmodSync">fchmodSync</a>
     <a href="#fs-lchmodSync">lchmodSync</a>
     <a href="#fs-fchownSync">fchownSync</a>
+    <a href="#fs-chownSync">chownSync</a>
+    <a href="#fs-realpathSync">realpathSync</a>
+    <a href="#fs-writevSync">writevSync</a>
     <a href="#fs-fsyncSync">fsyncSync</a>
     <a href="#fs-fdatasyncSync">fdatasyncSync</a>
     <a href="#fs-ftruncateSync">ftruncateSync</a>
@@ -308,6 +313,8 @@ console.log(emitter.listenerCount("greet")); // 1</code></pre>
     <a href="#fs-lutimesSync">lutimesSync</a>
     <a href="#fs-readdirSync">readdirSync</a>
     <a href="#fs-watch">watch</a>
+    <a href="#fs-createReadStream">createReadStream</a>
+    <a href="#fs-createWriteStream">createWriteStream</a>
   </div>
 
   <div class="api" id="fs-readFileSync">
@@ -537,10 +544,39 @@ fs.closeSync(fd);</code></pre>
   <div class="api" id="fs-fchownSync">
     <h5><code>fs.fchownSync(fd, uid, gid)</code> <span class="stability-pill stability-experimental" title="New this milestone, not yet covered by the conformance suite -- manually smoke-tested only.">Experimental</span></h5>
     <p class="sub">(int, int, int) → void &mdash; pass <code>-1</code> for either id to leave
-    it unchanged. The path-based <code>chownSync</code>/<code>lchownSync</code> are not
-    available yet (unimplemented in the underlying runtime).</p>
+    it unchanged.</p>
 <pre><code class="lumen">const fd: int = fs.openSync("data.bin", "w");
 fs.fchownSync(fd, 1000, -1);  // change owner, leave group alone
+fs.closeSync(fd);</code></pre>
+  </div>
+
+  <div class="api" id="fs-chownSync">
+    <h5><code>fs.chownSync(path, uid, gid)</code> <span class="stability-pill stability-experimental" title="New this milestone, not yet covered by the conformance suite -- manually smoke-tested only, including a real ownership change verified with stat.">Experimental</span></h5>
+    <p class="sub">(string, int, int) → void &mdash; pass <code>-1</code> for either id
+    to leave it unchanged. Follows symlinks (see <code>fs.lchownSync</code> in
+    Planned below for the one that shouldn't). Implemented by opening the file
+    and reusing <code>fchownSync</code>'s working fd-based path, since the
+    path-based owner-change call panics unconditionally in this Zig version's
+    runtime.</p>
+<pre><code class="lumen">fs.chownSync("data.bin", 1000, 1000);</code></pre>
+  </div>
+
+  <div class="api" id="fs-realpathSync">
+    <h5><code>fs.realpathSync(path)</code> <span class="stability-pill stability-experimental" title="New this milestone, not yet covered by the conformance suite -- manually smoke-tested including real symlink resolution.">Experimental</span></h5>
+    <p class="sub">string → string &mdash; resolves symlinks and returns the
+    canonical path. Returns <code>path</code> unchanged if it doesn't exist or
+    can't be resolved.</p>
+<pre><code class="lumen">console.log(fs.realpathSync("./current-link"));</code></pre>
+  </div>
+
+  <div class="api" id="fs-writevSync">
+    <h5><code>fs.writevSync(fd, buffers)</code> <span class="stability-pill stability-experimental" title="New this milestone, not yet covered by the conformance suite -- manually smoke-tested only.">Experimental</span></h5>
+    <p class="sub">(int, string[]) → int &mdash; writes every chunk in
+    <code>buffers</code> in a single syscall, returns the total bytes
+    written. Linux only (raw <code>writev</code>, no libc). <code>readvSync</code>
+    is not available &mdash; see Planned below.</p>
+<pre><code class="lumen">const fd: int = fs.openSync("out.bin", "w");
+const n: int = fs.writevSync(fd, ["hello ", "world"]);
 fs.closeSync(fd);</code></pre>
   </div>
 
@@ -610,6 +646,36 @@ for (const n of names) {
 }
 
 fs.watch("./src", onChange);</code></pre>
+  </div>
+
+  <div class="api" id="fs-createReadStream">
+    <h5><code>fs.createReadStream(path)</code> <span class="stability-pill stability-experimental" title="New this milestone, not yet covered by the conformance suite -- manually smoke-tested with a real, multi-chunk file.">Experimental</span></h5>
+    <p class="sub">string → <code>ReadableStream</code> &mdash; built the
+    same way <code>Map</code>/<code>Set</code>/<code>EventEmitter</code>
+    are, a real dedicated type. <code>.read()</code> returns the next
+    chunk (up to 64KB), an empty string at EOF; <code>.close()</code>
+    closes the file. A missing/unopenable file degrades to a stream that
+    always reads <code>""</code> rather than crashing, the same fallback
+    shape every other <code>fs</code> function already uses.
+    Synchronous/blocking, no async or backpressure integration yet.</p>
+<pre><code class="lumen">const r = fs.createReadStream("large.log");
+let chunk: string = r.read();
+while (chunk != "") {
+  console.log(chunk.length);
+  chunk = r.read();
+}
+r.close();</code></pre>
+  </div>
+
+  <div class="api" id="fs-createWriteStream">
+    <h5><code>fs.createWriteStream(path)</code> <span class="stability-pill stability-experimental" title="New this milestone, not yet covered by the conformance suite -- manually smoke-tested with a real, multi-write file.">Experimental</span></h5>
+    <p class="sub">string → <code>WritableStream</code> &mdash;
+    <code>.write(chunk)</code> appends a chunk to the file (opens/
+    truncates on creation); <code>.close()</code> flushes and closes.</p>
+<pre><code class="lumen">const w = fs.createWriteStream("out.log");
+w.write("line one\n");
+w.write("line two\n");
+w.close();</code></pre>
   </div>
 
   <h4 id="path">path</h4>
@@ -685,9 +751,13 @@ console.log(path.basename("/foo/bar/baz.html", ".html")); // baz</code></pre>
     "cd"-chains left to right, an absolute segment resets the result.
     <strong>Deviation from Node</strong>: if no argument is absolute, Node
     anchors the result to <code>process.cwd()</code> to guarantee an absolute
-    path; Lumen has no working way to read the real cwd as a string yet (the
-    same gap that blocks <code>fs.realpathSync</code>), so it stays relative
-    instead.</p>
+    path; Lumen's <code>path.*</code> functions are pure string manipulation
+    with no way to read the real cwd today, so it stays relative instead.
+    (<code>fs.realpathSync(".")</code> genuinely does resolve to the real
+    working directory now, confirmed against a real <code>pwd</code> -- this
+    is a confirmed-achievable follow-up, not implemented this pass since it
+    would mean giving <code>path.*</code> an <code>io</code> parameter for
+    the first time.)</p>
 <pre><code class="lumen">console.log(path.resolve("/foo/bar", "./baz")); // /foo/bar/baz
 console.log(path.resolve("foo", "bar"));        // foo/bar -- not absolute, see above</code></pre>
   </div>
@@ -727,9 +797,8 @@ console.log(p.name);  // file</code></pre>
 
   <h4 id="process">process</h4>
   <p class="stability-note stability-stable">Stable &mdash;
-  <code>cwd</code>/<code>chdir</code> go through the same primitives as
-  <code>fs</code> (not the libc-only gap that blocks
-  <code>fs.realpathSync</code>); <code>env</code> and <code>argv()</code>
+  <code>cwd</code>/<code>chdir</code> go through the same <code>Io</code>
+  primitives as <code>fs</code>; <code>env</code> and <code>argv()</code>
   reuse state the program's own startup already collects;
   <code>platform</code>/<code>arch</code> are compile-time constants;
   <code>pid()</code> is a raw Linux syscall. No libc linking required for any
@@ -1266,10 +1335,9 @@ http.createServer(8080, handleRequest);</code></pre>
   <h4>fs</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
-    <tr><td><code>fs.realpathSync(path)</code></td><td>only a raw libc binding exists, not wrapped by the runtime's I/O layer</td></tr>
-    <tr><td><code>fs.chownSync(path, uid, gid)</code> · <code>fs.lchownSync(path, uid, gid)</code></td><td>unimplemented in the underlying runtime (the fd-based <code>fchownSync</code> works and shipped)</td></tr>
-    <tr><td><code>fs.readvSync</code> / <code>writevSync</code> · append-mode <code>openSync</code></td><td>readv/writev need an array of buffers; append mode needs a seek primitive not available here</td></tr>
-    <tr><td><code>fs.promises.*</code> / streams / most async callback variants</td><td><code>fs.readFile</code>, <code>fs.writeFile</code>, and <code>fs.appendFile</code> are wired to the event loop; the rest needs lower-level async ops the runtime doesn't expose yet</td></tr>
+    <tr><td><code>fs.lchownSync(path, uid, gid)</code></td><td>the path-based <code>Dir.setFileOwner</code> is an unconditional panic in this Zig version's runtime, and unlike <code>chownSync</code> (which now opens the file and uses the working fd-based <code>setOwner</code> instead) this one specifically must not follow a symlink, and there's no open-without-following-symlinks option to route around the panic that way</td></tr>
+    <tr><td><code>fs.readvSync</code> · append-mode <code>openSync</code></td><td>readv fills caller-provided mutable buffers, which doesn't have a natural shape with Lumen's immutable <code>string</code> (unlike <code>writevSync</code>, which shipped); append mode needs a seek/position primitive not available here</td></tr>
+    <tr><td><code>fs.promises.*</code> / most async callback variants</td><td><code>fs.readFile</code>, <code>fs.writeFile</code>, and <code>fs.appendFile</code> are wired to the event loop; the rest needs lower-level async ops the runtime doesn't expose yet</td></tr>
     <tr><td><code>fs.watch</code> event-type distinction, recursive watching, non-Linux platforms</td><td><code>fs.watch(path, listener)</code> itself shipped (Linux, flat, one filename per event); each of these is a real, separate follow-up</td></tr>
     <tr><td><code>fs.opendirSync(path)</code> · <code>fs.globSync(pattern)</code></td><td>need a directory-iterator class / a real glob algorithm</td></tr>
   </table>
