@@ -656,6 +656,18 @@ pub fn emitExpr(e: *const Expr, w: *std.ArrayListUnmanaged(u8), arena: std.mem.A
                 try w.appendSlice(arena, "__timeNow(__io)");
             } else if (std.mem.eql(u8, cl.namespace, "time") and std.mem.eql(u8, cl.name, "monotonic")) {
                 try w.appendSlice(arena, "__timeMonotonic(__io)");
+            } else if (std.mem.eql(u8, cl.namespace, "http") and std.mem.eql(u8, cl.name, "request")) {
+                try w.appendSlice(arena, "__httpRequest(__io, __alloc, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[1], w, arena);
+                try w.appendSlice(arena, ", ");
+                try emitExpr(cl.args[2], w, arena);
+                try w.append(arena, ')');
+            } else if (std.mem.eql(u8, cl.namespace, "http") and std.mem.eql(u8, cl.name, "get")) {
+                try w.appendSlice(arena, "__httpRequest(__io, __alloc, ");
+                try emitExpr(cl.args[0], w, arena);
+                try w.appendSlice(arena, ", \"GET\", \"\")");
             } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "sep")) {
                 try w.appendSlice(arena, "@as([]const u8, \"/\")");
             } else if (std.mem.eql(u8, cl.namespace, "path") and std.mem.eql(u8, cl.name, "delimiter")) {

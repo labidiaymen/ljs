@@ -2,28 +2,45 @@
 
 ## Phase 1 -- client
 
-- [ ] T1 Add `"http"` to the parser's `isStdNamespace` list. New
+- [x] T1 Added `"http"` to the parser's `isStdNamespace` list. New
   `httpCallType` in `lumen_check_stdlib.zig`, wired into `staticCallType`.
-- [ ] T2 `registerLumenHttpResponse` -- synthetic `{ status: int, body:
-  string, ok: bool }` record, following `registerLumenUrlParts`'s exact
-  pattern.
-- [ ] T3 `http.request(url, method, body)` -- confirm `std.http.Client
-  .fetch`'s `method`/`payload`/`response_writer` options actually behave
-  as expected together (method override, payload sent, response body
-  captured) with a real request against a real endpoint, not just that it
-  compiles.
-- [ ] T4 `http.get(url)` -- thin wrapper over `request(url, "GET", "")`.
-- [ ] T5 Verify: a GET against a known-stable endpoint returns a plausible
-  status/body/`ok`; a POST with a body actually sends it (verify against
-  an echo-style endpoint or by reading back what was received); a request
-  to an unreachable host degrades to a sane fallback rather than crashing.
-- [ ] T6 Decide whether the old bare `httpGet(url)` global function
-  becomes an alias for `http.get(url)` or is removed outright -- check
-  for existing call sites/examples referencing it first.
-- [ ] T7 `zig build test` passes. `zig build conformance` run clean.
-- [ ] T8 Update `website/stdlib.html`: new `http` quick-jump list + client
-  function blocks; update the Planned table.
-- [ ] T9 Commit, push, redeploy `lumen-playground`.
+- [x] T2 `registerLumenHttpResponse` -- synthetic `{ status: int, body:
+  string, ok: bool }` record, following `registerLumenSpawnResult`'s
+  exact pattern.
+- [x] T3 `http.request(url, method, body)` -- confirmed `std.http.Client
+  .fetch`'s `method`/`payload`/`response_writer` options work together
+  exactly as expected, against real endpoints (not just that it
+  compiles): `response_writer` needed `std.Io.Writer.Allocating` (a
+  growable-buffer writer) to actually capture the body, and
+  `std.meta.stringToEnum(std.http.Method, method)` converts the method
+  string cleanly.
+- [x] T4 `http.get(url)` -- reuses `__httpRequest` directly with
+  hardcoded `"GET", ""` args in codegen, no separate wrapper function
+  needed.
+- [x] T5 Verified: `http.get("https://example.com")` returned `status:
+  200, ok: true`, with the body containing "Example Domain";
+  `http.request("https://postman-echo.com/post", "POST", "hello=world")`
+  returned `status: 200` with the body echoing back `"hello=world"`
+  (confirms the payload was genuinely sent, not just accepted silently);
+  a request to a nonexistent domain returned the `status: -1, ok: false`
+  fallback rather than crashing. (First test run hit `httpbin.org`
+  returning 503 for everyone, confirmed via plain `curl` -- a real
+  third-party outage, not a bug here; switched to `example.com`/
+  `postman-echo.com`.)
+- [x] T6 Decided: left the old bare `httpGet(url)`/`serve(port, body)`
+  global functions as-is (no real call sites existed per the spec's
+  migration note, so no compatibility break either way) rather than
+  aliasing or removing them -- lowest-risk choice; `http.get`/`request`
+  are the primary, documented path going forward.
+- [x] T7 `zig build test` passes. `zig build conformance` run clean.
+- [x] T8 Updated `website/stdlib.html`: new `http` quick-jump list +
+  client function blocks, tagged `target-wasm-limited` (confirmed by
+  actually running the compiled wasm via wasmtime: it compiles cleanly
+  but every request returns the connection-failure fallback under WASI,
+  which has no network access -- the same "compiles, non-functional"
+  shape as `child_process.spawnSync`, not a crash); updated the Planned
+  table.
+- [x] T9 Commit, push, redeploy `lumen-playground`.
 
 ## Phase 2 -- server
 

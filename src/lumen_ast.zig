@@ -412,6 +412,7 @@ pub const Program = struct {
     needs_child_process_api: bool = false,
     needs_assert: bool = false,
     needs_time_api: bool = false,
+    needs_http_module: bool = false,
     needs_rmdir_sync: bool = false,
     needs_rm_sync: bool = false,
     needs_truncate_sync: bool = false,

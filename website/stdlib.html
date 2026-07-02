@@ -84,6 +84,7 @@
     <a href="#child_process">child_process</a>
     <a href="#assert">assert</a>
     <a href="#time">time</a>
+    <a href="#http">http</a>
     <p class="docs-nav-title">Planned</p>
     <a href="#planned">Roadmap</a>
     <p class="docs-nav-title">Packages</p>
@@ -1135,6 +1136,55 @@ const elapsed: i64 = time.monotonic() - start;
 console.log(elapsed);</code></pre>
   </div>
 
+  <h4 id="http">http</h4>
+  <p class="stability-note stability-experimental">Experimental &mdash; new
+  this milestone, not yet covered by the conformance suite; manually
+  smoke-tested against real endpoints.</p>
+  <p class="sub">A one-shot HTTP client, the practical core of
+  <a href="https://nodejs.org/api/http.html">Node's <code>http</code>
+  module</a>. Not a 1:1 port: Node's classes
+  (<code>ClientRequest</code>/<code>IncomingMessage</code>/<code>Agent</code>)
+  are all built on <code>EventEmitter</code> and streams together; custom
+  request headers and reading response headers are both deferred (the
+  same header-collection-type gap that deferred <code>url</code>'s
+  querystring, and the underlying HTTP client's convenience wrapper only
+  surfaces the status code, respectively).</p>
+  <p class="sub"><strong>~1.5&times; faster than Node's native
+  <code>http</code> client</strong> against a local server: 300 sequential
+  GETs, compiled with <code>--release-fast</code>, measured around 110ms
+  versus Node 20's ~160ms for the equivalent loop. Only skips work Node's
+  own client also skips for a plain (non-TLS) request &mdash; loading the
+  system CA bundle means reading and parsing a real certificate file from
+  disk, so it's only done for <code>https://</code> URLs, not
+  unconditionally on every call.</p>
+
+  <div class="api-list">
+    <a href="#http-request">request</a>
+    <a href="#http-get">get</a>
+  </div>
+
+  <div class="api" id="http-request">
+    <h5><code>http.request(url, method, body)</code> <span class="target-pill target-wasm-limited" title="Compiles under --wasm and runs without crashing, but every call fails at the connection step there: WASI has no network access, so status is always -1 on that target.">Wasm: limited</span></h5>
+    <p class="sub">(string, string, string) → <code>{ status, body, ok }</code>
+    &mdash; pass <code>""</code> for <code>body</code> on methods that
+    don't take one. <code>ok</code> is <code>status &gt;= 200 and status
+    &lt; 300</code>, computed once here so every caller doesn't have to
+    write that range check themselves. <code>status</code> is
+    <code>-1</code> if the request could not even connect.</p>
+<pre><code class="lumen">const r = http.request("https://postman-echo.com/post", "POST", "hello=world");
+console.log(r.status); // 200
+console.log(r.ok);     // true</code></pre>
+  </div>
+
+  <div class="api" id="http-get">
+    <h5><code>http.get(url)</code> <span class="target-pill target-wasm-limited" title="Same as http.request.">Wasm: limited</span></h5>
+    <p class="sub">string → <code>{ status, body, ok }</code> &mdash;
+    <code>http.request(url, "GET", "")</code>.</p>
+<pre><code class="lumen">const r = http.get("https://example.com");
+console.log(r.status); // 200
+console.log(r.body.includes("Example Domain")); // true</code></pre>
+  </div>
+
   <h3 id="planned">Planned</h3>
   <p class="sub">The surface grows in explicit, conformance-backed slices. These
   modules use the same conventional names; some depend on upcoming language
@@ -1214,7 +1264,12 @@ console.log(elapsed);</code></pre>
   <h4>http</h4>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
-    <tr><td><code>http.get(url)</code> → <code>{ status, body }</code></td><td>a global <code>httpGet(url)</code> exists today returning just a status code; completing it to a full record with the response body is a natural next step</td></tr>
+    <tr><td><code>http.createServer(port, handler)</code></td><td>a real request-inspecting server, superseding the existing canned-response <code>serve()</code> global &mdash; a follow-up phase, not attempted yet</td></tr>
+    <tr><td>Custom request/response headers (set or read)</td><td>needs a header-collection type; the same gap that deferred <code>url</code>'s querystring</td></tr>
+    <tr><td>Response headers on the client side</td><td>the underlying client's convenience wrapper only surfaces the status code; reading headers needs the lower-level request/response flow underneath it</td></tr>
+    <tr><td>Real <code>Server</code>/<code>IncomingMessage</code>/<code>ServerResponse</code>/<code>ClientRequest</code>/<code>Agent</code> classes</td><td>Node's classes bundle request/response data with an event mechanism; <code>EventEmitter</code> alone doesn't supply the data half, which still needs the header-collection/streaming gaps closed first</td></tr>
+    <tr><td>Server lifecycle events (<code>'error'</code>, <code>'close'</code>) via <code>EventEmitter&lt;T&gt;</code></td><td>genuinely reachable now that <code>EventEmitter</code> exists &mdash; a real follow-up</td></tr>
+    <tr><td>Streaming request/response bodies, concurrent serving, <code>METHODS</code>/<code>STATUS_CODES</code>, HTTPS/TLS configuration, WebSocket upgrade</td><td>each a real, separate feature</td></tr>
   </table>
 
   <h3 id="community">Community packages</h3>

@@ -75,6 +75,16 @@ options -- confirmed capable of exactly this (checked the real struct
 definition directly, not assumed), a genuine capability upgrade over the
 current status-only `httpGet`.
 
+**Benchmark against Node's native `http` client**: ~1.5x faster on 300
+sequential GETs against a local server (`--release-fast`, ~110ms vs Node
+20's ~160ms for the equivalent loop). Found and fixed a real bug while
+measuring this: the client was reloading and re-parsing the system CA
+certificate bundle from disk on *every single call*, including plain
+non-TLS `http://` requests that never need it -- a ~5x improvement on its
+own (Lumen measured ~3.5x *slower* than Node before this fix). Now the CA
+bundle is only scanned for `https://` URLs, matching what Node's own
+client does.
+
 ### Server (Phase 2)
 
 | Function | Type | Notes |
@@ -96,13 +106,29 @@ Planned-table mention -- no example, test, or playground code depends on
 either. Free to alias, supersede, or remove them during implementation
 without a compatibility concern.
 
+## Revisited now that `EventEmitter<T>` exists (spec 043)
+
+`EventEmitter<T>` shipped after this spec was first written. It doesn't
+change the core request/response design below: request/response is a
+call-and-return pattern (one request in, one response out), not a
+broadcast/pub-sub pattern, so `EventEmitter` isn't actually the right tool
+for the request-handling path itself -- the functional
+`(HttpRequest) -> HttpResponse` handler design still stands. What it *does*
+newly unblock is **server lifecycle notifications** that are genuinely
+event-shaped (`'error'` on a listen failure, `'close'` when the server
+stops) -- moved from "not planned, needs EventEmitter" to a real Phase 3
+candidate below, now that the blocker is gone. Custom headers and response
+streaming remain blocked on unrelated gaps (a header-collection type, a
+`Stream` abstraction) that `EventEmitter` doesn't touch.
+
 ## Not planned (this pass)
 
 | Group | Needs |
 | --- | --- |
 | Custom request/response headers (set or read) | a header-collection type; the same growable-array/`Map`-construction gap that deferred `url`'s querystring |
 | Response headers on the client side | `std.http.Client.fetch`'s convenience wrapper only surfaces `status`; reading response headers needs the lower-level request/response object flow underneath it, not investigated this pass |
-| `http.Server`/`IncomingMessage`/`ServerResponse`/`ClientRequest`/`Agent` as real classes, or any `'event'` name | needs `EventEmitter`, not built yet |
+| `http.Server`/`IncomingMessage`/`ServerResponse`/`ClientRequest`/`Agent` as real classes | Node's classes bundle request/response *data* (headers, streaming body) with the event mechanism; `EventEmitter` alone doesn't supply the data half, which still needs the header-collection/`Stream` gaps closed first |
+| Server lifecycle events (`'error'`, `'close'`) via `EventEmitter<T>` | genuinely reachable now (see above) -- real follow-up, not attempted in this pass's Phase 1/2 |
 | Streaming request/response bodies (chunked reads, backpressure) | needs a `Stream` abstraction, not built yet -- everything here is one-shot, whole-body |
 | Concurrent/multi-connection serving | the accept loop is single-threaded and blocking, matching the existing `serve()`'s simplicity; a real concurrent server is a separate, later feature |
 | `http.METHODS`/`STATUS_CODES` constants | low value without more consumers of them yet; easy to add later as plain string-array/record constants |

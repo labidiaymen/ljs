@@ -1246,6 +1246,40 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_http_module) {
+        // http.request/get (spec 042): one-shot client request via
+        // std.http.Client.fetch, with a real method/payload/response body
+        // -- a genuine capability upgrade over the old status-only
+        // httpGet global. Response headers aren't surfaced: fetch's
+        // convenience wrapper only exposes status, reading headers needs
+        // the lower-level request/response flow underneath it.
+        try out.appendSlice(arena,
+            \\pub const __LumenHttpResponse = struct { status: i32, body: []const u8, ok: bool };
+            \\fn __httpRequest(io: std.Io, alloc: std.mem.Allocator, url: []const u8, method: []const u8, body: []const u8) __LumenHttpResponse {
+            \\    var client: std.http.Client = .{ .allocator = alloc, .io = io };
+            \\    defer client.deinit();
+            \\    // Loading the system CA bundle means reading and parsing a real
+            \\    // certificate file from disk -- skip it entirely for plain http://
+            \\    // requests, which never need it, rather than paying that cost on
+            \\    // every single call regardless of scheme.
+            \\    if (std.mem.startsWith(u8, url, "https://")) {
+            \\        client.ca_bundle.rescan(alloc, io, std.Io.Clock.now(.real, io)) catch return .{ .status = -1, .body = "", .ok = false };
+            \\    }
+            \\    var resp_writer: std.Io.Writer.Allocating = .init(alloc);
+            \\    const http_method = std.meta.stringToEnum(std.http.Method, method) orelse .GET;
+            \\    const payload: ?[]const u8 = if (body.len > 0) body else null;
+            \\    const res = client.fetch(.{
+            \\        .location = .{ .url = url },
+            \\        .method = http_method,
+            \\        .payload = payload,
+            \\        .response_writer = &resp_writer.writer,
+            \\    }) catch return .{ .status = -1, .body = "", .ok = false };
+            \\    const status_code: i32 = @intFromEnum(res.status);
+            \\    return .{ .status = status_code, .body = resp_writer.written(), .ok = status_code >= 200 and status_code < 300 };
+            \\}
+            \\
+        );
+    }
     if (program.needs_process_api) {
         // cwd/chdir/env go through Io-abstracted (cwd/chdir) or entry-captured
         // (env, same mechanism as __args) primitives -- none of these need
