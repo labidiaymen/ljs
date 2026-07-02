@@ -66,6 +66,29 @@ code.
   need either a custom-comparison variant of `Map` (doesn't exist) or
   normalizing every key to lowercase (a simpler follow-up if this proves
   to matter).
+- **Shipped: request headers (client) and response headers (server).
+  Deliberately not shipped: response headers (client)** -- always an
+  empty `Map` on `http.request`/`get`'s returned response for now.
+  Confirmed reachable (`std.http.Client`'s lower-level `Head`/`Response`
+  type has `iterateHeaders()`, checked by reading the source), but
+  getting there means restructuring `__httpRequest` off `client.fetch()`'s
+  one-shot convenience wrapper onto the lower-level
+  `request()`/`sendBodiless`/`sendBodyComplete`/`receiveHead()` flow,
+  several method signatures inferred from naming, never verified against
+  real behavior. Rewriting an already-working, already-benchmarked call
+  (spec 042's ~1.5x-faster-than-Node client) under time pressure for an
+  unverified API surface was the wrong trade -- a real follow-up, not an
+  oversight.
+- **Two real bugs found while shipping this, both fixed**: (1) a struct
+  field added to the checker's type registration (`registerLumenHttpResponse`)
+  but not to the *separate* literal Zig struct-definition string emitted
+  alongside `__httpRequest` -- two independent sources of truth for the
+  same record shape, both need updating, a trap worth remembering for the
+  next record-returning builtin change. (2) `alloc.alloc(...) catch &.{}`
+  silently inferred the whole expression as `[]const T` via peer type
+  resolution with the empty-array-literal fallback, even though
+  `alloc.alloc` itself returns a mutable `[]T` -- `catch unreachable`
+  avoided the const-inducing fallback.
 
 ## Not planned (this pass)
 

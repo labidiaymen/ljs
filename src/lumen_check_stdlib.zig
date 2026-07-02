@@ -1449,6 +1449,7 @@ pub fn urlCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall,
         registerLumenUrlParts(self) orelse return null;
         program.uses_io = true;
         program.needs_url_api = true;
+        program.needs_map = true;
         call.checked_type = .{ .named = "__LumenUrlParts" };
         return .{ .named = "__LumenUrlParts" };
     }
@@ -1464,6 +1465,7 @@ pub fn urlCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall,
         };
         program.uses_io = true;
         program.needs_url_api = true;
+        program.needs_map = true;
         call.checked_type = .string;
         return .string;
     }
@@ -1478,7 +1480,7 @@ pub fn urlCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall,
 // path's record.
 fn registerLumenUrlParts(self: *Checker) ?void {
     if (self.type_decls.get("__LumenUrlParts") == null) {
-        const fields = self.arena.alloc(ast.TypeField, 7) catch return null;
+        const fields = self.arena.alloc(ast.TypeField, 8) catch return null;
         fields[0] = .{ .name = "protocol", .annotation = "string", .checked_type = .string };
         fields[1] = .{ .name = "hostname", .annotation = "string", .checked_type = .string };
         fields[2] = .{ .name = "port", .annotation = "string", .checked_type = .string };
@@ -1486,6 +1488,15 @@ fn registerLumenUrlParts(self: *Checker) ?void {
         fields[4] = .{ .name = "search", .annotation = "string", .checked_type = .string };
         fields[5] = .{ .name = "hash", .annotation = "string", .checked_type = .string };
         fields[6] = .{ .name = "href", .annotation = "string", .checked_type = .string };
+        // spec 045: `search` stays the raw "?a=1&b=2" string as-is; `query`
+        // is additive, the same string parsed into key/value pairs.
+        const key_ty = self.arena.create(types.Type) catch return null;
+        key_ty.* = .string;
+        const val_ty = self.arena.create(types.Type) catch return null;
+        val_ty.* = .string;
+        const map_ty = self.arena.create(types.MapType) catch return null;
+        map_ty.* = .{ .key = key_ty, .value = val_ty };
+        fields[7] = .{ .name = "query", .annotation = "Map<string,string>", .checked_type = .{ .map_type = map_ty } };
         self.type_decls.put(self.arena, "__LumenUrlParts", .{ .fields = fields }) catch return null;
     }
 }
@@ -1585,7 +1596,7 @@ pub fn timeCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall
 
 pub fn httpCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, line: u32, col: u32) ?types.Type {
     if (std.mem.eql(u8, call.name, "request")) {
-        if (call.args.len != 3) {
+        if (call.args.len != 4) {
             _ = self.fail(line, col, "E_ARG_COUNT") catch {};
             return null;
         }
@@ -1596,9 +1607,21 @@ pub fn httpCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall
             _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
             return null;
         }
+        const key_ty = self.arena.create(types.Type) catch return null;
+        key_ty.* = .string;
+        const val_ty = self.arena.create(types.Type) catch return null;
+        val_ty.* = .string;
+        const map_ty = self.arena.create(types.MapType) catch return null;
+        map_ty.* = .{ .key = key_ty, .value = val_ty };
+        const headers_type = self.exprType(program, call.args[3], line, col) orelse return null;
+        if (!types.same(.{ .map_type = map_ty }, headers_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
         registerLumenHttpResponse(self) orelse return null;
         program.uses_io = true;
         program.needs_http_module = true;
+        program.needs_map = true;
         call.checked_type = .{ .named = "__LumenHttpResponse" };
         return .{ .named = "__LumenHttpResponse" };
     }
@@ -1615,6 +1638,7 @@ pub fn httpCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall
         registerLumenHttpResponse(self) orelse return null;
         program.uses_io = true;
         program.needs_http_module = true;
+        program.needs_map = true;
         call.checked_type = .{ .named = "__LumenHttpResponse" };
         return .{ .named = "__LumenHttpResponse" };
     }
@@ -1638,6 +1662,7 @@ pub fn httpCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall
         program.uses_io = true;
         program.needs_http_module = true;
         program.needs_http_server = true;
+        program.needs_map = true;
         call.checked_type = .void;
         return .void;
     }
@@ -1651,10 +1676,20 @@ pub fn httpCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall
 // introduced.
 pub fn registerLumenHttpResponse(self: *Checker) ?void {
     if (self.type_decls.get("__LumenHttpResponse") == null) {
-        const fields = self.arena.alloc(ast.TypeField, 3) catch return null;
+        const fields = self.arena.alloc(ast.TypeField, 4) catch return null;
         fields[0] = .{ .name = "status", .annotation = "int", .checked_type = .i32 };
         fields[1] = .{ .name = "body", .annotation = "string", .checked_type = .string };
         fields[2] = .{ .name = "ok", .annotation = "bool", .checked_type = .bool };
+        // spec 045: shared by the client's returned response (real response
+        // headers) and the server handler's return value (headers the
+        // handler chooses to send back).
+        const key_ty = self.arena.create(types.Type) catch return null;
+        key_ty.* = .string;
+        const val_ty = self.arena.create(types.Type) catch return null;
+        val_ty.* = .string;
+        const map_ty = self.arena.create(types.MapType) catch return null;
+        map_ty.* = .{ .key = key_ty, .value = val_ty };
+        fields[3] = .{ .name = "headers", .annotation = "Map<string,string>", .checked_type = .{ .map_type = map_ty } };
         self.type_decls.put(self.arena, "__LumenHttpResponse", .{ .fields = fields }) catch return null;
     }
 }

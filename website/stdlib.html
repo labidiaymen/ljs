@@ -1037,16 +1037,24 @@ console.log(token.length); // 32</code></pre>
 
   <div class="api" id="url-parse">
     <h5><code>url.parse(str)</code></h5>
-    <p class="sub">string → <code>{ protocol, hostname, port, pathname, search, hash, href }</code>
+    <p class="sub">string → <code>{ protocol, hostname, port, pathname, search, hash, href, query }</code>
     &mdash; the second record-returning builtin family after
     <code>path.parse</code>, same pattern: a synthetic record type, all
-    fields plain (non-optional) strings.</p>
-<pre><code class="lumen">const u = url.parse("https://example.com:8080/foo?a=1#b");
+    fields plain (non-optional) strings, except <code>query</code>.
+    <code>query</code> is <code>search</code> (which stays the raw
+    <code>"?a=1&amp;b=2"</code> string, unchanged) additionally parsed
+    into a real <code>Map&lt;string, string&gt;</code> &mdash; both are
+    available, not a choice between them. A repeated key overwrites (last
+    one wins), the same behavior any repeated <code>Map.set()</code> call
+    already has.</p>
+<pre><code class="lumen">const u = url.parse("https://example.com:8080/foo?a=1&b=hello#c");
 console.log(u.hostname); // example.com
 console.log(u.port);     // 8080
 console.log(u.pathname); // /foo
-console.log(u.search);   // ?a=1
-console.log(u.hash);     // #b</code></pre>
+console.log(u.search);   // ?a=1&b=hello
+console.log(u.hash);     // #c
+console.log(u.query.get("a")); // 1
+console.log(u.query.get("b")); // hello</code></pre>
   </div>
 
   <div class="api" id="url-format">
@@ -1162,11 +1170,12 @@ console.log(elapsed);</code></pre>
   <a href="https://nodejs.org/api/http.html">Node's <code>http</code>
   module</a>. Not a 1:1 port: Node's classes
   (<code>ClientRequest</code>/<code>IncomingMessage</code>/<code>Agent</code>)
-  are all built on <code>EventEmitter</code> and streams together; custom
-  request headers and reading response headers are both deferred (the
-  same header-collection-type gap that deferred <code>url</code>'s
-  querystring, and the underlying HTTP client's convenience wrapper only
-  surfaces the status code, respectively).</p>
+  are all built on <code>EventEmitter</code> and streams together. Custom
+  request headers and response headers (server-side) both work, via
+  <code>Map&lt;string, string&gt;</code>; response headers on the client
+  side are the one piece still deferred (the underlying HTTP client's
+  convenience wrapper only surfaces the status code -- reading real
+  headers needs a lower-level request flow than what's wired up yet).</p>
   <p class="sub"><strong>~1.5&times; faster than Node's native
   <code>http</code> client</strong> against a local server: 300 sequential
   GETs, compiled with <code>--release-fast</code>, measured around 110ms
@@ -1183,22 +1192,31 @@ console.log(elapsed);</code></pre>
   </div>
 
   <div class="api" id="http-request">
-    <h5><code>http.request(url, method, body)</code> <span class="target-pill target-wasm-limited" title="Compiles under --wasm and runs without crashing, but every call fails at the connection step there: WASI has no network access, so status is always -1 on that target.">Wasm: limited</span></h5>
-    <p class="sub">(string, string, string) → <code>{ status, body, ok }</code>
-    &mdash; pass <code>""</code> for <code>body</code> on methods that
-    don't take one. <code>ok</code> is <code>status &gt;= 200 and status
+    <h5><code>http.request(url, method, body, headers)</code> <span class="target-pill target-wasm-limited" title="Compiles under --wasm and runs without crashing, but every call fails at the connection step there: WASI has no network access, so status is always -1 on that target.">Wasm: limited</span></h5>
+    <p class="sub">(string, string, string, Map&lt;string, string&gt;) →
+    <code>{ status, body, ok, headers }</code> &mdash; pass
+    <code>""</code> for <code>body</code> on methods that don't take one,
+    and an empty <code>Map</code> for <code>headers</code> if there are
+    none to send. <code>ok</code> is <code>status &gt;= 200 and status
     &lt; 300</code>, computed once here so every caller doesn't have to
     write that range check themselves. <code>status</code> is
-    <code>-1</code> if the request could not even connect.</p>
-<pre><code class="lumen">const r = http.request("https://postman-echo.com/post", "POST", "hello=world");
+    <code>-1</code> if the request could not even connect. The response's
+    own <code>headers</code> is currently always an empty <code>Map</code>
+    &mdash; reading real response headers needs a lower-level request
+    flow than what's wired up yet, a deliberate, documented gap, not a
+    silent one.</p>
+<pre><code class="lumen">const headers = new Map&lt;string, string&gt;();
+headers.set("X-Request-Id", "abc123");
+const r = http.request("https://postman-echo.com/post", "POST", "hello=world", headers);
 console.log(r.status); // 200
 console.log(r.ok);     // true</code></pre>
   </div>
 
   <div class="api" id="http-get">
     <h5><code>http.get(url)</code> <span class="target-pill target-wasm-limited" title="Same as http.request.">Wasm: limited</span></h5>
-    <p class="sub">string → <code>{ status, body, ok }</code> &mdash;
-    <code>http.request(url, "GET", "")</code>.</p>
+    <p class="sub">string → <code>{ status, body, ok, headers }</code>
+    &mdash; <code>http.request(url, "GET", "", ...)</code> with an empty
+    headers map.</p>
 <pre><code class="lumen">const r = http.get("https://example.com");
 console.log(r.status); // 200
 console.log(r.body.includes("Example Domain")); // true</code></pre>
@@ -1210,16 +1228,19 @@ console.log(r.body.includes("Example Domain")); // true</code></pre>
     blocking accept loop, calls <code>handler</code> per request, never
     returns. <code>handler</code> must be a named function (block-bodied
     inline arrow functions don't parse in this position yet), and returns
-    the <em>same</em> <code>{ status, body, ok }</code> record the client
-    side uses (<code>ok</code> goes unused server-side). Superseded the
-    old canned-response <code>serve()</code> global, which always
-    returned the same body to every request; this one genuinely inspects
-    each request.</p>
+    the <em>same</em> <code>{ status, body, ok, headers }</code> record
+    the client side uses (<code>ok</code> goes unused server-side;
+    <code>headers</code> is written into the real response, one line per
+    entry). Superseded the old canned-response <code>serve()</code>
+    global, which always returned the same body to every request; this
+    one genuinely inspects each request.</p>
 <pre><code class="lumen">function handleRequest(req: HttpRequest): HttpResponse {
+  const headers = new Map&lt;string, string&gt;();
+  headers.set("X-Powered-By", "lumen");
   if (req.path == "/notfound") {
-    return { status: 404, body: "not found", ok: false };
+    return { status: 404, body: "not found", ok: false, headers: headers };
   }
-  return { status: 200, body: "hello from lumen (" + req.method + ")", ok: true };
+  return { status: 200, body: "hello from lumen (" + req.method + ")", ok: true, headers: headers };
 }
 
 http.createServer(8080, handleRequest);</code></pre>
@@ -1294,7 +1315,6 @@ http.createServer(8080, handleRequest);</code></pre>
   <table>
     <tr><th>API</th><th>Notes</th></tr>
     <tr><td>a real <code>URL</code> class / <code>.searchParams</code> / <code>.toString()</code></td><td>Node's modern API is class-based; the older function-based <code>parse</code>/<code>format</code> fit the static-function stdlib pattern better for v1</td></tr>
-    <tr><td><code>querystring.parse()</code>/<code>stringify()</code> · <code>URLSearchParams</code></td><td>needs a growable-array or <code>Map</code>-construction path from a builtin, neither exists yet</td></tr>
     <tr><td><code>username</code>/<code>password</code>/<code>auth</code> fields</td><td>niche; straightforward to add later</td></tr>
     <tr><td>relative-to-base URL resolution (<code>new URL(relative, base)</code>)</td><td>a separate feature from parsing one string</td></tr>
   </table>
@@ -1319,8 +1339,8 @@ http.createServer(8080, handleRequest);</code></pre>
     <tr><th>API</th><th>Notes</th></tr>
     <tr><td>Idle keep-alive connection timeouts</td><td>a connection stays open indefinitely as long as the client keeps sending requests and doesn't send <code>Connection: close</code></td></tr>
     <tr><td>Concurrent/multi-connection serving</td><td>still one connection served at a time (though its requests are now handled with keep-alive); real concurrency is a separate, later feature</td></tr>
-    <tr><td>Custom request/response headers (set or read)</td><td>needs a header-collection type; the same gap that deferred <code>url</code>'s querystring</td></tr>
-    <tr><td>Response headers on the client side</td><td>the underlying client's convenience wrapper only surfaces the status code; reading headers needs the lower-level request/response flow underneath it</td></tr>
+    <tr><td>Response headers on the client side</td><td><code>http.request</code>'s own request headers and <code>http.createServer</code>'s response headers both shipped, via <code>Map&lt;string, string&gt;</code>; reading real response headers on the client needs a lower-level request flow than what's wired up yet -- confirmed reachable, deliberately deferred rather than rewriting an already-working, already-benchmarked call under time pressure</td></tr>
+    <tr><td>Case-insensitive header lookup, repeated header/query values as an array</td><td><code>Map&lt;string, string&gt;</code>'s exact-match, last-write-wins lookup is what's available now</td></tr>
     <tr><td>Real <code>Server</code>/<code>IncomingMessage</code>/<code>ServerResponse</code>/<code>ClientRequest</code>/<code>Agent</code> classes</td><td>Node's classes bundle request/response data with an event mechanism; <code>EventEmitter</code> alone doesn't supply the data half, which still needs the header-collection/streaming gaps closed first</td></tr>
     <tr><td>Server lifecycle events (<code>'error'</code>, <code>'close'</code>) via <code>EventEmitter&lt;T&gt;</code></td><td>genuinely reachable now that <code>EventEmitter</code> exists &mdash; a real follow-up</td></tr>
     <tr><td>Streaming request/response bodies, concurrent serving, <code>METHODS</code>/<code>STATUS_CODES</code>, HTTPS/TLS configuration, WebSocket upgrade</td><td>each a real, separate feature</td></tr>
