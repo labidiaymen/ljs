@@ -43,6 +43,7 @@ pub const Type = union(enum) {
     class_type: []const u8, // a class instance  ->  Zig *Name (heap pointer)
     map_type: *const MapType, // Map<K, V>  ->  *LumenMap_<k>_<v> (heap pointer)
     set_type: *const Type, // Set<T>  ->  *LumenSet_<t> (heap pointer)
+    event_emitter_type: *const Type, // EventEmitter<T>  ->  *LumenEventEmitter_<t> (heap pointer)
     tuple_type: []const Type, // [A, B, ...]  ->  struct { @"0": A, @"1": B, ... }
     promise_type: *const Type, // Promise<T>  ->  *LumenPromise(T) (heap pointer)
 };
@@ -119,6 +120,7 @@ fn mangle(arena: std.mem.Allocator, t: Type) error{OutOfMemory}![]const u8 {
         .class_type => |n| try std.fmt.allocPrint(arena, "cls_{s}", .{n}),
         .map_type => |m| try std.fmt.allocPrint(arena, "map_{s}_{s}", .{ try mangle(arena, m.key.*), try mangle(arena, m.value.*) }),
         .set_type => |elem| try std.fmt.allocPrint(arena, "set_{s}", .{try mangle(arena, elem.*)}),
+        .event_emitter_type => |elem| try std.fmt.allocPrint(arena, "eventemitter_{s}", .{try mangle(arena, elem.*)}),
         .promise_type => |inner| try std.fmt.allocPrint(arena, "prom_{s}", .{try mangle(arena, inner.*)}),
         .tuple_type => |elems| blk2: {
             var buf2: std.ArrayListUnmanaged(u8) = .empty;
@@ -265,6 +267,10 @@ pub fn same(a: Type, b: Type) bool {
             .set_type => |b_e| same(a_e.*, b_e.*),
             else => false,
         },
+        .event_emitter_type => |a_e| switch (b) {
+            .event_emitter_type => |b_e| same(a_e.*, b_e.*),
+            else => false,
+        },
         .promise_type => |a_e| switch (b) {
             .promise_type => |b_e| same(a_e.*, b_e.*),
             else => false,
@@ -321,6 +327,10 @@ pub fn isMap(t: Type) bool {
 
 pub fn isSet(t: Type) bool {
     return t == .set_type;
+}
+
+pub fn isEventEmitter(t: Type) bool {
+    return t == .event_emitter_type;
 }
 
 pub fn isArray(t: Type) bool {
@@ -391,6 +401,10 @@ pub fn toAnnotation(arena: std.mem.Allocator, t: Type) error{OutOfMemory}!?[]con
         .set_type => |elem| blk: {
             const e = (try toAnnotation(arena, elem.*)) orelse break :blk null;
             break :blk try std.fmt.allocPrint(arena, "Set<{s}>", .{e});
+        },
+        .event_emitter_type => |elem| blk: {
+            const e = (try toAnnotation(arena, elem.*)) orelse break :blk null;
+            break :blk try std.fmt.allocPrint(arena, "EventEmitter<{s}>", .{e});
         },
         .promise_type => |inner| blk: {
             const e = (try toAnnotation(arena, inner.*)) orelse break :blk null;
@@ -481,6 +495,7 @@ pub fn zigName(arena: std.mem.Allocator, t: Type) ![]const u8 {
         .class_type => |name| try std.fmt.allocPrint(arena, "*{s}", .{name}),
         .map_type => |m| try std.fmt.allocPrint(arena, "*LumenMap({s}, {s})", .{ try zigName(arena, m.key.*), try zigName(arena, m.value.*) }),
         .set_type => |elem| try std.fmt.allocPrint(arena, "*LumenSet({s})", .{try zigName(arena, elem.*)}),
+        .event_emitter_type => |elem| try std.fmt.allocPrint(arena, "*LumenEventEmitter({s})", .{try zigName(arena, elem.*)}),
         .promise_type => |inner| try std.fmt.allocPrint(arena, "*LumenPromise({s})", .{try zigName(arena, inner.*)}),
         .tuple_type => |elems| try tupleStructName(arena, elems),
     };

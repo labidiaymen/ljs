@@ -379,6 +379,68 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_event_emitter) {
+        // EventEmitter<T> (spec 043): one payload type T shared by every
+        // event name on an instance (Lumen has no way to give each string
+        // key its own listener signature the way Node's untyped emitter
+        // does). Listener storage is a Zig-internal StringHashMap of
+        // growable listener lists -- Lumen's own array type has no push
+        // support yet, but that's invisible here since none of this is
+        // constructed via Lumen array syntax.
+        try out.appendSlice(arena,
+            \\fn LumenEventEmitter(comptime T: type) type {
+            \\    const CallFn = *const fn (*const anyopaque, T) void;
+            \\    const Listener = struct { ctx: *const anyopaque, call: CallFn, once: bool };
+            \\    return struct {
+            \\        const Self = @This();
+            \\        listeners: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(Listener)) = .empty,
+            \\        fn __init() *Self {
+            \\            const p = __sa().create(Self) catch unreachable;
+            \\            p.* = .{};
+            \\            return p;
+            \\        }
+            \\        fn __add(self: *Self, name: []const u8, listener: anytype, is_once: bool) void {
+            \\            const gop = self.listeners.getOrPut(__sa(), name) catch unreachable;
+            \\            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            \\            gop.value_ptr.append(__sa(), .{ .ctx = listener.ctx, .call = listener.call, .once = is_once }) catch unreachable;
+            \\        }
+            \\        fn on(self: *Self, name: []const u8, listener: anytype) void {
+            \\            self.__add(name, listener, false);
+            \\        }
+            \\        fn once(self: *Self, name: []const u8, listener: anytype) void {
+            \\            self.__add(name, listener, true);
+            \\        }
+            \\        fn emit(self: *Self, name: []const u8, value: T) void {
+            \\            const list = self.listeners.getPtr(name) orelse return;
+            \\            var has_once = false;
+            \\            for (list.items) |l| {
+            \\                l.call(l.ctx, value);
+            \\                if (l.once) has_once = true;
+            \\            }
+            \\            if (!has_once) return;
+            \\            var keep: std.ArrayListUnmanaged(Listener) = .empty;
+            \\            for (list.items) |l| {
+            \\                if (!l.once) keep.append(__sa(), l) catch unreachable;
+            \\            }
+            \\            list.deinit(__sa());
+            \\            list.* = keep;
+            \\        }
+            \\        fn removeAllListeners(self: *Self) void {
+            \\            var it = self.listeners.valueIterator();
+            \\            while (it.next()) |list| list.clearRetainingCapacity();
+            \\        }
+            \\        fn removeListenersFor(self: *Self, name: []const u8) void {
+            \\            if (self.listeners.getPtr(name)) |list| list.clearRetainingCapacity();
+            \\        }
+            \\        fn listenerCount(self: *Self, name: []const u8) i32 {
+            \\            if (self.listeners.get(name)) |list| return @intCast(list.items.len);
+            \\            return 0;
+            \\        }
+            \\    };
+            \\}
+            \\
+        );
+    }
     if (program.needs_async) {
         // The event loop is libxev. `setTimeout` schedules an `xev.Timer`;
         // `await` drives the loop one event at a time (`loop.run(.once)`) until

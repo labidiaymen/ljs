@@ -424,6 +424,7 @@ pub const Program = struct {
     needs_serve: bool = false,
     needs_map: bool = false,
     needs_set: bool = false,
+    needs_event_emitter: bool = false,
     // Async/await: emit the event-loop + Promise runtime and drain the loop in main.
     needs_async: bool = false,
 };

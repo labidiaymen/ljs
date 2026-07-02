@@ -86,6 +86,7 @@ pub const Checker = struct {
     pub const arrayMethod = check_stdlib.arrayMethod;
     pub const mapMethod = check_stdlib.mapMethod;
     pub const setMethod = check_stdlib.setMethod;
+    pub const eventEmitterMethod = check_stdlib.eventEmitterMethod;
     pub const stringMethod = check_stdlib.stringMethod;
     pub const staticCallType = check_stdlib.staticCallType;
     pub const fsCallType = check_stdlib.fsCallType;

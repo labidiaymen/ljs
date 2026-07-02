@@ -436,6 +436,22 @@ pub fn exprType(self: *Checker, program: *ast.Program, e: *ast.Expr, line: u32, 
                 program.needs_set = true;
                 return ct;
             }
+            if (std.mem.eql(u8, ne.class_name, "EventEmitter") and self.classes.get("EventEmitter") == null) {
+                if (ne.type_args.len != 1) {
+                    _ = self.fail(line, col, "E_TYPE_ARG_COUNT") catch {};
+                    return null;
+                }
+                if (ne.args.len != 0) {
+                    _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+                    return null;
+                }
+                const payload = self.arena.create(types.Type) catch return null;
+                payload.* = self.typeFromAnnotation(ne.type_args[0], line, col) catch return null;
+                const ct = types.Type{ .event_emitter_type = payload };
+                ne.container_type = ct;
+                program.needs_event_emitter = true;
+                return ct;
+            }
             // Generic class instantiation `new C<...>(...)`: specialize the
             // class and retarget `new` to the concrete mangled class.
             if (self.generic_classes.get(ne.class_name)) |gcls| {
@@ -539,6 +555,9 @@ pub fn exprType(self: *Checker, program: *ast.Program, e: *ast.Expr, line: u32, 
             }
             if (types.isSet(obj_type)) {
                 return self.setMethod(program, mc, obj_type, line, col);
+            }
+            if (types.isEventEmitter(obj_type)) {
+                return self.eventEmitterMethod(program, mc, obj_type, line, col);
             }
             if (obj_type != .class_type) {
                 _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};

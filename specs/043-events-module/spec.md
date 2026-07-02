@@ -70,6 +70,18 @@ functions can't represent.
 
 ## Design notes
 
+- **Mutating an emitter from inside one of its own listeners, during
+  `emit`, is not guaranteed-safe for that same event name**: `emit`
+  iterates the registered listener list and builds a fresh list of the
+  ones to keep (dropping fired `once` listeners) as it goes. If a
+  listener itself calls `.on()`/`.once()`/`.removeAllListeners()` for the
+  *same* name while that `emit` is still running, the growable listener
+  list backing it can reallocate mid-iteration. Node has specific,
+  documented behavior for this re-entrant case; matching it exactly
+  would need more careful iteration bookkeeping than this pass attempted.
+  Flagged explicitly rather than left as an unexamined edge case --
+  straightforward, non-re-entrant use (registering listeners up front,
+  emitting later) is unaffected.
 - **`off`/`removeListener` deferred**: removing one specific listener
   needs comparing two listener values for identity, and Lumen's closure
   representation (a fat pointer + context, per the `LumenFn` pattern

@@ -287,6 +287,86 @@ pub fn setMethod(self: *Checker, program: *ast.Program, mc: anytype, obj_type: t
     return null;
 }
 
+/// Validate a method call on an `EventEmitter<T>` receiver and return its
+/// statically-known result type. Mirrors `mapMethod`/`setMethod`. Every
+/// event name on one instance shares the same payload type T -- see
+/// spec 043 for why (Lumen has no way to express "this string key selects
+/// this listener signature" the way Node's untyped EventEmitter does).
+pub fn eventEmitterMethod(self: *Checker, program: *ast.Program, mc: anytype, obj_type: types.Type, line: u32, col: u32) ?types.Type {
+    mc.container_type = obj_type;
+    const payload = obj_type.event_emitter_type.*;
+    const name = mc.name;
+    const eq = std.mem.eql;
+
+    if (eq(u8, name, "on") or eq(u8, name, "once")) {
+        if (mc.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const name_type = self.exprType(program, mc.args[0], line, col) orelse return null;
+        if (!types.same(.string, name_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        const want = self.makeFuncType(&.{payload}, .void) orelse return null;
+        self.ensureAssignable(program, want, mc.args[1], line, col) catch {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        };
+        return .void;
+    }
+    if (eq(u8, name, "emit")) {
+        if (mc.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const name_type = self.exprType(program, mc.args[0], line, col) orelse return null;
+        if (!types.same(.string, name_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        self.ensureAssignable(program, payload, mc.args[1], line, col) catch {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        };
+        return .void;
+    }
+    if (eq(u8, name, "removeAllListeners")) {
+        if (mc.args.len > 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        // Zig has no default-parameter overloading, so the 0-arg ("clear
+        // everything") and 1-arg ("clear one name") forms need distinct
+        // runtime method names -- routed here, the same renaming trick
+        // `assert.equal` uses to route to a distinct string-comparison
+        // function.
+        if (mc.args.len == 1) {
+            const name_type = self.exprType(program, mc.args[0], line, col) orelse return null;
+            if (!types.same(.string, name_type)) {
+                _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+                return null;
+            }
+            mc.name = "removeListenersFor";
+        }
+        return .void;
+    }
+    if (eq(u8, name, "listenerCount")) {
+        if (mc.args.len != 1) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const name_type = self.exprType(program, mc.args[0], line, col) orelse return null;
+        if (!types.same(.string, name_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        return .i32;
+    }
+    _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+    return null;
+}
+
 /// Validate an instance method call on a `string` receiver and return its
 /// statically-known result type. Mirrors `arrayMethod`.
 pub fn stringMethod(self: *Checker, program: *ast.Program, mc: anytype, line: u32, col: u32) ?types.Type {
