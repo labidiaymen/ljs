@@ -550,7 +550,13 @@ fn watchRebuild(
         try err.flush();
         return;
     };
-    if (child.id) |id| WatchSignal.child_id.store(@intCast(id), .seq_cst);
+    // `child.id` is an opaque HANDLE on Windows, not an integer PID, and
+    // WatchSignal only exists to let a POSIX signal handler `std.posix.kill`
+    // the child on Ctrl-C (never installed on Windows to begin with -- see
+    // the guard above) -- so there's nothing to store there.
+    if (@import("builtin").os.tag != .windows) {
+        if (child.id) |id| WatchSignal.child_id.store(@intCast(id), .seq_cst);
+    }
     prev.* = child;
     try err.print("watch: running {s}\n", .{exe_rel});
     try err.flush();
