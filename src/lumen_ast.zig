@@ -404,6 +404,7 @@ pub const Program = struct {
     needs_utimes_sync: bool = false,
     needs_lchmod_sync: bool = false,
     needs_readdir_sync: bool = false,
+    needs_fs_watch: bool = false,
     needs_path_api: bool = false,
     needs_process_api: bool = false,
     needs_os_api: bool = false,

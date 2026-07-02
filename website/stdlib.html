@@ -307,6 +307,7 @@ console.log(emitter.listenerCount("greet")); // 1</code></pre>
     <a href="#fs-utimesSync">utimesSync</a>
     <a href="#fs-lutimesSync">lutimesSync</a>
     <a href="#fs-readdirSync">readdirSync</a>
+    <a href="#fs-watch">watch</a>
   </div>
 
   <div class="api" id="fs-readFileSync">
@@ -592,6 +593,23 @@ fs.closeSync(fd);</code></pre>
 for (const n of names) {
   console.log(n);
 }</code></pre>
+  </div>
+
+  <div class="api" id="fs-watch">
+    <h5><code>fs.watch(path, listener)</code> <span class="stability-pill stability-experimental" title="New this milestone, not yet covered by the conformance suite -- manually smoke-tested with real filesystem operations.">Experimental</span> <span class="target-pill target-wasm-limited" title="Compiles under --wasm, but exits immediately at startup there: WASI has no equivalent watch capability, matching http.createServer's precedent for the same reason.">Wasm: limited</span></h5>
+    <p class="sub">(string, (string) → void) → void &mdash; blocking,
+    never returns; calls <code>listener</code> with the name of the file
+    that changed on every create/modify/delete/rename event under
+    <code>path</code>. Linux only (raw <code>inotify</code>, no libc).
+    Not <code>EventEmitter</code>-based like Node's real <code>FSWatcher</code>
+    &mdash; nothing drives an emitter asynchronously on its own here, so
+    this calls the listener directly in a blocking loop instead, the same
+    shape as <code>http.createServer</code>.</p>
+<pre><code class="lumen">function onChange(name: string): void {
+  console.log(name);
+}
+
+fs.watch("./src", onChange);</code></pre>
   </div>
 
   <h4 id="path">path</h4>
@@ -1230,7 +1248,8 @@ http.createServer(8080, handleRequest);</code></pre>
     <tr><td><code>fs.realpathSync(path)</code></td><td>only a raw libc binding exists, not wrapped by the runtime's I/O layer</td></tr>
     <tr><td><code>fs.chownSync(path, uid, gid)</code> · <code>fs.lchownSync(path, uid, gid)</code></td><td>unimplemented in the underlying runtime (the fd-based <code>fchownSync</code> works and shipped)</td></tr>
     <tr><td><code>fs.readvSync</code> / <code>writevSync</code> · append-mode <code>openSync</code></td><td>readv/writev need an array of buffers; append mode needs a seek primitive not available here</td></tr>
-    <tr><td><code>fs.promises.*</code> / watch / streams / most async callback variants</td><td><code>fs.readFile</code>, <code>fs.writeFile</code>, and <code>fs.appendFile</code> are wired to the event loop; the rest needs lower-level async ops the runtime doesn't expose yet</td></tr>
+    <tr><td><code>fs.promises.*</code> / streams / most async callback variants</td><td><code>fs.readFile</code>, <code>fs.writeFile</code>, and <code>fs.appendFile</code> are wired to the event loop; the rest needs lower-level async ops the runtime doesn't expose yet</td></tr>
+    <tr><td><code>fs.watch</code> event-type distinction, recursive watching, non-Linux platforms</td><td><code>fs.watch(path, listener)</code> itself shipped (Linux, flat, one filename per event); each of these is a real, separate follow-up</td></tr>
     <tr><td><code>fs.opendirSync(path)</code> · <code>fs.globSync(pattern)</code></td><td>need a directory-iterator class / a real glob algorithm</td></tr>
   </table>
 

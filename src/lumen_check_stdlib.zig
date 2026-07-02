@@ -1035,6 +1035,25 @@ pub fn fsCallType(self: *Checker, program: *ast.Program, call: *ast.StaticCall, 
         call.checked_type = .string_array;
         return .string_array;
     }
+    if (std.mem.eql(u8, call.name, "watch")) {
+        if (call.args.len != 2) {
+            _ = self.fail(line, col, "E_ARG_COUNT") catch {};
+            return null;
+        }
+        const path_type = self.exprType(program, call.args[0], line, col) orelse return null;
+        if (!types.same(.string, path_type)) {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        }
+        const want = self.makeFuncType(&.{.string}, .void) orelse return null;
+        self.ensureAssignable(program, want, call.args[1], line, col) catch {
+            _ = self.fail(line, col, "E_TYPE_MISMATCH") catch {};
+            return null;
+        };
+        program.needs_fs_watch = true;
+        call.checked_type = .void;
+        return .void;
+    }
     _ = self.fail(line, col, "E_UNSUPPORTED_STD") catch {};
     return null;
 }

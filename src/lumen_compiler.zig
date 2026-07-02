@@ -1087,6 +1087,39 @@ pub fn compileToZigWithOptions(arena: std.mem.Allocator, source: []const u8, fil
             \\
         );
     }
+    if (program.needs_fs_watch) {
+        // fs.watch (spec 044): raw inotify, the same "raw Linux syscall, no
+        // libc" pattern os.uptime()/uname() already established. Blocking,
+        // like http.createServer -- there's no background mechanism to
+        // drive an EventEmitter asynchronously here, so this calls
+        // `listener` synchronously in a loop that never returns, rather
+        // than returning an EventEmitter-based watcher object the way
+        // Node's real fs.watch does.
+        try out.appendSlice(arena,
+            \\fn __fsWatch(path: []const u8, listener: anytype) noreturn {
+            \\    if (@import("builtin").os.tag != .linux) std.process.exit(1);
+            \\    const inotify = std.os.linux.inotify_init1(0);
+            \\    if (@as(isize, @bitCast(inotify)) < 0) std.process.exit(1);
+            \\    const fd: i32 = @intCast(inotify);
+            \\    const path_z = std.heap.page_allocator.dupeZ(u8, path) catch std.process.exit(1);
+            \\    const mask: u32 = std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE | std.os.linux.IN.DELETE | std.os.linux.IN.MOVE;
+            \\    const wd = std.os.linux.inotify_add_watch(fd, path_z, mask);
+            \\    if (@as(isize, @bitCast(wd)) < 0) std.process.exit(1);
+            \\    var buf: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
+            \\    while (true) {
+            \\        const n = std.posix.read(fd, &buf) catch continue;
+            \\        var offset: usize = 0;
+            \\        while (offset + @sizeOf(std.os.linux.inotify_event) <= n) {
+            \\            const ev: *const std.os.linux.inotify_event = @ptrCast(@alignCast(&buf[offset]));
+            \\            const name = ev.getName() orelse path;
+            \\            listener.call(listener.ctx, name);
+            \\            offset += @sizeOf(std.os.linux.inotify_event) + ev.len;
+            \\        }
+            \\    }
+            \\}
+            \\
+        );
+    }
     if (program.needs_path_api) {
         // path.* (spec 032): pure string manipulation, no Io parameter at all
         // -- the one stdlib namespace that doesn't thread `io` through.
