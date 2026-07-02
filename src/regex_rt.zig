@@ -115,7 +115,7 @@ pub const __lumen_regex = struct {
         fn parseRepeat(self: *Parser, inner: *Node) ParseError!*Node {
             __re_std.debug.assert(self.s[self.i] == '{');
             var j = self.i + 1;
-            const min = try readInt(self.s, &j);
+            const min = try __reReadInt(self.s, &j);
             var has_max = true;
             var max: u32 = min;
             if (j < self.s.len and self.s[j] == ',') {
@@ -123,7 +123,7 @@ pub const __lumen_regex = struct {
                 if (j < self.s.len and self.s[j] == '}') {
                     has_max = false;
                 } else {
-                    max = try readInt(self.s, &j);
+                    max = try __reReadInt(self.s, &j);
                 }
             }
             if (j >= self.s.len or self.s[j] != '}') return error.BadPattern;
@@ -250,7 +250,7 @@ pub const __lumen_regex = struct {
         }
     };
 
-    fn readInt(s: []const u8, j: *usize) ParseError!u32 {
+    fn __reReadInt(s: []const u8, j: *usize) ParseError!u32 {
         const start = j.*;
         var v: u32 = 0;
         while (j.* < s.len and s[j.*] >= '0' and s[j.*] <= '9') : (j.* += 1) {
@@ -275,85 +275,85 @@ pub const __lumen_regex = struct {
 
     const Prog = __re_std.ArrayListUnmanaged(Inst);
 
-    fn emit(prog: *Prog, a: __re_std.mem.Allocator, inst: Inst) ParseError!usize {
+    fn __reEmit(prog: *Prog, a: __re_std.mem.Allocator, inst: Inst) ParseError!usize {
         try prog.append(a, inst);
         return prog.items.len - 1;
     }
 
-    fn compile(node: *const Node, prog: *Prog, a: __re_std.mem.Allocator) ParseError!void {
+    fn __reCompile(node: *const Node, prog: *Prog, a: __re_std.mem.Allocator) ParseError!void {
         switch (node.*) {
             .empty => {},
-            .char => |c| _ = try emit(prog, a, .{ .char = c }),
-            .any => _ = try emit(prog, a, .any),
-            .class => |cl| _ = try emit(prog, a, .{ .class = cl }),
-            .astart => _ = try emit(prog, a, .astart),
-            .aend => _ = try emit(prog, a, .aend),
-            .concat => |items| for (items) |it| try compile(it, prog, a),
+            .char => |c| _ = try __reEmit(prog, a, .{ .char = c }),
+            .any => _ = try __reEmit(prog, a, .any),
+            .class => |cl| _ = try __reEmit(prog, a, .{ .class = cl }),
+            .astart => _ = try __reEmit(prog, a, .astart),
+            .aend => _ = try __reEmit(prog, a, .aend),
+            .concat => |items| for (items) |it| try __reCompile(it, prog, a),
             .alt => |alts| {
                 var jmps: __re_std.ArrayListUnmanaged(usize) = .empty;
                 for (alts, 0..) |alt, idx| {
                     if (idx + 1 < alts.len) {
-                        const sp = try emit(prog, a, .{ .split = .{ .x = prog.items.len + 1, .y = 0 } });
-                        try compile(alt, prog, a);
-                        try jmps.append(a, try emit(prog, a, .{ .jmp = 0 }));
+                        const sp = try __reEmit(prog, a, .{ .split = .{ .x = prog.items.len + 1, .y = 0 } });
+                        try __reCompile(alt, prog, a);
+                        try jmps.append(a, try __reEmit(prog, a, .{ .jmp = 0 }));
                         prog.items[sp].split.y = prog.items.len;
                     } else {
-                        try compile(alt, prog, a);
+                        try __reCompile(alt, prog, a);
                     }
                 }
                 for (jmps.items) |jp| prog.items[jp].jmp = prog.items.len;
             },
             .star => |inner| {
-                const l1 = try emit(prog, a, .{ .split = .{ .x = 0, .y = 0 } });
+                const l1 = try __reEmit(prog, a, .{ .split = .{ .x = 0, .y = 0 } });
                 prog.items[l1].split.x = prog.items.len;
-                try compile(inner, prog, a);
-                _ = try emit(prog, a, .{ .jmp = l1 });
+                try __reCompile(inner, prog, a);
+                _ = try __reEmit(prog, a, .{ .jmp = l1 });
                 prog.items[l1].split.y = prog.items.len;
             },
             .plus => |inner| {
                 const l1 = prog.items.len;
-                try compile(inner, prog, a);
-                _ = try emit(prog, a, .{ .split = .{ .x = l1, .y = prog.items.len + 1 } });
+                try __reCompile(inner, prog, a);
+                _ = try __reEmit(prog, a, .{ .split = .{ .x = l1, .y = prog.items.len + 1 } });
             },
             .quest => |inner| {
-                const sp = try emit(prog, a, .{ .split = .{ .x = prog.items.len + 1, .y = 0 } });
-                try compile(inner, prog, a);
+                const sp = try __reEmit(prog, a, .{ .split = .{ .x = prog.items.len + 1, .y = 0 } });
+                try __reCompile(inner, prog, a);
                 prog.items[sp].split.y = prog.items.len;
             },
         }
     }
 
-    fn lower(c: u8) u8 {
+    fn __reLower(c: u8) u8 {
         return if (c >= 'A' and c <= 'Z') c + 32 else c;
     }
 
-    fn chEq(a: u8, b: u8, ci: bool) bool {
-        return if (ci) lower(a) == lower(b) else a == b;
+    fn __reChEq(a: u8, b: u8, ci: bool) bool {
+        return if (ci) __reLower(a) == __reLower(b) else a == b;
     }
 
-    fn inRanges(ranges: []const Range, ch: u8) bool {
+    fn __reInRanges(ranges: []const Range, ch: u8) bool {
         for (ranges) |r| if (ch >= r.lo and ch <= r.hi) return true;
         return false;
     }
 
-    fn classMatch(cl: Class, ch: u8, ci: bool) bool {
-        var hit = inRanges(cl.ranges, ch);
+    fn __reClassMatch(cl: Class, ch: u8, ci: bool) bool {
+        var hit = __reInRanges(cl.ranges, ch);
         if (!hit and ci) {
             const swapped: u8 = if (ch >= 'a' and ch <= 'z') ch - 32 else if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
-            if (swapped != ch) hit = inRanges(cl.ranges, swapped);
+            if (swapped != ch) hit = __reInRanges(cl.ranges, swapped);
         }
         return hit != cl.negated;
     }
 
     // Backtracking VM: does prog match `text` starting at `sp`?
-    fn run(prog: []const Inst, pc0: usize, text: []const u8, sp0: usize, ci: bool) bool {
+    fn __reRun(prog: []const Inst, pc0: usize, text: []const u8, sp0: usize, ci: bool) bool {
         var pc = pc0;
         var sp = sp0;
         while (true) {
             switch (prog[pc]) {
                 .match => return true,
                 .char => |c| {
-                    if (sp < text.len and chEq(text[sp], c, ci)) {
+                    if (sp < text.len and __reChEq(text[sp], c, ci)) {
                         pc += 1;
                         sp += 1;
                     } else return false;
@@ -365,7 +365,7 @@ pub const __lumen_regex = struct {
                     } else return false;
                 },
                 .class => |cl| {
-                    if (sp < text.len and classMatch(cl, text[sp], ci)) {
+                    if (sp < text.len and __reClassMatch(cl, text[sp], ci)) {
                         pc += 1;
                         sp += 1;
                     } else return false;
@@ -378,7 +378,7 @@ pub const __lumen_regex = struct {
                 },
                 .jmp => |x| pc = x,
                 .split => |s| {
-                    if (run(prog, s.x, text, sp, ci)) return true;
+                    if (__reRun(prog, s.x, text, sp, ci)) return true;
                     pc = s.y;
                 },
             }
@@ -401,13 +401,13 @@ pub const __lumen_regex = struct {
 
     /// Compiles `pattern`/`flags` into reusable bytecode (allocated in `a`). Returns
     /// null on a malformed pattern.
-    pub fn compilePattern(a: __re_std.mem.Allocator, pattern: []const u8, flags: []const u8) ?Compiled {
+    pub fn __reCompilePattern(a: __re_std.mem.Allocator, pattern: []const u8, flags: []const u8) ?Compiled {
         var parser = Parser{ .s = pattern, .a = a };
         const ast = parser.parseAlt() catch return null;
         if (parser.i != pattern.len) return null; // trailing junk (e.g. stray ')')
         var prog: Prog = .empty;
-        compile(ast, &prog, a) catch return null;
-        _ = emit(&prog, a, .match) catch return null;
+        __reCompile(ast, &prog, a) catch return null;
+        _ = __reEmit(&prog, a, .match) catch return null;
         var ci = false;
         for (flags) |f| {
             if (f == 'i') ci = true;
@@ -416,10 +416,10 @@ pub const __lumen_regex = struct {
     }
 
     /// Does the compiled regex match anywhere in `input` (JS `RegExp.test`)?
-    pub fn matchOne(c: Compiled, input: []const u8) bool {
+    pub fn __reMatchOne(c: Compiled, input: []const u8) bool {
         var start: usize = 0;
         while (start <= input.len) : (start += 1) {
-            if (run(c.prog, 0, input, start, c.ci)) return true;
+            if (__reRun(c.prog, 0, input, start, c.ci)) return true;
         }
         return false;
     }
@@ -428,8 +428,8 @@ pub const __lumen_regex = struct {
     pub fn search(pattern: []const u8, flags: []const u8, input: []const u8) bool {
         var arena = __re_std.heap.ArenaAllocator.init(__re_std.heap.page_allocator);
         defer arena.deinit();
-        const c = compilePattern(arena.allocator(), pattern, flags) orelse return false;
-        return matchOne(c, input);
+        const c = __reCompilePattern(arena.allocator(), pattern, flags) orelse return false;
+        return __reMatchOne(c, input);
     }
 };
 
